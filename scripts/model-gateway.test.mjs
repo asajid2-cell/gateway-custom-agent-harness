@@ -12,6 +12,7 @@ import {
   anthropicToCodex,
   codexUsageToAnthropic,
   relayCodexStream,
+  relayDeepSeekStream,
 } from './model-gateway.mjs'
 import {
   anthropicToOpenCodeChat,
@@ -69,9 +70,11 @@ function responseEvents(response) {
 
 function upstreamFromEvents(events) {
   const payload = events
-    .map(event => `data: ${JSON.stringify(event)}\n\n`)
+    .map(event => typeof event === 'string' ? `data: ${event}\n\n` : `data: ${JSON.stringify(event)}\n\n`)
     .join('')
   return {
+    status: 200,
+    headers: new Headers({ 'content-type': 'text/event-stream' }),
     body: new ReadableStream({
       start(controller) {
         controller.enqueue(new TextEncoder().encode(payload))
@@ -79,6 +82,59 @@ function upstreamFromEvents(events) {
       },
     }),
   }
+}
+
+function anthropicUpstreamFromEvents(events) {
+  return upstreamFromEvents(events)
+}
+
+function deepSeekValidEvents() {
+  return [
+    { type: 'message_start', message: { id: 'msg-ds', type: 'message', role: 'assistant', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'OK' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+    { type: 'message_stop' },
+  ]
+}
+
+function deepSeekEmptyEvents() {
+  return [
+    { type: 'message_start', message: { id: 'msg-empty', type: 'message', role: 'assistant', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'message_stop' },
+  ]
+}
+
+function deepSeekContextFailureEvents() {
+  return [
+    { type: 'error', error: { type: 'invalid_request_error', message: 'Prompt is too long: context window exceeded' } },
+  ]
+}
+
+function deepSeekResetUpstream() {
+  let sent = false
+  return { status: 200, headers: new Headers({ 'content-type': 'text/event-stream' }), body: new ReadableStream({
+    pull(controller) {
+      if (!sent) {
+        sent = true
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'message_start', message: { id: 'msg-reset', type: 'message', role: 'assistant', content: [] } })}\n\n`))
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`))
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } })}\n\n`))
+      } else controller.error(new Error('ECONNRESET'))
+    },
+  }) }
+}
+
+function deepSeekHeaders() {
+  return new Headers({ 'content-type': 'text/event-stream' })
+}
+
+function deepSeekResponse(events) {
+  const upstream = anthropicUpstreamFromEvents(events)
+  upstream.headers = deepSeekHeaders()
+  return upstream
 }
 
 function delayedUpstream(delayMs, events = []) {
@@ -606,6 +662,42 @@ test('relay timing observes first byte, output, completion, bytes, and events wi
   assert.ok(trace.marks.events > 0)
   assert.equal(response.headers.status, 200)
 })
+
+test('DeepSeek delays HTTP 200 until usable output', async () => {
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResponse(deepSeekValidEvents()), traceCapture())
+  assert.equal(response.headers.status, 200)
+  assert.match(response.text(), /message_stop/)
+})
+
+test('DeepSeek rejects an empty stream before committing HTTP 200', async () => {
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResponse(deepSeekEmptyEvents()), traceCapture())
+  assert.equal(response.headers.status, 502)
+  assert.equal(JSON.parse(response.text()).error.message, 'DeepSeek returned an empty or malformed response')
+})
+
+test('DeepSeek maps a pre-output context failure to HTTP 400', async () => {
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResponse(deepSeekContextFailureEvents()), traceCapture())
+  assert.equal(response.headers.status, 400)
+  assert.match(JSON.parse(response.text()).error.message, /^Prompt is too long:/)
+})
+
+test('DeepSeek preserves an in-stream error after output and cancels the provider reader', async () => {
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResetUpstream(), traceCapture())
+  assert.equal(response.headers.status, 200)
+  assert.match(response.text(), /ECONNRESET/)
+})
+
+test('DeepSeek rejects malformed SSE before HTTP 200', async () => {
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResponse(['not-json']), traceCapture())
+  assert.equal(response.headers.status, 502)
+  assert.equal(JSON.parse(response.text()).error.message, 'DeepSeek returned malformed Anthropic SSE data')
+})
+
 
 test('a delayed stream remains bounded by the caller timeout contract', async () => {
   const controller = new AbortController()

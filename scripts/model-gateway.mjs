@@ -963,30 +963,123 @@ function copyResponseHeaders(upstream, includeStreamHeaders = false) {
   return headers
 }
 
-async function relayRawResponse(res, upstream, trace = null) {
-  res.writeHead(upstream.status, copyResponseHeaders(upstream, true))
-  if (!upstream.body) {
-    res.end()
-    return
+function deepSeekEventHasUsableOutput(event) {
+  if (event?.type === 'content_block_start') {
+    return event.content_block?.type === 'tool_use'
+  }
+  if (event?.type !== 'content_block_delta') return false
+  const delta = event.delta || {}
+  if (delta.type === 'text_delta') return typeof delta.text === 'string' && delta.text.length > 0
+  if (delta.type === 'input_json_delta') {
+    return typeof delta.partial_json === 'string' && delta.partial_json.length > 0
+  }
+  if (delta.type === 'thinking_delta') {
+    return typeof delta.thinking === 'string' && delta.thinking.length > 0
+  }
+  return false
+}
+
+function parseDeepSeekSseFrame(frame) {
+  const data = frame
+    .split(/\r?\n/)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trimStart())
+    .join('\n')
+  if (!data || data === '[DONE]') return null
+  try {
+    return JSON.parse(data)
+  } catch {
+    throw new Error('DeepSeek returned malformed Anthropic SSE data')
+  }
+}
+
+async function writeDeepSeekChunk(res, chunk) {
+  if (res.destroyed || res.writableEnded) return
+  if (!res.write(chunk)) {
+    await new Promise(resolve => res.once('drain', resolve))
+  }
+}
+
+export async function relayDeepSeekStream(res, upstream, trace = null) {
+  let streamStarted = false
+  let sawOutput = false
+  let sawMessageStop = false
+  let pending = ''
+  let buffer = ''
+  let reader = null
+  const maxPendingBytes = 1024 * 1024
+
+  const startStream = () => {
+    if (streamStarted) return
+    res.writeHead(upstream.status, copyResponseHeaders(upstream, true))
+    streamStarted = true
+    if (pending) {
+      res.write(pending)
+      pending = ''
+    }
   }
 
-  const reader = upstream.body.getReader()
+  const emitFrame = async frame => {
+    const event = parseDeepSeekSseFrame(frame)
+    if (event?.type === 'error') {
+      throw new Error(event.error?.message || 'DeepSeek Anthropic request failed')
+    }
+    if (event?.type === 'message_stop') sawMessageStop = true
+    if (deepSeekEventHasUsableOutput(event)) {
+      sawOutput = true
+      trace?.markOutput()
+      startStream()
+    }
+    if (streamStarted) {
+      await writeDeepSeekChunk(res, frame)
+      return
+    }
+    pending += frame
+    if (Buffer.byteLength(pending, 'utf8') > maxPendingBytes) {
+      throw new Error('DeepSeek response exceeded the pre-output buffer')
+    }
+  }
+
   try {
+    reader = upstream.body?.getReader()
+    if (!reader) throw new Error('DeepSeek returned an empty response body')
+    const decoder = new TextDecoder()
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
       trace?.markFirstByte()
       trace?.addBytes(value?.byteLength || 0)
       trace?.addEvent()
-      if (res.destroyed) return
-      if (!res.write(Buffer.from(value))) {
-        await new Promise(resolve => res.once('drain', resolve))
+      buffer += decoder.decode(value, { stream: true })
+      const frames = buffer.split(/\r?\n\r?\n/)
+      buffer = frames.pop() || ''
+      for (const frame of frames) {
+        if (frame) await emitFrame(`${frame}\n\n`)
       }
     }
+    buffer += decoder.decode()
+    if (buffer.trim()) await emitFrame(buffer)
+
+    if (!sawOutput) {
+      throw new Error(sawMessageStop
+        ? 'DeepSeek returned an empty or malformed response'
+        : 'DeepSeek stream ended before usable output')
+    }
+    if (!sawMessageStop) throw new Error('DeepSeek stream ended before message_stop')
+    trace?.markCompletion()
+    res.end()
+  } catch (error) {
+    trace?.markError(error)
+    await upstream.body?.cancel?.().catch(() => {})
+    if (!streamStarted) {
+      if (isContextWindowFailure(error)) finishAnthropicPromptTooLongError(res, error)
+      else anthropicError(res, 502, errorMessage(error))
+    } else {
+      finishAnthropicStreamWithError(res, error)
+    }
   } finally {
-    reader.releaseLock()
+    reader?.releaseLock()
   }
-  res.end()
 }
 
 async function handleCodex(body, req, res, modelName, route) {
@@ -1203,7 +1296,7 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   }
 
   try {
-    await relayRawResponse(res, upstream, trace)
+    await relayDeepSeekStream(res, upstream, trace)
     trace.markCompletion()
     trace.finish('success', null, res.statusCode)
   } catch (error) {
