@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $LaunchDirectory = (Get-Location).Path
 $GatewayScript = Join-Path $PSScriptRoot 'model-gateway.mjs'
+$ClaudeScript = Join-Path $Root 'dist\cli.js'
 $CodexAccountsRoot = Join-Path $env:USERPROFILE '.codex-accounts'
 $CodexSelectionPath = Join-Path $CodexAccountsRoot 'current.txt'
 $DefaultCodexHome = Join-Path $env:USERPROFILE '.codex'
@@ -29,7 +30,7 @@ function Resolve-SelectedCodexHome {
 # launch time instead of trusting that caller's inherited CODEX_HOME.
 $env:CODEX_HOME = Resolve-SelectedCodexHome
 $Keysafe = Join-Path $env:USERPROFILE '.claude\skills\keysafe\scripts\keysafe.ps1'
-$ClaudeExe = 'C:\Users\Ahmed\.local\bin\claude.exe'
+$ClaudeRunner = 'bun.exe'
 $RequestedModel = if ($env:MODEL_GATEWAY_DEFAULT) { $env:MODEL_GATEWAY_DEFAULT } else { 'gpt-5.6-luna' }
 $EffortWasExplicit = -not [string]::IsNullOrWhiteSpace($env:MODEL_GATEWAY_EFFORT)
 $ModelAliases = @{
@@ -38,13 +39,14 @@ $ModelAliases = @{
   'gpt-5.6-terra' = 'claude-gpt-terra'
   'deepseek-v4-flash' = 'claude-ds-flash'
   'deepseek-v4-pro' = 'claude-ds-pro'
+  'ox-alpha-free' = 'claude-opencode-ox-alpha'
 }
 $Model = if ($ModelAliases.ContainsKey($RequestedModel)) {
   $ModelAliases[$RequestedModel]
 } else {
   $RequestedModel
 }
-$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { 'high' }
+$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { $null }
 $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
 $ClaudeArgs = @($args)
@@ -226,7 +228,6 @@ $CallerSettings.enableWorkflows = $true
 $CallerSettings.workflowKeywordTriggerEnabled = $true
 
 $HasEffortArgument = $false
-$IsResume = $false
 foreach ($argument in $ClaudeArgs) {
   if ($argument -eq '--') {
     break
@@ -234,22 +235,8 @@ foreach ($argument in $ClaudeArgs) {
   if ($argument -eq '--effort' -or $argument -like '--effort=*') {
     $HasEffortArgument = $true
   }
-  if (
-    $argument -eq '--resume' -or
-    $argument -eq '-r' -or
-    $argument -eq '--continue' -or
-    $argument -eq '-c' -or
-    $argument -like '--resume=*'
-  ) {
-    $IsResume = $true
-  }
 }
-$SettingsEnableUltracode = $CallerSettings.ultracode -eq $true
-if (
-  -not $HasEffortArgument -and
-  ($EffortWasExplicit -or -not $IsResume) -and
-  ($EffortWasExplicit -or -not $SettingsEnableUltracode)
-) {
+if (-not $HasEffortArgument -and $EffortWasExplicit) {
   $ClaudeArgs += @('--effort', $Effort)
 }
 
@@ -339,6 +326,26 @@ function Stop-OwnedGateway {
   }
 }
 
+function Wrap-KeysafeCommand {
+  param(
+    [string]$KeyName,
+    [string]$EnvironmentVariable,
+    [string]$ChildCommand
+  )
+
+  $NestedScript = '$KeysafePath = ' +
+    ("'" + $Keysafe.Replace("'", "''") + "'") +
+    '; $ChildCommand = ' +
+    ("'" + $ChildCommand.Replace("'", "''") + "'") +
+    '; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $KeysafePath ' +
+    'run ' + $KeyName + ' -EnvVar ' + $EnvironmentVariable +
+    ' -Command $ChildCommand; exit $LASTEXITCODE'
+  $NestedEncoded = [Convert]::ToBase64String(
+    [Text.Encoding]::Unicode.GetBytes($NestedScript)
+  )
+  return '& powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + $NestedEncoded
+}
+
 if (-not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
   throw 'Node.js is required for the model gateway.'
 }
@@ -348,8 +355,24 @@ if (-not (Test-Path -LiteralPath $GatewayScript)) {
 if (-not (Test-Path -LiteralPath $Keysafe)) {
   throw "Keysafe is missing: $Keysafe"
 }
-if (-not (Test-Path -LiteralPath $ClaudeExe)) {
-  throw "Claude executable is missing: $ClaudeExe"
+if (-not (Get-Command $ClaudeRunner -ErrorAction SilentlyContinue)) {
+  throw 'Bun is required to run the deployed local Claude harness.'
+}
+if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
+  throw "Deployed Claude harness is missing: $ClaudeScript. Run 'bun run build' first."
+}
+
+# The global cc launcher intentionally points at this worktree. Rebuild before
+# every launch so a new terminal cannot silently run a stale dist/cli.js after
+# source changes or a resumed refactor.
+Push-Location $Root
+try {
+  & $ClaudeRunner 'run' 'build'
+  if ($LASTEXITCODE -ne 0) {
+    throw "Claude harness build failed with exit code $LASTEXITCODE."
+  }
+} finally {
+  Pop-Location
 }
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
@@ -378,12 +401,17 @@ $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'claude-ds-flash'
 $env:ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
 $env:ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
 $env:ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
-$env:CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = '1'
+$env:CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = $null
 $env:CLAUDE_CODE_EFFORT_LEVEL = $null
 $env:CLAUDE_CODE_WORKFLOWS = 'true'
 $env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = '1'
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
+$env:MODEL_GATEWAY_LOG_TIMING = '1'
+$env:CLAUDE_ENABLE_STREAM_WATCHDOG = '1'
+if ([string]::IsNullOrWhiteSpace($env:CLAUDE_STREAM_IDLE_TIMEOUT_MS)) {
+  $env:CLAUDE_STREAM_IDLE_TIMEOUT_MS = '90000'
+}
 
 try {
   $ScopedSettingsPath = Join-Path `
@@ -396,10 +424,22 @@ try {
   )
   $ClaudeArgs += @('--settings', $ScopedSettingsPath)
 
-  # Start the Gateway through a short-lived keysafe child. OpenCode is included
-  # only when its vault record is present, and the value never becomes an argument
-  # or file.
+  # Start the Gateway through short-lived nested Keysafe children. Each value
+  # remains inside the child environment and never becomes an argument or file.
   $GatewayCommand = 'node "' + $GatewayScript + '" --port ' + [string]$Port
+  $GatewayCommandWithKeys = $GatewayCommand
+  if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\opencode-go.cred') -PathType Leaf) {
+    $GatewayCommandWithKeys = Wrap-KeysafeCommand `
+      -KeyName 'opencode-go' `
+      -EnvironmentVariable 'OPENCODE_API_KEY' `
+      -ChildCommand $GatewayCommandWithKeys
+  }
+  if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\openrouter.cred') -PathType Leaf) {
+    $GatewayCommandWithKeys = Wrap-KeysafeCommand `
+      -KeyName 'openrouter' `
+      -EnvironmentVariable 'OPENROUTER_API_KEY' `
+      -ChildCommand $GatewayCommandWithKeys
+  }
   $GatewayArgumentList = @(
     '-NoProfile'
     '-ExecutionPolicy'
@@ -411,44 +451,8 @@ try {
     '-EnvVar'
     'DEEPSEEK_API_KEY'
     '-Command'
-    ($GatewayCommand)
+    $GatewayCommandWithKeys
   )
-  if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\opencode-go.cred') -PathType Leaf) {
-    # Keysafe injects one record per child. Nest the second runtime injection so
-    # the Gateway inherits both variables without exposing either value in an
-    # argument, file, or log.
-    # The outer keysafe runner parses its child command as PowerShell. Encode
-    # the nested invocation so its -EnvVar token cannot be rebound as a second
-    # parameter of the outer invocation. The encoded script contains only paths,
-    # key names, and the Gateway command; no credential value.
-    $NestedScript = '$KeysafePath = ' +
-      ("'" + $Keysafe.Replace("'", "''") + "'") +
-      '; $GatewayCommand = ' +
-      ("'" + $GatewayCommand.Replace("'", "''") + "'") +
-      '; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $KeysafePath ' +
-      'run opencode-go -EnvVar OPENCODE_API_KEY -Command $GatewayCommand; ' +
-      'exit $LASTEXITCODE'
-    $NestedEncoded = [Convert]::ToBase64String(
-      [Text.Encoding]::Unicode.GetBytes($NestedScript)
-    )
-    $NestedCommand = '& powershell.exe -NoProfile -ExecutionPolicy Bypass ' +
-      '-EncodedCommand ' + $NestedEncoded
-    # The common Start-Process argument quoting below wraps this complete
-    # nested command exactly once.
-    $GatewayArgumentList = @(
-      '-NoProfile'
-      '-ExecutionPolicy'
-      'Bypass'
-      '-File'
-      $Keysafe
-      'run'
-      'ds'
-      '-EnvVar'
-      'DEEPSEEK_API_KEY'
-      '-Command'
-      $NestedCommand
-    )
-  }
 
   # Start-Process serializes ArgumentList items into a native command line.
   # Quote the one outer -Command value so spaces and nested switches remain
@@ -503,8 +507,37 @@ try {
   # directory active so --resume uses the correct project namespace.
   Push-Location $LaunchDirectory
   try {
-    & $ClaudeExe @ClaudeArgs
-    $ExitCode = $LASTEXITCODE
+    $restartAttempted = $false
+    while ($true) {
+      # Keep the harness attached directly to the caller's console. Piping native
+      # output through PowerShell makes stdout non-TTY, which the CLI correctly
+      # interprets as --print/headless mode and then waits for prompt input.
+      & $ClaudeRunner $ClaudeScript @ClaudeArgs
+      $ExitCode = $LASTEXITCODE
+
+      $hasResumeArgument = @($ClaudeArgs | Where-Object {
+        $_ -eq '--resume' -or $_ -like '--resume=*'
+      }).Count -gt 0
+
+      # With direct console inheritance there is no safe way for PowerShell to
+      # tee native stderr without breaking TTY detection. A resumed session is
+      # persisted, so one bounded retry on an unexpected non-zero exit still
+      # recovers Bun panics and abrupt child termination without retrying Ctrl+C.
+      if (
+        -not $restartAttempted -and
+        $hasResumeArgument -and
+        $ExitCode -ne 0 -and
+        $ExitCode -ne 130
+      ) {
+        $restartAttempted = $true
+        [Console]::Error.WriteLine(
+          "cc: resumed session exited with code $ExitCode; restarting once from its persisted transcript."
+        )
+        Start-Sleep -Milliseconds 750
+        continue
+      }
+      break
+    }
   } finally {
     Pop-Location
   }

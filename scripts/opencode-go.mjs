@@ -5,6 +5,29 @@ export const OPENCODE_GO_BASE_URL =
 
 const PROTOCOLS = new Set(['responses', 'chat-completions', 'anthropic-messages'])
 
+const OPENCODE_MAX_SSE_PAYLOAD_BYTES = boundedEnvironment(
+  'OPENCODE_MAX_SSE_PAYLOAD_BYTES',
+  4 * 1024 * 1024,
+)
+const OPENCODE_MAX_STREAM_BYTES = boundedEnvironment(
+  'OPENCODE_MAX_STREAM_BYTES',
+  64 * 1024 * 1024,
+)
+const OPENCODE_MAX_TOOL_ARGUMENT_BYTES = boundedEnvironment(
+  'OPENCODE_MAX_TOOL_ARGUMENT_BYTES',
+  8 * 1024 * 1024,
+)
+
+function boundedEnvironment(name, fallback) {
+  const raw = process.env[name]
+  if (raw == null || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`)
+  }
+  return value
+}
+
 // The endpoint for a Go model is part of the official model contract. Do not
 // infer it from the model name: OpenCode Go deliberately serves three wire
 // protocols from the same base URL.
@@ -12,6 +35,7 @@ export const OPENCODE_GO_ROUTES = {
   'grok-4.5': 'responses',
   'gpt-5.6-luna': 'responses',
   'muse-spark-1.2-contributor': 'responses',
+  'ox-alpha-free': 'chat-completions',
   'glm-5.3': 'chat-completions',
   'glm-5.2': 'chat-completions',
   'glm-5.1': 'chat-completions',
@@ -34,6 +58,31 @@ export const OPENCODE_GO_ROUTES = {
 
 export const OPENCODE_GO_MODEL_IDS = Object.keys(OPENCODE_GO_ROUTES)
 
+// OpenCode Go exposes the standard named effort control across its routed
+// models. This is deliberately separate from `max`: max/xhigh is a
+// provider-specific capability and is not inferred from the standard control.
+export const OPENCODE_GO_STANDARD_EFFORT_LEVELS = Object.freeze([
+  'low',
+  'medium',
+  'high',
+])
+
+const OPENCODE_GO_EFFORT_OVERRIDES = Object.freeze({
+  // Live gateway probe: low/high are accepted; medium returns provider HTTP
+  // 400. Keep effort enabled without exposing a value the provider rejects.
+  'ox-alpha-free': ['low', 'high'],
+})
+
+export const OPENCODE_GO_EFFORT_LEVELS = Object.freeze(
+  Object.fromEntries(
+    OPENCODE_GO_MODEL_IDS.map(model => [
+      model,
+      OPENCODE_GO_EFFORT_OVERRIDES[model] ||
+        OPENCODE_GO_STANDARD_EFFORT_LEVELS,
+    ]),
+  ),
+)
+
 export function isOpenCodeGoProtocol(value) {
   return PROTOCOLS.has(value)
 }
@@ -52,10 +101,10 @@ export function openCodeGoEndpoint(protocol) {
       : 'messages'}`
 }
 
-export function openCodeGoHeaders(protocol, apiKey) {
+export function openCodeGoHeaders(protocol, apiKey, stream = false) {
   const headers = {
     'content-type': 'application/json',
-    accept: 'text/event-stream',
+    accept: stream ? 'text/event-stream' : 'application/json',
     'user-agent': 'claudex-model-gateway/0.1',
   }
   if (protocol === 'anthropic-messages') {
@@ -169,11 +218,12 @@ function appendResponsesMessage(input, message) {
 
   for (const block of blocks) {
     if (block?.type === 'tool_use') {
+      if (!block.name) throw new Error('Anthropic tool call is missing a function name')
       flush()
       input.push({
         type: 'function_call',
         call_id: block.id || `call_${randomUUID().replaceAll('-', '')}`,
-        name: block.name || 'tool',
+        name: block.name,
         arguments: jsonArguments(block.input),
       })
       continue
@@ -220,7 +270,7 @@ export function anthropicToOpenCodeResponses(body, upstreamModel) {
   for (const message of body.messages || []) appendResponsesMessage(input, message)
   const request = {
     model: upstreamModel,
-    stream: true,
+    stream: body.stream === true,
     store: false,
     input,
   }
@@ -264,10 +314,11 @@ function appendChatMessage(messages, message) {
 
   for (const block of blocks) {
     if (block?.type === 'tool_use') {
+      if (!block.name) throw new Error('Anthropic tool call is missing a function name')
       toolCalls.push({
         id: block.id || `call_${randomUUID().replaceAll('-', '')}`,
         type: 'function',
-        function: { name: block.name || 'tool', arguments: jsonArguments(block.input) },
+        function: { name: block.name, arguments: jsonArguments(block.input) },
       })
       continue
     }
@@ -313,7 +364,7 @@ export function anthropicToOpenCodeChat(body, upstreamModel) {
   const system = textOf(body.system)
   if (system) messages.push({ role: 'system', content: system })
   for (const message of body.messages || []) appendChatMessage(messages, message)
-  const request = { model: upstreamModel, stream: true, messages }
+  const request = { model: upstreamModel, stream: body.stream === true, messages }
   if (body.max_tokens != null) request.max_tokens = body.max_tokens
   if (body.temperature != null) request.temperature = body.temperature
   if (body.top_p != null) request.top_p = body.top_p
@@ -337,7 +388,7 @@ export function anthropicToOpenCodeChat(body, upstreamModel) {
 export function anthropicToOpenCodeRequest(body, route) {
   if (route.protocol === 'responses') return anthropicToOpenCodeResponses(body, route.upstream)
   if (route.protocol === 'chat-completions') return anthropicToOpenCodeChat(body, route.upstream)
-  if (route.protocol === 'anthropic-messages') return { ...body, model: route.upstream, stream: true }
+  if (route.protocol === 'anthropic-messages') return { ...body, model: route.upstream, stream: body.stream === true }
   throw new Error(`Unsupported OpenCode Go protocol: ${String(route.protocol)}`)
 }
 
@@ -396,10 +447,16 @@ function finishError(res, error) {
   if (res.destroyed || res.writableEnded) return
   const message = error instanceof Error ? error.message : String(error || 'Upstream stream failed')
   if (!res.headersSent) {
-    res.writeHead(502, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-    res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }))
+    const contextFailure = isContextWindowFailure(error)
+    const status = contextFailure ? 400 : 502
+    const output = contextFailure && !message.toLowerCase().startsWith('prompt is too long')
+      ? `Prompt is too long: ${message}`
+      : message
+    res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: output } }))
     return
   }
+
   try {
     eventLine(res, { type: 'error', error: { type: 'api_error', message } })
     res.end()
@@ -408,21 +465,32 @@ function finishError(res, error) {
   }
 }
 
-async function consumeSse(upstream, onData, trace = null) {
+async function consumeSse(upstream, onData, trace = null, control = null) {
   const reader = upstream.body?.getReader()
   if (!reader) throw new Error('OpenCode returned an empty response body')
+  control?.setUpstreamCancellation?.(() => reader.cancel())
   const decoder = new TextDecoder()
   let buffer = ''
   let dataLines = []
+  let streamBytes = 0
+  let payloadBytes = 0
   const flush = () => {
     if (!dataLines.length) return
     const payload = dataLines.join('\n')
     dataLines = []
+    payloadBytes = 0
     if (payload && payload !== '[DONE]') onData(payload)
     else if (payload === '[DONE]') onData('[DONE]')
   }
   const line = value => {
-    if (value.startsWith('data:')) dataLines.push(value.slice(5).trimStart())
+    if (value.startsWith('data:')) {
+      const data = value.slice(5).trimStart()
+      payloadBytes += Buffer.byteLength(data, 'utf8')
+      if (payloadBytes > OPENCODE_MAX_SSE_PAYLOAD_BYTES) {
+        throw new Error('OpenCode SSE payload exceeded the configured safety limit')
+      }
+      dataLines.push(data)
+    }
     else if (value === '') flush()
   }
   try {
@@ -430,14 +498,25 @@ async function consumeSse(upstream, onData, trace = null) {
       const { done, value } = await reader.read()
       if (done) break
       trace?.markFirstByte()
-      trace?.addBytes(value?.byteLength || 0)
+      const chunkBytes = value?.byteLength || 0
+      streamBytes += chunkBytes
+      if (streamBytes > OPENCODE_MAX_STREAM_BYTES) {
+        throw new Error('OpenCode stream exceeded the configured safety limit')
+      }
+      trace?.addBytes(chunkBytes)
       trace?.addEvent()
       buffer += decoder.decode(value, { stream: true })
+      if (Buffer.byteLength(buffer, 'utf8') > OPENCODE_MAX_SSE_PAYLOAD_BYTES) {
+        throw new Error('OpenCode SSE line exceeded the configured safety limit')
+      }
       const lines = buffer.split(/\r?\n/)
       buffer = lines.pop() || ''
       for (const item of lines) line(item)
     }
     buffer += decoder.decode()
+    if (Buffer.byteLength(buffer, 'utf8') > OPENCODE_MAX_SSE_PAYLOAD_BYTES) {
+      throw new Error('OpenCode SSE line exceeded the configured safety limit')
+    }
     if (buffer) line(buffer)
     flush()
   } finally {
@@ -453,7 +532,9 @@ function isContextWindowFailure(error) {
   const message = String(error?.message || error || '').toLowerCase()
   return message.includes('prompt is too long') ||
     message.includes('context window') ||
-    message.includes('exceeds the context')
+    message.includes('exceeds the context') ||
+    message.includes('context length') ||
+    message.includes('maximum context')
 }
 
 
@@ -469,7 +550,200 @@ function responseOutputFallback(response, emitText, emitTool) {
   }
 }
 
-export async function relayOpenCodeResponsesStream(res, upstream, model, trace = null) {
+function parseFunctionArguments(value) {
+  if (value == null || value === '') return {}
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  if (typeof value !== 'string') throw new Error('OpenCode returned malformed function-call arguments')
+  let parsed
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new Error('OpenCode returned malformed function-call arguments')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('OpenCode returned malformed function-call arguments')
+  }
+  return parsed
+}
+
+export function openCodeResponsesToAnthropic(response, model) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new Error('OpenCode returned malformed JSON')
+  }
+  if (response.error) {
+    const detail = typeof response.error === 'string' ? response.error : response.error.message
+    throw new Error(detail ? String(detail) : 'OpenCode Responses request failed')
+  }
+  if (response.status && response.status !== 'completed') {
+    throw new Error('OpenCode Responses request did not complete')
+  }
+  const content = []
+  let hasToolUse = false
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (item?.type === 'message') {
+      for (const part of Array.isArray(item.content) ? item.content : []) {
+        if (part?.type === 'output_text' && typeof part.text === 'string' && part.text) {
+          content.push({ type: 'text', text: part.text })
+        }
+      }
+    } else if (item?.type === 'function_call') {
+      if (!item.call_id && !item.id) throw new Error('OpenCode returned a function call without an id')
+      if (!item.name) throw new Error('OpenCode returned a function call without a name')
+      content.push({ type: 'tool_use', id: item.call_id || item.id, name: item.name, input: parseFunctionArguments(item.arguments) })
+      hasToolUse = true
+    }
+  }
+  if (!content.length) throw new Error('OpenCode returned an empty or malformed response')
+  return {
+    id: typeof response.id === 'string' && response.id ? response.id : `msg_${randomUUID().replaceAll('-', '')}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
+    stop_sequence: null,
+    usage: openCodeUsageToAnthropic(response.usage),
+  }
+}
+
+export async function relayOpenCodeResponse(res, upstream, model, trace = null, options = {}) {
+  try {
+    const raw = await upstream.text()
+    trace?.markFirstByte()
+    trace?.addBytes(new TextEncoder().encode(raw).byteLength)
+    trace?.addEvent()
+    const message = openCodeResponsesToAnthropic(JSON.parse(raw), model)
+    trace?.markOutput()
+    trace?.markCompletion()
+    if (!res.headersSent) res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(message))
+  } catch (error) {
+    trace?.markError(error)
+    if (options.throwPreOutput && !res.headersSent) {
+      await upstream.body?.cancel?.().catch(() => {})
+      throw error
+    }
+    finishError(res, error)
+  }
+}
+
+export async function relayOpenCodeChatResponse(res, upstream, model, trace = null, options = {}) {
+  try {
+    const raw = await upstream.text()
+    trace?.markFirstByte()
+    trace?.addBytes(new TextEncoder().encode(raw).byteLength)
+    trace?.addEvent()
+    const response = JSON.parse(raw)
+    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+      throw new Error('OpenCode returned malformed JSON')
+    }
+    if (response.error) {
+      const detail = typeof response.error === 'string' ? response.error : response.error.message
+      throw new Error(detail ? String(detail) : 'OpenCode Chat Completions request failed')
+    }
+    const choice = response.choices?.[0]
+    const providerMessage = choice?.message || {}
+    const content = []
+    const reasoning = [
+      typeof providerMessage.reasoning === 'string' ? providerMessage.reasoning : '',
+      typeof providerMessage.reasoning_content === 'string' ? providerMessage.reasoning_content : '',
+      ...(Array.isArray(providerMessage.reasoning_details)
+        ? providerMessage.reasoning_details.map(detail =>
+            typeof detail?.text === 'string' ? detail.text : '',
+          )
+        : []),
+    ].filter(Boolean).join('')
+    if (reasoning) content.push({ type: 'thinking', thinking: reasoning })
+    const messageContent = providerMessage.content
+    if (typeof messageContent === 'string' && messageContent) {
+      content.push({ type: 'text', text: messageContent })
+    } else if (Array.isArray(messageContent)) {
+      for (const part of messageContent) {
+        if (typeof part === 'string' && part) {
+          content.push({ type: 'text', text: part })
+        } else if (
+          part &&
+          typeof part === 'object' &&
+          typeof part.text === 'string' &&
+          part.text
+        ) {
+          content.push({ type: 'text', text: part.text })
+        }
+      }
+    } else if (
+      messageContent &&
+      typeof messageContent === 'object' &&
+      typeof messageContent.text === 'string' &&
+      messageContent.text
+    ) {
+      content.push({ type: 'text', text: messageContent.text })
+    }
+    for (const call of providerMessage.tool_calls || []) {
+      if (!call.function?.name) {
+        throw new Error('OpenCode returned a tool call without a function name')
+      }
+      content.push({ type: 'tool_use', id: call.id || `call_${randomUUID().replaceAll('-', '')}`, name: call.function.name, input: parseFunctionArguments(call.function?.arguments) })
+    }
+    if (!content.length) throw new Error('OpenCode returned an empty or malformed response')
+    const message = {
+      id: response.id || `msg_${randomUUID().replaceAll('-', '')}`,
+      type: 'message',
+      role: 'assistant',
+      model,
+      content,
+      stop_reason: content.some(block => block.type === 'tool_use') ? 'tool_use' : choice.finish_reason === 'length' ? 'max_tokens' : 'end_turn',
+      stop_sequence: null,
+      usage: openCodeUsageToAnthropic(response.usage),
+    }
+    trace?.markOutput()
+    trace?.markCompletion()
+    if (!res.headersSent) res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(message))
+  } catch (error) {
+    trace?.markError(error)
+    if (options.throwPreOutput && !res.headersSent) {
+      await upstream.body?.cancel?.().catch(() => {})
+      throw error
+    }
+    finishError(res, error)
+  }
+}
+
+export async function relayOpenCodeAnthropicResponse(res, upstream, model, trace = null, options = {}) {
+  try {
+    const raw = await upstream.text()
+    trace?.markFirstByte()
+    trace?.addBytes(new TextEncoder().encode(raw).byteLength)
+    trace?.addEvent()
+    const message = JSON.parse(raw)
+    if (!message || message.type !== 'message' || !Array.isArray(message.content) || !message.content.length) {
+      throw new Error('OpenCode returned an empty or malformed response')
+    }
+    trace?.markOutput()
+    trace?.markCompletion()
+    if (!res.headersSent) res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(message))
+  } catch (error) {
+    trace?.markError(error)
+    if (options.throwPreOutput && !res.headersSent) {
+      await upstream.body?.cancel?.().catch(() => {})
+      throw error
+    }
+    finishError(res, error)
+  }
+}
+
+export async function relayOpenCodeResponseByProtocol(res, upstream, model, protocol, trace = null, options = {}) {
+  if (protocol === 'responses') return relayOpenCodeResponse(res, upstream, model, trace, options)
+  if (protocol === 'chat-completions') return relayOpenCodeChatResponse(res, upstream, model, trace, options)
+  if (protocol === 'anthropic-messages') return relayOpenCodeAnthropicResponse(res, upstream, model, trace, options)
+  throw new Error(`Unsupported OpenCode Go protocol: ${String(protocol)}`)
+}
+
+// The JSON response relays are exported for the HTTP-boundary tests and for
+// consumers that need to prove the fallback never receives SSE framing.
+
+export async function relayOpenCodeResponsesStream(res, upstream, model, trace = null, options = {}) {
   let streamStarted = false
   let activeText = false
   let activeTool = null
@@ -478,6 +752,8 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
   let sawCompletion = false
   let toolCallSeen = false
   let usage = null
+  let pendingTool = null
+  let pendingToolArguments = ''
   const start = () => {
     if (!streamStarted) {
       startStream(res, model)
@@ -510,7 +786,8 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
       close()
       activeTool = {
         callId: item.call_id || item.id || `call_${randomUUID().replaceAll('-', '')}`,
-        name: item.name || 'tool',
+        name: item.name,
+        emittedArguments: 0,
       }
       toolCallSeen = true
       sawOutput = true
@@ -520,7 +797,26 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
         content_block: { type: 'tool_use', id: activeTool.callId, name: activeTool.name, input: {} },
       })
     }
-    if (argumentsDelta) eventLine(res, { type: 'content_block_delta', index: contentIndex, delta: { type: 'input_json_delta', partial_json: argumentsDelta } })
+    if (argumentsDelta) {
+      eventLine(res, { type: 'content_block_delta', index: contentIndex, delta: { type: 'input_json_delta', partial_json: argumentsDelta } })
+      activeTool.emittedArguments += argumentsDelta.length
+    }
+  }
+  const pendingToolDelta = (item = {}, argumentsDelta = '') => {
+    pendingTool = { ...(pendingTool || {}), ...item }
+    if (argumentsDelta) {
+      const repeatedCompleteArguments =
+        pendingToolArguments &&
+        argumentsDelta.startsWith(pendingToolArguments)
+      pendingToolArguments = repeatedCompleteArguments
+        ? argumentsDelta
+        : pendingToolArguments + argumentsDelta
+    }
+    if (!pendingTool.name) return false
+    tool(pendingTool, pendingToolArguments)
+    pendingTool = null
+    pendingToolArguments = ''
+    return true
   }
   try {
     await consumeSse(upstream, payload => {
@@ -529,11 +825,17 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
       try { event = JSON.parse(payload) } catch { throw new Error('OpenCode returned malformed Responses SSE data') }
       const type = event?.type
       if (type === 'response.output_text.delta') text(typeof event.delta === 'string' ? event.delta : '')
-      else if (type === 'response.output_item.added' && event.item?.type === 'function_call') tool(event.item)
-      else if (type === 'response.function_call_arguments.delta') tool(event.item || {}, event.delta || '')
+      else if (type === 'response.output_item.added' && event.item?.type === 'function_call') pendingToolDelta(event.item)
+      else if (type === 'response.function_call_arguments.delta') {
+        if (!activeTool) pendingToolDelta(event.item || {}, event.delta || '')
+        else tool(activeTool, event.delta || '')
+      }
       else if (type === 'response.output_item.done' && event.item?.type === 'function_call') {
-        if (!activeTool) tool(event.item)
-        else if (event.item.arguments && !event.delta) tool(event.item, event.item.arguments)
+        if (!activeTool) pendingToolDelta(event.item, event.item.arguments || '{}')
+        else if (event.item.arguments) {
+          const delta = event.item.arguments.slice(activeTool.emittedArguments)
+          if (delta) tool(activeTool, delta)
+        }
         close()
       } else if (type === 'response.completed') {
         sawCompletion = true
@@ -542,8 +844,11 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
       } else if (type === 'response.failed' || type === 'response.incomplete') {
         throw new Error(event.response?.error?.message || event.response?.status_details?.reason || 'OpenCode Responses request failed')
       }
-    }, trace)
+    }, trace, options.control)
     if (!sawCompletion) throw new Error('OpenCode Responses stream ended before response.completed')
+    if (pendingTool && !pendingTool.name) {
+      throw new Error('OpenCode returned a function call without a name')
+    }
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
     trace?.markCompletion()
     start()
@@ -553,12 +858,13 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
     res.end()
   } catch (error) {
     trace?.markError(error)
-    await cancelUpstream(upstream)
+    await (options.control?.cancelUpstream?.() || cancelUpstream(upstream))
+    if (options.throwPreOutput && !res.headersSent) throw error
     finishError(res, error)
   }
 }
 
-export async function relayOpenCodeChatStream(res, upstream, model, trace = null) {
+export async function relayOpenCodeChatStream(res, upstream, model, trace = null, options = {}) {
   let streamStarted = false
   let activeText = false
   let activeThinking = false
@@ -567,8 +873,10 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
   let sawOutput = false
   let sawCompletion = false
   let toolCallSeen = false
+  let sawUnnamedToolCall = false
   let finishReason = null
   let usage = null
+  const pendingTools = new Map()
   const start = () => {
     if (!streamStarted) {
       startStream(res, model)
@@ -586,6 +894,7 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
   }
   const thinking = value => {
     if (!value) return
+    trace?.addThinkingChars?.(value.length)
     start()
     if (!activeThinking) {
       close()
@@ -598,6 +907,7 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
   }
   const text = value => {
     if (!value) return
+    trace?.addTextChars?.(value.length)
     start()
     if (!activeText) {
       close()
@@ -610,20 +920,52 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
   }
   const tool = call => {
     const fn = call?.function || {}
+    const sourceIndex = Number.isInteger(call?.index) ? call.index : call?.id || '0'
+    const pending = pendingTools.get(sourceIndex) || {
+      callId: call?.id,
+      name: null,
+      argumentParts: [],
+      argumentLength: 0,
+    }
+    if (call?.id && !pending.callId) pending.callId = call.id
+    if (typeof fn.name === 'string' && fn.name) pending.name = fn.name
+    const argumentDelta = typeof fn.arguments === 'string' ? fn.arguments : ''
+    if (argumentDelta) {
+      const nextLength = pending.argumentLength + Buffer.byteLength(argumentDelta, 'utf8')
+      if (nextLength > OPENCODE_MAX_TOOL_ARGUMENT_BYTES) {
+        throw new Error('OpenCode tool arguments exceeded the configured safety limit')
+      }
+      pending.argumentParts.push(argumentDelta)
+      pending.argumentLength = nextLength
+      trace?.addToolArgumentChars?.(argumentDelta.length)
+    }
+    pendingTools.set(sourceIndex, pending)
+    if (!pending.name) {
+      sawUnnamedToolCall = true
+      return
+    }
     start()
-    if (!activeTool || activeTool.sourceIndex !== call.index) {
+    if (!activeTool || activeTool.sourceIndex !== sourceIndex) {
       close()
       activeTool = {
-        sourceIndex: call.index,
-        callId: call.id || `call_${randomUUID().replaceAll('-', '')}`,
-        name: fn.name || 'tool',
+        sourceIndex,
+        callId: pending.callId || `call_${randomUUID().replaceAll('-', '')}`,
+        name: pending.name,
+        emittedArguments: 0,
       }
       toolCallSeen = true
       sawOutput = true
       trace?.markOutput()
       eventLine(res, { type: 'content_block_start', index: contentIndex, content_block: { type: 'tool_use', id: activeTool.callId, name: activeTool.name, input: {} } })
     }
-    if (fn.arguments) eventLine(res, { type: 'content_block_delta', index: contentIndex, delta: { type: 'input_json_delta', partial_json: fn.arguments } })
+    if (activeTool.emittedArguments === 0 && pending.argumentLength > 0) {
+      const argumentsText = pending.argumentParts.join('')
+      activeTool.emittedArguments = argumentsText.length
+      eventLine(res, { type: 'content_block_delta', index: contentIndex, delta: { type: 'input_json_delta', partial_json: argumentsText } })
+    } else if (argumentDelta && activeTool.sourceIndex === sourceIndex) {
+      activeTool.emittedArguments += argumentDelta.length
+      eventLine(res, { type: 'content_block_delta', index: contentIndex, delta: { type: 'input_json_delta', partial_json: argumentDelta } })
+    }
   }
   try {
     await consumeSse(upstream, payload => {
@@ -647,9 +989,13 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
           if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') toolCallSeen = true
         }
       }
-    }, trace)
+    }, trace, options.control)
     if (!sawCompletion) throw new Error('OpenCode Chat Completions stream ended before completion')
+    if (sawUnnamedToolCall && !toolCallSeen) {
+      throw new Error('OpenCode returned a tool call without a function name')
+    }
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
+    pendingTools.clear()
     trace?.markCompletion()
     start()
     close()
@@ -658,12 +1004,13 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
     res.end()
   } catch (error) {
     trace?.markError(error)
-    await cancelUpstream(upstream)
+    await (options.control?.cancelUpstream?.() || cancelUpstream(upstream))
+    if (options.throwPreOutput && !res.headersSent) throw error
     finishError(res, error)
   }
 }
 
-export async function relayOpenCodeAnthropicStream(res, upstream, model, trace = null) {
+export async function relayOpenCodeAnthropicStream(res, upstream, model, trace = null, options = {}) {
   let streamStarted = false
   let sawOutput = false
   let sawCompletion = false
@@ -732,22 +1079,23 @@ export async function relayOpenCodeAnthropicStream(res, upstream, model, trace =
       }
       if (event.type === 'error') throw new Error(event.error?.message || 'OpenCode Anthropic request failed')
       emit(event)
-    }, trace)
+    }, trace, options.control)
     if (!sawCompletion) throw new Error('OpenCode Anthropic stream ended before message_stop')
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
     trace?.markCompletion()
     res.end()
   } catch (error) {
     trace?.markError(error)
-    await cancelUpstream(upstream)
+    await (options.control?.cancelUpstream?.() || cancelUpstream(upstream))
+    if (options.throwPreOutput && !res.headersSent) throw error
     finishError(res, error)
   }
 }
 
-export async function relayOpenCodeStream(res, upstream, model, protocol, trace = null) {
-  if (protocol === 'responses') return relayOpenCodeResponsesStream(res, upstream, model, trace)
-  if (protocol === 'chat-completions') return relayOpenCodeChatStream(res, upstream, model, trace)
-  if (protocol === 'anthropic-messages') return relayOpenCodeAnthropicStream(res, upstream, model, trace)
+export async function relayOpenCodeStream(res, upstream, model, protocol, trace = null, options = {}) {
+  if (protocol === 'responses') return relayOpenCodeResponsesStream(res, upstream, model, trace, options)
+  if (protocol === 'chat-completions') return relayOpenCodeChatStream(res, upstream, model, trace, options)
+  if (protocol === 'anthropic-messages') return relayOpenCodeAnthropicStream(res, upstream, model, trace, options)
   const error = new Error(`Unsupported OpenCode Go protocol: ${String(protocol)}`)
   trace?.markError(error)
   throw error
