@@ -37,11 +37,11 @@ test('gateway preserves max effort on Luna and clamps it on Terra', () => {
 test('DeepSeek exposes only its real effort levels', () => {
   assert.deepEqual(
     getSupportedEffortLevels('deepseek-v4-pro'),
-    ['low', 'high', 'max'],
+    ['low', 'high', 'max', 'ultracode'],
   )
   assert.deepEqual(
     getSupportedEffortLevels('deepseek-v4-flash'),
-    ['low', 'high', 'max'],
+    ['low', 'high', 'max', 'ultracode'],
   )
   assert.deepEqual(
     getSupportedEffortLevels('claude-ds-pro'),
@@ -61,13 +61,13 @@ test('DeepSeek exposes only its real effort levels', () => {
   assert.equal(resolveAppliedEffort('opencode-go/mimo-v2.5', 'ultracode'), 'ultracode')
   assert.equal(resolveProviderEffort('claude-opencode-ox-alpha', 'ultracode'), 'high')
   assert.equal(resolveProviderEffort('opencode-go/mimo-v2.5', 'ultracode'), 'high')
-  assert.equal(resolveProviderEffort('unknown-provider/model', 'ultracode'), undefined)
+  assert.equal(resolveProviderEffort('claude-ultracode', 'ultracode'), undefined)
   assert.equal(toPersistableEffort('ultracode'), 'ultracode')
   assert.deepEqual(
     getSupportedEffortLevels('opencode-go/qwen3.7-max'),
     ['low', 'medium', 'high', 'ultracode'],
   )
-  assert.deepEqual(getSupportedEffortLevels('unknown-provider/model'), ['ultracode'])
+  assert.deepEqual(getSupportedEffortLevels('claude-ultracode'), ['ultracode'])
 })
 
 test('OpenRouter requires explicit effort metadata', () => {
