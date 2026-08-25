@@ -1,18 +1,38 @@
 import type { Command } from '../../commands.js'
-import { deepSeekLogin, openCodeLogin } from './gateway-login.js'
 
-export const openCodeLoginCommand = {
-  type: 'local-jsx',
-  name: 'opencodelogin',
-  description: 'Add, check, or remove the OpenCode Go API key',
-  argumentHint: '[status|remove]',
-  load: async () => ({ call: openCodeLogin }),
-} satisfies Command
+const command = (name: string, description: string, keyName: string) =>
+  ({
+    type: 'local-jsx',
+    name,
+    description,
+    argumentHint: '[status|remove]',
+    load: async () => {
+      const module = await import('./login.js')
+      return {
+        call: (onDone, context, args) =>
+          module.call(onDone, context, args, keyName),
+      }
+    },
+  }) satisfies Command
 
-export const deepSeekLoginCommand = {
-  type: 'local-jsx',
-  name: 'deepseeklogin',
-  description: 'Add, check, or remove the native DeepSeek API key',
-  argumentHint: '[status|remove]',
-  load: async () => ({ call: deepSeekLogin }),
-} satisfies Command
+export const openCodeLogin = command(
+  'opencodelogin',
+  'Add, replace, inspect, or remove the OpenCode Go API key',
+  'opencode-go',
+)
+
+export const deepSeekLogin = command(
+  'deepseeklogin',
+  'Add, replace, inspect, or remove the DeepSeek API key',
+  'ds',
+)
+
+export const openRouterLogin = command(
+  'openrouterlogin',
+  'Add, replace, inspect, or remove the OpenRouter API key',
+  'openrouter',
+)
+
+// Compatibility aliases for the original command registry names.
+export const openCodeLoginCommand = openCodeLogin
+export const deepSeekLoginCommand = deepSeekLogin
