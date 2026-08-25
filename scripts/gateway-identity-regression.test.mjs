@@ -304,7 +304,10 @@ test(
   },
 )
 
-test('cc launcher scrubs inherited Anthropic/provider identity before starting a session', async () => {
+test(
+  'cc launcher scrubs inherited Anthropic/provider identity before starting a session',
+  { timeout: 20_000 },
+  async () => {
   const result = await runProcess(
     'powershell.exe',
     [
@@ -324,4 +327,5 @@ test('cc launcher scrubs inherited Anthropic/provider identity before starting a
   const report = lastJsonLine(result.stdout)
   assert.equal(report?.result, 'pass', result.stdout)
   assert.equal(report?.gatewayIdentity, true, result.stdout)
-})
+  },
+)
