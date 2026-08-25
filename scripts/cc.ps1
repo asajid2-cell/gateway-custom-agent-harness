@@ -3,11 +3,37 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $LaunchDirectory = (Get-Location).Path
 $GatewayScript = Join-Path $PSScriptRoot 'model-gateway.mjs'
+$GatewaySupervisor = Join-Path $PSScriptRoot 'gateway-supervisor.mjs'
 $CodexAccountsRoot = Join-Path $env:USERPROFILE '.codex-accounts'
 $CodexSelectionPath = Join-Path $CodexAccountsRoot 'current.txt'
 $DefaultCodexHome = Join-Path $env:USERPROFILE '.codex'
+$TandemCodexHome = if ($env:TANDEM_GATEWAY_CODEX_HOME) {
+  $env:TANDEM_GATEWAY_CODEX_HOME
+} else {
+  ''
+}
+$ClaudeRunner = if ($env:CC_CLAUDE_RUNNER_OVERRIDE) {
+  $env:CC_CLAUDE_RUNNER_OVERRIDE
+} else {
+  (Get-Command bun.exe -ErrorAction Stop).Source
+}
+$ClaudeScript = Join-Path $Root 'dist\cli.js'
+$CapabilityCatalogPath = Join-Path $Root 'scripts\effort-capabilities.json'
+if (-not (Test-Path -LiteralPath $CapabilityCatalogPath -PathType Leaf)) {
+  throw "Effort capability catalog is missing: $CapabilityCatalogPath"
+}
+$CapabilityCatalog = Get-Content -Raw -LiteralPath $CapabilityCatalogPath |
+  ConvertFrom-Json
 
 function Resolve-SelectedCodexHome {
+  if (-not [string]::IsNullOrWhiteSpace($TandemCodexHome)) {
+    $selectedHome = [IO.Path]::GetFullPath($TandemCodexHome)
+    if (-not (Test-Path -LiteralPath $selectedHome -PathType Container)) {
+      throw "Tandem Gateway account home does not exist: $selectedHome"
+    }
+    return $selectedHome
+  }
+
   $account = 'default'
   if (Test-Path -LiteralPath $CodexSelectionPath -PathType Leaf) {
     $account = (Get-Content -Raw -LiteralPath $CodexSelectionPath).Trim()
@@ -25,25 +51,38 @@ function Resolve-SelectedCodexHome {
   return $selectedHome
 }
 
-# cc can be started from an old shell or a resumed terminal. Resolve the account at
-# launch time instead of trusting that caller's inherited CODEX_HOME.
+# cc can be started from an old shell or a resumed terminal. A Tandem lane may
+# pin an explicit account through TANDEM_GATEWAY_CODEX_HOME; ordinary launches
+# still resolve the current account at launch time instead of trusting stale
+# inherited CODEX_HOME.
 $env:CODEX_HOME = Resolve-SelectedCodexHome
 $Keysafe = Join-Path $env:USERPROFILE '.claude\skills\keysafe\scripts\keysafe.ps1'
-$ClaudeExe = 'C:\Users\Ahmed\.local\bin\claude.exe'
-$RequestedModel = if ($env:MODEL_GATEWAY_DEFAULT) { $env:MODEL_GATEWAY_DEFAULT } else { 'gpt-5.6-luna' }
+$RequestedModel = if ($env:MODEL_GATEWAY_DEFAULT) { $env:MODEL_GATEWAY_DEFAULT } else { 'gateway-gpt-luna' }
 $EffortWasExplicit = -not [string]::IsNullOrWhiteSpace($env:MODEL_GATEWAY_EFFORT)
-$ModelAliases = @{
-  'gpt-5.6-luna' = 'claude-gpt-luna'
-  'gpt-5.6-sol' = 'claude-gpt-sol'
-  'gpt-5.6-terra' = 'claude-gpt-terra'
-  'deepseek-v4-flash' = 'claude-ds-flash'
-  'deepseek-v4-pro' = 'claude-ds-pro'
+$ModelAliases = @{}
+foreach ($canonical in $CapabilityCatalog.gatewayModelAliases.PSObject.Properties) {
+  foreach ($alias in @($canonical.Value)) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$alias)) {
+      $ModelAliases[[string]$alias] = [string]$canonical.Name
+    }
+  }
 }
-$Model = if ($ModelAliases.ContainsKey($RequestedModel)) {
-  $ModelAliases[$RequestedModel]
-} else {
-  $RequestedModel
+
+function Resolve-GatewayModel {
+  param([string]$Value)
+
+  if ($ModelAliases.ContainsKey($Value)) {
+    return $ModelAliases[$Value]
+  }
+  if ($Value -like 'claude-opencode-*') {
+    return 'gateway-opencode-' + $Value.Substring('claude-opencode-'.Length)
+  }
+  if ($Value -like 'opencode-go/*') {
+    return 'gateway-opencode-' + $Value.Substring('opencode-go/'.Length)
+  }
+  return $Value
 }
+$Model = Resolve-GatewayModel -Value $RequestedModel
 $Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { 'high' }
 $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
@@ -204,24 +243,169 @@ for ($i = 0; $i -lt $ClaudeArgs.Count; $i++) {
 }
 $ClaudeArgs = @($ForwardedArgs)
 
-# Gateway mode intentionally ignores ANTHROPIC_DEFAULT_* capability overrides.
-# Reverse model overrides give Claude Code a capability-bearing catalog identity
-# while requests still use the gateway alias on the wire.
-$GatewayModelOverrides = @{
-  'claude-opus-5' = 'claude-gpt-luna'
-  'claude-fable-5' = 'claude-gpt-sol'
-  'claude-opus-4-8' = 'claude-gpt-terra'
-}
-$ModelOverrides = @{}
-if ($CallerSettings.modelOverrides -is [System.Collections.IDictionary]) {
-  foreach ($key in $CallerSettings.modelOverrides.Keys) {
-    $ModelOverrides[[string]$key] = $CallerSettings.modelOverrides[$key]
+# Explicit model/effort arguments are authoritative over inherited launcher
+# defaults. Resolve them before constructing Gateway environment and provenance,
+# so the metadata describes the exact child invocation rather than a stale shell.
+$ExplicitModel = $null
+$ExplicitEffort = $null
+for ($i = 0; $i -lt $ClaudeArgs.Count; $i++) {
+  $argument = [string]$ClaudeArgs[$i]
+  if ($argument -eq '--') {
+    break
+  }
+  if ($argument -eq '--model') {
+    if ($i + 1 -ge $ClaudeArgs.Count) {
+      throw '--model needs a model name.'
+    }
+    $i++
+    $ExplicitModel = [string]$ClaudeArgs[$i]
+    continue
+  }
+  if ($argument -like '--model=*') {
+    $ExplicitModel = $argument.Substring('--model='.Length)
+    continue
+  }
+  if ($argument -eq '--effort') {
+    if ($i + 1 -ge $ClaudeArgs.Count) {
+      throw '--effort needs an effort level.'
+    }
+    $i++
+    $ExplicitEffort = [string]$ClaudeArgs[$i]
+    continue
+  }
+  if ($argument -like '--effort=*') {
+    $ExplicitEffort = $argument.Substring('--effort='.Length)
   }
 }
-foreach ($key in $GatewayModelOverrides.Keys) {
-  $ModelOverrides[$key] = $GatewayModelOverrides[$key]
+if ($null -ne $ExplicitModel) {
+  if ([string]::IsNullOrWhiteSpace($ExplicitModel)) {
+    throw '--model needs a non-empty model name.'
+  }
+  $RequestedModel = $ExplicitModel
+  $Model = Resolve-GatewayModel -Value $RequestedModel
 }
-$CallerSettings.modelOverrides = $ModelOverrides
+if ($null -ne $ExplicitEffort) {
+  if ([string]::IsNullOrWhiteSpace($ExplicitEffort)) {
+    throw '--effort needs a non-empty effort level.'
+  }
+  $Effort = $ExplicitEffort
+  $EffortWasExplicit = $true
+}
+
+function Test-HasPrintInput {
+  param([string[]]$Arguments)
+
+  function Test-RedirectedInputData {
+    if (-not [Console]::IsInputRedirected) {
+      return $false
+    }
+
+    if (-not ('CcInput.NativeMethods' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CcInput {
+  public static class NativeMethods {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int standardHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint GetFileType(IntPtr handle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PeekNamedPipe(
+      IntPtr handle,
+      IntPtr buffer,
+      uint bufferSize,
+      IntPtr bytesRead,
+      out uint bytesAvailable,
+      IntPtr bytesLeft,
+      IntPtr readMessage
+    );
+  }
+}
+'@
+    }
+
+    $handle = [CcInput.NativeMethods]::GetStdHandle(-10)
+    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr](-1)) {
+      return $false
+    }
+
+    # FILE_TYPE_DISK means a file was redirected into stdin. It is valid even
+    # when no bytes have been read yet, so accept it without peeking.
+    if ([CcInput.NativeMethods]::GetFileType($handle) -eq 1) {
+      return $true
+    }
+
+    # A pipe can be empty for a short moment while its producer starts. Wait
+    # briefly, but keep the launcher fail-fast for an actually empty pipe.
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+      [uint32]$available = 0
+      if ([CcInput.NativeMethods]::PeekNamedPipe(
+          $handle,
+          [IntPtr]::Zero,
+          0,
+          [IntPtr]::Zero,
+          [ref]$available,
+          [IntPtr]::Zero,
+          [IntPtr]::Zero
+        ) -and $available -gt 0) {
+        return $true
+      }
+      Start-Sleep -Milliseconds 20
+    }
+
+    return $false
+  }
+
+  if (Test-RedirectedInputData) {
+    return $true
+  }
+
+  $valueOptions = @(
+    '--model',
+    '--output-format',
+    '--input-format',
+    '--settings',
+    '--effort',
+    '--max-turns',
+    '--fallback-model',
+    '--agent',
+    '--append-system-prompt',
+    '--system-prompt',
+    '--mcp-config'
+  )
+  for ($i = 0; $i -lt $Arguments.Count; $i++) {
+    $argument = [string]$Arguments[$i]
+    if ($argument -in $valueOptions -and $i + 1 -lt $Arguments.Count) {
+      $i++
+      continue
+    }
+    if (
+      $argument -notlike '-*' -and
+      $argument -notlike '--*' -and
+      -not [string]::IsNullOrWhiteSpace($argument)
+    ) {
+      return $true
+    }
+  }
+  return $false
+}
+
+$PrintRequested = $ClaudeArgs | Where-Object {
+  $_ -eq '--print' -or $_ -eq '-p' -or $_ -like '--print=*'
+}
+if ($PrintRequested -and -not (Test-HasPrintInput -Arguments $ClaudeArgs)) {
+  throw 'cc: --print requires a prompt argument or redirected stdin. Invoke cc without --print for the interactive REPL.'
+}
+
+# Gateway owns its provider-qualified model catalog. Do not pass inherited
+# Anthropic modelOverrides into the Gateway child settings; legacy model IDs
+# are normalized only at the explicit resume/model-selection boundary.
+$CallerSettings.modelOverrides = @{}
 $CallerSettings.enableWorkflows = $true
 $CallerSettings.workflowKeywordTriggerEnabled = $true
 
@@ -244,6 +428,7 @@ foreach ($argument in $ClaudeArgs) {
     $IsResume = $true
   }
 }
+$AutoRestartAttempts = if ($IsResume) { 1 } else { 0 }
 $SettingsEnableUltracode = $CallerSettings.ultracode -eq $true
 if (
   -not $HasEffortArgument -and
@@ -283,7 +468,7 @@ function Test-LoopbackPortOccupied {
 function Test-OwnedGatewayProcess {
   param(
     $Process,
-    [string]$GatewayPath,
+    [string[]]$GatewayPaths,
     [int]$Port
   )
 
@@ -294,12 +479,17 @@ function Test-OwnedGatewayProcess {
   try {
     $arguments = @(ConvertFrom-WindowsCommandLine -CommandLine $Process.CommandLine)
     for ($i = 0; $i -lt ($arguments.Count - 2); $i++) {
-      if (
-        ([IO.Path]::GetFullPath([string]$arguments[$i]) -eq $GatewayPath) -and
-        ([string]$arguments[$i + 1] -eq '--port') -and
-        ([int]$arguments[$i + 2] -eq $Port)
-      ) {
-        return $true
+      try {
+        $candidatePath = [IO.Path]::GetFullPath([string]$arguments[$i])
+        if (
+          ($candidatePath -in @($GatewayPaths | ForEach-Object { [IO.Path]::GetFullPath($_) })) -and
+          ([string]$arguments[$i + 1] -eq '--port') -and
+          ([int]$arguments[$i + 2] -eq $Port)
+        ) {
+          return $true
+        }
+      } catch {
+        continue
       }
     }
   } catch {
@@ -315,12 +505,12 @@ function Stop-OwnedGateway {
     return
   }
   try {
-    $gatewayPath = [IO.Path]::GetFullPath($GatewayScript)
+    $gatewayPaths = @($GatewayScript, $GatewaySupervisor)
     $gatewayProcessIds = @()
     try {
       $gatewayProcessIds = @(
         Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-          Where-Object { Test-OwnedGatewayProcess -Process $_ -GatewayPath $gatewayPath -Port $Port } |
+          Where-Object { Test-OwnedGatewayProcess -Process $_ -GatewayPaths $gatewayPaths -Port $Port } |
           Select-Object -ExpandProperty ProcessId
       )
     } catch {
@@ -345,11 +535,14 @@ if (-not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
 if (-not (Test-Path -LiteralPath $GatewayScript)) {
   throw "Model gateway is missing: $GatewayScript"
 }
+if (-not (Test-Path -LiteralPath $GatewaySupervisor)) {
+  throw "Model gateway supervisor is missing: $GatewaySupervisor"
+}
 if (-not (Test-Path -LiteralPath $Keysafe)) {
   throw "Keysafe is missing: $Keysafe"
 }
-if (-not (Test-Path -LiteralPath $ClaudeExe)) {
-  throw "Claude executable is missing: $ClaudeExe"
+if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
+  throw "Gateway Claude build is missing: $ClaudeScript. Run 'bun run build' in $Root."
 }
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
@@ -362,28 +555,104 @@ if (Test-LoopbackPortOccupied -Port $Port) {
 $StdoutLog = Join-Path $env:TEMP "model-gateway-$PID-$Port.out.log"
 $StderrLog = Join-Path $env:TEMP "model-gateway-$PID-$Port.err.log"
 
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$Port"
-$env:CLAUDE_CODE_GB_BASE_URL = "http://127.0.0.1:$Port"
-$env:ANTHROPIC_API_KEY = $null
-$env:ANTHROPIC_AUTH_TOKEN = $GatewayToken
-$env:CLAUDE_CODE_OAUTH_TOKEN = $null
+# Gateway sessions are hermetic. A caller may have a Claude subscription,
+# Anthropic API-key, or third-party provider environment in its parent shell;
+# none of those values are valid inputs for this launcher.
+$GatewayInheritedVariables = @(
+  'ANTHROPIC_BASE_URL'
+  'ANTHROPIC_API_KEY'
+  'ANTHROPIC_AUTH_TOKEN'
+  'ANTHROPIC_MODEL'
+  'ANTHROPIC_SMALL_FAST_MODEL'
+  'ANTHROPIC_CUSTOM_HEADERS'
+  'ANTHROPIC_CUSTOM_MODEL_OPTION'
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME'
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES'
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL'
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME'
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION'
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES'
+  'CLAUDE_CODE_OAUTH_TOKEN'
+  'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR'
+  'CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR'
+  'ANTHROPIC_UNIX_SOCKET'
+  'CLAUDE_CODE_USE_BEDROCK'
+  'CLAUDE_CODE_USE_VERTEX'
+  'CLAUDE_CODE_USE_FOUNDRY'
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH'
+  'CLAUDE_CODE_SKIP_VERTEX_AUTH'
+  'CLAUDE_CODE_SKIP_FOUNDRY_AUTH'
+  'USE_STAGING_OAUTH'
+  'ANTHROPIC_FOUNDRY_API_KEY'
+  'ANTHROPIC_FOUNDRY_RESOURCE'
+  'ANTHROPIC_FOUNDRY_BASE_URL'
+  'ANTHROPIC_VERTEX_PROJECT_ID'
+  'VERTEX_BASE_URL'
+  'BEDROCK_BASE_URL'
+  'AWS_BEARER_TOKEN_BEDROCK'
+)
+foreach ($variableName in $GatewayInheritedVariables) {
+  Remove-Item -LiteralPath "Env:$variableName" -ErrorAction SilentlyContinue
+}
+$env:CLAUDE_CODE_GATEWAY_BASE_URL = "http://127.0.0.1:$Port"
+$env:CLAUDE_CODE_GATEWAY_TOKEN = $GatewayToken
 $env:CLAUDE_CODE_USE_GATEWAY = '1'
 $env:CLAUDE_GATEWAY_ALLOW_LOOPBACK = '1'
-$env:ANTHROPIC_MODEL = $Model
+$env:MODEL_GATEWAY_MODEL = $Model
 $env:CLAUDE_CODE_SUBAGENT_MODEL = $Model
+$env:TANDEM_GATEWAY_PROVENANCE_SOURCE = 'cc.ps1'
+$env:TANDEM_GATEWAY_PROVENANCE_PROVIDER = 'cc-gateway'
+$env:TANDEM_GATEWAY_PROVENANCE_MODEL = $Model
+$env:TANDEM_GATEWAY_PROVENANCE_EFFORT = $Effort
+$env:TANDEM_GATEWAY_PROVENANCE_CWD = $LaunchDirectory
+$env:TANDEM_GATEWAY_PROVENANCE_LAUNCH_NONCE = $env:TANDEM_BRANCH_PROVIDER_LAUNCH_NONCE
+# Balanced provider tool schemas preserve bounded tool-selection descriptions
+# while removing redundant schema metadata. Explicit compact/fallback modes
+# remain available for controlled experiments or compatibility.
+if ([string]::IsNullOrWhiteSpace($env:MODEL_GATEWAY_CODEX_TOOL_MODE)) {
+  $env:MODEL_GATEWAY_CODEX_TOOL_MODE = 'balanced'
+}
+# The provider already caches stable prefixes automatically. Keep the
+# experimental session namespace opt-in so it cannot reduce cache sharing.
+$env:CLAUDE_CODE_GATEWAY_PROVENANCE = @{
+  source = 'cc.ps1'
+  provider = 'cc-gateway'
+  model_actual = $Model
+  effort_actual = $Effort
+  cwd_actual = $LaunchDirectory
+  launch_nonce = $env:TANDEM_BRANCH_PROVIDER_LAUNCH_NONCE
+} | ConvertTo-Json -Compress
+$env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-luna'
+$env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-sol'
+$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'
+$env:MODEL_GATEWAY_SUBAGENT_MODEL = $Model
+# Keep gateway-backed cc on the standard native harness compaction path.
+# Session-memory compaction is a separate summary producer and can replace
+# compactConversation() without making a provider request, which makes it
+# impossible to validate or recover the gateway compaction boundary reliably.
+$env:DISABLE_CLAUDE_CODE_SM_COMPACT = '1'
+$env:ENABLE_CLAUDE_CODE_SM_COMPACT = $null
 
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL = 'claude-gpt-sol'
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL = 'claude-gpt-luna'
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = 'claude-ds-flash'
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES = 'effort,thinking,adaptive_thinking'
 $env:CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = '1'
+$env:MODEL_GATEWAY_EFFORT_CAPABILITIES = (
+  $CapabilityCatalog.gatewayAliases | ConvertTo-Json -Compress
+)
+$GatewayModelOptions = @($CapabilityCatalog.gatewayModelOptions)
+$env:MODEL_GATEWAY_MODEL_OPTIONS = ($GatewayModelOptions | ConvertTo-Json -Compress)
 $env:CLAUDE_CODE_EFFORT_LEVEL = $null
 $env:CLAUDE_CODE_WORKFLOWS = 'true'
 $env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = '1'
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
+$env:MODEL_GATEWAY_LOG_TIMING = '1'
 
 try {
   $ScopedSettingsPath = Join-Path `
@@ -399,7 +668,7 @@ try {
   # Start the Gateway through a short-lived keysafe child. OpenCode is included
   # only when its vault record is present, and the value never becomes an argument
   # or file.
-  $GatewayCommand = 'node "' + $GatewayScript + '" --port ' + [string]$Port
+  $GatewayCommand = 'node "' + $GatewaySupervisor + '" --port ' + [string]$Port
   $GatewayArgumentList = @(
     '-NoProfile'
     '-ExecutionPolicy'
@@ -458,53 +727,68 @@ try {
     ([string]$GatewayArgumentList[-1]).Replace('"', '\"') +
     '"'
 
-  $GatewayProcess = Start-Process `
-    -FilePath 'powershell.exe' `
-    -ArgumentList $GatewayArgumentList `
-    -WorkingDirectory $Root `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $StdoutLog `
-    -RedirectStandardError $StderrLog `
-    -PassThru
+  if ($env:CC_SKIP_GATEWAY_START -eq '1') {
+    # Test-only seam for launcher control-flow regression. Gateway startup and
+    # health are covered independently by the gateway and compiled replay gates.
+    $healthy = $true
+  } else {
+    $GatewayProcess = Start-Process `
+      -FilePath 'powershell.exe' `
+      -ArgumentList $GatewayArgumentList `
+      -WorkingDirectory $Root `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $StdoutLog `
+      -RedirectStandardError $StderrLog `
+      -PassThru
 
-  $healthy = $false
-  $deadline = [DateTime]::UtcNow.AddSeconds(15)
-  while (-not $healthy -and [DateTime]::UtcNow -lt $deadline) {
-    if ($GatewayProcess.HasExited) {
-      break
-    }
-    try {
-      $health = Invoke-RestMethod `
-        -Uri "http://127.0.0.1:$Port/health" `
-        -TimeoutSec 1
-      if ($health.status -eq 'ok') {
-        $healthy = $true
+    $healthy = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    while (-not $healthy -and [DateTime]::UtcNow -lt $deadline) {
+      if ($GatewayProcess.HasExited) {
         break
       }
-    } catch {
-      # The gateway may still be binding its loopback listener.
+      try {
+        $health = Invoke-RestMethod `
+          -Uri "http://127.0.0.1:$Port/health" `
+          -TimeoutSec 1
+        if ($health.status -eq 'ok') {
+          $healthy = $true
+          break
+        }
+      } catch {
+        # The gateway may still be binding its loopback listener.
+      }
+      Start-Sleep -Milliseconds 250
     }
-    Start-Sleep -Milliseconds 250
-  }
 
-  if (-not $healthy) {
-    $detail = if (Test-Path -LiteralPath $StderrLog) {
-      (Get-Content -Raw -LiteralPath $StderrLog).Trim()
-    } else {
-      ''
+    if (-not $healthy) {
+      $detail = if (Test-Path -LiteralPath $StderrLog) {
+        (Get-Content -Raw -LiteralPath $StderrLog).Trim()
+      } else {
+        ''
+      }
+      if ($detail) {
+        throw "Model gateway did not become healthy. $detail"
+      }
+      throw 'Model gateway did not become healthy within 15 seconds.'
     }
-    if ($detail) {
-      throw "Model gateway did not become healthy. $detail"
-    }
-    throw 'Model gateway did not become healthy within 15 seconds.'
   }
 
   # Claude resolves transcripts from the caller's directory. Keep that
   # directory active so --resume uses the correct project namespace.
   Push-Location $LaunchDirectory
   try {
-    & $ClaudeExe @ClaudeArgs
-    $ExitCode = $LASTEXITCODE
+    for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
+      & $ClaudeRunner $ClaudeScript @ClaudeArgs
+      $ExitCode = $LASTEXITCODE
+      if ($ExitCode -eq 0 -or $attempt -ge $AutoRestartAttempts) {
+        break
+      }
+      [Console]::Error.WriteLine(
+        "cc: Claude exited unexpectedly with code $ExitCode; restarting the resumed session once..."
+      )
+      Start-Sleep -Milliseconds 500
+    }
   } finally {
     Pop-Location
   }

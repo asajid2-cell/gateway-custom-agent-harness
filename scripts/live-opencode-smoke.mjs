@@ -1,5 +1,6 @@
 const model = process.env.OPENCODE_SMOKE_MODEL || 'mimo-v2.5'
 const protocol = process.env.OPENCODE_SMOKE_PROTOCOL || 'chat-completions'
+const effort = process.env.OPENCODE_SMOKE_EFFORT
 const gatewayUrl = process.env.OPENCODE_SMOKE_GATEWAY_URL
   || 'https://opencode.ai/zen/go/v1'
 const endpoint = {
@@ -25,10 +26,30 @@ if (!key || !endpoint) {
     ? { model, stream: true, input: [{ role: 'user', content: [{ type: 'input_text', text: 'Reply with exactly OK.' }] }], max_output_tokens: 8 }
     : protocol === 'anthropic-messages'
       ? { model, stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'Reply with exactly OK.' }] }
-      : { model, stream: true, max_tokens: 8, messages: [{ role: 'user', content: 'Reply with exactly OK.' }] }
+    : {
+      model,
+      stream: true,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'Reply with exactly OK.' }],
+      ...(effort ? { reasoning_effort: effort } : {}),
+    }
   const started = performance.now()
   try {
-    const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) })
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(Number(process.env.OPENCODE_SMOKE_TIMEOUT_MS || 60000)),
+    })
+    const rawResponse = response.clone()
+    let providerError = ''
+    if (!response.ok) {
+      try {
+        providerError = (await rawResponse.text()).slice(0, 1000)
+      } catch {
+        providerError = ''
+      }
+    }
     const firstByteStart = performance.now()
     const reader = response.body?.getReader()
     let chunks = 0
@@ -68,7 +89,7 @@ if (!key || !endpoint) {
       }
     }
     if (reader) {
-      while (chunks < 16) {
+      while (chunks < 128 && !hasDone) {
         const next = await reader.read()
         if (next.done) break
         chunks += 1
@@ -79,10 +100,33 @@ if (!key || !endpoint) {
         recordSse(text)
       }
       recordSse('\\n\\n')
-      await reader.cancel().catch(() => {})
+      await Promise.race([
+        Promise.resolve(reader.cancel()).catch(() => {}),
+        new Promise(resolve => setTimeout(resolve, 250)),
+      ])
     }
-    console.log(JSON.stringify({ model, protocol, status: response.status, ok: response.ok, firstByteMs: Math.round(firstByteStart - started), chunks, bytes, hasData, hasDone, eventShapes, result: response.ok && hasData ? 'pass' : 'provider-response-failed' }))
-    process.exitCode = response.ok && hasData ? 0 : 1
+    const hasTerminalEvent = eventShapes.some(event =>
+      event.type === 'response.completed' ||
+      event.type === 'message_stop' ||
+      event.choiceShapes?.some(choice => choice.finish != null),
+    )
+    console.log(JSON.stringify({
+      model,
+      protocol,
+      effort: effort || null,
+      status: response.status,
+      ok: response.ok,
+      providerError,
+      firstByteMs: Math.round(firstByteStart - started),
+      chunks,
+      bytes,
+      hasData,
+      hasDone,
+      hasTerminalEvent,
+      eventShapes,
+      result: response.ok && hasData && hasTerminalEvent ? 'pass' : 'provider-response-failed',
+    }))
+    process.exitCode = response.ok && hasData && hasTerminalEvent ? 0 : 1
   } catch (error) {
     console.log(JSON.stringify({ model, protocol, result: 'connection-error', errorClass: error?.name || 'Error' }))
     process.exitCode = 1

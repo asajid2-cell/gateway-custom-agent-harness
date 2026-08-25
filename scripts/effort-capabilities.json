@@ -1,0 +1,332 @@
+{
+  "gpt56": [
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max"
+  ],
+  "opencodeGo": {
+    "gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+    "ox-alpha-free": ["low", "high", "max"],
+    "mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
+    "mimo-v2.5-pro": [],
+    "glm-5.3": ["low", "high", "max"],
+    "glm-5.2": ["high", "max"],
+    "glm-5.1": [],
+    "grok-4.5": ["low", "medium", "high"],
+    "muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+    "kimi-k3": ["max"],
+    "kimi-k2.7-code": [],
+    "kimi-k2.6": [],
+    "deepseek-v4-pro": ["high", "max"],
+    "deepseek-v4-flash": ["low", "high", "max"],
+    "hy3": ["none", "low", "high"],
+    "minimax-m3": [],
+    "minimax-m2.7": [],
+    "minimax-m2.5": [],
+    "qwen3.8-max": [],
+    "qwen3.7-max": [],
+    "qwen3.7-plus": [],
+    "qwen3.6-plus": []
+  },
+  "gatewayAliases": {
+    "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-ox-alpha": ["low", "high", "max"],
+    "gateway-ds-flash": ["low", "medium", "high"],
+    "gateway-ds-pro": ["low", "medium", "high"],
+    "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-opencode-ox-alpha-free": ["low", "high", "max"],
+    "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-opencode-mimo-v2.5-pro": [],
+    "gateway-opencode-glm-5.3": ["low", "high", "max"],
+    "gateway-opencode-glm-5.2": ["high", "max"],
+    "gateway-opencode-glm-5.1": [],
+    "gateway-opencode-grok-4.5": ["low", "medium", "high"],
+    "gateway-opencode-muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+    "gateway-opencode-kimi-k3": ["max"],
+    "gateway-opencode-kimi-k2.7-code": [],
+    "gateway-opencode-kimi-k2.6": [],
+    "gateway-opencode-deepseek-v4-pro": ["high", "max"],
+    "gateway-opencode-deepseek-v4-flash": ["low", "high", "max"],
+    "gateway-opencode-hy3": ["none", "low", "high"],
+    "gateway-opencode-minimax-m3": [],
+    "gateway-opencode-minimax-m2.7": [],
+    "gateway-opencode-minimax-m2.5": [],
+    "gateway-opencode-qwen3.8-max": [],
+    "gateway-opencode-qwen3.7-max": [],
+    "gateway-opencode-qwen3.7-plus": [],
+    "gateway-opencode-qwen3.6-plus": []
+  },
+  "legacyAliases": {
+    "claude-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-ox-alpha": ["low", "high", "max"],
+    "claude-ds-flash": ["low", "medium", "high"],
+    "claude-ds-pro": ["low", "medium", "high"],
+    "claude-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-opencode-ox-alpha-free": ["low", "high", "max"],
+    "claude-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-opencode-mimo-v2.5-pro": [],
+    "claude-opencode-glm-5.3": ["low", "high", "max"],
+    "claude-opencode-glm-5.2": ["high", "max"],
+    "claude-opencode-glm-5.1": [],
+    "claude-opencode-grok-4.5": ["low", "medium", "high"],
+    "claude-opencode-muse-spark-1.2-contributor": ["minimal", "low", "medium", "high", "xhigh"],
+    "claude-opencode-kimi-k3": ["max"],
+    "claude-opencode-kimi-k2.7-code": [],
+    "claude-opencode-kimi-k2.6": [],
+    "claude-opencode-deepseek-v4-pro": ["high", "max"],
+    "claude-opencode-deepseek-v4-flash": ["low", "high", "max"],
+    "claude-opencode-hy3": ["none", "low", "high"],
+    "claude-opencode-minimax-m3": [],
+    "claude-opencode-minimax-m2.7": [],
+    "claude-opencode-minimax-m2.5": [],
+    "claude-opencode-qwen3.8-max": [],
+    "claude-opencode-qwen3.7-max": [],
+    "claude-opencode-qwen3.7-plus": [],
+    "claude-opencode-qwen3.6-plus": []
+  },
+  "gatewayModelOptions": [
+    {
+      "value": "gateway-gpt-luna",
+      "label": "GPT 5.6 Luna",
+      "description": "Gateway - GPT 5.6 Luna"
+    },
+    {
+      "value": "gateway-gpt-sol",
+      "label": "GPT 5.6 Sol",
+      "description": "Gateway - GPT 5.6 Sol"
+    },
+    {
+      "value": "gateway-gpt-terra",
+      "label": "GPT 5.6 Terra",
+      "description": "Gateway - GPT 5.6 Terra"
+    },
+    {
+      "value": "gateway-ds-flash",
+      "label": "DeepSeek v4 Flash",
+      "description": "DeepSeek - v4 Flash"
+    },
+    {
+      "value": "gateway-ds-pro",
+      "label": "DeepSeek v4 Pro",
+      "description": "DeepSeek - v4 Pro"
+    },
+    {
+      "value": "gateway-ox-alpha",
+      "label": "Ox Alpha",
+      "description": "OpenCode - Ox Alpha Free"
+    },
+    {
+      "value": "gateway-opencode-gpt-5.6-luna",
+      "label": "OpenCode GPT 5.6 Luna",
+      "description": "OpenCode - GPT 5.6 Luna"
+    },
+    {
+      "value": "gateway-opencode-ox-alpha-free",
+      "label": "OpenCode Ox Alpha Free",
+      "description": "OpenCode - Ox Alpha Free"
+    },
+    {
+      "value": "gateway-opencode-mimo-v2.5",
+      "label": "OpenCode Mimo v2.5",
+      "description": "OpenCode - Mimo v2.5"
+    },
+    {
+      "value": "gateway-opencode-mimo-v2.5-pro",
+      "label": "OpenCode Mimo v2.5 Pro",
+      "description": "OpenCode - Mimo v2.5 Pro"
+    },
+    {
+      "value": "gateway-opencode-hy3",
+      "label": "OpenCode Hy3",
+      "description": "OpenCode - Hy3"
+    },
+    {
+      "value": "gateway-opencode-muse-spark-1.2-contributor",
+      "label": "OpenCode Muse Spark",
+      "description": "OpenCode - Muse Spark 1.2 Contributor"
+    },
+    {
+      "value": "gateway-opencode-qwen3.7-plus",
+      "label": "OpenCode Qwen 3.7 Plus",
+      "description": "OpenCode - Qwen 3.7 Plus"
+    },
+    {
+      "value": "gateway-opencode-deepseek-v4-flash",
+      "label": "OpenCode DeepSeek v4 Flash",
+      "description": "OpenCode - DeepSeek v4 Flash"
+    },
+    {
+      "value": "gateway-opencode-deepseek-v4-pro",
+      "label": "OpenCode DeepSeek v4 Pro",
+      "description": "OpenCode - DeepSeek v4 Pro"
+    },
+    {
+      "value": "gateway-opencode-grok-4.5",
+      "label": "OpenCode Grok 4.5",
+      "description": "OpenCode - Grok 4.5"
+    },
+    {
+      "value": "gateway-opencode-glm-5.3",
+      "label": "OpenCode GLM 5.3",
+      "description": "OpenCode - GLM 5.3"
+    },
+    {
+      "value": "gateway-opencode-glm-5.2",
+      "label": "OpenCode GLM 5.2",
+      "description": "OpenCode - GLM 5.2"
+    },
+    {
+      "value": "gateway-opencode-glm-5.1",
+      "label": "OpenCode GLM 5.1",
+      "description": "OpenCode - GLM 5.1"
+    },
+    {
+      "value": "gateway-opencode-kimi-k3",
+      "label": "OpenCode Kimi K3",
+      "description": "OpenCode - Kimi K3"
+    },
+    {
+      "value": "gateway-opencode-kimi-k2.7-code",
+      "label": "OpenCode Kimi K2.7 Code",
+      "description": "OpenCode - Kimi K2.7 Code"
+    },
+    {
+      "value": "gateway-opencode-kimi-k2.6",
+      "label": "OpenCode Kimi K2.6",
+      "description": "OpenCode - Kimi K2.6"
+    },
+    {
+      "value": "gateway-opencode-minimax-m3",
+      "label": "OpenCode MiniMax M3",
+      "description": "OpenCode - MiniMax M3"
+    },
+    {
+      "value": "gateway-opencode-minimax-m2.7",
+      "label": "OpenCode MiniMax M2.7",
+      "description": "OpenCode - MiniMax M2.7"
+    },
+    {
+      "value": "gateway-opencode-minimax-m2.5",
+      "label": "OpenCode MiniMax M2.5",
+      "description": "OpenCode - MiniMax M2.5"
+    },
+    {
+      "value": "gateway-opencode-qwen3.8-max",
+      "label": "OpenCode Qwen 3.8 Max",
+      "description": "OpenCode - Qwen 3.8 Max"
+    },
+    {
+      "value": "gateway-opencode-qwen3.7-max",
+      "label": "OpenCode Qwen 3.7 Max",
+      "description": "OpenCode - Qwen 3.7 Max"
+    },
+    {
+      "value": "gateway-opencode-qwen3.6-plus",
+      "label": "OpenCode Qwen 3.6 Plus",
+      "description": "OpenCode - Qwen 3.6 Plus"
+    }
+  ],
+  "gatewayModelAliases": {
+    "gateway-gpt-luna": ["gpt-5.6-luna", "claude-gpt-luna"],
+    "gateway-gpt-sol": ["gpt-5.6-sol", "claude-gpt-sol"],
+    "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
+    "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],
+    "gateway-ds-pro": ["deepseek-v4-pro", "claude-ds-pro"],
+    "gateway-ox-alpha": ["ox-alpha-free", "claude-ox-alpha"],
+    "gateway-opencode-gpt-5.6-luna": [
+      "opencode-go/gpt-5.6-luna",
+      "claude-opencode-gpt-5.6-luna"
+    ],
+    "gateway-opencode-ox-alpha-free": [
+      "opencode-go/ox-alpha-free",
+      "claude-opencode-ox-alpha-free"
+    ],
+    "gateway-opencode-mimo-v2.5": [
+      "opencode-go/mimo-v2.5",
+      "claude-opencode-mimo-v2.5"
+    ],
+    "gateway-opencode-mimo-v2.5-pro": [
+      "opencode-go/mimo-v2.5-pro",
+      "claude-opencode-mimo-v2.5-pro"
+    ],
+    "gateway-opencode-hy3": [
+      "opencode-go/hy3",
+      "claude-opencode-hy3"
+    ],
+    "gateway-opencode-muse-spark-1.2-contributor": [
+      "opencode-go/muse-spark-1.2-contributor",
+      "claude-opencode-muse-spark-1.2-contributor"
+    ],
+    "gateway-opencode-qwen3.7-plus": [
+      "opencode-go/qwen3.7-plus",
+      "claude-opencode-qwen3.7-plus"
+    ],
+    "gateway-opencode-deepseek-v4-flash": [
+      "opencode-go/deepseek-v4-flash",
+      "claude-opencode-deepseek-v4-flash"
+    ],
+    "gateway-opencode-deepseek-v4-pro": [
+      "opencode-go/deepseek-v4-pro",
+      "claude-opencode-deepseek-v4-pro"
+    ],
+    "gateway-opencode-grok-4.5": [
+      "opencode-go/grok-4.5",
+      "claude-opencode-grok-4.5"
+    ],
+    "gateway-opencode-glm-5.3": [
+      "opencode-go/glm-5.3",
+      "claude-opencode-glm-5.3"
+    ],
+    "gateway-opencode-glm-5.2": [
+      "opencode-go/glm-5.2",
+      "claude-opencode-glm-5.2"
+    ],
+    "gateway-opencode-glm-5.1": [
+      "opencode-go/glm-5.1",
+      "claude-opencode-glm-5.1"
+    ],
+    "gateway-opencode-kimi-k3": [
+      "opencode-go/kimi-k3",
+      "claude-opencode-kimi-k3"
+    ],
+    "gateway-opencode-kimi-k2.7-code": [
+      "opencode-go/kimi-k2.7-code",
+      "claude-opencode-kimi-k2.7-code"
+    ],
+    "gateway-opencode-kimi-k2.6": [
+      "opencode-go/kimi-k2.6",
+      "claude-opencode-kimi-k2.6"
+    ],
+    "gateway-opencode-minimax-m3": [
+      "opencode-go/minimax-m3",
+      "claude-opencode-minimax-m3"
+    ],
+    "gateway-opencode-minimax-m2.7": [
+      "opencode-go/minimax-m2.7",
+      "claude-opencode-minimax-m2.7"
+    ],
+    "gateway-opencode-minimax-m2.5": [
+      "opencode-go/minimax-m2.5",
+      "claude-opencode-minimax-m2.5"
+    ],
+    "gateway-opencode-qwen3.8-max": [
+      "opencode-go/qwen3.8-max",
+      "claude-opencode-qwen3.8-max"
+    ],
+    "gateway-opencode-qwen3.7-max": [
+      "opencode-go/qwen3.7-max",
+      "claude-opencode-qwen3.7-max"
+    ],
+    "gateway-opencode-qwen3.6-plus": [
+      "opencode-go/qwen3.6-plus",
+      "claude-opencode-qwen3.6-plus"
+    ]
+  }
+}

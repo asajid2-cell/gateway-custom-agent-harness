@@ -1,0 +1,73 @@
+import { readFileSync } from 'node:fs'
+
+const CATALOG = JSON.parse(
+  readFileSync(new URL('./effort-capabilities.json', import.meta.url), 'utf8'),
+)
+
+export const NATIVE_EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]
+
+export const GPT56_EFFORT_LEVELS = [...CATALOG.gpt56]
+
+export const GATEWAY_MODEL_OPTIONS = Object.freeze(
+  (Array.isArray(CATALOG.gatewayModelOptions)
+    ? CATALOG.gatewayModelOptions
+    : []
+  ).map(option => Object.freeze({ ...option })),
+)
+
+export const GATEWAY_MODEL_ALIAS_MAP = Object.freeze(
+  Object.fromEntries(
+    Object.entries(CATALOG.gatewayModelAliases || {}).flatMap(
+      ([canonical, aliases]) =>
+        (Array.isArray(aliases) ? aliases : []).map(alias => [
+          alias.toLowerCase(),
+          canonical,
+        ]),
+    ),
+  ),
+)
+
+export function gatewayCatalogDrift(routeIds) {
+  const routedModelIds = new Set(routeIds)
+  const catalogModelIds = new Set(
+    GATEWAY_MODEL_OPTIONS.map(option => option.value),
+  )
+  return {
+    missingRoutes: [...catalogModelIds].filter(
+      model => !routedModelIds.has(model),
+    ),
+    missingCatalogEntries: [...routedModelIds].filter(
+      model => !catalogModelIds.has(model),
+    ),
+    unknownAliases: Object.entries(GATEWAY_MODEL_ALIAS_MAP)
+      .filter(([, canonical]) => !routedModelIds.has(canonical))
+      .map(([alias, canonical]) => `${alias}->${canonical}`),
+  }
+}
+
+// OpenCode publishes a generic variant vocabulary, but its model catalog is
+// authoritative per model. Keep this table explicit so a route cannot
+// accidentally advertise every level just because its wire protocol supports
+// a reasoning field. Entries marked conservatively can be expanded after a
+// live model-catalog or request smoke test confirms the provider accepts it.
+export const OPENCODE_GO_EFFORT_LEVELS = Object.fromEntries(
+  Object.entries(CATALOG.opencodeGo).map(([model, levels]) => [model, [...levels]]),
+)
+
+export function effortLevelsForOpenCodeModel(model) {
+  const levels = OPENCODE_GO_EFFORT_LEVELS[model]
+  return levels ? [...levels] : []
+}
+
+export function effortWireMapForOpenCodeModel(model) {
+  if (model === 'hy3') return { none: 'no_think' }
+  return {}
+}

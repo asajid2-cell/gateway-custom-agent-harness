@@ -2,18 +2,36 @@ import http from 'node:http'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import {
   OPENCODE_GO_ROUTES,
   OPENCODE_GO_MODEL_IDS,
+  openCodeGoEffortLevels,
+  openCodeGoEffortWireMap,
   isOpenCodeGoProtocol,
   anthropicToOpenCodeRequest,
   openCodeGoEndpoint,
   openCodeGoHeaders,
   redactSecret,
   relayOpenCodeStream,
+  relayOpenCodeResponseByProtocol,
 } from './opencode-go.mjs'
+import {
+  gatewayCatalogDrift,
+  GPT56_EFFORT_LEVELS,
+  NATIVE_EFFORT_LEVELS,
+} from './effort-capabilities.mjs'
+import {
+  appendRuntimeToolContract,
+  gatewayQuerySource,
+  isCompactionRequest,
+  isNativeSummaryRequest,
+  rewriteGatewaySystemPrompt,
+  RUNTIME_TOOL_CONTRACT,
+  sanitizeLegacyCompactionContent,
+  sanitizeStaleToolCapabilityContent,
+} from './gateway-contract.mjs'
 
 const HOST = '127.0.0.1'
 const CODEX_ENDPOINT =
@@ -47,28 +65,146 @@ const CONSUMER_TIMEOUT_MS = durationEnvironment(
   'MODEL_GATEWAY_CONSUMER_TIMEOUT_MS',
   180_000,
 )
+const OPENCODE_ALPHA_TIMEOUT_MS = durationEnvironment(
+  'MODEL_GATEWAY_ALPHA_TIMEOUT_MS',
+  60_000,
+)
+const UPSTREAM_RETRIES = integerEnvironment(
+  'MODEL_GATEWAY_UPSTREAM_RETRIES',
+  2,
+)
+const UPSTREAM_RETRY_BASE_MS = durationEnvironment(
+  'MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS',
+  250,
+)
+const UPSTREAM_RETRY_MAX_MS = durationEnvironment(
+  'MODEL_GATEWAY_UPSTREAM_RETRY_MAX_MS',
+  5_000,
+)
+const RETRY_ATTEMPT_TIMEOUT_MS = durationEnvironment(
+  'MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS',
+  30_000,
+)
+const RETRY_RESPONSE_TIMEOUT_MS = RETRY_ATTEMPT_TIMEOUT_MS > 0
+  ? Math.min(UPSTREAM_TIMEOUT_MS, RETRY_ATTEMPT_TIMEOUT_MS)
+  : UPSTREAM_TIMEOUT_MS
+const RETRY_400 = process.env.MODEL_GATEWAY_RETRY_400 === '1'
+const CODEX_TOOL_MODE = process.env.MODEL_GATEWAY_CODEX_TOOL_MODE || 'fallback'
+const CODEX_PROMPT_CACHE_KEY_MODE =
+  process.env.MODEL_GATEWAY_CODEX_PROMPT_CACHE_KEY_MODE || 'off'
+const LOG_REQUEST_SHAPE = process.env.MODEL_GATEWAY_LOG_SHAPE === '1'
+
+if (!['fallback', 'balanced', 'compact'].includes(CODEX_TOOL_MODE)) {
+  throw new Error(
+    'MODEL_GATEWAY_CODEX_TOOL_MODE must be fallback, balanced, or compact',
+  )
+}
+if (!['off', 'auto'].includes(CODEX_PROMPT_CACHE_KEY_MODE)) {
+  throw new Error(
+    'MODEL_GATEWAY_CODEX_PROMPT_CACHE_KEY_MODE must be off or auto',
+  )
+}
+
+function integerEnvironment(name, fallback) {
+  const raw = process.env[name]
+  if (raw == null || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+  return value
+}
 
 const DEFAULT_MODELS = {
-  'gpt-5.6-luna': { backend: 'codex', upstream: 'gpt-5.6-luna' },
-  'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol' },
-  'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra' },
-  'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
-  'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
+  // Provider-native IDs remain routable for old scripts and direct callers,
+  // but are deliberately hidden from Gateway discovery and the /model picker.
+  'gpt-5.6-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
+  'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
   ...Object.fromEntries(
     OPENCODE_GO_MODEL_IDS.map(model => [
       `opencode-go/${model}`,
-      { backend: 'opencode-go', upstream: model, protocol: OPENCODE_GO_ROUTES[model] },
+      {
+        backend: 'opencode-go',
+        upstream: model,
+        protocol: OPENCODE_GO_ROUTES[model],
+        effortLevels: openCodeGoEffortLevels(model),
+        effortWireMap: openCodeGoEffortWireMap(model),
+        hidden: true,
+        ...(model === 'hy3' ? { supportsTools: false } : {}),
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+          ? { supportsForcedToolChoice: false }
+          : {}),
+      },
     ]),
   ),
-  // claude-* aliases so Claude Code's GATEWAY MODEL DISCOVERY lists them in /model:
-  // the discovery filter only surfaces IDs starting with "claude"/"anthropic". Each alias
-  // routes to its real backend via `upstream`. Add/remove entries freely; MODEL_GATEWAY_MODELS
-  // can override the whole map at launch.
-  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna' },
-  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol' },
-  'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra' },
-  'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
-  'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
+  // Gateway-visible aliases make the provider boundary explicit in /model and
+  // /v1/models. The raw opencode-go/* IDs remain supported for direct callers.
+  ...Object.fromEntries(
+    OPENCODE_GO_MODEL_IDS.map(model => [
+      `gateway-opencode-${model}`,
+      {
+        backend: 'opencode-go',
+        upstream: model,
+        protocol: OPENCODE_GO_ROUTES[model],
+        effortLevels: openCodeGoEffortLevels(model),
+        effortWireMap: openCodeGoEffortWireMap(model),
+        ...(model === 'hy3' ? { supportsTools: false } : {}),
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+          ? { supportsForcedToolChoice: false }
+          : {}),
+      },
+    ]),
+  ),
+  'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS },
+  'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS },
+  'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS },
+  'gateway-ox-alpha': {
+    backend: 'opencode-go',
+    upstream: 'ox-alpha-free',
+    protocol: 'chat-completions',
+    effortLevels: openCodeGoEffortLevels('ox-alpha-free'),
+    supportsForcedToolChoice: false,
+  },
+  'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
+  'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
+  // Legacy aliases for existing transcripts and direct callers. They remain
+  // routable but hidden so a new session cannot accidentally select a Claude-
+  // named route.
+  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'claude-ox-alpha': {
+    backend: 'opencode-go',
+    upstream: 'ox-alpha-free',
+    protocol: 'chat-completions',
+    effortLevels: openCodeGoEffortLevels('ox-alpha-free'),
+    hidden: true,
+    // Live Alpha accepts tools, but a forced tool_choice can stall instead
+    // of producing a tool call. Leave selection to the provider.
+    supportsForcedToolChoice: false,
+  },
+  'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
+  'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
+  ...Object.fromEntries(
+    OPENCODE_GO_MODEL_IDS.map(model => [
+      `claude-opencode-${model}`,
+      {
+        backend: 'opencode-go',
+        upstream: model,
+        protocol: OPENCODE_GO_ROUTES[model],
+        effortLevels: openCodeGoEffortLevels(model),
+        effortWireMap: openCodeGoEffortWireMap(model),
+        hidden: true,
+        ...(model === 'hy3' ? { supportsTools: false } : {}),
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+          ? { supportsForcedToolChoice: false }
+          : {}),
+      },
+    ]),
+  ),
 }
 
 function loadModels() {
@@ -106,6 +242,7 @@ function loadModels() {
     if (value.backend === 'opencode-go' && !isOpenCodeGoProtocol(value.protocol)) {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} needs a valid OpenCode Go protocol`)
     }
+    const previous = models[name]
     models[name] = {
       backend: value.backend,
       ...(typeof value.upstream === 'string' && value.upstream
@@ -114,6 +251,23 @@ function loadModels() {
           ? { upstream: name }
           : {}),
       ...(value.backend === 'opencode-go' ? { protocol: value.protocol } : {}),
+      ...(Array.isArray(value.effortLevels)
+        ? { effortLevels: value.effortLevels.filter(level => NATIVE_EFFORT_LEVELS.includes(level)) }
+        : {}),
+      ...(value.effortWireMap && typeof value.effortWireMap === 'object' && !Array.isArray(value.effortWireMap)
+        ? { effortWireMap: { ...value.effortWireMap } }
+        : {}),
+      ...(typeof value.supportsTools === 'boolean'
+        ? { supportsTools: value.supportsTools }
+        : {}),
+      ...(typeof value.supportsForcedToolChoice === 'boolean'
+        ? { supportsForcedToolChoice: value.supportsForcedToolChoice }
+        : {}),
+      ...(typeof value.hidden === 'boolean'
+        ? { hidden: value.hidden }
+        : typeof previous?.hidden === 'boolean'
+          ? { hidden: previous.hidden }
+          : {}),
     }
   }
   return models
@@ -121,6 +275,29 @@ function loadModels() {
 
 const MODELS = loadModels()
 const MODEL_NAMES = Object.keys(MODELS)
+const DISCOVERABLE_MODEL_NAMES = MODEL_NAMES.filter(
+  model => MODELS[model].hidden !== true,
+)
+
+function validateGatewayCatalog() {
+  const routedModelIds = Object.entries(DEFAULT_MODELS)
+    .filter(([, route]) => route.hidden !== true)
+    .map(([model]) => model)
+  const drift = gatewayCatalogDrift(routedModelIds)
+  if (
+    drift.missingRoutes.length > 0 ||
+    drift.missingCatalogEntries.length > 0 ||
+    drift.unknownAliases.length > 0
+  ) {
+    throw new Error(
+      `Gateway catalog/runtime drift: missing_routes=${drift.missingRoutes.join(',') || 'none'} ` +
+      `missing_catalog_entries=${drift.missingCatalogEntries.join(',') || 'none'} ` +
+      `unknown_aliases=${drift.unknownAliases.join(',') || 'none'}`,
+    )
+  }
+}
+
+validateGatewayCatalog()
 
 function parsePort(raw, source) {
   if (raw == null || raw === '') return 0
@@ -147,6 +324,20 @@ function resolvePort() {
 
 const PORT = resolvePort()
 
+function requestTimeoutsForRoute(route) {
+  if (
+    route?.backend === 'opencode-go' &&
+    route?.upstream === 'ox-alpha-free'
+  ) {
+    return {
+      upstreamTimeoutMs: Math.min(UPSTREAM_TIMEOUT_MS, OPENCODE_ALPHA_TIMEOUT_MS),
+      consumerTimeoutMs: Math.min(CONSUMER_TIMEOUT_MS, OPENCODE_ALPHA_TIMEOUT_MS),
+      totalTimeoutMs: OPENCODE_ALPHA_TIMEOUT_MS,
+    }
+  }
+  return {}
+}
+
 function json(res, status, body) {
   if (res.headersSent || res.destroyed || res.writableEnded) return
   res.writeHead(status, {
@@ -164,7 +355,13 @@ function classifyGatewayError(error) {
     message.includes('context window') ||
     message.includes('exceeds the context')
   ) return 'context-window'
-  if (message.includes('empty') || message.includes('malformed')) return 'malformed-response'
+  if (
+    error instanceof SyntaxError ||
+    message.includes('empty') ||
+    message.includes('malformed') ||
+    message.includes('unexpected token') ||
+    message.includes('unexpected end of json')
+  ) return 'malformed-response'
   if (message.includes('econnreset') || message.includes('connection reset')) return 'connection-reset'
   if (message.includes('http ')) return 'upstream-http-error'
   return 'upstream-error'
@@ -183,6 +380,7 @@ function createGatewayTrace({ model, backend, protocol }) {
   let bytes = 0
   let events = 0
   let errorClass = null
+  let usage = null
   let finished = false
 
   const elapsed = () => Math.round(performance.now() - started)
@@ -199,6 +397,10 @@ function createGatewayTrace({ model, backend, protocol }) {
       mark('error')
       if (!errorClass) errorClass = classifyGatewayError(error)
     },
+    clearError() {
+      errorClass = null
+      marks.error = null
+    },
     markTimeout(message = 'Gateway request timed out') {
       const error = new Error(message)
       error.gatewayStatus = 504
@@ -212,6 +414,9 @@ function createGatewayTrace({ model, backend, protocol }) {
     addEvent() {
       events = Math.min(TRACE_MAX_EVENTS, events + 1)
     },
+    setUsage(value) {
+      usage = value && typeof value === 'object' ? value : null
+    },
     finish(outcome, error = null, status = null) {
       if (finished) return
       if (error) this.markError(error)
@@ -222,6 +427,11 @@ function createGatewayTrace({ model, backend, protocol }) {
       finished = true
       if (outcome === 'success') this.markCompletion()
       if (process.env.MODEL_GATEWAY_LOG_TIMING !== '1') return
+      const {
+        inputTokens,
+        cachedInputTokens,
+        cacheWriteInputTokens,
+      } = codexUsageTokenCounts(usage)
       const fields = [
         `route=${safeLogValue(backend)}`,
         `model=${safeLogValue(model)}`,
@@ -234,6 +444,10 @@ function createGatewayTrace({ model, backend, protocol }) {
         `error_ms=${marks.error ?? -1}`,
         `bytes=${bytes}`,
         `events=${events}`,
+        `input_count=${inputTokens}`,
+        `cache_read_count=${cachedInputTokens}`,
+        `cache_write_count=${cacheWriteInputTokens}`,
+        `output_count=${nonNegativeInteger(usage?.output_tokens)}`,
         `status=${status == null ? -1 : status}`,
         `outcome=${safeLogValue(outcome)}`,
         `error_class=${safeLogValue(errorClass || 'none')}`,
@@ -244,12 +458,17 @@ function createGatewayTrace({ model, backend, protocol }) {
   }
 }
 
-function createRequestControl(req, res, trace) {
+function createRequestControl(req, res, trace, options = {}) {
+  const upstreamTimeoutMs = options.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS
+  const consumerTimeoutMs = options.consumerTimeoutMs ?? CONSUMER_TIMEOUT_MS
+  const totalTimeoutMs = options.totalTimeoutMs ?? 0
   const controller = new AbortController()
   let closed = false
   let upstreamTimer = null
   let consumerTimer = null
+  let totalTimer = null
   let upstreamStarted = false
+  let streamErrorFinalizer = null
   const abort = (message, status = 504) => {
     if (closed) return
     closed = true
@@ -262,17 +481,33 @@ function createRequestControl(req, res, trace) {
     if (!res.headersSent) {
       anthropicError(res, status, message)
     } else {
+      streamErrorFinalizer?.()
       finishAnthropicStreamWithError(res, error)
     }
   }
-  const armUpstreamTimeout = () => {
-    if (upstreamStarted || UPSTREAM_TIMEOUT_MS <= 0) return
+  const abortUpstream = (reason, status = 504) => {
+    if (controller.signal.aborted) return
+    const error = reason instanceof Error ? reason : new Error(String(reason || 'Gateway upstream request timed out'))
+    error.gatewayStatus = status
+    if (status === 504) trace.markTimeout(error.message)
+    else trace.markError(error)
+    controller.abort(error)
+  }
+  const armTotalTimeout = () => {
+    if (totalTimer || totalTimeoutMs <= 0) return
+    totalTimer = setTimeout(
+      () => abort('Gateway total request timeout', 504),
+      totalTimeoutMs,
+    )
+  }
+  const armUpstreamTimeout = (timeoutMs = upstreamTimeoutMs) => {
+    if (upstreamStarted || upstreamTimeoutMs <= 0) return
     upstreamStarted = true
-    upstreamTimer = setTimeout(() => abort('Gateway upstream request timed out', 504), UPSTREAM_TIMEOUT_MS)
+    upstreamTimer = setTimeout(() => abort('Gateway upstream request timed out', 504), timeoutMs)
   }
   const armConsumerTimeout = () => {
-    if (CONSUMER_TIMEOUT_MS <= 0 || consumerTimer) return
-    consumerTimer = setTimeout(() => abort('Gateway consumer timeout', 504), CONSUMER_TIMEOUT_MS)
+    if (consumerTimeoutMs <= 0 || consumerTimer) return
+    consumerTimer = setTimeout(() => abort('Gateway consumer timeout', 504), consumerTimeoutMs)
   }
 
   const onRequestAborted = () => abort('Gateway request was aborted', 499)
@@ -288,6 +523,7 @@ function createRequestControl(req, res, trace) {
   return {
     signal: controller.signal,
     startUpstream() {
+      armTotalTimeout()
       armUpstreamTimeout()
       armConsumerTimeout()
     },
@@ -296,6 +532,30 @@ function createRequestControl(req, res, trace) {
         clearTimeout(upstreamTimer)
         upstreamTimer = null
       }
+      // Header acquisition completes one upstream attempt. Outer relay
+      // retries must be treated as a new attempt, even when the first fetch
+      // returned a response before its body proved usable.
+      upstreamStarted = false
+    },
+    retryUpstream() {
+      if (upstreamTimer) clearTimeout(upstreamTimer)
+      upstreamTimer = null
+      upstreamStarted = false
+      armUpstreamTimeout(
+        RETRY_ATTEMPT_TIMEOUT_MS > 0
+          ? Math.min(upstreamTimeoutMs, RETRY_ATTEMPT_TIMEOUT_MS)
+          : upstreamTimeoutMs,
+      )
+    },
+    abortUpstream,
+    upstreamActivity() {
+      if (closed || consumerTimeoutMs <= 0) return
+      if (consumerTimer) clearTimeout(consumerTimer)
+      consumerTimer = null
+      armConsumerTimeout()
+    },
+    setStreamErrorFinalizer(finalizer) {
+      streamErrorFinalizer = typeof finalizer === 'function' ? finalizer : null
     },
     statusFor(error) {
       return Number.isInteger(error?.gatewayStatus)
@@ -307,6 +567,7 @@ function createRequestControl(req, res, trace) {
     cleanup() {
       if (upstreamTimer) clearTimeout(upstreamTimer)
       if (consumerTimer) clearTimeout(consumerTimer)
+      if (totalTimer) clearTimeout(totalTimer)
       if (req && typeof req.removeListener === 'function') req.removeListener('aborted', onRequestAborted)
       if (res && typeof res.removeListener === 'function') res.removeListener('close', onResponseClose)
     },
@@ -462,11 +723,53 @@ function systemText(system) {
   return contentText(system)
 }
 
-function rewriteCodexSystemPrompt(system) {
-  // Claude Code sends a large Claude-specific prompt. Replace it entirely so
-  // the Codex model follows the actual user conversation instead.
-  void systemText(system)
-  return CODEX_SYSTEM_INSTRUCTION
+function rewriteCodexSystemPrompt(system, querySource) {
+  // Keep the harness-provided operational context. Dropping it makes the
+  // model lose cwd, tool, skill, plan, and environment instructions after a
+  // long turn or compaction even though the tool schemas are still present.
+  return rewriteGatewaySystemPrompt(
+    system,
+    CODEX_SYSTEM_INSTRUCTION,
+    querySource,
+  )
+}
+
+function metadataSessionId(metadata) {
+  if (!metadata || typeof metadata !== 'object') return ''
+  if (typeof metadata.session_id === 'string' && metadata.session_id.trim()) {
+    return metadata.session_id.trim()
+  }
+
+  if (typeof metadata.user_id !== 'string') return ''
+  try {
+    const user = JSON.parse(metadata.user_id)
+    return typeof user?.session_id === 'string' ? user.session_id.trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+export function codexPromptCacheKeyForBody(
+  body,
+  mode = CODEX_PROMPT_CACHE_KEY_MODE,
+) {
+  if (mode !== 'auto') return null
+
+  const sessionId =
+    metadataSessionId(body?.metadata) ||
+    String(process.env.CLAUDE_CODE_SESSION_ID || '').trim()
+  if (!sessionId) return null
+
+  // Keep the provider key opaque while making it stable for this Claude
+  // session. The key namespaces a cache; it does not change the prompt.
+  return `claude-code:${createHash('sha256')
+    .update(sessionId)
+    .digest('hex')
+    .slice(0, 32)}`
+}
+
+function codexPromptCacheKey(body) {
+  return codexPromptCacheKeyForBody(body)
 }
 
 function logFeatureSignals(body) {
@@ -494,11 +797,14 @@ function logFeatureSignals(body) {
 
 function appendAnthropicMessage(input, message) {
   const role = message.role === 'assistant' ? 'assistant' : 'user'
+  const sanitizedContent = role === 'assistant'
+    ? sanitizeStaleToolCapabilityContent(message.content)
+    : sanitizeLegacyCompactionContent(message.content)
   const content =
-    typeof message.content === 'string'
-      ? [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: message.content }]
-      : Array.isArray(message.content)
-        ? message.content
+    typeof sanitizedContent === 'string'
+      ? [{ type: role === 'assistant' ? 'output_text' : 'input_text', text: sanitizedContent }]
+      : Array.isArray(sanitizedContent)
+        ? sanitizedContent
         : []
 
   for (const block of content) {
@@ -599,7 +905,105 @@ function appendAnthropicMessage(input, message) {
   }
 }
 
-export function anthropicToCodex(body, upstreamModel) {
+export function normalizeGatewayEffort(body, route, querySource) {
+  if (
+    isNativeSummaryRequest(querySource) ||
+    body?.thinking?.type === 'disabled'
+  ) {
+    const outputConfig = body.output_config
+      ? { ...body.output_config }
+      : undefined
+    const reasoning = body.reasoning
+      ? { ...body.reasoning }
+      : undefined
+    if (outputConfig) delete outputConfig.effort
+    if (reasoning) delete reasoning.effort
+    return {
+      ...body,
+      ...(outputConfig ? { output_config: outputConfig } : {}),
+      ...(reasoning ? { reasoning } : {}),
+    }
+  }
+
+  const requested = body?.output_config?.effort || body?.reasoning?.effort
+  if (!requested) return body
+
+  const levels = Array.isArray(route?.effortLevels)
+    ? route.effortLevels
+    : ['low', 'medium', 'high']
+  let effort = requested
+  if (requested === 'ultracode') {
+    effort = levels.includes('max')
+      ? 'max'
+      : levels.includes('high')
+        ? 'high'
+        : undefined
+  } else if (!levels.includes(requested)) {
+    effort = levels.includes('high') ? 'high' : undefined
+  }
+
+  const outputConfig = body.output_config
+    ? { ...body.output_config }
+    : undefined
+  if (outputConfig) {
+    if (effort) outputConfig.effort = effort
+    else delete outputConfig.effort
+  }
+  const reasoning = body.reasoning ? { ...body.reasoning } : undefined
+  if (reasoning) {
+    if (effort) reasoning.effort = effort
+    else delete reasoning.effort
+  }
+  return {
+    ...body,
+    ...(outputConfig ? { output_config: outputConfig } : {}),
+    ...(reasoning ? { reasoning } : {}),
+  }
+}
+
+export function stripUnsupportedOpenCodeTools(body, route) {
+  if (
+    route?.backend !== 'opencode-go' ||
+    route.supportsTools !== false ||
+    !Array.isArray(body?.tools) ||
+    body.tools.length === 0
+  ) {
+    return body
+  }
+
+  process.stderr.write(
+    `model-gateway tools-disabled model=${safeLogValue(route.upstream || 'unknown')} reason=provider-capability\n`,
+  )
+  const next = { ...body }
+  delete next.tools
+  delete next.tool_choice
+  return next
+}
+
+function isForcedToolChoice(choice) {
+  return choice === 'any' ||
+    choice === 'required' ||
+    (choice && typeof choice === 'object' && choice.type === 'tool' && typeof choice.name === 'string')
+}
+
+export function stripUnsupportedOpenCodeToolChoice(body, route) {
+  if (
+    route?.backend !== 'opencode-go' ||
+    route.supportsForcedToolChoice !== false ||
+    !isForcedToolChoice(body?.tool_choice)
+  ) {
+    return body
+  }
+
+  process.stderr.write(
+    `model-gateway tool-choice-disabled model=${safeLogValue(route.upstream || 'unknown')} reason=provider-capability\n`,
+  )
+  const next = { ...body }
+  delete next.tool_choice
+  return next
+}
+
+export function anthropicToCodex(body, upstreamModel, querySource) {
   logFeatureSignals(body)
 
   const input = []
@@ -609,18 +1013,31 @@ export function anthropicToCodex(body, upstreamModel) {
 
   const request = {
     model: upstreamModel,
-    stream: true,
+    stream: body.stream === true,
     store: false,
     input,
-    reasoning: {
+    instructions: rewriteCodexSystemPrompt(body.system, querySource),
+  }
+  const promptCacheKey = codexPromptCacheKey(body)
+  if (promptCacheKey) request.prompt_cache_key = promptCacheKey
+
+  // Native harness compaction explicitly disables thinking. Do not invent a
+  // provider reasoning request for that turn: the gateway is an adapter, not
+  // a second compaction/effort policy.
+  if (
+    !isNativeSummaryRequest(querySource) &&
+    body.thinking?.type !== 'disabled'
+  ) {
+    request.reasoning = {
       effort: body.output_config?.effort || body.reasoning?.effort || CODEX_REASONING_EFFORT,
       summary: 'detailed',
-    },
-    instructions: rewriteCodexSystemPrompt(body.system),
+    }
   }
 
-  if (body.temperature != null) request.temperature = body.temperature
-  if (body.top_p != null) request.top_p = body.top_p
+  if (body.max_tokens != null) request.max_output_tokens = body.max_tokens
+  // Codex Responses rejects sampling controls for the GPT-5 reasoning route.
+  // Claude's subagent requests may set these even when the parent request does
+  // not, so forwarding them makes Agent calls fail while the parent succeeds.
   if (body.tools?.length) {
     request.tools = body.tools.map(tool => ({
       type: 'function',
@@ -636,8 +1053,160 @@ export function anthropicToCodex(body, upstreamModel) {
     request.tool_choice = { type: 'function', name: body.tool_choice.name }
   }
 
-  process.stderr.write('model-gateway codex effort=' + String(request.reasoning.effort) + '\n')
+  process.stderr.write(
+    'model-gateway codex effort=' +
+    String(request.reasoning?.effort || 'disabled') +
+    '\n',
+  )
   return request
+}
+
+const CORE_TOOL_NAME_PATTERN =
+  /^(read|write|edit|bash|glob|grep|skill|task|agent|todo|askuser)/i
+
+function slimCodexSchema(value) {
+  if (Array.isArray(value)) return value.map(slimCodexSchema)
+  if (!value || typeof value !== 'object') return value
+
+  const result = {}
+  for (const [key, child] of Object.entries(value)) {
+    if (
+      key === 'description' ||
+      key === 'title' ||
+      key === 'default' ||
+      key === 'examples' ||
+      key === 'example' ||
+      key === '$comment'
+    ) continue
+    result[key] = slimCodexSchema(child)
+  }
+  return result
+}
+
+function contextFallbackRequests(request) {
+  if (!Array.isArray(request.tools) || request.tools.length === 0) return []
+
+  const slimTools = compactCodexTools(request)
+  const coreTools = slimTools.filter(tool => CORE_TOOL_NAME_PATTERN.test(tool.name))
+  const variants = [{ ...request, tools: slimTools }]
+  if (coreTools.length && coreTools.length < slimTools.length) {
+    variants.push({ ...request, tools: coreTools })
+  }
+  return variants
+}
+
+function compactCodexTools(request) {
+  return request.tools.map(tool => ({
+    ...tool,
+    description: '',
+    parameters: slimCodexSchema(tool.parameters),
+  }))
+}
+
+function boundedToolDescription(value, limit = 320) {
+  const description = String(value || '').replace(/\s+/g, ' ').trim()
+  return description.length > limit
+    ? `${description.slice(0, Math.max(0, limit - 3))}...`
+    : description
+}
+
+function safeCodexSchema(value) {
+  if (Array.isArray(value)) return value.map(safeCodexSchema)
+  if (!value || typeof value !== 'object') return value
+
+  const result = {}
+  for (const [key, child] of Object.entries(value)) {
+    // These fields do not change the callable contract. Keep descriptions,
+    // enums, required fields, defaults that matter to the model, and all
+    // structural constraints intact so balanced mode remains quality-safe.
+    if (
+      key === 'title' ||
+      key === 'examples' ||
+      key === 'example' ||
+      key === '$comment'
+    ) continue
+    result[key] = safeCodexSchema(child)
+  }
+  return result
+}
+
+function balancedCodexTools(request) {
+  return request.tools.map(tool => {
+    const isCoreTool = CORE_TOOL_NAME_PATTERN.test(String(tool.name || ''))
+    return {
+      ...tool,
+      // Built-in tools are the model's primary action vocabulary. Preserve
+      // their complete descriptions and schemas. Optional/MCP tools still
+      // receive bounded descriptions and metadata-only schema compression.
+      description: isCoreTool
+        ? String(tool.description || '')
+        : boundedToolDescription(tool.description),
+      parameters: isCoreTool
+        ? tool.parameters
+        : safeCodexSchema(tool.parameters),
+    }
+  })
+}
+
+function codexRequestVariants(request, nativeCompaction = false) {
+  // Native harness compaction deliberately carries the canonical tool catalog
+  // for cache/protocol compatibility. Do not let a gateway-side schema mode or
+  // context fallback rewrite that request and create a second compact policy.
+  if (nativeCompaction) return [request]
+
+  if (
+    CODEX_TOOL_MODE === 'fallback' ||
+    !Array.isArray(request.tools) ||
+    request.tools.length === 0
+  ) {
+    return [request, ...contextFallbackRequests(request)]
+  }
+
+  const compressedTools = CODEX_TOOL_MODE === 'balanced'
+    ? balancedCodexTools(request)
+    : compactCodexTools(request)
+  const compactRequest = {
+    ...request,
+    tools: compressedTools,
+  }
+  return [compactRequest, request, ...contextFallbackRequests(request)]
+}
+
+function codexRequestShape(request) {
+  return [
+    `input_items=${Array.isArray(request.input) ? request.input.length : 0}`,
+    `tools=${Array.isArray(request.tools) ? request.tools.length : 0}`,
+    `bytes=${Buffer.byteLength(JSON.stringify(request), 'utf8')}`,
+  ].join(' ')
+}
+
+function fingerprint(value) {
+  return createHash('sha256')
+    .update(typeof value === 'string' ? value : JSON.stringify(value) || '')
+    .digest('hex')
+    .slice(0, 16)
+}
+
+function providerPrefixMaterial(providerRequest) {
+  return JSON.stringify({
+    instructions: providerRequest?.instructions || '',
+    tools: Array.isArray(providerRequest?.tools)
+      ? providerRequest.tools
+      : [],
+  })
+}
+
+const cachePrefixObservations = new Map()
+
+function cachePrefixState(body, model, querySource, prefixFingerprint) {
+  const sessionId =
+    metadataSessionId(body?.metadata) ||
+    String(process.env.CLAUDE_CODE_SESSION_ID || '').trim()
+  const observationKey = `${model}|${querySource || 'normal'}|${sessionId || 'anonymous'}`
+  const previous = cachePrefixObservations.get(observationKey)
+  cachePrefixObservations.set(observationKey, prefixFingerprint)
+  if (!previous) return 'first'
+  return previous === prefixFingerprint ? 'reuse' : 'changed'
 }
 
 async function readRawBody(req) {
@@ -675,12 +1244,7 @@ function nonNegativeInteger(value) {
   return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : 0
 }
 
-/**
- * Codex reports cached input as a subset of input_tokens. Anthropic exposes
- * that subset separately, so subtract it before forwarding input_tokens or
- * Claude Code's context footer would count cached tokens twice.
- */
-export function codexUsageToAnthropic(usage) {
+function codexUsageTokenCounts(usage) {
   const inputTokens = nonNegativeInteger(
     usage?.input_tokens ??
       (nonNegativeInteger(usage?.total_tokens) -
@@ -695,12 +1259,246 @@ export function codexUsageToAnthropic(usage) {
         usage?.cache_read_input_tokens,
     ),
   )
+  const remainingInputTokens = Math.max(0, inputTokens - cachedInputTokens)
+  const cacheWriteInputTokens = Math.min(
+    remainingInputTokens,
+    nonNegativeInteger(
+      usage?.input_tokens_details?.cache_write_tokens ??
+        usage?.input_tokens_details?.cache_creation_input_tokens ??
+        usage?.cache_write_input_tokens ??
+        usage?.cache_write_tokens ??
+        usage?.cache_creation_input_tokens,
+    ),
+  )
 
   return {
-    input_tokens: inputTokens - cachedInputTokens,
-    cache_creation_input_tokens: 0,
+    inputTokens,
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    uncachedInputTokens: remainingInputTokens - cacheWriteInputTokens,
+  }
+}
+
+/**
+ * Codex reports cached input as a subset of input_tokens. Anthropic exposes
+ * that subset separately, so subtract it before forwarding input_tokens or
+ * Claude Code's context footer would count cached tokens twice.
+ */
+export function codexUsageToAnthropic(usage) {
+  const {
+    cachedInputTokens,
+    cacheWriteInputTokens,
+    uncachedInputTokens,
+  } = codexUsageTokenCounts(usage)
+
+  return {
+    input_tokens: uncachedInputTokens,
+    cache_creation_input_tokens: cacheWriteInputTokens,
     cache_read_input_tokens: cachedInputTokens,
     output_tokens: nonNegativeInteger(usage?.output_tokens),
+  }
+}
+
+function codexResponseFailure(response) {
+  const detail = [
+    response?.error?.message,
+    response?.response?.error?.message,
+    response?.status_details?.reason,
+  ]
+    .find(value => typeof value === 'string' && value)
+  const message = String(detail || '')
+  if (isContextWindowFailure(new Error(message))) {
+    throw new Error('Prompt is too long: Codex context window exceeded')
+  }
+  throw new Error('Codex response failed')
+}
+
+function parseCodexFunctionArguments(argumentsValue) {
+  if (argumentsValue == null || argumentsValue === '') return {}
+  if (typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)) {
+    return argumentsValue
+  }
+  if (typeof argumentsValue !== 'string') {
+    throw new Error('Codex returned malformed function-call arguments')
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(argumentsValue)
+  } catch {
+    throw new Error('Codex returned malformed function-call arguments')
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Codex returned malformed function-call arguments')
+  }
+  return parsed
+}
+
+/**
+ * Convert one completed non-streaming Codex Responses object to an Anthropic
+ * Messages response. This is deliberately separate from the SSE relay: the
+ * Anthropic SDK's streaming fallback requires JSON, not a 200 SSE response.
+ */
+export function codexResponseToAnthropic(response, model) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw new Error('Codex returned malformed JSON')
+  }
+  if (response.error || response.response?.error) codexResponseFailure(response)
+  if (response.status && response.status !== 'completed') {
+    const reason = response.incomplete_details?.reason || response.status
+    if (String(reason).toLowerCase().includes('max')) {
+      throw new Error('Codex response reached the output token limit')
+    }
+    throw new Error('Codex response did not complete')
+  }
+
+  const content = []
+  let hasToolUse = false
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (item?.type === 'message') {
+      for (const part of Array.isArray(item.content) ? item.content : []) {
+        if (part?.type === 'output_text' && typeof part.text === 'string' && part.text) {
+          content.push({ type: 'text', text: part.text })
+        }
+      }
+    } else if (item?.type === 'function_call') {
+      if (!item.call_id && !item.id) throw new Error('Codex returned a function call without an id')
+      if (!item.name) throw new Error('Codex returned a function call without a name')
+      content.push({
+        type: 'tool_use',
+        id: item.call_id || item.id,
+        name: item.name,
+        input: parseCodexFunctionArguments(item.arguments),
+      })
+      hasToolUse = true
+    }
+  }
+
+  if (!content.length) throw new Error('Codex returned an empty or malformed response')
+
+  return {
+    id: typeof response.id === 'string' && response.id ? response.id : `msg_${randomUUID().replaceAll('-', '')}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
+    stop_sequence: null,
+    usage: codexUsageToAnthropic(response.usage),
+  }
+}
+
+export async function relayCodexResponse(
+  res,
+  upstream,
+  model,
+  trace = null,
+  forceStream = false,
+  control = null,
+  options = {},
+) {
+  let reader = null
+  try {
+    let response
+    const contentType = upstream.headers?.get?.('content-type') || ''
+    if (forceStream || contentType.includes('text/event-stream')) {
+      reader = upstream.body?.getReader()
+      if (!reader) throw new Error('Codex returned an empty response body')
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let completed = null
+      let text = ''
+      const toolCalls = new Map()
+      const handleEvent = event => {
+        if (event.type === 'response.output_text.delta') {
+          text += typeof event.delta === 'string' ? event.delta : ''
+          return
+        }
+        if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
+          const item = {
+            type: 'function_call',
+            id: event.item.id,
+            call_id: event.item.call_id,
+            name: event.item.name,
+            arguments: '',
+          }
+          toolCalls.set(item.call_id || item.id, item)
+          return
+        }
+        if (event.type === 'response.function_call_arguments.delta') {
+          const key = event.call_id || event.item?.call_id || event.item?.id
+          const item = toolCalls.get(key)
+          if (item) item.arguments += typeof event.delta === 'string' ? event.delta : ''
+          return
+        }
+        if (event.type === 'response.failed') {
+          throw new Error(event.response?.error?.message || 'Codex response failed')
+        }
+        if (event.type === 'response.completed') {
+          completed = event.response || event
+        }
+      }
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        control?.upstreamActivity?.()
+        trace?.markFirstByte()
+        trace?.addBytes(value?.byteLength || 0)
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split(/\r?\n/)
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const data = line.slice(6)
+          if (!data || data === '[DONE]') continue
+          trace?.addEvent()
+          handleEvent(JSON.parse(data))
+        }
+      }
+      if (buffer.startsWith('data: ')) {
+        const data = buffer.slice(6)
+        if (data && data !== '[DONE]') {
+          trace?.addEvent()
+          handleEvent(JSON.parse(data))
+        }
+      }
+      if (!completed) throw new Error('Codex stream ended before response.completed')
+      if (!completed.output?.length && (text || toolCalls.size)) {
+        completed = {
+          ...completed,
+          output: [
+            ...(text ? [{ type: 'message', content: [{ type: 'output_text', text }] }] : []),
+            ...toolCalls.values(),
+          ],
+        }
+      }
+      response = completed
+    } else {
+      const raw = await upstream.text()
+      trace?.markFirstByte()
+      trace?.addBytes(Buffer.byteLength(raw, 'utf8'))
+      trace?.addEvent()
+      response = JSON.parse(raw)
+    }
+    trace?.setUsage?.(response?.usage)
+    const message = codexResponseToAnthropic(response, model)
+    trace?.markOutput()
+    trace?.markCompletion()
+    json(res, 200, message)
+    return true
+  } catch (error) {
+    trace?.markError(error)
+    if (options.throwPreOutput) {
+      await cancelUpstreamReader(reader, upstream)
+      throw error
+    }
+    if (isContextWindowFailure(error)) {
+      finishAnthropicPromptTooLongError(res, error)
+    } else {
+      anthropicError(res, 502, errorMessage(error))
+    }
+    return false
+  } finally {
+    reader?.releaseLock?.()
   }
 }
 
@@ -747,13 +1545,252 @@ function safeUpstreamError(status, provider) {
   return `${provider} returned HTTP ${status}`
 }
 
+export async function safeUpstreamResponseError(response, provider, secret = '', options = {}) {
+  return safeUpstreamResponseErrorBounded(response, provider, secret, options)
+}
+
+async function readResponseCloneText(response, {
+  signal = null,
+  timeoutMs = 0,
+  onTimeout = null,
+} = {}) {
+  const clone = response.clone()
+  const textPromise = clone.text()
+  // A timed-out race leaves the body promise pending until cancellation or
+  // the provider closes it. Attach a rejection handler so that cleanup does
+  // not create an unhandled rejection.
+  textPromise.catch(() => {})
+  if ((!signal || typeof signal.addEventListener !== 'function') && timeoutMs <= 0) {
+    return textPromise
+  }
+
+  let timer = null
+  let abortHandler = null
+  let timedOut = false
+  try {
+    const races = [textPromise]
+    if (signal && typeof signal.addEventListener === 'function') {
+      races.push(new Promise((_, reject) => {
+        abortHandler = () => reject(signal.reason || new Error('Gateway request aborted'))
+        if (signal.aborted) abortHandler()
+        else signal.addEventListener('abort', abortHandler, { once: true })
+      }))
+    }
+    if (timeoutMs > 0) {
+      races.push(new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true
+          const error = new Error('Gateway upstream response body timed out')
+          error.gatewayStatus = 504
+          onTimeout?.(error)
+          reject(error)
+        }, timeoutMs)
+      }))
+    }
+    return await Promise.race(races)
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (signal && abortHandler) signal.removeEventListener('abort', abortHandler)
+    if (timedOut) await clone.body?.cancel?.().catch(() => {})
+  }
+}
+
+async function safeUpstreamResponseErrorBounded(
+  response,
+  provider,
+  secret = '',
+  options = {},
+) {
+  let detail = ''
+  try {
+    const raw = await readResponseCloneText(response, options)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      const candidates = []
+      const collect = value => {
+        if (typeof value === 'string') {
+          const text = value.trim()
+          if (text) candidates.push(text)
+        } else if (Array.isArray(value)) {
+          for (const item of value) collect(item)
+        } else if (value && typeof value === 'object') {
+          for (const item of Object.values(value)) collect(item)
+        }
+      }
+      collect(parsed?.error?.message ?? parsed?.message ?? parsed)
+      detail = candidates
+        .sort((a, b) => a.length - b.length)
+        .find(value => value.length <= 500) || ''
+    }
+  } catch (error) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason || error
+    }
+    // Keep the generic status when the provider body is not safe JSON.
+  }
+  const suffix = detail ? `: ${redactSecret(detail, secret)}` : ''
+  return `${provider} returned HTTP ${response.status}${suffix}`
+}
+
+async function cancelUpstreamReader(reader, upstream) {
+  if (reader && typeof reader.cancel === 'function') {
+    try {
+      await reader.cancel()
+      return
+    } catch {
+      // Fall through to the body-level cancellation attempt.
+    }
+  }
+  await Promise.resolve(upstream?.body?.cancel?.()).catch(() => {})
+}
+
+function retryAfterMs(response) {
+  const value = response?.headers?.get?.('retry-after')
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(UPSTREAM_RETRY_MAX_MS, Math.round(seconds * 1000))
+  }
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) return null
+  return Math.max(0, Math.min(UPSTREAM_RETRY_MAX_MS, timestamp - Date.now()))
+}
+
+function retryableStatus(status) {
+  return (RETRY_400 && status === 400) ||
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+}
+
+async function retryableResponse(provider, response, control = null) {
+  if (retryableStatus(response.status)) return true
+  if (response.status !== 400 || !String(provider).toLowerCase().includes('opencode')) {
+    return false
+  }
+
+  try {
+    const body = (await readResponseCloneText(response, {
+      signal: control?.signal,
+      timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+      onTimeout: error => control?.abortUpstream?.(error),
+    })).toLowerCase()
+    return [
+      'temporarily unavailable',
+      'try again',
+      'overloaded',
+      'upstream timeout',
+      'gateway timeout',
+      'provider timeout',
+      'capacity',
+      'rate limit',
+    ].some(marker => body.includes(marker))
+  } catch {
+    if (control?.signal?.aborted) throw control.signal.reason
+    return false
+  }
+}
+
+function retryableConnectionError(error, signal) {
+  if (signal?.aborted) return false
+  const code = String(error?.code || '').toUpperCase()
+  const message = errorMessage(error).toLowerCase()
+  return code === 'ECONNRESET' ||
+    code === 'ECONNREFUSED' ||
+    code === 'EPIPE' ||
+    message.includes('fetch failed') ||
+    message.includes('socket') ||
+    message.includes('connection reset')
+}
+
+function retryDelayMs(retryNumber, response) {
+  const hinted = retryAfterMs(response)
+  if (hinted != null) return hinted
+  const exponential = UPSTREAM_RETRY_BASE_MS * (2 ** Math.max(0, retryNumber - 1))
+  return Math.min(UPSTREAM_RETRY_MAX_MS, exponential)
+}
+
+async function waitForRetry(delayMs, signal) {
+  if (delayMs <= 0) return
+  await new Promise((resolve, reject) => {
+    let timer = null
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+    }
+    timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, delayMs)
+    const abort = () => {
+      cleanup()
+      reject(signal.reason || new Error('Gateway request aborted'))
+    }
+    if (signal?.aborted) {
+      abort()
+      return
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+async function fetchWithRetry({
+  provider,
+  url,
+  options,
+  control,
+  trace,
+}) {
+  let lastError = null
+  for (let attempt = 1; attempt <= UPSTREAM_RETRIES + 1; attempt += 1) {
+    if (attempt > 1) control.retryUpstream?.()
+    try {
+      const response = await fetch(url, options)
+      trace.markUpstreamConnect()
+      control.upstreamConnected()
+      if (response.ok || !(await retryableResponse(provider, response, control)) || attempt > UPSTREAM_RETRIES) {
+        return response
+      }
+
+      const delay = retryDelayMs(attempt, response)
+      await response.body?.cancel().catch(() => {})
+      process.stderr.write(
+        `model-gateway retry provider=${safeLogValue(provider)} status=${response.status} attempt=${attempt} delay_ms=${delay}\n`,
+      )
+      await waitForRetry(delay, control.signal)
+    } catch (error) {
+      lastError = error
+      if (!retryableConnectionError(error, control.signal) || attempt > UPSTREAM_RETRIES) {
+        throw error
+      }
+      const delay = retryDelayMs(attempt, null)
+      process.stderr.write(
+        `model-gateway retry provider=${safeLogValue(provider)} error=${safeLogValue(error?.code || classifyGatewayError(error))} attempt=${attempt} delay_ms=${delay}\n`,
+      )
+      await waitForRetry(delay, control.signal)
+    }
+  }
+  throw lastError || new Error(`${provider} upstream request failed`)
+}
+
 function isContextWindowFailure(error) {
   const message = errorMessage(error).toLowerCase()
   return (
     message.includes('prompt is too long') ||
     message.includes('exceeds the context window') ||
-    message.includes('context window limit')
+    message.includes('context window limit') ||
+    message.includes('context length') ||
+    message.includes('maximum context')
   )
+}
+
+function retryablePreOutputRelayError(error) {
+  const errorClass = classifyGatewayError(error)
+  return errorClass === 'malformed-response' ||
+    errorClass === 'connection-reset' ||
+    errorClass === 'upstream-error'
 }
 
 function finishAnthropicPromptTooLongError(res, error) {
@@ -764,16 +1801,25 @@ function finishAnthropicPromptTooLongError(res, error) {
   anthropicError(res, 400, message)
 }
 
-export async function relayCodexStream(res, upstream, model, trace = null) {
+export async function relayCodexStream(
+  res,
+  upstream,
+  model,
+  trace = null,
+  control = null,
+  options = {},
+) {
   let contentIndex = 0
   let activeText = false
   let activeTool = null
   let sawOutput = false
   let toolCallSeen = false
   let usage = null
+  let reader = null
   let sawCompletion = false
   let buffer = ''
   let streamStarted = false
+  let pendingTool = null
 
   const startStream = () => {
     if (streamStarted) return
@@ -821,6 +1867,27 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
     })
   }
 
+  const openPendingTool = (item, argumentsDelta = '') => {
+    const hasToolIdentity = item &&
+      typeof item === 'object' &&
+      (item.call_id || item.id || item.name)
+    const tool = hasToolIdentity ? item : pendingTool
+    if (!tool) return false
+    openTool(tool)
+    pendingTool = null
+    if (argumentsDelta) {
+      sendEvent(res, 'content_block_delta', {
+        index: contentIndex,
+        delta: { type: 'input_json_delta', partial_json: argumentsDelta },
+      })
+    }
+    return true
+  }
+
+  control?.setStreamErrorFinalizer(() => {
+    if (streamStarted) closeActive()
+  })
+
   const emitCompletedOutputFallback = response => {
     if (sawOutput || !response?.output) return
     for (const item of response.output) {
@@ -847,7 +1914,9 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
   const handleEvent = event => {
     const type = event?.type
     if (type === 'response.output_item.added' && event.item?.type === 'function_call') {
-      openTool(event.item)
+      // Metadata alone is not usable output. Buffer it until arguments arrive
+      // so a provider timeout cannot commit an incomplete Anthropic message.
+      pendingTool = event.item
       return
     }
     if (type === 'response.output_text.delta') {
@@ -861,15 +1930,25 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
       return
     }
     if (type === 'response.function_call_arguments.delta') {
-      if (!activeTool) openTool(event.item || {})
-      sendEvent(res, 'content_block_delta', {
-        index: contentIndex,
-        delta: { type: 'input_json_delta', partial_json: event.delta || '' },
-      })
+      const delta = typeof event.delta === 'string' ? event.delta : ''
+      if (!delta) return
+      if (!activeTool) {
+        openPendingTool(event.item || {}, delta)
+      } else {
+        sendEvent(res, 'content_block_delta', {
+          index: contentIndex,
+          delta: { type: 'input_json_delta', partial_json: delta },
+        })
+      }
       return
     }
     if (type === 'response.output_item.done' && event.item?.type === 'function_call') {
-      if (!activeTool) openTool(event.item)
+      if (!activeTool) {
+        const argumentsValue = typeof event.item.arguments === 'string'
+          ? event.item.arguments
+          : ''
+        openPendingTool(event.item, argumentsValue || '{}')
+      }
       closeActive()
       contentIndex += 1
       return
@@ -877,6 +1956,7 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
     if (type === 'response.completed') {
       sawCompletion = true
       usage = event.response?.usage || event.usage || null
+      trace?.setUsage?.(usage)
       emitCompletedOutputFallback(event.response)
       return
     }
@@ -887,12 +1967,13 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
 
   try {
     const decoder = new TextDecoder()
-    const reader = upstream.body?.getReader()
+    reader = upstream.body?.getReader()
     if (!reader) throw new Error('Codex returned an empty response body')
 
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
+      control?.upstreamActivity?.()
       trace?.markFirstByte()
       trace?.addBytes(value?.byteLength || 0)
       buffer += decoder.decode(value, { stream: true })
@@ -933,11 +2014,16 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
     })
     sendEvent(res, 'message_stop', {})
     res.end()
+    return true
   } catch (error) {
     process.stderr.write(
       `model-gateway codex stream-error model=${safeLogValue(model)} class=${safeLogValue(classifyGatewayError(error))}\n`,
     )
     trace?.markError(error)
+    if (!streamStarted && options.throwPreOutput) {
+      await cancelUpstreamReader(reader, upstream)
+      throw error
+    }
     if (!streamStarted) {
       if (isContextWindowFailure(error)) {
         finishAnthropicPromptTooLongError(res, error)
@@ -946,7 +2032,33 @@ export async function relayCodexStream(res, upstream, model, trace = null) {
       }
       return
     }
+    closeActive()
     finishAnthropicStreamWithError(res, error)
+    return false
+  } finally {
+    reader?.releaseLock?.()
+  }
+}
+
+async function responseIsContextWindowFailure(response) {
+  if (response?.status !== 400 || typeof response.clone !== 'function') return false
+  try {
+    const raw = await response.clone().text()
+    if (!raw) return false
+    const values = []
+    const collectStrings = value => {
+      if (typeof value === 'string') {
+        values.push(value)
+      } else if (Array.isArray(value)) {
+        for (const item of value) collectStrings(item)
+      } else if (value && typeof value === 'object') {
+        for (const child of Object.values(value)) collectStrings(child)
+      }
+    }
+    collectStrings(JSON.parse(raw))
+    return values.some(value => isContextWindowFailure(new Error(value)))
+  } catch {
+    return false
   }
 }
 
@@ -1000,13 +2112,21 @@ async function writeDeepSeekChunk(res, chunk) {
   }
 }
 
-export async function relayDeepSeekStream(res, upstream, trace = null) {
+export async function relayDeepSeekStream(
+  res,
+  upstream,
+  trace = null,
+  options = {},
+) {
   let streamStarted = false
   let sawOutput = false
   let sawMessageStop = false
   let pending = ''
   let buffer = ''
   let reader = null
+  const signal = options.signal
+  let aborted = false
+  let onAbort = null
   const maxPendingBytes = 1024 * 1024
 
   const startStream = () => {
@@ -1043,10 +2163,23 @@ export async function relayDeepSeekStream(res, upstream, trace = null) {
   try {
     reader = upstream.body?.getReader()
     if (!reader) throw new Error('DeepSeek returned an empty response body')
+    onAbort = () => {
+      aborted = true
+      void cancelUpstreamReader(reader, upstream)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
     const decoder = new TextDecoder()
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        if (aborted || signal?.aborted) {
+          throw signal?.reason || new Error('Gateway request aborted')
+        }
+        break
+      }
+      if (aborted || signal?.aborted) {
+        throw signal?.reason || new Error('Gateway request aborted')
+      }
       trace?.markFirstByte()
       trace?.addBytes(value?.byteLength || 0)
       trace?.addEvent()
@@ -1070,7 +2203,7 @@ export async function relayDeepSeekStream(res, upstream, trace = null) {
     res.end()
   } catch (error) {
     trace?.markError(error)
-    await upstream.body?.cancel?.().catch(() => {})
+    await cancelUpstreamReader(reader, upstream)
     if (!streamStarted) {
       if (isContextWindowFailure(error)) finishAnthropicPromptTooLongError(res, error)
       else anthropicError(res, 502, errorMessage(error))
@@ -1078,13 +2211,64 @@ export async function relayDeepSeekStream(res, upstream, trace = null) {
       finishAnthropicStreamWithError(res, error)
     }
   } finally {
+    if (onAbort) signal?.removeEventListener('abort', onAbort)
     reader?.releaseLock()
+  }
+}
+
+function deepSeekJsonHasUsableOutput(message) {
+  return Array.isArray(message?.content) && message.content.some(block => {
+    if (block?.type === 'text') return typeof block.text === 'string' && block.text.length > 0
+    if (block?.type === 'tool_use') {
+      return typeof block.id === 'string' && block.id.length > 0 &&
+        typeof block.name === 'string' && block.name.length > 0
+    }
+    if (block?.type === 'thinking') return typeof block.thinking === 'string' && block.thinking.length > 0
+    return false
+  })
+}
+
+function deepSeekJsonFailure(response) {
+  const detail = [
+    response?.error?.message,
+    response?.message,
+    typeof response?.error === 'string' ? response.error : null,
+  ].find(value => typeof value === 'string' && value)
+  if (detail && isContextWindowFailure(new Error(detail))) {
+    throw new Error(`Prompt is too long: ${detail}`)
+  }
+  throw new Error(detail ? String(detail) : 'DeepSeek response failed')
+}
+
+export async function relayDeepSeekResponse(res, upstream, trace = null) {
+  try {
+    const raw = await upstream.text()
+    trace?.markFirstByte()
+    trace?.addBytes(Buffer.byteLength(raw, 'utf8'))
+    trace?.addEvent()
+    const response = JSON.parse(raw)
+    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+      throw new Error('DeepSeek returned malformed JSON')
+    }
+    if (response.type === 'error' || response.error) deepSeekJsonFailure(response)
+    if (response.type !== 'message' || !deepSeekJsonHasUsableOutput(response)) {
+      throw new Error('DeepSeek returned an empty or malformed response')
+    }
+    trace?.markOutput()
+    trace?.markCompletion()
+    json(res, 200, response)
+  } catch (error) {
+    trace?.markError(error)
+    if (isContextWindowFailure(error)) finishAnthropicPromptTooLongError(res, error)
+    else anthropicError(res, 502, errorMessage(error))
   }
 }
 
 async function handleCodex(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'codex', protocol: 'responses' })
   const control = createRequestControl(req, res, trace)
+  const querySource = gatewayQuerySource(req)
+  const nativeCompaction = isCompactionRequest(req)
   let auth
   try {
     auth = await readCodexAuth()
@@ -1098,7 +2282,24 @@ async function handleCodex(body, req, res, modelName, route) {
 
   let request
   try {
-    request = anthropicToCodex(body, route.upstream)
+    const normalizedBody = normalizeGatewayEffort(body, route, querySource)
+    request = anthropicToCodex(normalizedBody, route.upstream, querySource)
+    // The Codex Responses endpoint requires SSE even when the Anthropic caller
+    // requested a buffered JSON response. Buffering back to JSON happens in
+    // relayCodexResponse.
+    request.stream = true
+    // The current Codex Responses endpoint rejects both max_tokens and
+    // max_output_tokens. Keep the caller's cap in the Anthropic contract, but
+    // omit the unsupported field from the upstream request.
+    delete request.max_output_tokens
+    // Compaction is owned by the native harness. The gateway only translates
+    // the request protocol; it must not infer or invent a second compaction
+    // contract from the prompt contents.
+    if (nativeCompaction) {
+      process.stderr.write(
+        `model-gateway native-compaction source=${safeLogValue(querySource)}\n`,
+      )
+    }
   } catch (error) {
     trace.markError(error)
     anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
@@ -1107,61 +2308,184 @@ async function handleCodex(body, req, res, modelName, route) {
     return
   }
 
-  let upstream
-  control.startUpstream()
-  try {
-    upstream = await fetch(CODEX_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${auth.accessToken}`,
-        'chatgpt-account-id': auth.accountId,
-        'content-type': 'application/json',
-        accept: 'text/event-stream',
-        'user-agent': 'claudex-model-gateway/0.1',
-      },
-      body: JSON.stringify(request),
-      signal: control.signal,
-    })
-    trace.markUpstreamConnect()
-    control.upstreamConnected()
-  } catch (error) {
-    trace.markError(error)
-    const status = control.signal.aborted ? control.statusFor(error) : 502
-    anthropicError(res, status, status === 504 ? 'Codex upstream request timed out' : 'Codex connection failed')
-    trace.finish('upstream-error', error, status)
-    control.cleanup()
-    return
-  }
-
-  if (!upstream.ok) {
-    await upstream.body?.cancel().catch(() => {})
-    const status = upstream.status >= 500 ? 502 : upstream.status
-    anthropicError(res, status, safeUpstreamError(upstream.status, 'Codex'))
-    trace.finish('upstream-http-error', null, status)
-    control.cleanup()
-    return
-  }
+  const wantsStream = body.stream === true
+  const requests = codexRequestVariants(request, nativeCompaction)
+  let requestError = null
+  let completed = false
 
   try {
-    await relayCodexStream(res, upstream, modelName, trace)
-    trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
-  } catch (error) {
-    trace.markError(error)
-    if (!res.headersSent) {
-      anthropicError(res, 502, error instanceof Error ? error.message : 'Codex stream failed')
-    } else {
-      process.stderr.write(
-        `model-gateway codex-stream-error model=${safeLogValue(modelName)} class=${safeLogValue(classifyGatewayError(error))}\n`,
+    let variantIndex = 0
+    while (variantIndex < requests.length) {
+      const variant = requests[variantIndex]
+      if (variantIndex > 0) {
+        trace.clearError?.()
+        process.stderr.write(
+          `model-gateway context-fallback model=${safeLogValue(modelName)} variant=${variantIndex} ${codexRequestShape(variant)}\n`,
+        )
+      }
+      logRequestShape({
+        body,
+        providerRequest: variant,
+        model: modelName,
+        backend: 'codex',
+        protocol: 'responses',
+        querySource,
+        variant: variantIndex,
+      })
+
+      let responseRetryAttempt = 0
+      let advanceVariant = true
+      while (true) {
+        control.startUpstream()
+        let upstream
+        try {
+          upstream = await fetchWithRetry({
+            provider: 'Codex',
+            url: CODEX_ENDPOINT,
+            options: {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${auth.accessToken}`,
+                'chatgpt-account-id': auth.accountId,
+                'content-type': 'application/json',
+                accept: 'text/event-stream',
+                'user-agent': 'claudex-model-gateway/0.1',
+              },
+              body: JSON.stringify(variant),
+              signal: control.signal,
+            },
+            control,
+            trace,
+          })
+        } catch (error) {
+          requestError = error
+          const status = control.signal.aborted ? control.statusFor(error) : 502
+          anthropicError(res, status, status === 504 ? 'Codex upstream request timed out' : 'Codex connection failed')
+          trace.finish('upstream-error', error, status)
+          advanceVariant = false
+          variantIndex = requests.length
+          break
+        }
+
+        if (!upstream.ok) {
+          const contextFailure = await responseIsContextWindowFailure(upstream)
+          const detail = await safeUpstreamResponseError(
+            upstream,
+            'Codex',
+            '',
+            {
+              signal: control.signal,
+              timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+              onTimeout: error => control.abortUpstream(error),
+            },
+          )
+          await upstream.body?.cancel().catch(() => {})
+          if (contextFailure && variantIndex < requests.length - 1) {
+            requestError = new Error('Prompt is too long: Codex context window exceeded')
+            break
+          }
+          const status = upstream.status >= 500 ? 502 : upstream.status
+          const error = contextFailure
+            ? new Error('Prompt is too long: Codex context window exceeded')
+            : new Error(detail)
+          anthropicError(res, contextFailure ? 400 : status, error.message)
+          trace.finish('upstream-http-error', error, contextFailure ? 400 : status)
+          advanceVariant = false
+          variantIndex = requests.length
+          break
+        }
+
+        try {
+          const throwPreOutput = true
+          completed = wantsStream
+            ? await relayCodexStream(res, upstream, modelName, trace, control, { throwPreOutput })
+            : await relayCodexResponse(res, upstream, modelName, trace, true, control, { throwPreOutput })
+          break
+        } catch (error) {
+          requestError = error
+          if (isContextWindowFailure(error) && !res.headersSent && variantIndex < requests.length - 1) {
+            break
+          }
+          if (
+            !res.headersSent &&
+            retryablePreOutputRelayError(error) &&
+            responseRetryAttempt < UPSTREAM_RETRIES
+          ) {
+            responseRetryAttempt += 1
+            const delay = retryDelayMs(responseRetryAttempt, null)
+            trace.clearError?.()
+            process.stderr.write(
+              `model-gateway retry provider=Codex error=pre-output-${safeLogValue(classifyGatewayError(error))} attempt=${responseRetryAttempt} delay_ms=${delay}\n`,
+            )
+            await waitForRetry(delay, control.signal)
+            continue
+          }
+          if (!res.headersSent) {
+            if (isContextWindowFailure(error)) {
+              finishAnthropicPromptTooLongError(res, error)
+            } else {
+              anthropicError(res, 502, error instanceof Error ? error.message : 'Codex request failed')
+            }
+          } else if (wantsStream) {
+            process.stderr.write(
+              `model-gateway codex-stream-error model=${safeLogValue(modelName)} class=${safeLogValue(classifyGatewayError(error))}\n`,
+            )
+            finishAnthropicStreamWithError(res, error)
+          }
+          advanceVariant = false
+          variantIndex = requests.length
+          break
+        }
+      }
+
+      if (completed) break
+      if (variantIndex < requests.length - 1 && advanceVariant) {
+        variantIndex += 1
+      } else if (variantIndex < requests.length) {
+        variantIndex += 1
+      }
+    }
+
+    if (!completed && !res.headersSent && requestError) {
+      anthropicError(res, isContextWindowFailure(requestError) ? 400 : 502, errorMessage(requestError))
+    }
+    if (!trace.finished) {
+      trace.finish(
+        completed || res.statusCode === 200 ? 'success' : 'error',
+        requestError,
+        res.statusCode,
       )
+    }
+  } catch (error) {
+    requestError ||= error
+    trace.markError(error)
+    // A downstream disconnect can abort a retry backoff or an in-flight
+    // fetch. That is expected request cancellation, not a gateway crash.
+    // Never attempt to write a second response after the client is gone.
+    if (!control.signal.aborted && !res.headersSent && !res.destroyed && !res.writableEnded) {
+      anthropicError(res, 502, error instanceof Error ? error.message : 'Codex request failed')
+    } else if (
+      !control.signal.aborted &&
+      res.headersSent &&
+      wantsStream &&
+      !res.destroyed &&
+      !res.writableEnded
+    ) {
       finishAnthropicStreamWithError(res, error)
     }
-    trace.finish('stream-error', error, res.statusCode)
+    if (!trace.finished) {
+      trace.finish(
+        control.signal.aborted ? 'cancelled' : 'request-error',
+        error,
+        res.statusCode,
+      )
+    }
   } finally {
     control.cleanup()
   }
 }
 
-function deepSeekHeaders(req, apiKey) {
+function deepSeekHeaders(req, apiKey, stream = false) {
   const hopByHop = new Set([
     'connection',
     'content-length',
@@ -1175,6 +2499,7 @@ function deepSeekHeaders(req, apiKey) {
     'upgrade',
     'x-api-key',
     'authorization',
+    'accept',
   ])
   const headers = new Headers()
   for (const [name, value] of Object.entries(req.headers)) {
@@ -1182,13 +2507,16 @@ function deepSeekHeaders(req, apiKey) {
     headers.set(name, Array.isArray(value) ? value.join(', ') : value)
   }
   headers.set('x-api-key', apiKey)
+  headers.set('accept', stream ? 'text/event-stream' : 'application/json')
   if (!headers.has('content-type')) headers.set('content-type', 'application/json')
   return headers
 }
 
 async function handleOpenCodeGo(body, req, res, modelName, route) {
+  const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-go', protocol: route.protocol })
-  const control = createRequestControl(req, res, trace)
+  const control = createRequestControl(req, res, trace, requestTimeoutsForRoute(route))
+  const querySource = gatewayQuerySource(req)
   const apiKey = process.env.OPENCODE_API_KEY
   if (!apiKey) {
     anthropicError(res, 401, 'OpenCode Go API key is not configured')
@@ -1199,7 +2527,28 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
 
   let request
   try {
-    request = anthropicToOpenCodeRequest(body, route)
+    const toolSafeBody = stripUnsupportedOpenCodeToolChoice(
+      stripUnsupportedOpenCodeTools(body, route),
+      route,
+    )
+    const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
+    // The native harness owns compaction semantics, including tool denial and
+    // summary construction. OpenCode receives the same request shape as any
+    // other turn; only provider capability adapters may alter it.
+    if (isCompactionRequest(req)) {
+      process.stderr.write(
+        `model-gateway native-compaction source=${safeLogValue(querySource)}\n`,
+      )
+    }
+    request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    logRequestShape({
+      body: normalizedBody,
+      providerRequest: request,
+      model: modelName,
+      backend: 'opencode-go',
+      protocol: route.protocol,
+      querySource,
+    })
   } catch (error) {
     anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
     trace.finish('invalid-request', error, 400)
@@ -1207,52 +2556,133 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
     return
   }
 
-  let upstream
-  control.startUpstream()
   try {
-    upstream = await fetch(openCodeGoEndpoint(route.protocol), {
-      method: 'POST',
-      headers: openCodeGoHeaders(route.protocol, apiKey),
-      body: JSON.stringify(request),
-      signal: control.signal,
-    })
-    trace.markUpstreamConnect()
-    control.upstreamConnected()
-  } catch (error) {
-    trace.markError(error)
-    const status = control.signal.aborted ? control.statusFor(error) : 502
-    anthropicError(res, status, status === 504 ? 'OpenCode Go upstream request timed out' : 'OpenCode Go connection failed')
-    trace.finish('upstream-error', error, status)
-    control.cleanup()
-    return
-  }
+    let relayAttempt = 0
+    while (true) {
+      let upstream
+      control.startUpstream()
+      try {
+        upstream = await fetchWithRetry({
+          provider: 'OpenCode Go',
+          url: openCodeGoEndpoint(route.protocol),
+          options: {
+            method: 'POST',
+            headers: openCodeGoHeaders(route.protocol, apiKey, wantsStream),
+            body: JSON.stringify(request),
+            signal: control.signal,
+          },
+          control,
+          trace,
+        })
+      } catch (error) {
+        trace.markError(error)
+        const status = control.signal.aborted ? control.statusFor(error) : 502
+        anthropicError(res, status, status === 504 ? 'OpenCode Go upstream request timed out' : 'OpenCode Go connection failed')
+        trace.finish('upstream-error', error, status)
+        return
+      }
 
-  if (!upstream.ok) {
-    await upstream.body?.cancel().catch(() => {})
-    const status = upstream.status >= 500 ? 502 : upstream.status
-    anthropicError(res, status, redactSecret(safeUpstreamError(upstream.status, 'OpenCode Go'), apiKey))
-    trace.finish('upstream-http-error', null, status)
-    control.cleanup()
-    return
-  }
+      if (!upstream.ok) {
+        const detail = await safeUpstreamResponseError(
+          upstream,
+          'OpenCode Go',
+          apiKey,
+          {
+            signal: control.signal,
+            timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+            onTimeout: error => control.abortUpstream(error),
+          },
+        )
+        await upstream.body?.cancel().catch(() => {})
+        const contextFailure = upstream.status === 400 &&
+          isContextWindowFailure(new Error(detail))
+        const status = contextFailure
+          ? 400
+          : upstream.status >= 500
+            ? 502
+            : upstream.status
+        if (contextFailure) {
+          finishAnthropicPromptTooLongError(res, new Error(detail))
+        } else {
+          anthropicError(res, status, detail)
+        }
+        trace.finish('upstream-http-error', null, status)
+        return
+      }
 
-  try {
-    await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace)
+      try {
+        const relayOptions = {
+          signal: control.signal,
+          throwPreOutput: true,
+        }
+        if (wantsStream) {
+          await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
+        } else {
+          await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+        }
+        break
+      } catch (error) {
+        if (
+          !res.headersSent &&
+          !control.signal.aborted &&
+          retryablePreOutputRelayError(error) &&
+          relayAttempt < UPSTREAM_RETRIES
+        ) {
+          relayAttempt += 1
+          const delay = retryDelayMs(relayAttempt, null)
+          trace.clearError?.()
+          process.stderr.write(
+            `model-gateway retry provider=OpenCode-Go error=pre-output-${safeLogValue(classifyGatewayError(error))} attempt=${relayAttempt} delay_ms=${delay}\n`,
+          )
+          await waitForRetry(delay, control.signal)
+          continue
+        }
+        if (!res.headersSent) {
+          if (isContextWindowFailure(error)) finishAnthropicPromptTooLongError(res, error)
+          else anthropicError(res, 502, redactSecret(errorMessage(error), apiKey))
+        } else if (wantsStream) {
+          finishAnthropicStreamWithError(res, error)
+        }
+        break
+      }
+    }
     trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
   } catch (error) {
     trace.markError(error)
     if (!res.headersSent) {
-      anthropicError(res, 502, error instanceof Error ? error.message : 'OpenCode Go stream failed')
-    } else {
+      anthropicError(res, 502, error instanceof Error ? error.message : 'OpenCode Go request failed')
+    } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
     }
-    trace.finish('stream-error', error, res.statusCode)
+    trace.finish('request-error', error, res.statusCode)
   } finally {
     control.cleanup()
   }
 }
 
 async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
+  const querySource = gatewayQuerySource(req)
+  let body
+  try {
+    body = JSON.parse(rawBody.toString('utf8'))
+  } catch (error) {
+    anthropicError(res, 400, error instanceof Error ? error.message : 'Invalid JSON')
+    return
+  }
+  body = normalizeGatewayEffort({
+    ...body,
+    system: appendRuntimeToolContract(body.system, querySource),
+    messages: Array.isArray(body.messages)
+      ? body.messages.map(message => ({
+          ...message,
+          content: message.role === 'assistant'
+            ? sanitizeStaleToolCapabilityContent(message.content)
+            : sanitizeLegacyCompactionContent(message.content),
+        }))
+      : body.messages,
+  }, MODELS[modelName], querySource)
+  rawBody = Buffer.from(JSON.stringify(body))
+  const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: 'deepseek', protocol: 'anthropic-messages' })
   const control = createRequestControl(req, res, trace)
   const apiKey = process.env.DEEPSEEK_API_KEY
@@ -1267,16 +2697,28 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   upstreamUrl.search = requestUrl.search
 
   let upstream
+  logRequestShape({
+    body,
+    providerRequest: body,
+    model: modelName,
+    backend: 'deepseek',
+    protocol: 'anthropic-messages',
+    querySource,
+  })
   control.startUpstream()
   try {
-    upstream = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: deepSeekHeaders(req, apiKey),
-      body: rawBody,
-      signal: control.signal,
+    upstream = await fetchWithRetry({
+      provider: 'DeepSeek',
+      url: upstreamUrl,
+      options: {
+        method: 'POST',
+        headers: deepSeekHeaders(req, apiKey, wantsStream),
+        body: rawBody,
+        signal: control.signal,
+      },
+      control,
+      trace,
     })
-    trace.markUpstreamConnect()
-    control.upstreamConnected()
   } catch (error) {
     trace.markError(error)
     const status = control.signal.aborted ? control.statusFor(error) : 502
@@ -1287,16 +2729,47 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   }
 
   if (!upstream.ok) {
-    await upstream.body?.cancel().catch(() => {})
     const status = upstream.status >= 500 ? 502 : upstream.status
-    anthropicError(res, status, safeUpstreamError(upstream.status, 'DeepSeek'))
+    let detail
+    try {
+      detail = await safeUpstreamResponseError(
+        upstream,
+        'DeepSeek',
+        apiKey,
+        {
+          signal: control.signal,
+          timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+          onTimeout: error => control.abortUpstream(error),
+        },
+      )
+    } catch (error) {
+      const boundedStatus = control.signal.aborted ? control.statusFor(error) : status
+      anthropicError(
+        res,
+        boundedStatus,
+        boundedStatus === 504
+          ? 'DeepSeek upstream request timed out'
+          : 'DeepSeek provider error',
+      )
+      trace.finish('upstream-http-error', error, boundedStatus)
+      control.cleanup()
+      return
+    }
+    await upstream.body?.cancel().catch(() => {})
+    anthropicError(res, status, detail)
     trace.finish('upstream-http-error', null, status)
     control.cleanup()
     return
   }
 
   try {
-    await relayDeepSeekStream(res, upstream, trace)
+    if (wantsStream) {
+      await relayDeepSeekStream(res, upstream, trace, {
+        signal: control.signal,
+      })
+    } else {
+      await relayDeepSeekResponse(res, upstream, trace)
+    }
     trace.markCompletion()
     trace.finish('success', null, res.statusCode)
   } catch (error) {
@@ -1316,14 +2789,99 @@ function safeLogValue(value) {
   return String(value ?? 'unknown').replace(/[\r\n]/g, ' ')
 }
 
-function logRoute(requestUrl, modelName, backend) {
+function byteLength(value) {
+  if (value == null) return 0
+  try {
+    const serialized = typeof value === 'string' ? value : JSON.stringify(value)
+    return Buffer.byteLength(serialized == null ? '' : serialized, 'utf8')
+  } catch {
+    return 0
+  }
+}
+
+export function gatewayRequestShape(body, providerRequest) {
+  const system = body?.system
+  const messages = body?.messages
+  const tools = Array.isArray(body?.tools) ? body.tools : []
+  const input = Array.isArray(providerRequest?.input)
+    ? providerRequest.input
+    : []
+  const providerTools = Array.isArray(providerRequest?.tools)
+    ? providerRequest.tools
+    : []
+  const prefix = providerPrefixMaterial(providerRequest)
+  const lastInput = input.at(-1)
+  const promptCacheKey = providerRequest?.prompt_cache_key
+  return {
+    anthropic_bytes: byteLength(body),
+    system_bytes: byteLength(system),
+    message_bytes: byteLength(messages),
+    tool_schema_bytes: byteLength(tools),
+    system_block_count: Array.isArray(system) ? system.length : (system ? 1 : 0),
+    message_count: Array.isArray(messages) ? messages.length : 0,
+    tool_count: tools.length,
+    provider_input_items: input.length,
+    provider_input_bytes: byteLength(input),
+    provider_instructions_bytes: byteLength(providerRequest?.instructions),
+    provider_tool_count: providerTools.length,
+    provider_tool_schema_bytes: byteLength(providerTools),
+    provider_request_bytes: byteLength(providerRequest),
+    provider_last_input_bytes: byteLength(lastInput),
+    provider_prefix_bytes: Buffer.byteLength(prefix, 'utf8'),
+    provider_prefix_fingerprint: fingerprint(prefix),
+    prompt_cache_key_present:
+      typeof promptCacheKey === 'string' ? 1 : 0,
+    prompt_cache_key_fingerprint:
+      typeof promptCacheKey === 'string' ? fingerprint(promptCacheKey) : 'none',
+  }
+}
+
+function logRequestShape({
+  body,
+  providerRequest,
+  model,
+  backend,
+  protocol,
+  querySource,
+  variant = 0,
+}) {
+  if (!LOG_REQUEST_SHAPE) return
+  const shape = gatewayRequestShape(body, providerRequest)
+  const prefixState = cachePrefixState(
+    body,
+    model,
+    querySource,
+    shape.provider_prefix_fingerprint,
+  )
+  const fields = [
+    `model=${safeLogValue(model)}`,
+    `backend=${safeLogValue(backend)}`,
+    `protocol=${safeLogValue(protocol || 'none')}`,
+    `query_source=${safeLogValue(querySource || 'normal')}`,
+    `variant=${Number.isInteger(variant) ? variant : 0}`,
+    `stream=${body?.stream === true ? 'sse' : 'json'}`,
+    `effort=${safeLogValue(body?.output_config?.effort || body?.reasoning?.effort || 'disabled')}`,
+    `cache_prefix_state=${prefixState}`,
+    `cache_key_mode=${safeLogValue(CODEX_PROMPT_CACHE_KEY_MODE)}`,
+    ...Object.entries(shape).map(([key, value]) => `${key}=${safeLogValue(value)}`),
+  ]
+  process.stderr.write(`model-gateway shape ${fields.join(' ')}\n`)
+}
+
+function logRoute(requestUrl, modelName, backend, body = null) {
+  const tools = Array.isArray(body?.tools) ? body.tools : []
+  const mcpToolCount = tools.filter(tool =>
+    typeof tool?.name === 'string' && tool.name.startsWith('mcp__'),
+  ).length
   process.stderr.write(
-    `model-gateway route path=${requestUrl.pathname} model=${safeLogValue(modelName)} backend=${backend}\n`,
+    `model-gateway route path=${requestUrl.pathname} model=${safeLogValue(modelName)} backend=${backend}` +
+    ` stream=${body?.stream === true ? 'sse' : 'json'}` +
+    ` tool_count=${tools.length} mcp_tool_count=${mcpToolCount}\n`,
   )
 }
 
-function modelsResponse() {
-  const data = MODEL_NAMES.map(id => {
+export function modelsResponse() {
+  const data = DISCOVERABLE_MODEL_NAMES.map(id => {
     const backend = MODELS[id].backend
     const upstream = MODELS[id].upstream || id
     return {
@@ -1338,12 +2896,16 @@ function modelsResponse() {
             ? 'deepseek'
             : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
+      effort_levels: Array.isArray(MODELS[id].effortLevels)
+        ? [...MODELS[id].effortLevels]
+        : [],
+      ...(MODELS[id].supportsTools === false ? { supports_tools: false } : {}),
     }
   })
   return {
     object: 'list',
     data,
-    models: MODEL_NAMES,
+    models: DISCOVERABLE_MODEL_NAMES,
   }
 }
 
@@ -1393,7 +2955,7 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  logRoute(requestUrl, modelName, route.backend)
+  logRoute(requestUrl, modelName, route.backend, body)
   if (route.backend === 'codex') {
     await handleCodex(body, req, res, modelName, route)
     return
@@ -1430,7 +2992,7 @@ if (
     const address = server.address()
     const boundPort = typeof address === 'object' && address ? address.port : PORT
     process.stderr.write(
-      `model-gateway listening on http://${HOST}:${boundPort} models=${MODEL_NAMES.join(',')}\n`,
+      `model-gateway listening on http://${HOST}:${boundPort} models=${DISCOVERABLE_MODEL_NAMES.join(',')}\n`,
     )
   })
 }
