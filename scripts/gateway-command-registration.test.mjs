@@ -12,8 +12,8 @@ const loginSource = await readFile(
 )
 
 test('gateway login command objects expose the expected interactive names', () => {
-  assert.match(loginSource, /name:\s*'opencodelogin'/)
-  assert.match(loginSource, /name:\s*'deepseeklogin'/)
+  assert.match(loginSource, /command\(\s*'opencodelogin'/)
+  assert.match(loginSource, /command\(\s*'deepseeklogin'/)
   assert.match(loginSource, /type:\s*'local-jsx'/)
 })
 

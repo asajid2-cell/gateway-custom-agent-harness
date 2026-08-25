@@ -821,16 +821,23 @@ try {
   # directory active so --resume uses the correct project namespace.
   Push-Location $LaunchDirectory
   try {
+    # Keep the harness attached directly to the caller's console
     for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
       & $ClaudeRunner $ClaudeScript @ClaudeArgs
       $ExitCode = $LASTEXITCODE
-      if ($ExitCode -eq 0 -or $attempt -ge $AutoRestartAttempts) {
+      if (
+        ($ExitCode -ne 0 -and $ExitCode -ne 130) -and
+        $attempt -lt $AutoRestartAttempts
+      ) {
+        [Console]::Error.WriteLine(
+          "cc: Claude exited unexpectedly with code $ExitCode; restarting the resumed session once..."
+        )
+        Start-Sleep -Milliseconds 500
+        continue
+      }
+      if ($ExitCode -eq 130 -or $attempt -ge $AutoRestartAttempts) {
         break
       }
-      [Console]::Error.WriteLine(
-        "cc: Claude exited unexpectedly with code $ExitCode; restarting the resumed session once..."
-      )
-      Start-Sleep -Milliseconds 500
     }
   } finally {
     Pop-Location
