@@ -362,17 +362,50 @@ if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
   throw "Deployed Claude harness is missing: $ClaudeScript. Run 'bun run build' first."
 }
 
-# The global cc launcher intentionally points at this worktree. Rebuild before
-# every launch so a new terminal cannot silently run a stale dist/cli.js after
-# source changes or a resumed refactor.
-Push-Location $Root
-try {
-  & $ClaudeRunner 'run' 'build'
-  if ($LASTEXITCODE -ne 0) {
-    throw "Claude harness build failed with exit code $LASTEXITCODE."
+function Test-ClaudeArtifactFresh {
+  if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
+    return $false
   }
-} finally {
-  Pop-Location
+
+  $buildInputs = @(
+    (Join-Path $Root 'src'),
+    (Join-Path $Root 'scripts\build.ts'),
+    (Join-Path $Root 'package.json'),
+    (Join-Path $Root 'bun.lock'),
+    (Join-Path $Root 'bun.lockb'),
+    (Join-Path $Root 'tsconfig.json')
+  )
+  $inputFiles = @(
+    foreach ($inputPath in $buildInputs) {
+      if (Test-Path -LiteralPath $inputPath -PathType Container) {
+        Get-ChildItem -LiteralPath $inputPath -File -Recurse -Force
+      } elseif (Test-Path -LiteralPath $inputPath -PathType Leaf) {
+        Get-Item -LiteralPath $inputPath
+      }
+    }
+  )
+  if ($inputFiles.Count -eq 0) {
+    return $false
+  }
+
+  $latestInput = ($inputFiles | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+  $artifact = Get-Item -LiteralPath $ClaudeScript
+  return $artifact.LastWriteTimeUtc -ge $latestInput
+}
+
+# The global cc launcher intentionally points at this worktree. Rebuild only
+# when the compiled harness is older than its source or build inputs; this keeps
+# new terminals current without paying the full Bun build cost on every launch.
+if (-not (Test-ClaudeArtifactFresh)) {
+  Push-Location $Root
+  try {
+    & $ClaudeRunner 'run' 'build'
+    if ($LASTEXITCODE -ne 0) {
+      throw "Claude harness build failed with exit code $LASTEXITCODE."
+    }
+  } finally {
+    Pop-Location
+  }
 }
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
