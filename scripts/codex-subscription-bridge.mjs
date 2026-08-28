@@ -365,7 +365,7 @@ async function handleMessages(req, res) {
         'chatgpt-account-id': auth.accountId,
         'content-type': 'application/json',
         accept: 'text/event-stream',
-        'user-agent': 'claudex-luna/0.1',
+        'user-agent': 'gateway-luna/0.1',
       },
       body: JSON.stringify(request),
     })
@@ -412,5 +412,5 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.listen(port, host, () => {
-  process.stderr.write(`claudex-luna bridge listening on http://${host}:${port} model=${model} effort=${reasoningEffort}\n`)
+  process.stderr.write(`gateway-luna bridge listening on http://${host}:${port} model=${model} effort=${reasoningEffort}\n`)
 })

@@ -112,7 +112,7 @@ export function removeOpenRouterModel(value: string): boolean {
 
 export async function fetchOpenRouterModels(): Promise<OpenRouterModel[]> {
   const response = await fetch(OPENROUTER_MODELS_URL, {
-    headers: { accept: 'application/json', 'user-agent': 'claudex-openrouter-models/1.0' },
+    headers: { accept: 'application/json', 'user-agent': 'gateway-openrouter-models/1.0' },
     signal: AbortSignal.timeout(20_000),
   })
   if (!response.ok) {

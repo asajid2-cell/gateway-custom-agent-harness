@@ -75,7 +75,7 @@ export function openCodeGoHeaders(protocol, apiKey, stream = false) {
   const headers = {
     'content-type': 'application/json',
     accept: stream ? 'text/event-stream' : 'application/json',
-    'user-agent': 'claudex-model-gateway/0.1',
+    'user-agent': 'gateway-model-gateway/0.1',
   }
   if (protocol === 'anthropic-messages') {
     headers['x-api-key'] = apiKey

@@ -133,7 +133,7 @@ try {
 
   $text = $response.content[0].text
   Write-Host "DeepSeek API test passed: $text"
-  Write-Host 'Run claudex with: bun run deepseek'
+  Write-Host 'Run Gateway with: bun run deepseek'
 } catch {
   $status = $null
   if ($_.Exception.Response) {

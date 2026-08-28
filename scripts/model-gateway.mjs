@@ -2349,7 +2349,7 @@ async function handleCodex(body, req, res, modelName, route) {
                 'chatgpt-account-id': auth.accountId,
                 'content-type': 'application/json',
                 accept: 'text/event-stream',
-                'user-agent': 'claudex-model-gateway/0.1',
+                'user-agent': 'gateway-model-gateway/0.1',
               },
               body: JSON.stringify(variant),
               signal: control.signal,
