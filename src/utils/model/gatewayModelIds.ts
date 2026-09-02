@@ -24,9 +24,29 @@ export function normalizeGatewayModelId(model: string): string {
   if (lower.startsWith('opencode-go/')) {
     return `gateway-opencode-${model.slice('opencode-go/'.length)}`
   }
+  if (lower.startsWith('opencode-zen/')) {
+    return `gateway-opencode-${model.slice('opencode-zen/'.length)}`
+  }
   return model
 }
 
 export function isCanonicalGatewayModelId(model: string): boolean {
   return model.toLowerCase().startsWith('gateway-')
+}
+
+const GATEWAY_MODEL_DISPLAY_NAMES = new Map(
+  (catalog.gatewayModelOptions as Array<{ value?: unknown; label?: unknown }>)
+    .filter(
+      option =>
+        typeof option.value === 'string' &&
+        typeof option.label === 'string' &&
+        option.value.length > 0 &&
+        option.label.length > 0,
+    )
+    .map(option => [option.value!.toLowerCase(), option.label as string]),
+)
+
+export function getGatewayModelDisplayName(model: string): string | null {
+  const canonical = normalizeGatewayModelId(model)
+  return GATEWAY_MODEL_DISPLAY_NAMES.get(canonical.toLowerCase()) ?? null
 }

@@ -21,8 +21,8 @@ test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsMaxEffort('claude-ds-pro'), true)
   assert.equal(modelSupportsEffort('claude-ds-flash'), true)
   assert.equal(modelSupportsMaxEffort('claude-ds-flash'), true)
-  assert.equal(modelSupportsEffort('claude-opencode-ox-alpha'), true)
-  assert.equal(modelSupportsMaxEffort('claude-opencode-ox-alpha'), false)
+  assert.equal(modelSupportsEffort('gateway-opencode-glm-5.3-flash'), true)
+  assert.equal(modelSupportsMaxEffort('gateway-opencode-glm-5.3-flash'), true)
   assert.equal(modelSupportsEffort('claude-openrouter-anthropic%2Fclaude'), true)
   assert.equal(modelSupportsEffort('claude-ultracode'), true)
 })
@@ -48,18 +48,18 @@ test('DeepSeek exposes only its real effort levels', () => {
     ['low', 'high', 'max', 'ultracode'],
   )
   assert.deepEqual(
-    getSupportedEffortLevels('claude-opencode-ox-alpha'),
-    ['low', 'high', 'ultracode'],
+    getSupportedEffortLevels('gateway-opencode-glm-5.3-flash'),
+    ['low', 'high', 'max', 'ultracode'],
   )
-  assert.equal(modelSupportsEffort('claude-opencode-ox-alpha'), true)
-  assert.equal(getSupportedEffortLevels('claude-opencode-ox-alpha').includes('medium'), false)
+  assert.equal(modelSupportsEffort('gateway-opencode-glm-5.3-flash'), true)
+  assert.equal(getSupportedEffortLevels('gateway-opencode-glm-5.3-flash').includes('medium'), false)
   assert.deepEqual(
     getSupportedEffortLevels('opencode-go/mimo-v2.5'),
     ['low', 'medium', 'high', 'ultracode'],
   )
-  assert.equal(resolveAppliedEffort('claude-opencode-ox-alpha', 'ultracode'), 'ultracode')
+  assert.equal(resolveAppliedEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'ultracode')
   assert.equal(resolveAppliedEffort('opencode-go/mimo-v2.5', 'ultracode'), 'ultracode')
-  assert.equal(resolveProviderEffort('claude-opencode-ox-alpha', 'ultracode'), 'high')
+  assert.equal(resolveProviderEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('opencode-go/mimo-v2.5', 'ultracode'), 'high')
   assert.equal(resolveProviderEffort('claude-ultracode', 'ultracode'), undefined)
   assert.equal(toPersistableEffort('ultracode'), 'ultracode')

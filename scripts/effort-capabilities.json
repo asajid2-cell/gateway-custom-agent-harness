@@ -9,9 +9,9 @@
   ],
   "opencodeGo": {
     "gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-    "ox-alpha-free": ["low", "high", "max"],
     "mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "mimo-v2.5-pro": [],
+    "glm-5.3-flash": ["low", "high", "max"],
     "glm-5.3": ["low", "high", "max"],
     "glm-5.2": ["high", "max"],
     "glm-5.1": [],
@@ -31,16 +31,23 @@
     "qwen3.7-plus": [],
     "qwen3.6-plus": []
   },
+  "opencodeZen": {
+    "big-pickle": [],
+    "mimo-v2.5-free": [],
+    "hy3-free": ["none", "low", "high"],
+    "nemotron-3-ultra-free": [],
+    "nemotron-3.5-lightning-free": [],
+    "muse-spark-1.2-contributor-free": []
+  },
   "gatewayAliases": {
     "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
-    "gateway-ox-alpha": ["low", "high", "max"],
     "gateway-ds-flash": ["low", "medium", "high"],
     "gateway-ds-pro": ["low", "medium", "high"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-    "gateway-opencode-ox-alpha-free": ["low", "high", "max"],
     "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-opencode-glm-5.3-flash": ["low", "high", "max"],
     "gateway-opencode-mimo-v2.5-pro": [],
     "gateway-opencode-glm-5.3": ["low", "high", "max"],
     "gateway-opencode-glm-5.2": ["high", "max"],
@@ -59,17 +66,21 @@
     "gateway-opencode-qwen3.8-max": [],
     "gateway-opencode-qwen3.7-max": [],
     "gateway-opencode-qwen3.7-plus": [],
-    "gateway-opencode-qwen3.6-plus": []
+    "gateway-opencode-qwen3.6-plus": [],
+    "gateway-opencode-big-pickle": [],
+    "gateway-opencode-mimo-v2.5-free": [],
+    "gateway-opencode-hy3-free": ["none", "low", "high"],
+    "gateway-opencode-nemotron-3-ultra-free": [],
+    "gateway-opencode-nemotron-3.5-lightning-free": [],
+    "gateway-opencode-muse-spark-1.2-contributor-free": []
   },
   "legacyAliases": {
     "claude-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
-    "claude-ox-alpha": ["low", "high", "max"],
     "claude-ds-flash": ["low", "medium", "high"],
     "claude-ds-pro": ["low", "medium", "high"],
     "claude-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-    "claude-opencode-ox-alpha-free": ["low", "high", "max"],
     "claude-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-opencode-mimo-v2.5-pro": [],
     "claude-opencode-glm-5.3": ["low", "high", "max"],
@@ -89,7 +100,13 @@
     "claude-opencode-qwen3.8-max": [],
     "claude-opencode-qwen3.7-max": [],
     "claude-opencode-qwen3.7-plus": [],
-    "claude-opencode-qwen3.6-plus": []
+    "claude-opencode-qwen3.6-plus": [],
+    "claude-opencode-big-pickle": ["opencode-zen/big-pickle"],
+    "claude-opencode-mimo-v2.5-free": ["opencode-zen/mimo-v2.5-free"],
+    "claude-opencode-hy3-free": ["opencode-zen/hy3-free"],
+    "claude-opencode-nemotron-3-ultra-free": ["opencode-zen/nemotron-3-ultra-free"],
+    "claude-opencode-nemotron-3.5-lightning-free": ["opencode-zen/nemotron-3.5-lightning-free"],
+    "claude-opencode-muse-spark-1.2-contributor-free": ["opencode-zen/muse-spark-1.2-contributor-free"]
   },
   "gatewayModelOptions": [
     {
@@ -118,19 +135,9 @@
       "description": "DeepSeek - v4 Pro"
     },
     {
-      "value": "gateway-ox-alpha",
-      "label": "Ox Alpha",
-      "description": "OpenCode - Ox Alpha Free"
-    },
-    {
       "value": "gateway-opencode-gpt-5.6-luna",
       "label": "OpenCode GPT 5.6 Luna",
       "description": "OpenCode - GPT 5.6 Luna"
-    },
-    {
-      "value": "gateway-opencode-ox-alpha-free",
-      "label": "OpenCode Ox Alpha Free",
-      "description": "OpenCode - Ox Alpha Free"
     },
     {
       "value": "gateway-opencode-mimo-v2.5",
@@ -171,6 +178,41 @@
       "value": "gateway-opencode-grok-4.5",
       "label": "OpenCode Grok 4.5",
       "description": "OpenCode - Grok 4.5"
+    },
+    {
+      "value": "gateway-opencode-glm-5.3-flash",
+      "label": "OpenCode GLM 5.3 Flash",
+      "description": "OpenCode - GLM 5.3 Flash"
+    },
+    {
+      "value": "gateway-opencode-big-pickle",
+      "label": "OpenCode Big Pickle Free",
+      "description": "OpenCode Zen - Big Pickle (free)"
+    },
+    {
+      "value": "gateway-opencode-mimo-v2.5-free",
+      "label": "OpenCode Mimo v2.5 Free",
+      "description": "OpenCode Zen - Mimo v2.5 (free)"
+    },
+    {
+      "value": "gateway-opencode-hy3-free",
+      "label": "OpenCode Hy3 Free",
+      "description": "OpenCode Zen - Hy3 (free)"
+    },
+    {
+      "value": "gateway-opencode-nemotron-3-ultra-free",
+      "label": "OpenCode Nemotron 3 Ultra Free",
+      "description": "OpenCode Zen - Nemotron 3 Ultra (free)"
+    },
+    {
+      "value": "gateway-opencode-nemotron-3.5-lightning-free",
+      "label": "OpenCode Nemotron 3.5 Lightning Free",
+      "description": "OpenCode Zen - Nemotron 3.5 Lightning (free)"
+    },
+    {
+      "value": "gateway-opencode-muse-spark-1.2-contributor-free",
+      "label": "OpenCode Muse Spark Free",
+      "description": "OpenCode Zen - Muse Spark 1.2 Contributor (free)"
     },
     {
       "value": "gateway-opencode-glm-5.3",
@@ -239,14 +281,13 @@
     "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
     "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],
     "gateway-ds-pro": ["deepseek-v4-pro", "claude-ds-pro"],
-    "gateway-ox-alpha": ["ox-alpha-free", "claude-ox-alpha"],
     "gateway-opencode-gpt-5.6-luna": [
       "opencode-go/gpt-5.6-luna",
       "claude-opencode-gpt-5.6-luna"
     ],
-    "gateway-opencode-ox-alpha-free": [
-      "opencode-go/ox-alpha-free",
-      "claude-opencode-ox-alpha-free"
+    "gateway-opencode-glm-5.3-flash": [
+      "opencode-go/glm-5.3-flash",
+      "claude-opencode-glm-5.3-flash"
     ],
     "gateway-opencode-mimo-v2.5": [
       "opencode-go/mimo-v2.5",
@@ -327,6 +368,30 @@
     "gateway-opencode-qwen3.6-plus": [
       "opencode-go/qwen3.6-plus",
       "claude-opencode-qwen3.6-plus"
+    ],
+    "gateway-opencode-big-pickle": [
+      "opencode-zen/big-pickle",
+      "claude-opencode-big-pickle"
+    ],
+    "gateway-opencode-mimo-v2.5-free": [
+      "opencode-zen/mimo-v2.5-free",
+      "claude-opencode-mimo-v2.5-free"
+    ],
+    "gateway-opencode-nemotron-3-ultra-free": [
+      "opencode-zen/nemotron-3-ultra-free",
+      "claude-opencode-nemotron-3-ultra-free"
+    ],
+    "gateway-opencode-nemotron-3.5-lightning-free": [
+      "opencode-zen/nemotron-3.5-lightning-free",
+      "claude-opencode-nemotron-3.5-lightning-free"
+    ],
+    "gateway-opencode-hy3-free": [
+      "opencode-zen/hy3-free",
+      "claude-opencode-hy3-free"
+    ],
+    "gateway-opencode-muse-spark-1.2-contributor-free": [
+      "opencode-zen/muse-spark-1.2-contributor-free",
+      "claude-opencode-muse-spark-1.2-contributor-free"
     ]
   }
 }

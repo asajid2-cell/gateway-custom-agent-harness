@@ -1,4 +1,4 @@
-const model = process.env.OPENCODE_MULTI_TOOL_MODEL || 'ox-alpha-free'
+const model = process.env.OPENCODE_MULTI_TOOL_MODEL || 'glm-5.3-flash'
 const endpoint = process.env.OPENCODE_GO_CHAT_COMPLETIONS_URL
   || 'https://opencode.ai/zen/go/v1/chat/completions'
 const key = process.env.OPENCODE_API_KEY

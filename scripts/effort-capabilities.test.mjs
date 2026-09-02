@@ -6,8 +6,10 @@ import {
   GPT56_EFFORT_LEVELS,
   OPENCODE_GO_EFFORT_LEVELS,
   effortLevelsForOpenCodeModel,
+  effortLevelsForOpenCodeZenModel,
 } from './effort-capabilities.mjs'
 import { OPENCODE_GO_MODEL_IDS } from './opencode-go.mjs'
+import { OPENCODE_ZEN_MODEL_IDS } from './opencode-zen.mjs'
 import {
   getGatewayNativeEffortLevels,
 } from '../src/utils/model/gatewayEffortCapabilities.ts'
@@ -31,6 +33,16 @@ test('every OpenCode Go route has explicit capability metadata', () => {
   }
 })
 
+test('every OpenCode Zen route has explicit capability metadata', () => {
+  assert.deepEqual(
+    Object.keys(catalog.opencodeZen).sort(),
+    [...OPENCODE_ZEN_MODEL_IDS].sort(),
+  )
+  for (const model of OPENCODE_ZEN_MODEL_IDS) {
+    assert.deepEqual(effortLevelsForOpenCodeZenModel(model), catalog.opencodeZen[model])
+  }
+})
+
 test('gateway aliases mirror the provider capability contract', () => {
   for (const [alias, levels] of Object.entries(catalog.gatewayAliases)) {
     assert.ok(Array.isArray(levels), `${alias} must have an array of levels`)
@@ -44,13 +56,36 @@ test('gateway aliases mirror the provider capability contract', () => {
     catalog.opencodeGo['deepseek-v4-pro'],
   )
   assert.deepEqual(
-    catalog.gatewayAliases['gateway-ox-alpha'],
-    catalog.opencodeGo['ox-alpha-free'],
+    catalog.gatewayAliases['gateway-opencode-glm-5.3-flash'],
+    catalog.opencodeGo['glm-5.3-flash'],
+  )
+  assert.deepEqual(
+    catalog.gatewayAliases['gateway-opencode-mimo-v2.5-free'],
+    catalog.opencodeZen['mimo-v2.5-free'],
+  )
+  assert.deepEqual(
+    catalog.gatewayModelAliases['gateway-opencode-glm-5.3-flash'],
+    ['opencode-go/glm-5.3-flash', 'claude-opencode-glm-5.3-flash'],
+  )
+  assert.deepEqual(
+    catalog.gatewayModelAliases['gateway-opencode-mimo-v2.5-free'],
+    ['opencode-zen/mimo-v2.5-free', 'claude-opencode-mimo-v2.5-free'],
+  )
+  assert.deepEqual(
+    catalog.legacyAliases['claude-opencode-mimo-v2.5-free'],
+    ['opencode-zen/mimo-v2.5-free'],
   )
   assert.deepEqual(
     catalog.legacyAliases['claude-opencode-deepseek-v4-pro'],
     catalog.opencodeGo['deepseek-v4-pro'],
   )
+  for (const model of OPENCODE_ZEN_MODEL_IDS) {
+    assert.deepEqual(
+      catalog.gatewayAliases[`gateway-opencode-${model}`],
+      catalog.opencodeZen[model],
+    )
+    assert.ok(catalog.legacyAliases[`claude-opencode-${model}`])
+  }
 })
 
 test('compiled client fallback resolves provider-qualified gateway effort levels', () => {
@@ -60,8 +95,8 @@ test('compiled client fallback resolves provider-qualified gateway effort levels
     catalog.opencodeGo['gpt-5.6-luna'],
   )
   assert.deepEqual(
-    getGatewayNativeEffortLevels('gateway-ox-alpha'),
-    catalog.opencodeGo['ox-alpha-free'],
+    getGatewayNativeEffortLevels('gateway-opencode-glm-5.3-flash'),
+    catalog.opencodeGo['glm-5.3-flash'],
   )
   assert.deepEqual(
     getGatewayNativeEffortLevels('gateway-opencode-mimo-v2.5'),

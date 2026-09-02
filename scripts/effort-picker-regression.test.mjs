@@ -20,14 +20,14 @@ test('5.6 model switching preserves the full native ladder', () => {
   )
 })
 
-test('Alpha clamps an unsupported native level to verified high', () => {
-  const alphaLevels = getGatewayNativeEffortLevels('gateway-ox-alpha')
+test('GLM 5.3 Flash clamps an unsupported native level to verified high', () => {
+  const flashLevels = getGatewayNativeEffortLevels('gateway-opencode-glm-5.3-flash')
 
   assert.equal(
-    resolveGatewayEffortAfterModelSwitch(alphaLevels, 'medium', 'medium', 'medium', true),
+    resolveGatewayEffortAfterModelSwitch(flashLevels, 'medium', 'medium', 'medium', true),
     'high',
   )
-  assert.equal(clampGatewayEffort(alphaLevels, 'medium'), 'high')
+  assert.equal(clampGatewayEffort(flashLevels, 'medium'), 'high')
 })
 
 test('switching to a model without native effort removes stale native values', () => {
@@ -44,8 +44,8 @@ test('switching to a model without native effort removes stale native values', (
 })
 
 test('ultracode cycles as a harness control', () => {
-  const alphaLevels = [...getGatewayNativeEffortLevels('claude-ox-alpha'), 'ultracode']
+  const flashLevels = [...getGatewayNativeEffortLevels('gateway-opencode-glm-5.3-flash'), 'ultracode']
 
-  assert.equal(cycleGatewayEffort('max', 'right', alphaLevels), 'ultracode')
-  assert.equal(cycleGatewayEffort('ultracode', 'right', alphaLevels), 'low')
+  assert.equal(cycleGatewayEffort('max', 'right', flashLevels), 'ultracode')
+  assert.equal(cycleGatewayEffort('ultracode', 'right', flashLevels), 'low')
 })

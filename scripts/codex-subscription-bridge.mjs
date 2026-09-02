@@ -324,7 +324,14 @@ async function relayStream(res, upstream) {
       stop_sequence: null,
     },
     usage: {
-      output_tokens: usage?.output_tokens || 0,
+      input_tokens: usage?.input_tokens || 0,
+      cache_creation_input_tokens: usage?.cache_creation_input_tokens || 0,
+      cache_read_input_tokens:
+        usage?.input_tokens_details?.cached_tokens ||
+        usage?.prompt_tokens_details?.cached_tokens ||
+        usage?.cached_tokens ||
+        0,
+      output_tokens: usage?.output_tokens || usage?.completion_tokens || 0,
     },
   })
   sendEvent(res, 'message_stop', {})

@@ -12,7 +12,7 @@ const cli = path.join(root, 'dist', 'cli.js')
 const bun = process.env.BUN_EXECUTABLE ||
   (process.platform === 'win32' ? 'bun.exe' : 'bun')
 const timeoutMs = Number(process.env.OPENCODE_REPLAY_TIMEOUT_MS || 12_000)
-const model = 'gateway-ox-alpha'
+const model = 'gateway-opencode-glm-5.3-flash'
 let replayState = null
 
 function sse(res, payload) {

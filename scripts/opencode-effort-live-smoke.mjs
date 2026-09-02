@@ -9,7 +9,7 @@ const allCases = [
   ['claude-gpt-luna', ['low', 'medium', 'high', 'max', 'ultracode']],
   ['claude-gpt-sol', ['low', 'medium', 'high', 'max', 'ultracode']],
   ['claude-gpt-terra', ['low', 'medium', 'high', 'ultracode']],
-  ['claude-opencode-ox-alpha', ['low', 'high', 'ultracode']],
+  ['gateway-opencode-glm-5.3-flash', ['low', 'high', 'max', 'ultracode']],
   ['opencode-go/gpt-5.6-luna', ['low', 'medium', 'high', 'ultracode']],
   ['opencode-go/mimo-v2.5', ['low', 'medium', 'high', 'ultracode']],
   ['opencode-go/minimax-m3', ['low', 'medium', 'high', 'ultracode']],

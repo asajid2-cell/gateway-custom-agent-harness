@@ -33,6 +33,32 @@ test('gateway model options parse and deduplicate provider-qualified entries', a
   ])
 })
 
+test('gateway model options normalize OpenCode Zen aliases', async () => {
+  const options = await loadWithEnv(JSON.stringify([
+    { value: 'opencode-zen/mimo-v2.5-free', label: 'Mimo Free' },
+  ]))
+  assert.deepEqual(options, [
+    { value: 'gateway-opencode-mimo-v2.5-free', label: 'Mimo Free', description: 'Gateway model' },
+  ])
+})
+
+test('gateway display labels preserve Gateway identities and normalize provider IDs', async () => {
+  const { getGatewayModelDisplayName } = await import(
+    `../src/utils/model/gatewayModelIds.ts?display=${Date.now()}-${Math.random()}`,
+  )
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-terra'), 'GPT 5.6 Terra')
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-sol'), 'GPT 5.6 Sol')
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-luna'), 'GPT 5.6 Luna')
+  assert.equal(
+    getGatewayModelDisplayName('opencode-go/glm-5.3-flash'),
+    'OpenCode GLM 5.3 Flash',
+  )
+  assert.equal(
+    getGatewayModelDisplayName('opencode-zen/mimo-v2.5-free'),
+    'OpenCode Mimo v2.5 Free',
+  )
+})
+
 test('gateway model options fail closed outside gateway mode and on malformed JSON', async () => {
   assert.deepEqual(await loadWithEnv('{bad-json'), [])
   assert.deepEqual(await loadWithEnv(JSON.stringify([{ value: 'x' }]), '0'), [])

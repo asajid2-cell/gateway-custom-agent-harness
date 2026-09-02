@@ -22,7 +22,7 @@ export const OPENCODE_GO_ROUTES = {
   'grok-4.5': 'responses',
   'gpt-5.6-luna': 'responses',
   'muse-spark-1.2-contributor': 'responses',
-  'ox-alpha-free': 'chat-completions',
+  'glm-5.3-flash': 'chat-completions',
   'glm-5.3': 'chat-completions',
   'glm-5.2': 'chat-completions',
   'glm-5.1': 'chat-completions',
@@ -338,7 +338,7 @@ function chatToolChoice(choice) {
   return undefined
 }
 
-export function anthropicToOpenCodeChat(body, upstreamModel, querySource) {
+export function anthropicToOpenCodeChat(body, upstreamModel, querySource, effortWireMap = openCodeGoEffortWireMap(upstreamModel)) {
   const messages = []
   const system = rewriteGatewaySystemPrompt(body.system, '', querySource)
   messages.push({ role: 'system', content: system })
@@ -365,8 +365,7 @@ export function anthropicToOpenCodeChat(body, upstreamModel, querySource) {
     !isNativeSummaryRequest(querySource) &&
     body.thinking?.type !== 'disabled'
   ) {
-    const wireMap = openCodeGoEffortWireMap(upstreamModel)
-    request.reasoning_effort = wireMap[effort] || effort
+    request.reasoning_effort = effortWireMap[effort] || effort
   }
   return request
 }
@@ -376,7 +375,12 @@ export function anthropicToOpenCodeRequest(body, route, querySource) {
     return anthropicToOpenCodeResponses(body, route.upstream, querySource)
   }
   if (route.protocol === 'chat-completions') {
-    return anthropicToOpenCodeChat(body, route.upstream, querySource)
+    return anthropicToOpenCodeChat(
+      body,
+      route.upstream,
+      querySource,
+      route.effortWireMap || openCodeGoEffortWireMap(route.upstream),
+    )
   }
   if (route.protocol === 'anthropic-messages') {
     return {

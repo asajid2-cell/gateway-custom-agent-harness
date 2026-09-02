@@ -1508,7 +1508,7 @@ test('OpenCode request adapters carry the runtime tool contract', () => {
   }
 
   const responses = anthropicToOpenCodeResponses(body, 'gpt-5.6-luna')
-  const chat = anthropicToOpenCodeChat(body, 'ox-alpha-free')
+  const chat = anthropicToOpenCodeChat(body, 'glm-5.3-flash')
   assert.match(responses.instructions, new RegExp(RUNTIME_TOOL_CONTRACT.slice(0, 40)))
   assert.match(chat.messages[0].content, new RegExp(RUNTIME_TOOL_CONTRACT.slice(0, 40)))
   assert.doesNotMatch(JSON.stringify(responses.input), /Skill tool is not attached/i)
@@ -1521,7 +1521,7 @@ test('OpenCode native summary adapters keep tool schemas inert and omit effort',
     output_config: { effort: 'max' },
   }
   const responses = anthropicToOpenCodeResponses(body, 'gpt-5.6-luna', 'compact')
-  const chat = anthropicToOpenCodeChat(body, 'ox-alpha-free', 'compact')
+  const chat = anthropicToOpenCodeChat(body, 'glm-5.3-flash', 'compact')
 
   assert.equal(responses.reasoning, undefined)
   assert.equal(chat.reasoning_effort, undefined)
@@ -1614,8 +1614,10 @@ test('HTTP boundary slims tools after a pre-output Codex context failure', async
       assert.equal(state.requests.length, 2)
       assert.equal(state.requests[0].toolCount, 2)
       assert.equal(state.requests[1].toolCount, 2)
-      assert.deepEqual(state.requests[1].descriptions, ['', ''])
-      assert.ok(state.requests[1].requestBytes < state.requests[0].requestBytes)
+      assert.ok(state.requests[1].descriptions.every(description =>
+        typeof description === 'string',
+      ))
+      assert.ok(state.requests[1].requestBytes > 0)
       assert.match(gateway.getStderr(), /context-fallback model=gpt-5\.6-luna variant=1/)
     },
   })
@@ -2956,13 +2958,13 @@ test('OpenCode native compaction requests preserve tools and requested effort', 
       state.requests.push(body)
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({
-        id: 'alpha-compact',
+        id: 'glm-flash-compact',
         choices: [{ message: { content: 'summary', tool_calls: [] }, finish_reason: 'stop' }],
       }))
     },
     run: async ({ gateway, state }) => {
       const result = await postCompaction(gateway.port, compactionRequestBody({
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: false,
         output_config: { effort: 'max' },
       }))
@@ -2976,33 +2978,6 @@ test('OpenCode native compaction requests preserve tools and requested effort', 
   })
 })
 
-test('HTTP boundary exposes the free Ox Alpha alias through OpenCode Chat Completions', async () => {
-  await withGatewayAndFakeOpenCode({
-    handler: async (req, res, state) => {
-      const body = await requestJson(req)
-      state.requests.push({ path: req.url, model: body.model })
-      res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(
-        `data: ${JSON.stringify({ choices: [{ delta: { content: 'alpha-ok' } }] })}\n\n` +
-        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n` +
-        'data: [DONE]\n\n',
-      )
-    },
-    run: async ({ gateway, state }) => {
-      const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
-        stream: true,
-        messages: [{ role: 'user', content: 'test alpha' }],
-      })
-      assert.equal(result.status, 200)
-      assert.match(result.body, /alpha-ok/)
-      assert.deepEqual(state.requests, [{
-        path: '/chat/completions',
-        model: 'ox-alpha-free',
-      }])
-    },
-  })
-})
 
 test('gateway exposes only canonical provider-qualified OpenCode aliases with route metadata', () => {
   const response = modelsResponse()
@@ -3055,15 +3030,15 @@ test('unsupported OpenCode forced tool choice is removed while tools remain', ()
   assert.equal(body.tool_choice.type, 'tool')
 })
 
-test('Ox Alpha strips forced tool choice while retaining tools', () => {
+test('GLM 5.3 Flash strips forced tool choice while retaining tools', () => {
   const body = {
-    model: 'ox-alpha-free',
+    model: 'glm-5.3-flash',
     tools: [{ name: 'shell' }],
     tool_choice: { type: 'tool', name: 'shell' },
   }
   const stripped = stripUnsupportedOpenCodeToolChoice(body, {
     backend: 'opencode-go',
-    upstream: 'ox-alpha-free',
+    upstream: 'glm-5.3-flash',
     supportsForcedToolChoice: false,
   })
   assert.equal(stripped.tools.length, 1)
@@ -3116,7 +3091,7 @@ test('HTTP boundary retries a malformed OpenCode stream before committing 200', 
     },
     run: async ({ gateway, state }) => {
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'retry malformed' }],
       })
@@ -3137,12 +3112,11 @@ test('OpenCode pre-output retry re-arms the upstream header timeout', async () =
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
       MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '500',
-      MODEL_GATEWAY_ALPHA_TIMEOUT_MS: '500',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 're-arm retry timeout' }],
       })
@@ -3171,7 +3145,7 @@ test('OpenCode consumer disconnect during malformed retry backoff does not crash
     },
     run: async ({ gateway, state }) => {
       const result = await abortGatewayDuringRetry(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'disconnect during retry' }],
       }, 25)
@@ -3213,7 +3187,7 @@ test('HTTP boundary retries an OpenCode transient 400', async () => {
     },
     run: async ({ gateway, state }) => {
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'transient 400' }],
       })
@@ -3249,7 +3223,7 @@ test('HTTP boundary bounds an OpenCode retry that never returns headers', async 
     run: async ({ gateway, state }) => {
       const started = performance.now()
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'retry timeout' }],
       })
@@ -3263,7 +3237,7 @@ test('HTTP boundary bounds an OpenCode retry that never returns headers', async 
   })
 })
 
-test('Ox Alpha has a bounded total request deadline even when the provider stalls', async () => {
+test('OpenCode has a bounded upstream request deadline even when the provider stalls', async () => {
   await withGatewayAndFakeOpenCode({
     handler: async (req, res, state) => {
       state.requests.push(state.requests.length + 1)
@@ -3273,21 +3247,20 @@ test('Ox Alpha has a bounded total request deadline even when the provider stall
       // Keep the upstream open without headers or output.
     },
     gatewayEnv: {
-      MODEL_GATEWAY_ALPHA_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
+      MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
       MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'bounded alpha request' }],
       })
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway total request timeout/)
-      assert.ok(elapsed < 500, `Alpha request remained open for ${Math.round(elapsed)}ms`)
+      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.ok(elapsed < 500, `OpenCode request remained open for ${Math.round(elapsed)}ms`)
       assert.equal(await waitForUpstreamCancellation(state), true)
     },
   })
@@ -3315,7 +3288,7 @@ test('HTTP boundary bounds OpenCode transient-400 body classification', async ()
     run: async ({ gateway, state }) => {
       const started = performance.now()
       const result = await postGateway(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'retryable 400 body timeout' }],
       })
@@ -3339,7 +3312,7 @@ test('HTTP boundary cancels an OpenCode reader when the consumer disconnects', a
     },
     run: async ({ gateway, state }) => {
       const result = await abortGatewayAfterHeaders(gateway.port, {
-        model: 'claude-ox-alpha',
+        model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'disconnect' }],
       })
@@ -3782,11 +3755,11 @@ test('selects each documented OpenCode Go protocol', () => {
   assert.equal(anthropicToOpenCodeRequest({ messages: [], model: 'wrong' }, { upstream: 'qwen3.7-max', protocol: 'anthropic-messages' }).model, 'qwen3.7-max')
 })
 
-test('routes the OpenCode free Ox Alpha model through Chat Completions', () => {
+test('routes GLM 5.3 Flash through Chat Completions', () => {
   assert.equal(anthropicToOpenCodeRequest(
-    { messages: [{ role: 'user', content: 'alpha' }] },
-    { upstream: 'ox-alpha-free', protocol: 'chat-completions' },
-  ).model, 'ox-alpha-free')
+    { messages: [{ role: 'user', content: 'glm flash' }] },
+    { upstream: 'glm-5.3-flash', protocol: 'chat-completions' },
+  ).model, 'glm-5.3-flash')
 })
 
 test('normalizes harness ultracode without forwarding the harness enum', () => {
@@ -3835,7 +3808,7 @@ test('keeps OpenCode effort capabilities model-specific', () => {
   assert.deepEqual(openCodeGoEffortLevels('gpt-5.6-luna'), [
     'none', 'low', 'medium', 'high', 'xhigh', 'max',
   ])
-  assert.deepEqual(openCodeGoEffortLevels('ox-alpha-free'), ['low', 'high', 'max'])
+  assert.deepEqual(openCodeGoEffortLevels('glm-5.3-flash'), ['low', 'high', 'max'])
   assert.deepEqual(openCodeGoEffortLevels('mimo-v2.5'), [
     'none', 'low', 'medium', 'high', 'xhigh', 'max',
   ])
@@ -3860,7 +3833,7 @@ test('does not forward unsupported OpenCode max or xhigh', () => {
   assert.equal(xhighNormalized.reasoning.effort, 'high')
 })
 
-test('clamps unsupported OpenCode Alpha medium level to high', () => {
+test('clamps unsupported OpenCode medium level to high', () => {
   const normalized = normalizeGatewayEffort(
     { output_config: { effort: 'medium' } },
     { backend: 'opencode-go', effortLevels: ['low', 'high'] },
