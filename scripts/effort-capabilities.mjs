@@ -62,12 +62,26 @@ export const OPENCODE_GO_EFFORT_LEVELS = Object.fromEntries(
   Object.entries(CATALOG.opencodeGo).map(([model, levels]) => [model, [...levels]]),
 )
 
+export const OPENCODE_ZEN_EFFORT_LEVELS = Object.fromEntries(
+  Object.entries(CATALOG.opencodeZen || {}).map(([model, levels]) => [model, [...levels]]),
+)
+
 export function effortLevelsForOpenCodeModel(model) {
   const levels = OPENCODE_GO_EFFORT_LEVELS[model]
   return levels ? [...levels] : []
 }
 
+export function effortLevelsForOpenCodeZenModel(model) {
+  const levels = OPENCODE_ZEN_EFFORT_LEVELS[model]
+  return levels ? [...levels] : []
+}
+
 export function effortWireMapForOpenCodeModel(model) {
   if (model === 'hy3') return { none: 'no_think' }
+  return {}
+}
+
+export function effortWireMapForOpenCodeZenModel(model) {
+  if (model === 'hy3-free') return { none: 'no_think' }
   return {}
 }

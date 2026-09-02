@@ -6,9 +6,9 @@ import {
   getSupportedEffortLevels,
   resolveAppliedEffort,
   resolveProviderEffort,
-  toPersistableEffort,
 } from '../src/utils/effort.ts'
 import { openRouterModelOption } from '../src/utils/model/openRouterModels.ts'
+import { createStore } from '../src/state/store.ts'
 
 test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsEffort('claude-gpt-luna'), true)
@@ -68,6 +68,23 @@ test('DeepSeek exposes only its real effort levels', () => {
     ['low', 'medium', 'high', 'ultracode'],
   )
   assert.deepEqual(getSupportedEffortLevels('claude-ultracode'), ['ultracode'])
+})
+
+test('effort selections remain independent between session stores', () => {
+  const sessionOne = createStore<{ effortValue: 'low' | 'medium' | 'high' | undefined }>({
+    effortValue: 'low',
+  })
+  const sessionTwo = createStore<{ effortValue: 'low' | 'medium' | 'high' | undefined }>({
+    effortValue: 'medium',
+  })
+
+  sessionOne.setState(prev => ({ ...prev, effortValue: 'high' }))
+  assert.equal(sessionOne.getState().effortValue, 'high')
+  assert.equal(sessionTwo.getState().effortValue, 'medium')
+
+  sessionTwo.setState(prev => ({ ...prev, effortValue: undefined }))
+  assert.equal(sessionOne.getState().effortValue, 'high')
+  assert.equal(sessionTwo.getState().effortValue, undefined)
 })
 
 test('OpenRouter requires explicit effort metadata', () => {

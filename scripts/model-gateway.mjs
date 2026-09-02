@@ -18,6 +18,15 @@ import {
   relayOpenCodeResponseByProtocol,
 } from './opencode-go.mjs'
 import {
+  OPENCODE_ZEN_ROUTES,
+  OPENCODE_ZEN_MODEL_IDS,
+  openCodeZenEffortLevels,
+  openCodeZenEffortWireMap,
+  openCodeZenEndpoint,
+  openCodeZenHeaders,
+  isOpenCodeZenProtocol,
+} from './opencode-zen.mjs'
+import {
   gatewayCatalogDrift,
   GPT56_EFFORT_LEVELS,
   NATIVE_EFFORT_LEVELS,
@@ -64,10 +73,6 @@ const UPSTREAM_TIMEOUT_MS = durationEnvironment(
 const CONSUMER_TIMEOUT_MS = durationEnvironment(
   'MODEL_GATEWAY_CONSUMER_TIMEOUT_MS',
   180_000,
-)
-const OPENCODE_ALPHA_TIMEOUT_MS = durationEnvironment(
-  'MODEL_GATEWAY_ALPHA_TIMEOUT_MS',
-  60_000,
 )
 const UPSTREAM_RETRIES = integerEnvironment(
   'MODEL_GATEWAY_UPSTREAM_RETRIES',
@@ -143,6 +148,33 @@ const DEFAULT_MODELS = {
   // Gateway-visible aliases make the provider boundary explicit in /model and
   // /v1/models. The raw opencode-go/* IDs remain supported for direct callers.
   ...Object.fromEntries(
+    OPENCODE_ZEN_MODEL_IDS.map(model => [
+      `opencode-zen/${model}`,
+      {
+        backend: 'opencode-zen',
+        upstream: model,
+        protocol: OPENCODE_ZEN_ROUTES[model],
+        effortLevels: openCodeZenEffortLevels(model),
+        effortWireMap: openCodeZenEffortWireMap(model),
+        hidden: true,
+        ...(model === 'hy3-free' ? { supportsTools: false } : {}),
+      },
+    ]),
+  ),
+  ...Object.fromEntries(
+    OPENCODE_ZEN_MODEL_IDS.map(model => [
+      `gateway-opencode-${model}`,
+      {
+        backend: 'opencode-zen',
+        upstream: model,
+        protocol: OPENCODE_ZEN_ROUTES[model],
+        effortLevels: openCodeZenEffortLevels(model),
+        effortWireMap: openCodeZenEffortWireMap(model),
+        ...(model === 'hy3-free' ? { supportsTools: false } : {}),
+      },
+    ]),
+  ),
+  ...Object.fromEntries(
     OPENCODE_GO_MODEL_IDS.map(model => [
       `gateway-opencode-${model}`,
       {
@@ -161,13 +193,6 @@ const DEFAULT_MODELS = {
   'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS },
   'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS },
   'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS },
-  'gateway-ox-alpha': {
-    backend: 'opencode-go',
-    upstream: 'ox-alpha-free',
-    protocol: 'chat-completions',
-    effortLevels: openCodeGoEffortLevels('ox-alpha-free'),
-    supportsForcedToolChoice: false,
-  },
   'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
   'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
   // Legacy aliases for existing transcripts and direct callers. They remain
@@ -176,18 +201,22 @@ const DEFAULT_MODELS = {
   'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
   'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
   'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
-  'claude-ox-alpha': {
-    backend: 'opencode-go',
-    upstream: 'ox-alpha-free',
-    protocol: 'chat-completions',
-    effortLevels: openCodeGoEffortLevels('ox-alpha-free'),
-    hidden: true,
-    // Live Alpha accepts tools, but a forced tool_choice can stall instead
-    // of producing a tool call. Leave selection to the provider.
-    supportsForcedToolChoice: false,
-  },
   'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
   'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
+  ...Object.fromEntries(
+    OPENCODE_ZEN_MODEL_IDS.map(model => [
+      `claude-opencode-${model}`,
+      {
+        backend: 'opencode-zen',
+        upstream: model,
+        protocol: OPENCODE_ZEN_ROUTES[model],
+        effortLevels: openCodeZenEffortLevels(model),
+        effortWireMap: openCodeZenEffortWireMap(model),
+        hidden: true,
+        ...(model === 'hy3-free' ? { supportsTools: false } : {}),
+      },
+    ]),
+  ),
   ...Object.fromEntries(
     OPENCODE_GO_MODEL_IDS.map(model => [
       `claude-opencode-${model}`,
@@ -232,25 +261,39 @@ function loadModels() {
     if (
       value.backend !== 'codex' &&
       value.backend !== 'deepseek' &&
-      value.backend !== 'opencode-go'
+      value.backend !== 'opencode-go' &&
+      value.backend !== 'opencode-zen'
     ) {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} has an invalid backend`)
     }
     if (typeof (value.upstream || name) !== 'string') {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} needs a string upstream model`)
     }
-    if (value.backend === 'opencode-go' && !isOpenCodeGoProtocol(value.protocol)) {
+    if (
+      value.backend === 'opencode-go' &&
+      !isOpenCodeGoProtocol(value.protocol)
+    ) {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} needs a valid OpenCode Go protocol`)
+    }
+    if (
+      value.backend === 'opencode-zen' &&
+      !isOpenCodeZenProtocol(value.protocol)
+    ) {
+      throw new Error(`MODEL_GATEWAY_MODELS entry ${name} needs a valid OpenCode Zen protocol`)
     }
     const previous = models[name]
     models[name] = {
       backend: value.backend,
       ...(typeof value.upstream === 'string' && value.upstream
         ? { upstream: value.upstream }
-        : value.backend === 'codex' || value.backend === 'opencode-go'
+        : value.backend === 'codex' ||
+            value.backend === 'opencode-go' ||
+            value.backend === 'opencode-zen'
           ? { upstream: name }
           : {}),
-      ...(value.backend === 'opencode-go' ? { protocol: value.protocol } : {}),
+      ...(value.backend === 'opencode-go' || value.backend === 'opencode-zen'
+        ? { protocol: value.protocol }
+        : {}),
       ...(Array.isArray(value.effortLevels)
         ? { effortLevels: value.effortLevels.filter(level => NATIVE_EFFORT_LEVELS.includes(level)) }
         : {}),
@@ -323,20 +366,6 @@ function resolvePort() {
 }
 
 const PORT = resolvePort()
-
-function requestTimeoutsForRoute(route) {
-  if (
-    route?.backend === 'opencode-go' &&
-    route?.upstream === 'ox-alpha-free'
-  ) {
-    return {
-      upstreamTimeoutMs: Math.min(UPSTREAM_TIMEOUT_MS, OPENCODE_ALPHA_TIMEOUT_MS),
-      consumerTimeoutMs: Math.min(CONSUMER_TIMEOUT_MS, OPENCODE_ALPHA_TIMEOUT_MS),
-      totalTimeoutMs: OPENCODE_ALPHA_TIMEOUT_MS,
-    }
-  }
-  return {}
-}
 
 function json(res, status, body) {
   if (res.headersSent || res.destroyed || res.writableEnded) return
@@ -963,7 +992,7 @@ export function normalizeGatewayEffort(body, route, querySource) {
 
 export function stripUnsupportedOpenCodeTools(body, route) {
   if (
-    route?.backend !== 'opencode-go' ||
+    !['opencode-go', 'opencode-zen'].includes(route?.backend) ||
     route.supportsTools !== false ||
     !Array.isArray(body?.tools) ||
     body.tools.length === 0
@@ -988,7 +1017,7 @@ function isForcedToolChoice(choice) {
 
 export function stripUnsupportedOpenCodeToolChoice(body, route) {
   if (
-    route?.backend !== 'opencode-go' ||
+    !['opencode-go', 'opencode-zen'].includes(route?.backend) ||
     route.supportsForcedToolChoice !== false ||
     !isForcedToolChoice(body?.tool_choice)
   ) {
@@ -2515,7 +2544,7 @@ function deepSeekHeaders(req, apiKey, stream = false) {
 async function handleOpenCodeGo(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-go', protocol: route.protocol })
-  const control = createRequestControl(req, res, trace, requestTimeoutsForRoute(route))
+  const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
   const apiKey = process.env.OPENCODE_API_KEY
   if (!apiKey) {
@@ -2651,6 +2680,91 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
     trace.markError(error)
     if (!res.headersSent) {
       anthropicError(res, 502, error instanceof Error ? error.message : 'OpenCode Go request failed')
+    } else if (wantsStream) {
+      finishAnthropicStreamWithError(res, error)
+    }
+    trace.finish('request-error', error, res.statusCode)
+  } finally {
+    control.cleanup()
+  }
+}
+
+async function handleOpenCodeZen(body, req, res, modelName, route) {
+  const wantsStream = body.stream === true
+  const trace = createGatewayTrace({ model: modelName, backend: 'opencode-zen', protocol: route.protocol })
+  const control = createRequestControl(req, res, trace)
+  const querySource = gatewayQuerySource(req)
+  const apiKey = process.env.OPENCODE_API_KEY
+  if (!apiKey) {
+    anthropicError(res, 401, 'OpenCode Zen API key is not configured')
+    trace.finish('auth-error', null, 401)
+    control.cleanup()
+    return
+  }
+
+  let request
+  try {
+    const toolSafeBody = stripUnsupportedOpenCodeToolChoice(
+      stripUnsupportedOpenCodeTools(body, route),
+      route,
+    )
+    const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
+    request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    logRequestShape({
+      body: normalizedBody,
+      providerRequest: request,
+      model: modelName,
+      backend: 'opencode-zen',
+      protocol: route.protocol,
+      querySource,
+    })
+  } catch (error) {
+    anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
+    trace.finish('invalid-request', error, 400)
+    control.cleanup()
+    return
+  }
+
+  try {
+    control.startUpstream()
+    const upstream = await fetchWithRetry({
+      provider: 'OpenCode Zen',
+      url: openCodeZenEndpoint(route.protocol),
+      options: {
+        method: 'POST',
+        headers: openCodeZenHeaders(apiKey, wantsStream),
+        body: JSON.stringify(request),
+        signal: control.signal,
+      },
+      control,
+      trace,
+    })
+    if (!upstream.ok) {
+      const detail = await safeUpstreamResponseError(
+        upstream,
+        'OpenCode Zen',
+        apiKey,
+        { signal: control.signal, timeoutMs: RETRY_RESPONSE_TIMEOUT_MS },
+      )
+      await upstream.body?.cancel().catch(() => {})
+      const status = upstream.status >= 500 ? 502 : upstream.status
+      anthropicError(res, status, detail)
+      trace.finish('upstream-http-error', null, status)
+      return
+    }
+
+    const relayOptions = { signal: control.signal, throwPreOutput: true }
+    if (wantsStream) {
+      await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
+    } else {
+      await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+    }
+    trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
+  } catch (error) {
+    trace.markError(error)
+    if (!res.headersSent) {
+      const status = control.signal.aborted ? control.statusFor(error) : 502
+      anthropicError(res, status, control.signal.aborted ? 'OpenCode Zen upstream request timed out' : redactSecret(errorMessage(error), apiKey))
     } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
     }
@@ -2894,7 +3008,9 @@ export function modelsResponse() {
           ? 'codex'
           : backend === 'deepseek'
             ? 'deepseek'
-            : 'opencode-go',
+            : backend === 'opencode-zen'
+              ? 'opencode-zen'
+              : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
       effort_levels: Array.isArray(MODELS[id].effortLevels)
         ? [...MODELS[id].effortLevels]
@@ -2962,6 +3078,10 @@ const server = http.createServer(async (req, res) => {
   }
   if (route.backend === 'opencode-go') {
     await handleOpenCodeGo(body, req, res, modelName, route)
+    return
+  }
+  if (route.backend === 'opencode-zen') {
+    await handleOpenCodeZen(body, req, res, modelName, route)
     return
   }
 
