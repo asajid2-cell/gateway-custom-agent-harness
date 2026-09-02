@@ -6,9 +6,37 @@ import {
   getSupportedEffortLevels,
   resolveAppliedEffort,
   resolveProviderEffort,
-  toPersistableEffort,
 } from '../src/utils/effort.ts'
 import { openRouterModelOption } from '../src/utils/model/openRouterModels.ts'
+import { createStore } from '../src/state/store.ts'
+
+test('effort selections remain independent between session stores', () => {
+  const sessionOne = createStore<{ effortValue: 'low' | 'medium' | 'high' | undefined }>({ effortValue: 'low' })
+  const sessionTwo = createStore<{ effortValue: 'low' | 'medium' | 'high' | undefined }>({ effortValue: 'medium' })
+
+  sessionOne.setState(prev => ({ ...prev, effortValue: 'high' }))
+  assert.equal(sessionOne.getState().effortValue, 'high')
+  assert.equal(sessionTwo.getState().effortValue, 'medium')
+
+  sessionOne.setState(prev => ({ ...prev, effortValue: undefined }))
+  assert.equal(sessionOne.getState().effortValue, undefined)
+  assert.equal(sessionTwo.getState().effortValue, 'medium')
+})
+
+test('settings changes do not define the runtime effort value', () => {
+  const session = createStore<{ effortValue: 'low' | undefined; settings: { effortLevel: string } }>({
+    effortValue: 'low',
+    settings: { effortLevel: 'medium' },
+  })
+
+  session.setState(prev => ({
+    ...prev,
+    settings: { effortLevel: 'high' },
+  }))
+
+  assert.equal(session.getState().effortValue, 'low')
+})
+
 
 test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsEffort('claude-gpt-luna'), true)
@@ -62,7 +90,11 @@ test('DeepSeek exposes only its real effort levels', () => {
   assert.equal(resolveProviderEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('opencode-go/mimo-v2.5', 'ultracode'), 'high')
   assert.equal(resolveProviderEffort('claude-ultracode', 'ultracode'), undefined)
-  assert.equal(toPersistableEffort('ultracode'), 'ultracode')
+
+  assert.equal(resolveAppliedEffort('gateway-gpt-luna', 'medium'), 'medium')
+  assert.equal(resolveAppliedEffort('gateway-gpt-sol', 'low'), 'low')
+  assert.equal(resolveAppliedEffort('gateway-gpt-terra', 'high'), 'high')
+
   assert.deepEqual(
     getSupportedEffortLevels('opencode-go/qwen3.7-max'),
     ['low', 'medium', 'high', 'ultracode'],

@@ -12,6 +12,10 @@ export type WeeklyUtilization = {
   utilization: number
 }
 
+export type CodexQuotaDisplay = {
+  remainingPercent: number
+}
+
 export function getContextUsageValues(
   usage: CurrentUsage | null,
   contextWindowSize: number,
@@ -63,10 +67,15 @@ export function formatBottomBarUsage(
   usage: CurrentUsage | null,
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
+  codexQuota?: CodexQuotaDisplay | null,
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
   const weeklyRemaining = getWeeklyRemainingPercent(weekly)
   const parts = [getGatewayProviderLabel(model), `model ${model}`]
+
+  if (codexQuota && getGatewayProviderLabel(model) === 'Codex') {
+    parts.push(`Codex remaining ${codexQuota.remainingPercent}%`)
+  }
 
   if (usage) {
     parts.push(
