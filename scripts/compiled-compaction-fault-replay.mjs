@@ -526,6 +526,7 @@ async function main() {
         env: {
           ...commonCliEnv,
           COMPACTION_DEBUG_TRACE: '1',
+          COMPACTION_TTY_SESSION_ID: sessionId,
           COMPACTION_TTY_SCENARIO: partialTtyMode
             ? 'partial'
             : 'automatic',
@@ -553,6 +554,7 @@ async function main() {
           !result.timedOut &&
           result.exitCode === 0 &&
           captureReport.result === 'pass' &&
+          captureReport.sawResumeFooter &&
           captureReport.sawProgress &&
           captureReport.sawSecond &&
           (!partialTtyMode ||

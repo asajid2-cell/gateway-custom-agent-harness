@@ -1,4 +1,5 @@
 import { calculateContextPercentages } from './context.js'
+import { quotePowerShellLiteral } from './shell/powershellQuote.js'
 import { formatTokens } from './format.js'
 
 export type CurrentUsage = {
@@ -60,6 +61,13 @@ export function getGatewayProviderLabel(model: string): string {
   if (lower.includes('opencode')) return 'OpenCode'
   if (lower.includes('gateway-gpt-')) return 'Codex'
   return 'Gateway'
+}
+
+export function formatSessionResumeCommand(
+  directory: string,
+  sessionId: string,
+): string {
+  return `Set-Location -LiteralPath ${quotePowerShellLiteral(directory)}; cc --resume ${sessionId}`
 }
 
 export function formatBottomBarUsage(

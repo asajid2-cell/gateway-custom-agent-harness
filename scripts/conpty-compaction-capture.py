@@ -128,6 +128,20 @@ def main():
     try:
         wait_for("bypasspermissionson", "interactive prompt", compact=True)
         saw_prompt = True
+        session_id = os.environ.get("COMPACTION_TTY_SESSION_ID")
+        if not session_id:
+            raise RuntimeError("COMPACTION_TTY_SESSION_ID is required")
+        quoted_directory = "'" + os.getcwd().replace("'", "''") + "'"
+        expected_resume_command = (
+            f"Set-Location -LiteralPath {quoted_directory}; "
+            f"cc --resume {session_id}"
+        )
+        wait_for(
+            expected_resume_command,
+            "session resume footer",
+            compact=True,
+        )
+        saw_resume_footer = True
         time.sleep(0.3)
         submit("First turn.")
         wait_for("FIRST_OK", "first assistant response")
@@ -220,6 +234,7 @@ def main():
             "exitStatus": child.exitstatus,
             "elapsedMs": round((time.monotonic() - started) * 1000),
             "sawPrompt": saw_prompt,
+            "sawResumeFooter": saw_resume_footer,
             "sawFirst": saw_first,
             "sawProgress": saw_progress,
             "sawSecond": saw_second,

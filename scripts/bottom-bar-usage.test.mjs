@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   formatBottomBarUsage,
+  formatSessionResumeCommand,
   getContextUsageValues,
   getGatewayProviderLabel,
   getWeeklyRemainingPercent,
@@ -32,6 +33,23 @@ test('weekly remaining is only derived from valid provider utilization', () => {
   assert.equal(getWeeklyRemainingPercent({ utilization: 0.37 }), 63)
   assert.equal(getWeeklyRemainingPercent(undefined), null)
   assert.equal(getWeeklyRemainingPercent({ utilization: Number.NaN }), null)
+})
+
+test('session resume command keeps the directory and session ID copyable', () => {
+  assert.equal(
+    formatSessionResumeCommand(
+      'Z:\\Work Repo\\gateway',
+      '0bffad12-00fb-420d-95b3-09e5a3390a63',
+    ),
+    "Set-Location -LiteralPath 'Z:\\Work Repo\\gateway'; cc --resume 0bffad12-00fb-420d-95b3-09e5a3390a63",
+  )
+  assert.equal(
+    formatSessionResumeCommand(
+      "C:\\Ahmed's Work",
+      '12345678-1234-1234-1234-123456789abc',
+    ),
+    "Set-Location -LiteralPath 'C:\\Ahmed''s Work'; cc --resume 12345678-1234-1234-1234-123456789abc",
+  )
 })
 
 test('bottom bar identifies Gateway providers without inventing quota data', () => {

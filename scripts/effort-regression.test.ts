@@ -1,6 +1,14 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { regenerateSessionId } from '../src/bootstrap/state.ts'
+import {
+  getSessionId,
+  getSessionProjectDir,
+  getSessionResumeDirectory,
+  onSessionSwitch,
+  regenerateSessionId,
+  switchSession,
+} from '../src/bootstrap/state.ts'
+import { asSessionId } from '../src/types/ids.ts'
 import type { AppState } from '../src/state/AppState.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
 import {
@@ -23,6 +31,35 @@ import {
   type PersistState,
 } from '../src/skills/bundled/persist.ts'
 import type { SessionHooksState } from '../src/utils/hooks/sessionHooks.ts'
+
+test('session identity updates atomically for resumed sessions', () => {
+  const resumedId = asSessionId('12345678-1234-1234-1234-123456789abc')
+  let notifications = 0
+  const unsubscribe = onSessionSwitch(() => {
+    notifications++
+  })
+
+  try {
+    switchSession(
+      resumedId,
+      'C:\\Users\\Ahmed\\.claude\\projects\\encoded-project',
+      'Z:\\Work Repo\\gateway-worktree',
+    )
+    assert.equal(getSessionId(), resumedId)
+    assert.equal(
+      getSessionProjectDir(),
+      'C:\\Users\\Ahmed\\.claude\\projects\\encoded-project',
+    )
+    assert.equal(
+      getSessionResumeDirectory(),
+      'Z:\\Work Repo\\gateway-worktree',
+    )
+    assert.equal(notifications, 1)
+  } finally {
+    unsubscribe()
+    regenerateSessionId()
+  }
+})
 
 test('effort selections remain independent between session stores', () => {
   const sessionOne = createStore<{ effortValue: 'low' | 'medium' | 'high' | undefined }>({ effortValue: 'low' })
