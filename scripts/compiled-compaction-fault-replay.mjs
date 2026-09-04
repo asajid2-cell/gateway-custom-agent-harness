@@ -20,6 +20,7 @@ const toolPoisonMode =
   process.env.COMPACTION_FAULT_REPLAY_MODE === 'tool-poison'
 const sessionMemoryMode =
   process.env.COMPACTION_FAULT_REPLAY_MODE === 'session-memory'
+const overflowMode = process.env.COMPACTION_FAULT_REPLAY_MODE === 'overflow'
 const ttyMode = process.env.COMPACTION_FAULT_REPLAY_MODE === 'tty'
 const partialTtyMode =
   process.env.COMPACTION_FAULT_REPLAY_MODE === 'partial-tty'
@@ -258,6 +259,8 @@ async function main() {
     sessionMemorySeen: false,
     postCompactionToolCounts: [],
     missingToolCatalog: false,
+    promptTooLongResponses: 0,
+    successfulNormalResponses: 0,
   }
   const provider = createServer(async (req, res) => {
     const body = await readJson(req)
@@ -285,6 +288,26 @@ async function main() {
     const toolCount = Array.isArray(body?.tools) ? body.tools.length : 0
 
     if (!compaction) {
+      if (
+        overflowMode &&
+        state.successfulNormalResponses === 1 &&
+        state.compactionRequests === 0
+      ) {
+        state.promptTooLongResponses += 1
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          error: {
+            type: 'invalid_request_error',
+            message: 'Prompt is too long: 71000 tokens > 70000 maximum',
+          },
+        }))
+        return
+      }
+      if (overflowMode && state.compactionRequests > 0) {
+        state.successfulNormalResponses += 1
+        sendNormalResponse(res, 'SECOND_OK', 100)
+        return
+      }
       if (toolPoisonMode && state.compactionRequests > 0) {
         const staleControl = [
           'Runtime capability reconciliation',
@@ -333,10 +356,13 @@ async function main() {
         sendNormalResponse(res, 'TOOL_OK')
         return
       }
+      if (overflowMode) state.successfulNormalResponses += 1
       sendNormalResponse(
         res,
-        state.totalRequests === 1 ? 'FIRST_OK' : 'SECOND_OK',
-        partialTtyMode ? 100 : 45_000,
+        state.successfulNormalResponses === 1 || state.totalRequests === 1
+          ? 'FIRST_OK'
+          : 'SECOND_OK',
+        partialTtyMode ? 100 : overflowMode ? 30_000 : 45_000,
       )
       return
     }
@@ -352,6 +378,10 @@ async function main() {
     }
     if (manualSuccessMode) {
       sendNormalResponse(res, 'Manual summary preserved.', 100)
+      return
+    }
+    if (overflowMode) {
+      sendNormalResponse(res, 'Overflow recovery summary preserved.', 100)
       return
     }
     if (toolPoisonMode) {
@@ -670,10 +700,12 @@ async function main() {
       ? state.compactionRequests === 1
       : manualSuccessMode
         ? state.compactionRequests === 1
-        : toolPoisonMode
-          ? state.compactionRequests === 1
-        : state.compactionRequests >= 1 &&
-          (state.compactionAborted || state.responseClosed)
+        : overflowMode
+          ? state.compactionRequests === 1 && state.promptTooLongResponses >= 1
+          : toolPoisonMode
+            ? state.compactionRequests === 1
+            : state.compactionRequests >= 1 &&
+              (state.compactionAborted || state.responseClosed)
 
     const report = {
       result: !result.timedOut &&
@@ -684,17 +716,19 @@ async function main() {
           ? timedOutExecutionError
           : manualSuccessMode
             ? successfulContinuation
-            : toolMode
-              ? toolContinuation &&
-                successfulToolContinuation &&
-                successfulContinuation
-              : toolPoisonMode
-                ? poisonedToolContinuation &&
+            : overflowMode
+              ? successfulContinuation
+              : toolMode
+                ? toolContinuation &&
                   successfulToolContinuation &&
-                  successfulPoisonedContinuation
-              : sessionMemoryMode
-                ? sessionMemoryContinuation
-                : successfulContinuation)
+                  successfulContinuation
+                : toolPoisonMode
+                  ? poisonedToolContinuation &&
+                    successfulToolContinuation &&
+                    successfulPoisonedContinuation
+                  : sessionMemoryMode
+                    ? sessionMemoryContinuation
+                    : successfulContinuation)
         ? 'pass'
         : 'fail',
       ...result,
@@ -724,13 +758,15 @@ async function main() {
         ? 'manual'
         : manualSuccessMode
           ? 'manual-success'
+          : overflowMode
+            ? 'overflow'
             : toolMode
               ? 'tool'
               : toolPoisonMode
                 ? 'tool-poison'
-              : sessionMemoryMode
-              ? 'session-memory'
-              : 'automatic',
+                : sessionMemoryMode
+                  ? 'session-memory'
+                  : 'automatic',
       gatewayStderrTail: gatewayInfo.stderr().split(/\r?\n/).slice(-20),
       cliStderrTail: result.stderr.split(/\r?\n/).slice(-20),
     }

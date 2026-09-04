@@ -1,30 +1,28 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { startCompactionProgress } from '../src/commands/compact/compact.ts'
-import { runCompactionCacheSharingAttempt } from '../src/services/compact/compact.ts'
+import {
+  runCompactionCacheSharingAttempt,
+  startCompactProgressHeartbeat,
+} from '../src/services/compact/compact.ts'
 
-test('manual compaction reports progress before preflight work starts', async () => {
+test('compaction progress heartbeat reports phases and stops cleanly', async () => {
   const events: string[] = []
-  const context = {
-    setSDKStatus: (status: string | null) => events.push(`status:${status}`),
-    setStreamMode: (mode: string) => events.push(`mode:${mode}`),
-    setResponseLength: () => events.push('response:reset'),
-    onCompactProgress: (event: { type: string }) => events.push(event.type),
-  } as never
+  const progress = startCompactProgressHeartbeat(
+    {
+      onCompactProgress: event => events.push(event.type),
+    },
+    5,
+  )
 
-  const stop = startCompactionProgress(context)
-  assert.deepEqual(events.slice(0, 5), [
-    'status:compacting',
-    'mode:requesting',
-    'response:reset',
-    'compact_start',
-    'compact_end',
-  ].slice(0, 4))
+  progress.setPhase('summarizing', 1)
+  await new Promise(resolve => setTimeout(resolve, 10))
+  progress.stop()
+  const eventCount = events.length
+  await new Promise(resolve => setTimeout(resolve, 10))
 
-  await new Promise(resolve => setTimeout(resolve, 5))
-  stop()
-  assert.equal(events.at(-1), 'status:null')
-  assert.equal(events.filter(event => event === 'compact_end').length, 1)
+  assert.ok(events.length >= 2)
+  assert.equal(events.length, eventCount)
+  assert.ok(events.every(event => event === 'compact_progress'))
 })
 
 test('compaction cache-sharing attempts abort when the provider never resolves', async () => {
