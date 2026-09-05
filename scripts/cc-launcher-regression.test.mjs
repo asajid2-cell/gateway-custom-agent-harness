@@ -42,3 +42,17 @@ test('interactive cc skips the full build when the compiled harness is fresh', a
     'the launcher must not rebuild unconditionally',
   )
 })
+
+test('interactive cc avoids the Defender-blocked nested encoded launcher', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.equal(script.includes('$NestedEncoded'), false)
+  assert.doesNotMatch(
+    script,
+    /\$NestedCommand\s*=\s*['"]& powershell\.exe[\s\S]*-EncodedCommand/,
+  )
+  assert.match(
+    script,
+    /\$NestedCommand\s*=\s*'& '\s*\+[\s\S]*\$Keysafe\.Replace/,
+    'the second credential should be injected by invoking keysafe directly in the existing child',
+  )
+})

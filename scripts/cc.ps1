@@ -726,25 +726,15 @@ try {
     ($GatewayCommand)
   )
   if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\opencode-go.cred') -PathType Leaf) {
-    # Keysafe injects one record per child. Nest the second runtime injection so
-    # the Gateway inherits both variables without exposing either value in an
-    # argument, file, or log.
-    # The outer keysafe runner parses its child command as PowerShell. Encode
-    # the nested invocation so its -EnvVar token cannot be rebound as a second
-    # parameter of the outer invocation. The encoded script contains only paths,
-    # key names, and the Gateway command; no credential value.
-    $NestedScript = '$KeysafePath = ' +
+    # Keysafe injects one record per child. Invoke the second keysafe script in
+    # the first keysafe child so the Gateway inherits both variables without
+    # exposing either value in an argument, file, or log. Do not create a nested
+    # powershell.exe -EncodedCommand chain: Defender blocks that launcher shape.
+    $NestedCommand = '& ' +
       ("'" + $Keysafe.Replace("'", "''") + "'") +
-      '; $GatewayCommand = ' +
+      ' run opencode-go -EnvVar OPENCODE_API_KEY -Command ' +
       ("'" + $GatewayCommand.Replace("'", "''") + "'") +
-      '; & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $KeysafePath ' +
-      'run opencode-go -EnvVar OPENCODE_API_KEY -Command $GatewayCommand; ' +
-      'exit $LASTEXITCODE'
-    $NestedEncoded = [Convert]::ToBase64String(
-      [Text.Encoding]::Unicode.GetBytes($NestedScript)
-    )
-    $NestedCommand = '& powershell.exe -NoProfile -ExecutionPolicy Bypass ' +
-      '-EncodedCommand ' + $NestedEncoded
+      '; exit $LASTEXITCODE'
     # The common Start-Process argument quoting below wraps this complete
     # nested command exactly once.
     $GatewayArgumentList = @(
