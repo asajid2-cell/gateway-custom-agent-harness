@@ -37,7 +37,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
   const goal = useSyncExternalStore(subscribePersist, getCurrentPersistRecord, getCurrentPersistRecord)
   const { columns: terminalColumns, rows: terminalRows } = useTerminalSize()
   const scrollRef = useRef<ScrollBoxHandle>(null)
-  const detailHeight = Math.max(2, Math.floor(terminalRows / 2) - 6)
+  const detailHeight = goal ? Math.max(2, Math.min(10, Math.floor(terminalRows / 2) - 6)) : 2
   const [{ sessionId, fullPath }] = useState(() => ({
     sessionId: getSessionId(),
     fullPath: getTranscriptPath(),
@@ -61,23 +61,20 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
     }
   }, [sessionId])
 
-  const handleCancel = useCallback(() => {
-    if (!saving) onDone()
-  }, [onDone, saving])
-  useInput((_input, key) => {
-    if (key.escape) handleCancel()
-    if (key.pageDown) scrollRef.current?.scrollBy(detailHeight)
-    if (key.pageUp) scrollRef.current?.scrollBy(-detailHeight)
-  })
-
+  const closing = useRef(false)
   const handleSubmit = useCallback(async () => {
     const newName = name.trim()
-    if (teammate || !newName || saving) return
+    if (saving || closing.current) return
+    if (teammate || !newName) {
+      onDone()
+      return
+    }
     if (getSessionId() !== sessionId || getTranscriptPath() !== fullPath) {
       onDone()
       return
     }
 
+    closing.current = true
     setSaving(true)
     setSaveError(undefined)
     try {
@@ -102,10 +99,18 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
       }))
       onDone()
     } catch {
+      closing.current = false
       setSaveError('Unable to save session name; inspect storage permissions.')
       setSaving(false)
     }
   }, [appStateStore, fullPath, name, onDone, saving, sessionId, teammate])
+
+  const handleCancel = useCallback(() => { void handleSubmit() }, [handleSubmit])
+  useInput((_input, key) => {
+    if (key.escape) handleCancel()
+    if (key.pageDown) scrollRef.current?.scrollBy(detailHeight)
+    if (key.pageUp) scrollRef.current?.scrollBy(-detailHeight)
+  })
 
   const muxSummary = useMemo(() => {
     if (!muxResult) return <Text dimColor>Checking local mux metadata…</Text>
@@ -191,7 +196,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
           {!teammate && (
             <KeyboardShortcutHint shortcut="Enter" action={saving ? 'saving' : 'save'} />
           )}
-          <Text dimColor>PgUp/PgDn details · Esc close</Text>
+          <Text dimColor>Esc save & close{goal ? ' · PgUp/PgDn details' : ''}</Text>
         </Byline>
       </Box>
     </Dialog>

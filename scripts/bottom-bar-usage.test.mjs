@@ -41,14 +41,14 @@ test('session resume command keeps the directory and session ID copyable', () =>
       'Z:\\Work Repo\\gateway',
       '0bffad12-00fb-420d-95b3-09e5a3390a63',
     ),
-    "Set-Location -LiteralPath 'Z:\\Work Repo\\gateway'; cc --resume 0bffad12-00fb-420d-95b3-09e5a3390a63",
+    "cd 'Z:\\Work Repo\\gateway'; & cc --resume 0bffad12-00fb-420d-95b3-09e5a3390a63",
   )
   assert.equal(
     formatSessionResumeCommand(
       "C:\\Ahmed's Work",
       '12345678-1234-1234-1234-123456789abc',
     ),
-    "Set-Location -LiteralPath 'C:\\Ahmed''s Work'; cc --resume 12345678-1234-1234-1234-123456789abc",
+    "cd 'C:\\Ahmed''s Work'; & cc --resume 12345678-1234-1234-1234-123456789abc",
   )
 })
 

@@ -67,7 +67,7 @@ export function formatSessionResumeCommand(
   directory: string,
   sessionId: string,
 ): string {
-  return `Set-Location -LiteralPath ${quotePowerShellLiteral(directory)}; cc --resume ${sessionId}`
+  return `cd ${quotePowerShellLiteral(directory)}; & cc --resume ${sessionId}`
 }
 
 export function formatBottomBarUsage(

@@ -3,7 +3,7 @@ import test from 'node:test'
 import { readFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getSessionId } from '../src/bootstrap/state.ts'
+import { getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } from '../src/bootstrap/state.ts'
 import { restorePersistForCurrentSession } from '../src/skills/bundled/persist.ts'
 import { writePersistSessionRecord, saveSessionName } from '../src/utils/sessionStorage.ts'
 import { asSessionId } from '../src/types/ids.ts'
@@ -14,8 +14,10 @@ import { AppStateProvider } from '../src/state/AppState.tsx'
 import { SessionMetadataDialog } from '../src/components/SessionMetadataDialog.tsx'
 import { FullscreenLayout } from '../src/components/FullscreenLayout.tsx'
 import { useSetPromptOverlayDialog } from '../src/context/promptOverlayContext.tsx'
-import { Box, Button, Text } from '../src/ink.ts'
+import { Box, Button, Text, useInput } from '../src/ink.ts'
 import instances from '../src/ink/instances.ts'
+import { isFullscreenEnvEnabled } from '../src/utils/fullscreen.ts'
+import { formatSessionResumeCommand } from '../src/utils/bottomBarUsage.ts'
 
 function MetadataPortal({ onDone }: { onDone: () => void }) {
   const dialog = React.useMemo(() => React.createElement(SessionMetadataDialog, { onDone }), [onDone])
@@ -30,7 +32,8 @@ test('metadata and goal UI retain session identity and fullscreen wiring', async
   assert.match(dialog, /onSessionSwitch\(\(\) => onDone\(\)\)/)
   assert.match(dialog, /saveSessionName\(sessionId, newName, fullPath\)/)
   assert.match(dialog, /placeholder="Unnamed session"/)
-  assert.match(dialog, /teammate \|\| !newName \|\| saving/)
+  assert.match(dialog, /saving \|\| closing.current/)
+  assert.match(dialog, /teammate \|\| !newName/)
   assert.match(prompt, /useSetPromptOverlayDialog\(isFullscreenEnvEnabled\(\) \? promptOverlayDialog/)
   assert.match(footer, /useSyncExternalStore\(subscribePersist, getCurrentPersistRecord/)
   assert.match(dialog, /controlPersistGoal\(action, appStateStore.setState\)/)
@@ -53,32 +56,72 @@ import {
   type MuxWebSocketLike,
 } from '../src/utils/muxSessionMetadata.ts'
 
-test('actual footer goal button responds to hover and click', async () => {
+test('resume command matches the mux directory and UUID form', () => {
+  assert.equal(formatSessionResumeCommand('Z:\\different work', '00000000-0000-4000-8000-000000000001'),
+    "cd 'Z:\\different work'; & cc --resume 00000000-0000-4000-8000-000000000001")
+})
+
+test('Gateway does not opt external users into fullscreen', () => {
+  const saved = { gateway: process.env.CLAUDE_CODE_USE_GATEWAY, fullscreen: process.env.CLAUDE_CODE_NO_FLICKER }
+  try {
+    process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+    delete process.env.CLAUDE_CODE_NO_FLICKER
+    assert.equal(isFullscreenEnvEnabled(), process.env.USER_TYPE === 'ant')
+    process.env.CLAUDE_CODE_NO_FLICKER = '0'
+    assert.equal(isFullscreenEnvEnabled(), false)
+  } finally {
+    if (saved.gateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = saved.gateway
+    if (saved.fullscreen === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = saved.fullscreen
+  }
+})
+
+for (const control of ['goal', 'pencil']) {
+test(`actual footer ${control} responds to terminal mouse input`, async () => {
   const source = await readFile(new URL('../src/components/PromptInput/PromptInputFooter.tsx', import.meta.url), 'utf8')
-  const start = source.indexOf('<Button onAction={() => onOpenSessionMetadata?.()}')
-  const end = source.indexOf('</Button>', start) + '</Button>'.length
+  const start = source.indexOf(control === 'goal' ? '<Button onAction={() => onOpenSessionMetadata?.()}' : 'export function SessionEditControl')
+  const end = control === 'goal' ? source.indexOf('</Button>', start) + '</Button>'.length : source.indexOf('\ntype BridgeStatusProps', start)
   assert.ok(start >= 0 && end > start)
-  const code = new Bun.Transpiler({ loader: 'tsx', tsconfig: { compilerOptions: { jsx: 'react' } } }).transformSync(`const element = ${source.slice(start, end)};`)
+  const snippet = control === 'goal'
+    ? `const element = ${source.slice(start, end)};`
+    : `${source.slice(start, end).replace('export function', 'function')}\nconst element = React.createElement(SessionEditControl, { onOpen: onOpenSessionMetadata });`
+  const code = new Bun.Transpiler({ loader: 'tsx', tsconfig: { compilerOptions: { jsx: 'react' } } }).transformSync(snippet)
   const stdout = Object.assign(new PassThrough(), { columns: 100, rows: 24, isTTY: true })
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} })
   let output = ''
   let opened = false
   stdout.on('data', chunk => { output += chunk.toString() })
-  const element = new Function('React', 'Button', 'Text', 'persistGoal', 'isNarrow', 'onOpenSessionMetadata', `${code}; return element`)(
-    React, Button, Text, { task: 'HOVER_GOAL', status: 'active', keep: true, nudgesRemaining: 2 }, false, () => { opened = true })
-  const app = await render(element, { stdout: stdout as unknown as NodeJS.WriteStream, stderr: stdout as unknown as NodeJS.WriteStream,
+  const element = new Function('React', 'Button', 'Text', 'Box', 'persistGoal', 'isNarrow', 'onOpenSessionMetadata', `${code}; return element`)(
+    React, Button, Text, Box, { task: 'HOVER_GOAL', status: 'active', keep: true, nudgesRemaining: 2 }, false, () => { opened = true })
+  function InputHost() {
+    useInput(() => {})
+    return element
+  }
+  const app = await render(React.createElement(InputHost), { stdout: stdout as unknown as NodeJS.WriteStream, stderr: stdout as unknown as NodeJS.WriteStream,
     stdin: stdin as unknown as NodeJS.ReadStream, patchConsole: false, exitOnCtrlC: false })
   try {
     const instance = instances.get(stdout as unknown as NodeJS.WriteStream)!
     instance.setAltScreenActive(true, true)
     await new Promise(resolve => setTimeout(resolve, 100))
-    instance.dispatchHover(1, 0)
+    stdin.write('\x1b[<35;1;1M')
     await new Promise(resolve => setTimeout(resolve, 100))
-    assert.match(output, /HOVER_GOAL/)
-    instance.dispatchClick(1, 0)
+    if (control === 'goal') assert.match(output, /HOVER_GOAL/)
+    stdin.write('\x1b[<0;1;1M')
+    stdin.write('\x1b[<0;1;1m')
+    await new Promise(resolve => setTimeout(resolve, 100))
     assert.equal(opened, true)
+    if (control === 'pencil') {
+      opened = false
+      stdin.write(' ')
+      stdin.write('\t')
+      stdin.write(' ')
+      await new Promise(resolve => setTimeout(resolve, 100))
+      assert.equal(opened, false, 'typing Space or tabbing must not activate the pencil')
+    }
   } finally { app.unmount() }
 })
+}
 
 test('native rename appends both resume metadata records to the captured transcript', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'session-rename-'))
@@ -94,6 +137,41 @@ test('native rename appends both resume metadata records to the captured transcr
     ])
     assert.equal(entries.length, 4)
   } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('inline rename saves typed spaces on Escape and closes exactly once', async () => {
+  const original = { id: getSessionId(), project: getSessionProjectDir(), directory: getSessionResumeDirectory() }
+  const directory = await mkdtemp(join(tmpdir(), 'rename-input-'))
+  const id = asSessionId('00000000-0000-4000-8000-000000000099')
+  const previous = process.env.CLAUDE_CODE_NO_FLICKER
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  switchSession(id, directory)
+  const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24, isTTY: true })
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} })
+  let closed = 0
+  const app = await render(React.createElement(AppStateProvider, null,
+    React.createElement(SessionMetadataDialog, { onDone: () => { closed++ } })), {
+    stdout: stdout as unknown as NodeJS.WriteStream, stderr: stdout as unknown as NodeJS.WriteStream,
+    stdin: stdin as unknown as NodeJS.ReadStream, patchConsole: false, exitOnCtrlC: false,
+  })
+  try {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    stdin.write('Reliable session name')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(closed, 0)
+    stdin.write('\x1b')
+    await new Promise(resolve => setTimeout(resolve, 150))
+    assert.equal(closed, 1)
+    const records = (await readFile(join(directory, `${id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.equal(records.filter(record => record.type === 'custom-title').length, 1)
+    assert.equal(records.find(record => record.type === 'custom-title').customTitle, 'Reliable session name')
+  } finally {
+    app.unmount()
+    switchSession(original.id, original.project, original.directory)
+    if (previous === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = previous
     await rm(directory, { recursive: true, force: true })
   }
 })
