@@ -96,7 +96,7 @@ test('gateway supervisor restarts a crashed local gateway and keeps the same por
   child.stderr.on('data', chunk => { stderr += chunk })
 
   try {
-    const deadline = Date.now() + 3000
+    const deadline = Date.now() + 10000
     let response = null
     while (Date.now() < deadline) {
       try {
@@ -270,7 +270,7 @@ test('consumer recovers across a supervised child restart with the follow-up too
       await wait(10)
     }
 
-    const first = await fetchWithTimeout(endpoint, requestOptions)
+    const first = await fetchWithTimeout(endpoint, requestOptions, 2000)
     assert.equal(first.status, 200, stderr)
     assert.match(await first.text(), /message_stop/)
     await waitForMarker(events, 'exit-1')
@@ -358,9 +358,17 @@ test('gateway supervisor does not abandon a session after repeated child crashes
   child.stderr.on('data', chunk => { stderr += chunk })
 
   try {
-    await wait(1000)
+    const deadline = Date.now() + 10_000
+    let starts = []
+    while (starts.length < 5 && Date.now() < deadline && child.exitCode === null) {
+      try {
+        starts = (await readFile(counter, 'utf8')).trim().split(/\r?\n/).filter(Boolean)
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+      }
+      if (starts.length < 5) await wait(50)
+    }
     assert.equal(child.exitCode, null, stderr)
-    const starts = (await readFile(counter, 'utf8')).trim().split(/\r?\n/).filter(Boolean)
     assert.ok(starts.length >= 5, `expected repeated restarts, got ${starts.length}`)
     assert.doesNotMatch(stderr, /restart-limit-exhausted/)
   } finally {

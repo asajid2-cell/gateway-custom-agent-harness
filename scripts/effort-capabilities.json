@@ -7,6 +7,24 @@
     "xhigh",
     "max"
   ],
+  "gatewayModelMetadata": {
+    "gateway-gpt-astra": {
+      "defaultReasoning": "low",
+      "nativeEffortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "ultraDescription": "Maximum reasoning with automatic task delegation.",
+      "contextWindow": 272000,
+      "maximumContext": 872000,
+      "effectiveContextPercentage": 95,
+      "modalities": ["text", "image"],
+      "apiSupported": true,
+      "tier": "fast",
+      "codeModeOnly": true,
+      "execution": "unified",
+      "webSearch": true,
+      "imageDetail": "original",
+      "defaultVerbosity": "low"
+    }
+  },
   "opencodeGo": {
     "gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -43,6 +61,7 @@
     "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+    "gateway-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gateway-ds-flash": ["low", "medium", "high"],
     "gateway-ds-pro": ["low", "medium", "high"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -78,6 +97,7 @@
     "claude-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
+    "claude-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "claude-ds-flash": ["low", "medium", "high"],
     "claude-ds-pro": ["low", "medium", "high"],
     "claude-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -118,6 +138,11 @@
       "value": "gateway-gpt-sol",
       "label": "GPT 5.6 Sol",
       "description": "Gateway - GPT 5.6 Sol"
+    },
+    {
+      "value": "gateway-gpt-astra",
+      "label": "GPT-6-Astra",
+      "description": "Our most capable model for complex, demanding work."
     },
     {
       "value": "gateway-gpt-terra",
@@ -279,6 +304,7 @@
     "gateway-gpt-luna": ["gpt-5.6-luna", "claude-gpt-luna"],
     "gateway-gpt-sol": ["gpt-5.6-sol", "claude-gpt-sol"],
     "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
+    "gateway-gpt-astra": ["gpt-6-astra", "claude-gpt-astra"],
     "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],
     "gateway-ds-pro": ["deepseek-v4-pro", "claude-ds-pro"],
     "gateway-opencode-gpt-5.6-luna": [

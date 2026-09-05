@@ -3,7 +3,12 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import {
+  ASTRA_EFFORT_LEVELS,
   GPT56_EFFORT_LEVELS,
+  GPT_LUNA_EFFORT_LEVELS,
+  GPT_SOL_EFFORT_LEVELS,
+  GPT_TERRA_EFFORT_LEVELS,
+  NATIVE_EFFORT_LEVELS,
   OPENCODE_GO_EFFORT_LEVELS,
   effortLevelsForOpenCodeModel,
   effortLevelsForOpenCodeZenModel,
@@ -18,9 +23,18 @@ const catalog = JSON.parse(
   await readFile(new URL('./effort-capabilities.json', import.meta.url), 'utf8'),
 )
 
-test('shared effort catalog preserves the GPT-5.6 ladder', () => {
+test('shared effort catalog preserves model-specific GPT ladders', () => {
   assert.deepEqual(catalog.gpt56, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(GPT56_EFFORT_LEVELS, catalog.gpt56)
+  assert.deepEqual(GPT_LUNA_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-luna'])
+  assert.deepEqual(GPT_SOL_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-sol'])
+  assert.deepEqual(GPT_TERRA_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-terra'])
+  assert.deepEqual(GPT_SOL_EFFORT_LEVELS, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(GPT_TERRA_EFFORT_LEVELS, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(ASTRA_EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.deepEqual(ASTRA_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-astra'])
+  assert.equal(GPT_SOL_EFFORT_LEVELS.includes('ultra'), false)
+  assert.equal(GPT_TERRA_EFFORT_LEVELS.includes('ultra'), false)
 })
 
 test('every OpenCode Go route has explicit capability metadata', () => {
@@ -47,7 +61,7 @@ test('gateway aliases mirror the provider capability contract', () => {
   for (const [alias, levels] of Object.entries(catalog.gatewayAliases)) {
     assert.ok(Array.isArray(levels), `${alias} must have an array of levels`)
     assert.ok(
-      levels.every(level => GPT56_EFFORT_LEVELS.includes(level) || level === 'minimal'),
+      levels.every(level => NATIVE_EFFORT_LEVELS.includes(level)),
       `${alias} contains an unknown effort level`,
     )
   }
@@ -90,6 +104,14 @@ test('gateway aliases mirror the provider capability contract', () => {
 
 test('compiled client fallback resolves provider-qualified gateway effort levels', () => {
   assert.deepEqual(getGatewayNativeEffortLevels('gateway-gpt-luna'), catalog.gpt56)
+  assert.deepEqual(
+    getGatewayNativeEffortLevels('gateway-gpt-astra'),
+    ASTRA_EFFORT_LEVELS,
+  )
+  assert.deepEqual(
+    getGatewayNativeEffortLevels('claude-gpt-astra'),
+    ASTRA_EFFORT_LEVELS,
+  )
   assert.deepEqual(
     getGatewayNativeEffortLevels('gateway-opencode-gpt-5.6-luna'),
     catalog.opencodeGo['gpt-5.6-luna'],

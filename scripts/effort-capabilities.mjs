@@ -12,9 +12,14 @@ export const NATIVE_EFFORT_LEVELS = [
   'high',
   'xhigh',
   'max',
+  'ultra',
 ]
 
 export const GPT56_EFFORT_LEVELS = [...CATALOG.gpt56]
+export const GPT_LUNA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-luna']]
+export const GPT_SOL_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-sol']]
+export const GPT_TERRA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-terra']]
+export const ASTRA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-astra']]
 
 export const GATEWAY_MODEL_OPTIONS = Object.freeze(
   (Array.isArray(CATALOG.gatewayModelOptions)

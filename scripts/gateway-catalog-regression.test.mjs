@@ -18,6 +18,14 @@ test('shared catalog exports the exact visible Gateway picker metadata', () => {
   assert.deepEqual(GATEWAY_MODEL_OPTIONS, catalog.gatewayModelOptions)
   assert.equal(new Set(optionIds).size, optionIds.length)
   assert.ok(optionIds.every(id => id.startsWith('gateway-')))
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-astra'),
+    {
+      value: 'gateway-gpt-astra',
+      label: 'GPT-6-Astra',
+      description: 'Our most capable model for complex, demanding work.',
+    },
+  )
 })
 
 test('every visible Gateway route is represented by the shared catalog', () => {
@@ -35,6 +43,10 @@ test('every visible Gateway route is represented by the shared catalog', () => {
 
 test('catalog aliases resolve only to visible Gateway routes', () => {
   const aliases = Object.entries(catalog.gatewayModelAliases)
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-astra'], [
+    'gpt-6-astra',
+    'claude-gpt-astra',
+  ])
   const flattened = aliases.flatMap(([, values]) => values)
   assert.equal(
     new Set(flattened.map(alias => alias.toLowerCase())).size,

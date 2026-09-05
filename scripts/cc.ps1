@@ -2,6 +2,25 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
 $LaunchDirectory = (Get-Location).Path
+$DiagnosticPath = Join-Path $env:LOCALAPPDATA 'Gateway\launcher.jsonl'
+function Write-LaunchDiagnostic {
+  param([string]$Event, [hashtable]$Fields = @{})
+  try {
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $DiagnosticPath))
+    # Never include arguments, environment values, prompts, or exception text.
+    $record = @{ time = [DateTime]::UtcNow.ToString('o'); pid = $PID; event = $Event }
+    foreach ($key in @('exitCode', 'attempt', 'port', 'errorType')) {
+      if ($Fields.ContainsKey($key)) { $record[$key] = $Fields[$key] }
+    }
+    if ((Test-Path -LiteralPath $DiagnosticPath) -and (Get-Item -LiteralPath $DiagnosticPath).Length -gt 1048576) {
+      Move-Item -LiteralPath $DiagnosticPath -Destination "$DiagnosticPath.previous" -Force
+    }
+    [IO.File]::AppendAllText($DiagnosticPath, (($record | ConvertTo-Json -Compress) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+  } catch {
+    # Diagnostics must never prevent launch or hide the original failure.
+  }
+}
+Write-LaunchDiagnostic 'launch-start'
 $GatewayScript = Join-Path $PSScriptRoot 'model-gateway.mjs'
 $GatewaySupervisor = Join-Path $PSScriptRoot 'gateway-supervisor.mjs'
 $CodexAccountsRoot = Join-Path $env:USERPROFILE '.codex-accounts'
@@ -550,6 +569,8 @@ function Test-ClaudeArtifactFresh {
   $buildInputs = @(
     (Join-Path $Root 'src'),
     (Join-Path $Root 'scripts\build.ts'),
+    (Join-Path $Root 'scripts\effort-capabilities.json'),
+    (Join-Path $Root 'scripts\effort-capabilities.mjs'),
     (Join-Path $Root 'package.json'),
     (Join-Path $Root 'bun.lock'),
     (Join-Path $Root 'bun.lockb'),
@@ -579,7 +600,9 @@ function Test-ClaudeArtifactFresh {
 if (-not (Test-ClaudeArtifactFresh)) {
   Push-Location $Root
   try {
+    Write-LaunchDiagnostic 'build-start'
     & $ClaudeRunner 'run' 'build'
+    Write-LaunchDiagnostic 'build-exit' @{ exitCode = $LASTEXITCODE }
     if ($LASTEXITCODE -ne 0) {
       throw "Claude harness build failed with exit code $LASTEXITCODE."
     }
@@ -795,15 +818,8 @@ try {
     }
 
     if (-not $healthy) {
-      $detail = if (Test-Path -LiteralPath $StderrLog) {
-        (Get-Content -Raw -LiteralPath $StderrLog).Trim()
-      } else {
-        ''
-      }
-      if ($detail) {
-        throw "Model gateway did not become healthy. $detail"
-      }
-      throw 'Model gateway did not become healthy within 15 seconds.'
+      Write-LaunchDiagnostic 'gateway-unhealthy' @{ port = $Port }
+      throw "Model gateway did not become healthy within 15 seconds. Safe diagnostics: $DiagnosticPath"
     }
   }
 
@@ -813,8 +829,13 @@ try {
   try {
     # Keep the harness attached directly to the caller's console
     for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
+      Write-LaunchDiagnostic 'harness-start' @{ attempt = $attempt; port = $Port }
       & $ClaudeRunner $ClaudeScript @ClaudeArgs
       $ExitCode = $LASTEXITCODE
+      Write-LaunchDiagnostic 'harness-exit' @{ attempt = $attempt; exitCode = $ExitCode }
+      if ($ExitCode -ne 0 -and $ExitCode -ne 130) {
+        [Console]::Error.WriteLine("cc: exit diagnostics saved to $DiagnosticPath")
+      }
       if (
         ($ExitCode -ne 0 -and $ExitCode -ne 130) -and
         $attempt -lt $AutoRestartAttempts
@@ -825,7 +846,7 @@ try {
         Start-Sleep -Milliseconds 500
         continue
       }
-      if ($ExitCode -eq 130 -or $attempt -ge $AutoRestartAttempts) {
+      if ($ExitCode -eq 0 -or $ExitCode -eq 130 -or $attempt -ge $AutoRestartAttempts) {
         break
       }
     }

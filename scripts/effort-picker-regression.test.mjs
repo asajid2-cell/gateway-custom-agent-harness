@@ -12,11 +12,23 @@ test('5.6 model switching preserves the full native ladder', () => {
   const lunaLevels = getGatewayNativeEffortLevels('gateway-gpt-luna')
   const terraLevels = getGatewayNativeEffortLevels('gateway-gpt-terra')
 
+  const solLevels = getGatewayNativeEffortLevels('gateway-gpt-sol')
+  const astraLevels = getGatewayNativeEffortLevels('gateway-gpt-astra')
+
   assert.deepEqual(lunaLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(solLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(terraLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(astraLevels, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.equal(solLevels.includes('ultra'), false)
+  assert.equal(terraLevels.includes('ultra'), false)
+  assert.equal(lunaLevels.includes('ultra'), false)
   assert.equal(
     resolveGatewayEffortAfterModelSwitch(terraLevels, 'max', 'max', 'max', true),
     'max',
+  )
+  assert.equal(
+    resolveGatewayEffortAfterModelSwitch(astraLevels, 'ultra', 'ultra', 'ultra', true),
+    'ultra',
   )
 })
 

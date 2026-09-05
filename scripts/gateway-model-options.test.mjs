@@ -49,6 +49,9 @@ test('gateway display labels preserve Gateway identities and normalize provider 
   assert.equal(getGatewayModelDisplayName('gateway-gpt-terra'), 'GPT 5.6 Terra')
   assert.equal(getGatewayModelDisplayName('gateway-gpt-sol'), 'GPT 5.6 Sol')
   assert.equal(getGatewayModelDisplayName('gateway-gpt-luna'), 'GPT 5.6 Luna')
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-astra'), 'GPT-6-Astra')
+  assert.equal(getGatewayModelDisplayName('gpt-6-astra'), 'GPT-6-Astra')
+  assert.equal(getGatewayModelDisplayName('claude-gpt-astra'), 'GPT-6-Astra')
   assert.equal(
     getGatewayModelDisplayName('opencode-go/glm-5.3-flash'),
     'OpenCode GLM 5.3 Flash',

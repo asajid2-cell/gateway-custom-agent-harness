@@ -28,7 +28,10 @@ import {
 } from './opencode-zen.mjs'
 import {
   gatewayCatalogDrift,
-  GPT56_EFFORT_LEVELS,
+  ASTRA_EFFORT_LEVELS,
+  GPT_LUNA_EFFORT_LEVELS,
+  GPT_SOL_EFFORT_LEVELS,
+  GPT_TERRA_EFFORT_LEVELS,
   NATIVE_EFFORT_LEVELS,
 } from './effort-capabilities.mjs'
 import {
@@ -123,9 +126,10 @@ function integerEnvironment(name, fallback) {
 const DEFAULT_MODELS = {
   // Provider-native IDs remain routable for old scripts and direct callers,
   // but are deliberately hidden from Gateway discovery and the /model picker.
-  'gpt-5.6-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
-  'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
-  'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'gpt-5.6-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
+  'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
+  'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
+  'gpt-6-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
   'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
   'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
   ...Object.fromEntries(
@@ -190,17 +194,19 @@ const DEFAULT_MODELS = {
       },
     ]),
   ),
-  'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS },
-  'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS },
-  'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS },
+  'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
+  'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
+  'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS },
+  'gateway-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS },
   'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
   'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
-  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
-  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
-  'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT56_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
   'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
   'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
   ...Object.fromEntries(
@@ -962,11 +968,13 @@ export function normalizeGatewayEffort(body, route, querySource) {
     : ['low', 'medium', 'high']
   let effort = requested
   if (requested === 'ultracode') {
-    effort = levels.includes('max')
-      ? 'max'
-      : levels.includes('high')
-        ? 'high'
-        : undefined
+    effort = levels.includes('ultra')
+      ? 'ultra'
+      : levels.includes('max')
+        ? 'max'
+        : levels.includes('high')
+          ? 'high'
+          : undefined
   } else if (!levels.includes(requested)) {
     effort = levels.includes('high') ? 'high' : undefined
   }

@@ -1,8 +1,56 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readFile, mkdtemp, rm } from 'node:fs/promises'
+import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import test from 'node:test'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+test('build stages the bundle and validates with Bun rather than Node', async () => {
+  const build = await readFile(new URL('./build.ts', import.meta.url), 'utf8')
+  assert.match(build, /mkdtempSync\(join\(OUT_DIR, '.build-'\)\)/)
+  assert.match(build, /new Bun.Transpiler/)
+  assert.match(build, /renameSync\(artifact, join\(OUT_DIR, 'cli.js'\)\)/)
+  assert.doesNotMatch(build, /\['node', '--check'/)
+})
+
+test('launcher diagnostics use an explicit safe-field allowlist', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  assert.match(script, /@\('exitCode', 'attempt', 'port', 'errorType'\)/)
+  assert.match(script, /Write-LaunchDiagnostic 'harness-exit'/)
+  assert.match(script, /Write-LaunchDiagnostic 'build-exit'/)
+  assert.doesNotMatch(script, /throw[^\n]*\$detail/)
+  assert.match(script, /scripts\\effort-capabilities\.json/)
+})
+
+test('runtime diagnostic writer excludes exception text and records exit code', async () => {
+  const source = await readFile(new URL('../src/utils/gracefulShutdown.ts', import.meta.url), 'utf8')
+  const start = source.indexOf('function recordGatewayFailure(')
+  const end = source.indexOf('\nexport const setupGracefulShutdown', start)
+  assert.ok(start >= 0 && end > start)
+  const code = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end))
+  const directory = await mkdtemp(path.join(tmpdir(), 'gateway-diagnostics-'))
+  const fakeProcess = {
+    env: { CLAUDE_CODE_USE_GATEWAY: '1', LOCALAPPDATA: directory },
+    pid: 123, version: 'test-runtime', uptime: () => 1,
+    memoryUsage: () => ({ rss: 42 }),
+  }
+  try {
+    const record = new Function('process', 'join', 'homedir', 'mkdirSync', 'statSync', 'renameSync', 'appendFileSync', 'getSessionId',
+      `${code}; return recordGatewayFailure`)(fakeProcess, path.join, tmpdir, mkdirSync, statSync, renameSync, appendFileSync, () => 'test-session')
+    const error = new Error('SECRET_SENTINEL must never be logged')
+    error.stack = 'Error: SECRET_SENTINEL\n    at run (cli.js:12:34)'
+    record('uncaught-exception', error)
+    record('runtime-exit', undefined, 17)
+    const raw = await readFile(path.join(directory, 'Gateway', 'harness-123.jsonl'), 'utf8')
+    assert.equal(raw.includes('SECRET_SENTINEL'), false)
+    const records = raw.trim().split('\n').map(JSON.parse)
+    assert.deepEqual(records[0].frames, ['cli.js:12:34'])
+    assert.equal(records[1].exitCode, 17)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 const scriptPath = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -25,6 +73,8 @@ test('interactive cc launches the harness without a PowerShell output pipeline',
     /\$ExitCode -ne 0[\s\S]*\$ExitCode -ne 130/,
     'resumed sessions should have one bounded non-zero-exit recovery attempt',
   )
+  assert.match(script, /if \(\$ExitCode -eq 0 -or \$ExitCode -eq 130 -or \$attempt -ge \$AutoRestartAttempts\)/,
+    'successful exits must not relaunch resumed sessions')
   assert.equal(script.includes('Tee-Object -FilePath $ClaudeCrashLog'), false)
 })
 

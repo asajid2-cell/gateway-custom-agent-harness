@@ -297,7 +297,7 @@ async function abortGatewayAfterHeaders(port, body) {
   })
 }
 
-async function abortGatewayDuringRetry(port, body, delayMs) {
+async function abortGatewayDuringRetry(port, body, delayMs, ready = () => true) {
   return new Promise((resolve, reject) => {
     const request = httpRequest(`http://127.0.0.1:${port}/v1/messages`, {
       method: 'POST',
@@ -321,12 +321,23 @@ async function abortGatewayDuringRetry(port, body, delayMs) {
       response.once('end', () => finish({ disconnected: false, status: response.statusCode }))
     })
     request.end(JSON.stringify(body))
-    setTimeout(() => {
-      if (!settled) {
-        request.destroy()
-        finish({ disconnected: true })
+    const deadline = Date.now() + 5000
+    const abortWhenReady = () => {
+      if (settled) return
+      if (!ready()) {
+        if (Date.now() >= deadline) {
+          settled = true
+          request.destroy()
+          reject(new Error('Upstream request was not observed before abort deadline'))
+          return
+        }
+        setTimeout(abortWhenReady, 5)
+        return
       }
-    }, delayMs)
+      request.destroy()
+      finish({ disconnected: true })
+    }
+    setTimeout(abortWhenReady, delayMs)
   })
 }
 
@@ -780,6 +791,18 @@ function operationalContextContinuityCodexHandler(state) {
   }
 }
 
+function astraCodexHandler(state) {
+  return async (req, res) => {
+    const body = await requestJson(req)
+    state.requests.push(body)
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end(
+      `data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'astra-ok' })}\n\n` +
+      `data: ${JSON.stringify({ type: 'response.completed', response: completedCodexResponse('astra-ok') })}\n\n`,
+    )
+  }
+}
+
 function healthyCodexHandler(req, res) {
   return upstreamResponseFromRequest(req, res)
 }
@@ -966,6 +989,26 @@ test('HTTP boundary cancels the upstream when the consumer disconnects after out
       assert.equal(fields.status, '200')
       assert.ok(['stream-error', 'success'].includes(fields.outcome))
       assertNoPayloadTimingFields(timing.line)
+    },
+  })
+})
+
+test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to ultra', async () => {
+  await withGatewayAndFakeCodexState({
+    handlerFactory: astraCodexHandler,
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-gpt-astra',
+        stream: true,
+        output_config: { effort: 'ultracode' },
+        reasoning: { effort: 'ultracode' },
+        messages: [{ role: 'user', content: 'synthetic Astra request' }],
+      })
+      assert.equal(result.status, 200)
+      assert.equal(state.requests.length, 1)
+      assert.equal(state.requests[0].model, 'gpt-6-astra')
+      assert.equal(state.requests[0].reasoning.effort, 'ultra')
+      assert.equal(JSON.stringify(state.requests[0]).includes('ultracode'), false)
     },
   })
 })
@@ -1687,7 +1730,7 @@ test('Codex consumer disconnect during malformed retry backoff does not crash th
       MODEL_GATEWAY_UPSTREAM_RETRY_MAX_MS: '200',
     },
     run: async ({ gateway, state }) => {
-      const result = await abortGatewayDuringRetry(gateway.port, minimalCodexBody(), 25)
+      const result = await abortGatewayDuringRetry(gateway.port, minimalCodexBody(), 25, () => state.requests.length > 0)
       assert.equal(result.disconnected, true)
       await new Promise(resolve => setTimeout(resolve, 300))
       assert.equal(gateway.child.exitCode, null, gateway.getStderr())
@@ -2979,8 +3022,12 @@ test('OpenCode native compaction requests preserve tools and requested effort', 
 })
 
 
-test('gateway exposes only canonical provider-qualified OpenCode aliases with route metadata', () => {
+test('gateway exposes canonical routes with Astra metadata and provider-qualified OpenCode aliases', () => {
   const response = modelsResponse()
+  const astra = response.data.find(item => item.id === 'gateway-gpt-astra')
+  assert.ok(astra)
+  assert.equal(astra.display_name, 'gpt-6-astra')
+  assert.deepEqual(astra.effort_levels, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
   for (const model of [
     'gateway-opencode-mimo-v2.5',
     'gateway-opencode-hy3',
@@ -3762,18 +3809,31 @@ test('routes GLM 5.3 Flash through Chat Completions', () => {
   ).model, 'glm-5.3-flash')
 })
 
-test('normalizes harness ultracode without forwarding the harness enum', () => {
+test('normalizes harness ultracode to the highest explicit native level', () => {
   const body = {
     output_config: { effort: 'ultracode' },
     reasoning: { effort: 'ultracode' },
   }
-  const normalized = normalizeGatewayEffort(body, {
-    backend: 'opencode-go',
-    effortLevels: ['low', 'medium', 'high', 'max'],
-  })
-  assert.equal(normalized.output_config.effort, 'max')
-  assert.equal(normalized.reasoning.effort, 'max')
-  assert.notEqual(normalized.output_config.effort, 'ultracode')
+  const nativeLevels = [
+    { levels: ['low', 'medium', 'high', 'max', 'ultra'], expected: 'ultra' },
+    { levels: ['low', 'medium', 'high', 'max'], expected: 'max' },
+    { levels: ['low', 'medium', 'high'], expected: 'high' },
+    { levels: ['low', 'medium'], expected: undefined },
+  ]
+  for (const { levels, expected } of nativeLevels) {
+    const normalized = normalizeGatewayEffort(body, {
+      backend: 'codex',
+      effortLevels: levels,
+    })
+    assert.equal(normalized.output_config.effort, expected)
+    assert.equal(normalized.reasoning.effort, expected)
+    assert.notEqual(normalized.output_config.effort, 'ultracode')
+    assert.notEqual(normalized.reasoning.effort, 'ultracode')
+    if (expected === undefined) {
+      assert.equal(Object.hasOwn(normalized.output_config, 'effort'), false)
+      assert.equal(Object.hasOwn(normalized.reasoning, 'effort'), false)
+    }
+  }
 })
 
 test('disabled native thinking removes gateway effort overrides', () => {
