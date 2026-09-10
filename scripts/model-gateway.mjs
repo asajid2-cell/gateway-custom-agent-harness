@@ -101,6 +101,7 @@ const CODEX_TOOL_MODE = process.env.MODEL_GATEWAY_CODEX_TOOL_MODE || 'fallback'
 const CODEX_PROMPT_CACHE_KEY_MODE =
   process.env.MODEL_GATEWAY_CODEX_PROMPT_CACHE_KEY_MODE || 'off'
 const LOG_REQUEST_SHAPE = process.env.MODEL_GATEWAY_LOG_SHAPE === '1'
+const LOG_EVENT_SHAPE = process.env.MODEL_GATEWAY_LOG_EVENT_SHAPE === '1'
 
 if (!['fallback', 'balanced', 'compact'].includes(CODEX_TOOL_MODE)) {
   throw new Error(
@@ -414,9 +415,27 @@ function createGatewayTrace({ model, backend, protocol }) {
   }
   let bytes = 0
   let events = 0
+  const eventTypeCounts = new Map()
+  let completionShape = null
   let errorClass = null
   let usage = null
   let finished = false
+
+  const eventTypeSummary = () => {
+    if (eventTypeCounts.size === 0) return 'none'
+    return [...eventTypeCounts.entries()]
+      .map(([type, count]) => `${safeLogValue(type).slice(0, 80)}:${count}`)
+      .join(',')
+  }
+
+  const completionShapeSummary = () => {
+    if (!completionShape) return {
+      status: 'none',
+      outputCount: -1,
+      outputTypes: 'none',
+    }
+    return completionShape
+  }
 
   const elapsed = () => Math.round(performance.now() - started)
   const mark = name => {
@@ -449,9 +468,26 @@ function createGatewayTrace({ model, backend, protocol }) {
     addEvent() {
       events = Math.min(TRACE_MAX_EVENTS, events + 1)
     },
+    addEventType(type) {
+      const key = typeof type === 'string' && type ? type : 'missing'
+      if (!eventTypeCounts.has(key) && eventTypeCounts.size >= 64) return
+      eventTypeCounts.set(key, (eventTypeCounts.get(key) || 0) + 1)
+    },
+    setCompletionShape(response) {
+      const output = Array.isArray(response?.output) ? response.output : []
+      completionShape = {
+        status: safeLogValue(response?.status || 'missing'),
+        outputCount: output.length,
+        outputTypes: output.length === 0
+          ? 'none'
+          : output.map(item => safeLogValue(item?.type || 'missing').slice(0, 40)).join(',').slice(0, 240),
+      }
+    },
     setUsage(value) {
       usage = value && typeof value === 'object' ? value : null
     },
+    eventTypeSummary,
+    completionShapeSummary,
     finish(outcome, error = null, status = null) {
       if (finished) return
       if (error) this.markError(error)
@@ -486,6 +522,8 @@ function createGatewayTrace({ model, backend, protocol }) {
         `status=${status == null ? -1 : status}`,
         `outcome=${safeLogValue(outcome)}`,
         `error_class=${safeLogValue(errorClass || 'none')}`,
+        `provider_event_types=${safeLogValue(eventTypeSummary())}`,
+        ...Object.entries(completionShapeSummary()).map(([key, value]) => `completion_${key}=${safeLogValue(value)}`),
       ]
       process.stderr.write(`model-gateway timing ${fields.join(' ')}\n`)
     },
@@ -782,6 +820,19 @@ function metadataSessionId(metadata) {
   } catch {
     return ''
   }
+}
+
+function validHeaderValue(value) {
+  return typeof value === 'string' && value.length > 0 && /^[\u0020-\u007e\u0080-\u00ff]+$/.test(value)
+}
+
+function upstreamSessionId(req, body) {
+  const incoming = req?.headers?.['x-opencode-session']
+  const candidate = Array.isArray(incoming) ? incoming[0] : incoming
+  const sessionId = validHeaderValue(candidate?.trim?.() || '')
+    ? candidate.trim()
+    : metadataSessionId(body?.metadata) || String(process.env.CLAUDE_CODE_SESSION_ID || '').trim()
+  return validHeaderValue(sessionId) ? sessionId : ''
 }
 
 export function codexPromptCacheKeyForBody(
@@ -1350,6 +1401,88 @@ function codexResponseFailure(response) {
   throw new Error('Codex response failed')
 }
 
+function codexOutputText(item) {
+  if (item?.type !== 'message' || !Array.isArray(item.content)) return ''
+  return item.content
+    .filter(part => part?.type === 'output_text' && typeof part.text === 'string')
+    .map(part => part.text)
+    .join('')
+}
+
+function codexEventShape(event) {
+  if (LOG_EVENT_SHAPE !== true) return
+  const type = event?.type
+  if (![
+    'response.output_item.added',
+    'response.content_part.added',
+    'response.output_text.done',
+    'response.content_part.done',
+    'response.output_item.done',
+    'response.completed',
+    'response.failed',
+  ].includes(type)) return
+
+  const keys = value => value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.keys(value).sort().join(',') || 'none'
+    : 'none'
+  const types = value => Array.isArray(value)
+    ? value.map(item => safeLogValue(item?.type || typeof item).slice(0, 40)).join(',') || 'none'
+    : 'none'
+  const text = value => typeof value === 'string'
+    ? `string:${Buffer.byteLength(value, 'utf8')}`
+    : safeLogValue(value == null ? 'missing' : typeof value)
+  const item = event?.item
+  const response = event?.response
+  const fields = [
+    `type=${safeLogValue(type)}`,
+    `keys=${keys(event)}`,
+    `response_keys=${keys(response)}`,
+    `response_output_count=${Array.isArray(response?.output) ? response.output.length : -1}`,
+    `response_output_types=${types(response?.output)}`,
+    `item_keys=${keys(item)}`,
+    `item_content_count=${Array.isArray(item?.content) ? item.content.length : -1}`,
+    `item_content_types=${types(item?.content)}`,
+    `text=${text(event?.text)}`,
+    `delta=${text(event?.delta)}`,
+    `part_keys=${keys(event?.part)}`,
+    `part_text=${text(event?.part?.text)}`,
+    `output_text_keys=${keys(event?.output_text)}`,
+    `output_text_text=${text(event?.output_text?.text)}`,
+    `content_keys=${keys(event?.content)}`,
+    `content_text=${text(event?.content?.text)}`,
+    `content_part_keys=${keys(event?.content_part)}`,
+    `content_part_text=${text(event?.content_part?.text)}`,
+    `output_item_keys=${keys(event?.output_item)}`,
+  ]
+  process.stderr.write(`model-gateway event-shape ${fields.join(' ')}\n`)
+}
+
+function codexOutputMessageFromEvent(event) {
+  if (event?.type === 'response.output_text.done') {
+    if (typeof event.text === 'string') return event.text
+    if (typeof event.part?.text === 'string') return event.part.text
+    if (typeof event.content?.text === 'string') return event.content.text
+  }
+  if (event?.type === 'response.output_item.done') {
+    return codexOutputText(event.item)
+  }
+  return ''
+}
+
+function codexOutputMessageFromResponse(response) {
+  if (!response || typeof response !== 'object') return ''
+  if (typeof response.output_text === 'string') return response.output_text
+  if (typeof response.text === 'string') return response.text
+  if (Array.isArray(response.content)) {
+    const text = response.content
+      .filter(part => part?.type === 'output_text' && typeof part.text === 'string')
+      .map(part => part.text)
+      .join('')
+    if (text) return text
+  }
+  return ''
+}
+
 function parseCodexFunctionArguments(argumentsValue) {
   if (argumentsValue == null || argumentsValue === '') return {}
   if (typeof argumentsValue === 'object' && !Array.isArray(argumentsValue)) {
@@ -1446,8 +1579,22 @@ export async function relayCodexResponse(
       let text = ''
       const toolCalls = new Map()
       const handleEvent = event => {
+        codexEventShape(event)
         if (event.type === 'response.output_text.delta') {
-          text += typeof event.delta === 'string' ? event.delta : ''
+          const delta = typeof event.delta === 'string'
+            ? event.delta
+            : typeof event.part?.text === 'string'
+              ? event.part.text
+              : ''
+          text += delta
+          return
+        }
+        if (event.type === 'response.output_text.done') {
+          if (!text) text = codexOutputMessageFromEvent(event)
+          return
+        }
+        if (event.type === 'response.output_item.done' && event.item?.type === 'message') {
+          if (!text) text = codexOutputMessageFromEvent(event)
           return
         }
         if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
@@ -1488,14 +1635,27 @@ export async function relayCodexResponse(
           const data = line.slice(6)
           if (!data || data === '[DONE]') continue
           trace?.addEvent()
-          handleEvent(JSON.parse(data))
+          const event = JSON.parse(data)
+          trace?.addEventType?.(event?.type)
+          handleEvent(event)
+          if (completed) {
+            trace?.setCompletionShape?.(completed)
+            break
+          }
+        }
+        if (completed) {
+          await cancelUpstreamReader(reader, upstream)
+          break
         }
       }
-      if (buffer.startsWith('data: ')) {
+      if (!completed && buffer.startsWith('data: ')) {
         const data = buffer.slice(6)
         if (data && data !== '[DONE]') {
           trace?.addEvent()
-          handleEvent(JSON.parse(data))
+          const event = JSON.parse(data)
+          trace?.addEventType?.(event?.type)
+          handleEvent(event)
+          if (completed) trace?.setCompletionShape?.(completed)
         }
       }
       if (!completed) throw new Error('Codex stream ended before response.completed')
@@ -1515,6 +1675,10 @@ export async function relayCodexResponse(
       trace?.addBytes(Buffer.byteLength(raw, 'utf8'))
       trace?.addEvent()
       response = JSON.parse(raw)
+      trace?.setCompletionShape?.(response)
+      if (Array.isArray(response?.output)) {
+        for (const item of response.output) trace?.addEventType?.(`output.${item?.type || 'missing'}`)
+      }
     }
     trace?.setUsage?.(response?.usage)
     const message = codexResponseToAnthropic(response, model)
@@ -1949,6 +2113,7 @@ export async function relayCodexStream(
   }
 
   const handleEvent = event => {
+    codexEventShape(event)
     const type = event?.type
     if (type === 'response.output_item.added' && event.item?.type === 'function_call') {
       // Metadata alone is not usable output. Buffer it until arguments arrive
@@ -1964,6 +2129,29 @@ export async function relayCodexStream(
         index: contentIndex,
         delta: { type: 'text_delta', text },
       })
+      return
+    }
+    if (type === 'response.output_text.done') {
+      if (!activeText && typeof event.text === 'string' && event.text) {
+        openText()
+        sendEvent(res, 'content_block_delta', {
+          index: contentIndex,
+          delta: { type: 'text_delta', text: event.text },
+        })
+      }
+      return
+    }
+    if (type === 'response.output_item.done' && event.item?.type === 'message') {
+      if (!activeText) {
+        const text = codexOutputText(event.item)
+        if (text) {
+          openText()
+          sendEvent(res, 'content_block_delta', {
+            index: contentIndex,
+            delta: { type: 'text_delta', text },
+          })
+        }
+      }
       return
     }
     if (type === 'response.function_call_arguments.delta') {
@@ -1992,6 +2180,7 @@ export async function relayCodexStream(
     }
     if (type === 'response.completed') {
       sawCompletion = true
+      trace?.setCompletionShape?.(event.response || event)
       usage = event.response?.usage || event.usage || null
       trace?.setUsage?.(usage)
       emitCompletedOutputFallback(event.response)
@@ -2021,13 +2210,28 @@ export async function relayCodexStream(
         if (!line.startsWith('data: ')) continue
         const data = line.slice(6)
         if (!data || data === '[DONE]') continue
-        handleEvent(JSON.parse(data))
+        const event = JSON.parse(data)
+        trace?.addEventType?.(event?.type)
+        handleEvent(event)
+        if (sawCompletion) {
+          trace?.setCompletionShape?.(event.response || event)
+          break
+        }
+      }
+      if (sawCompletion) {
+        await cancelUpstreamReader(reader, upstream)
+        break
       }
     }
 
-    if (buffer.startsWith('data: ')) {
+    if (!sawCompletion && buffer.startsWith('data: ')) {
       const data = buffer.slice(6)
-      if (data && data !== '[DONE]') handleEvent(JSON.parse(data))
+      if (data && data !== '[DONE]') {
+        const event = JSON.parse(data)
+        trace?.addEventType?.(event?.type)
+        handleEvent(event)
+        if (sawCompletion) trace?.setCompletionShape?.(event.response || event)
+      }
     }
 
     if (!sawCompletion) {
@@ -2551,6 +2755,7 @@ function deepSeekHeaders(req, apiKey, stream = false) {
 
 async function handleOpenCodeGo(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
+  const sessionId = upstreamSessionId(req, body)
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-go', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
@@ -2604,7 +2809,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
           url: openCodeGoEndpoint(route.protocol),
           options: {
             method: 'POST',
-            headers: openCodeGoHeaders(route.protocol, apiKey, wantsStream),
+            headers: openCodeGoHeaders(route.protocol, apiKey, wantsStream, sessionId),
             body: JSON.stringify(request),
             signal: control.signal,
           },
@@ -2699,6 +2904,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
 
 async function handleOpenCodeZen(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
+  const sessionId = upstreamSessionId(req, body)
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-zen', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
@@ -2740,7 +2946,7 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
       url: openCodeZenEndpoint(route.protocol),
       options: {
         method: 'POST',
-        headers: openCodeZenHeaders(apiKey, wantsStream),
+        headers: openCodeZenHeaders(apiKey, wantsStream, sessionId),
         body: JSON.stringify(request),
         signal: control.signal,
       },

@@ -71,11 +71,14 @@ export function openCodeGoEndpoint(protocol) {
       : 'messages'}`
 }
 
-export function openCodeGoHeaders(protocol, apiKey, stream = false) {
+export function openCodeGoHeaders(protocol, apiKey, stream = false, sessionId = '') {
   const headers = {
     'content-type': 'application/json',
     accept: stream ? 'text/event-stream' : 'application/json',
     'user-agent': 'gateway-model-gateway/0.1',
+  }
+  if (typeof sessionId === 'string' && sessionId && /^[\u0020-\u007e\u0080-\u00ff]+$/.test(sessionId)) {
+    headers['x-opencode-session'] = sessionId
   }
   if (protocol === 'anthropic-messages') {
     headers['x-api-key'] = apiKey

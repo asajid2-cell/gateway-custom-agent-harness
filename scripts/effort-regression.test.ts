@@ -166,6 +166,7 @@ test('persist parses bounded work and planning tasks', () => {
       task: 'finish the UI and test it',
       mode: 'work',
       keep: false,
+      taskMode: 'bounded',
       nudges: 1,
     },
   })
@@ -175,6 +176,7 @@ test('persist parses bounded work and planning tasks', () => {
       task: 'connect the UI and backend',
       mode: 'plan',
       keep: false,
+      taskMode: 'bounded',
       nudges: 3,
     },
   })
@@ -184,6 +186,7 @@ test('persist parses bounded work and planning tasks', () => {
       task: 'reorder modifiers',
       mode: 'plan',
       keep: true,
+      taskMode: 'keep',
       nudges: 2,
     },
   })
@@ -193,6 +196,7 @@ test('persist parses bounded work and planning tasks', () => {
       task: 'another ordering',
       mode: 'plan',
       keep: true,
+      taskMode: 'keep',
       nudges: 2,
     },
   })
@@ -213,6 +217,7 @@ test('persist sidecar survives writes and ignores corrupt state', async t => {
     task: 'finish and verify',
     mode: 'work' as const,
     keep: true,
+    taskMode: 'keep' as const,
     nudgesRemaining: 2,
     nudgesSent: 1,
     status: 'active' as const,
@@ -430,6 +435,7 @@ test('persist registers, replaces, nudges, and clears its session hook', async t
       reviewEvidence: 'final verification',
       mode: 'work',
       keep: false,
+      taskMode: 'bounded',
       nudgesRemaining: 0,
       nudgesSent: 1,
       status: 'exhausted',

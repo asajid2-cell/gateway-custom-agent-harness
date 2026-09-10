@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const gatewayScript = path.join(root, 'scripts', 'model-gateway.mjs')
-const cli = path.join(root, 'dist', 'cli.js')
+const cli = process.env.COMPACTION_REPLAY_CLI || path.join(root, 'dist', 'cli.js')
 const bunExecutable = process.env.BUN_EXECUTABLE ||
   (process.platform === 'win32' ? 'bun.exe' : 'bun')
 const timeoutMs = Number(process.env.COMPACTION_FAULT_REPLAY_TIMEOUT_MS || 8_000)
@@ -377,7 +377,12 @@ async function main() {
       return
     }
     if (manualSuccessMode) {
-      sendNormalResponse(res, 'Manual summary preserved.', 100)
+      if (process.env.COMPACTION_REPLAY_KEEP_STREAM_OPEN === '1') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(`data: ${JSON.stringify({ type: 'response.completed', response: completedResponse('Manual summary preserved.', 100) })}\n\n`)
+      } else {
+        sendNormalResponse(res, 'Manual summary preserved.', 100)
+      }
       return
     }
     if (overflowMode) {

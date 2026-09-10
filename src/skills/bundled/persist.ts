@@ -8,8 +8,6 @@ import {
 } from '../../utils/hooks/sessionHooks.js'
 import type { SetAppState } from '../../utils/messageQueueManager.js'
 import {
-  getAssistantMessageText,
-  getLastAssistantMessage,
   getUserMessageText,
 } from '../../utils/messages.js'
 import { plural } from '../../utils/stringUtils.js'
@@ -21,11 +19,13 @@ import {
 import type {
   PersistSessionRecord,
   PersistSessionStatus,
+  PersistTaskMode,
 } from '../../utils/sessionStorage.js'
 import { escapeXml } from '../../utils/xml.js'
 import { registerBundledSkill } from '../bundledSkills.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { registerCleanup } from '../../utils/cleanupRegistry.js'
+import { advanceDelivery, deliveryDirection, parseDeliveryReview, type DeliveryCheckpoint } from './persistDelivery.js'
 
 export type { PersistSessionRecord, PersistSessionStatus }
 
@@ -33,9 +33,45 @@ const DEFAULT_NUDGES = 1
 const MAX_NUDGES = 3
 const MAX_TASK_CONTEXT_LENGTH = 2000
 const MAX_USER_CONTEXT_LENGTH = 1000
-const MAX_ASSISTANT_CONTEXT_LENGTH = 500
+const TASK_BLOCKER_REVIEW_GUIDANCE = 'In task mode, hypotheses, reversible tests, and diagnosis uncertainty are not blockers: use persist-review checkpoint or continue and keep working. A blocked review must be JSON {kind:\'blocked\', blocker:\'user-input\'|\'authorization\'|\'safety\'|\'external-dependency\'|\'provider-failure\', canProceedWithoutUser:false, next:string, evidence:string} proving a hard stop condition.'
 
 type PersistMode = 'work' | 'plan'
+type TaskBlockerKind = 'user-input' | 'authorization' | 'safety' | 'external-dependency' | 'provider-failure'
+type TaskBlocker = {
+  kind: 'blocked'
+  blocker: TaskBlockerKind
+  canProceedWithoutUser: false
+  next: string
+  evidence: string
+}
+
+function parseTaskBlocker(input: string): TaskBlocker | undefined {
+  try {
+    const value: unknown = JSON.parse(input)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+    const candidate = value as Record<string, unknown>
+    const blockers: TaskBlockerKind[] = ['user-input', 'authorization', 'safety', 'external-dependency', 'provider-failure']
+    if (
+      candidate.kind !== 'blocked' ||
+      !blockers.includes(candidate.blocker as TaskBlockerKind) ||
+      candidate.canProceedWithoutUser !== false ||
+      typeof candidate.next !== 'string' ||
+      typeof candidate.evidence !== 'string'
+    ) return undefined
+    const next = candidate.next.trim()
+    const evidence = candidate.evidence.trim()
+    if (!next || !evidence || next.length > 1200 || evidence.length > 1200) return undefined
+    return {
+      kind: 'blocked',
+      blocker: candidate.blocker as TaskBlockerKind,
+      canProceedWithoutUser: false,
+      next,
+      evidence,
+    }
+  } catch {
+    return undefined
+  }
+}
 
 /**
  * Runtime state for a persisted task. The hook ID is deliberately kept out
@@ -47,12 +83,14 @@ export type PersistState = {
   task: string
   mode: PersistMode
   keep?: boolean
+  taskMode?: PersistTaskMode
   nudgesRemaining: number
   nudgesSent: number
   hookId: string
   initialPlanningResponseAllowed: boolean
   status?: PersistSessionStatus
   reviewEvidence?: string
+  delivery?: DeliveryCheckpoint
 }
 
 type PersistRuntime = {
@@ -86,7 +124,13 @@ export function getPersistGoalContext(): string | undefined {
   const record = getCurrentPersistRecord()
   if (!record || record.status === 'completed' || record.status === 'cleared') return undefined
   if (record.status === 'paused' || record.status === 'blocked') return `Stored goal (${record.status}): ${escapeXml(record.task)}. Do not automatically pursue it. Wait for /persist resume; the current conversation takes precedence.`
-  return `Durable session goal (${record.status}, ${record.keep ? 'keep' : 'bounded'}):\n<goal>\n${escapeXml(record.task)}\n</goal>\nThe latest user instruction takes precedence. Side conversations do not erase this goal. Check completion criteria and verification evidence before declaring completion. Do not spend reminders on unrelated discussion. At turn end use the persist-review skill with continue, unrelated, blocked, or complete followed by concrete evidence. This is self-assessment, not independent verification. Review unrelated for side conversations, blocked when user input is needed, and complete only when completion criteria are met. Goal controls: /persist status, /persist complete, /persist clear.`
+  const taskMode = record.taskMode
+  const continuation = taskMode === 'task'
+    ? `Task mode uses the in-process Stop-hook heartbeat and does not stop at the nudge budget. Keep doing useful work until the goal-wide doneWhen condition has concrete completion evidence. ${TASK_BLOCKER_REVIEW_GUIDANCE}`
+    : taskMode === 'keep'
+      ? 'Keep mode retains goal custody until explicit completion or release.'
+      : 'Bounded mode stops automatic continuation when its reminder budget is exhausted.'
+  return `Durable session goal (${record.status}, ${taskMode}):\n<goal>\n${escapeXml(record.task)}\n</goal>\n${continuation} The latest user instruction takes precedence. Side conversations do not erase this goal. Check completion criteria and verification evidence before declaring completion. Do not spend reminders on unrelated discussion. At meaningful checkpoints or attempted stops use the persist-review skill with checkpoint, continue, unrelated, blocked, or complete followed by concrete evidence. This is self-assessment, not independent verification. Review unrelated for side conversations, blocked when user input is needed, and complete only when completion criteria are met. Goal controls: /persist status, /persist pause, /persist complete, /persist clear.\n${deliveryDirection(record.delivery)}`
 }
 function publishPersist(): void {
   for (const listener of persistListeners) listener()
@@ -120,17 +164,28 @@ function getStateStatus(state: PersistState): PersistSessionStatus {
   return state.status ?? 'active'
 }
 
+function getTaskMode(state: PersistState): PersistTaskMode {
+  return state.taskMode ?? (state.keep ? 'keep' : 'bounded')
+}
+
+function isContinuationMode(state: PersistState): boolean {
+  return getTaskMode(state) !== 'bounded'
+}
+
 function recordFromState(state: PersistState): PersistSessionRecord {
+  const taskMode = getTaskMode(state)
   return {
     version: 1,
     task: state.task,
     mode: state.mode,
-    keep: state.keep === true,
+    keep: taskMode === 'keep',
+    taskMode,
     nudgesRemaining: Math.max(0, state.nudgesRemaining),
     nudgesSent: Math.max(0, state.nudgesSent),
     status: getStateStatus(state),
     initialPlanningResponseAllowed: state.initialPlanningResponseAllowed,
     ...(state.reviewEvidence ? { reviewEvidence: state.reviewEvidence } : {}),
+    ...(state.delivery ? { delivery: state.delivery } : {}),
   }
 }
 
@@ -141,13 +196,15 @@ function stateFromRecord(
   return {
     task: record.task,
     mode: record.mode,
-    keep: record.keep,
+    keep: record.taskMode === 'keep',
+    taskMode: record.taskMode,
     nudgesRemaining: record.nudgesRemaining,
     nudgesSent: record.nudgesSent,
     hookId,
     initialPlanningResponseAllowed: record.initialPlanningResponseAllowed,
     status: record.status,
     ...(record.reviewEvidence ? { reviewEvidence: record.reviewEvidence } : {}),
+    ...(record.delivery ? { delivery: record.delivery } : {}),
   }
 }
 
@@ -229,6 +286,7 @@ export type PersistOptions = {
   task: string
   mode: PersistMode
   keep: boolean
+  taskMode: PersistTaskMode
   nudges: number
 }
 
@@ -252,11 +310,6 @@ function tail(value: string, maxLength: number): string {
 function getLastUserText(messages: Message[]): string {
   const message = messages.findLast(item => item.type === 'user' && !item.isMeta)
   return message ? (getUserMessageText(message)?.trim() ?? '') : ''
-}
-
-function getLastAssistantText(messages: Message[]): string {
-  const message = getLastAssistantMessage(messages)
-  return message ? (getAssistantMessageText(message)?.trim() ?? '') : ''
 }
 
 function parseNudges(value: string | undefined): number | undefined {
@@ -286,7 +339,7 @@ export function parsePersistArgs(args: string):
   if (command === 'complete' || command === 'done') return { kind: 'complete' }
 
   let mode: PersistMode = 'work'
-  let keep = false
+  let taskMode: PersistTaskMode = 'bounded'
   let nudges = DEFAULT_NUDGES
 
   while (input) {
@@ -297,10 +350,20 @@ export function parsePersistArgs(args: string):
       continue
     }
 
-    const modifier = input.match(/^(plan|keep)(?:\s+|$)/i)
+    const modifier = input.match(/^(plan|keep|task|--task)(?:\s+|$)/i)
     if (modifier) {
-      if (modifier[1]?.toLowerCase() === 'plan') mode = 'plan'
-      else keep = true
+      const value = modifier[1]?.toLowerCase()
+      if (value === 'plan') mode = 'plan'
+      else {
+        const nextTaskMode = value === 'keep' ? 'keep' : 'task'
+        if (taskMode !== 'bounded' && taskMode !== nextTaskMode) {
+          return {
+            kind: 'error',
+            message: 'Choose either task mode or keep mode, not both.',
+          }
+        }
+        taskMode = nextTaskMode
+      }
       input = input.slice(modifier[0].length).trim()
       continue
     }
@@ -331,11 +394,20 @@ export function parsePersistArgs(args: string):
     return {
       kind: 'error',
       message:
-        'Usage: /persist [plan] [keep] [--nudges N] <task> | status | pause | resume | clear | complete',
+        'Usage: /persist task [plan] [--nudges N] <goal> | [plan] [keep] [--nudges N] <task> | status | pause | resume | clear | complete',
     }
   }
 
-  return { kind: 'task', options: { task: input, mode, keep, nudges } }
+  return {
+    kind: 'task',
+    options: {
+      task: input,
+      mode,
+      keep: taskMode === 'keep',
+      taskMode,
+      nudges,
+    },
+  }
 }
 
 export function decidePersistStop(
@@ -368,10 +440,10 @@ export function decidePersistStop(
     return { kind: 'allow', reason: 'inactive' }
   }
 
-  // keep is an explicit goal-custody mode. Its initial nudge budget controls
-  // the first reminders, but the task remains active and keeps prompting after
-  // that budget reaches zero until the user explicitly completes or clears it.
-  if (state.nudgesRemaining === 0 && !state.keep) {
+  // Continuation modes use the nudge budget only as an initial reminder count.
+  // Unlike bounded mode, reaching zero never disarms the in-process Stop hook.
+  const taskMode = getTaskMode(state)
+  if (state.nudgesRemaining === 0 && taskMode === 'bounded') {
     state.status = 'exhausted'
     return { kind: 'allow', reason: 'budget-exhausted' }
   }
@@ -379,18 +451,19 @@ export function decidePersistStop(
   if (state.nudgesRemaining > 0) state.nudgesRemaining -= 1
   state.nudgesSent += 1
   const lastUser = getLastUserText(messages)
-  const lastAssistant = getLastAssistantText(messages)
   const task = tail(state.task, MAX_TASK_CONTEXT_LENGTH)
   const userContext = lastUser
     ? ` Latest user context: ${tail(lastUser, MAX_USER_CONTEXT_LENGTH)}`
     : ''
-  const assistantContext = lastAssistant
-    ? ` Your last response ended with: ${tail(lastAssistant, MAX_ASSISTANT_CONTEXT_LENGTH)}`
-    : ''
-  const countText = state.keep
+  const countText = isContinuationMode(state)
     ? `${state.nudgesSent}`
     : `${state.nudgesSent} of ${state.nudgesSent + state.nudgesRemaining}`
-  const message = `Persist reminder (${countText}). Active task: ${task}.${userContext}${assistantContext} Continue only if useful work remains. Check the actual implementation and runtime path, finish remaining verification, and test it.${state.keep ? ' This task remains active until explicit completion through persist-review complete with evidence or /persist complete; do not infer completion from prose.' : ' Stop normally only if the task is genuinely complete or all remaining work has an unworkable blocker requiring user input or access.'}`
+  const continuationText = taskMode === 'task'
+    ? ' Task heartbeat remains armed beyond the initial nudge budget. Continue through useful implementation, integration, and verification work. Do not yield after a small step or claim completion without goal-wide doneWhen evidence recorded through persist-review complete. Stop for explicit pause, complete, or clear; abort or provider/API failure; persist-review blocked; or a genuine unworkable blocker.'
+    : taskMode === 'keep'
+      ? ' This task remains active until explicit completion through persist-review complete with evidence or /persist complete; do not infer completion from prose.'
+      : ' Stop normally only if the task is genuinely complete or all remaining work has an unworkable blocker requiring user input or access.'
+  const message = `Persist ${taskMode === 'task' ? 'task heartbeat' : 'reminder'} (${countText}). Active task: ${task}.${userContext} ${deliveryDirection(state.delivery)}${continuationText}`
   return {
     kind: 'nudge',
     nudgesRemaining: state.nudgesRemaining,
@@ -410,20 +483,21 @@ async function loadPersistRecord(
   return record
 }
 
-function statusText(
-  record: PersistSessionRecord | PersistState | undefined,
-): string {
+function statusText(record: PersistSessionRecord | undefined): string {
   if (!record) return 'No persist task recorded in this session.'
-  const status = 'status' in record ? record.status ?? 'active' : 'active'
-  const keep = 'keep' in record && record.keep === true
+  const status = record.status
+  const taskMode = record.taskMode
   const task = record.task
-  if (status === 'paused' || status === 'blocked') return `Persist goal ${status} (task retained): ${task}`
-  if (status === 'completed') return `Completed persist task: ${task}`
-  if (status === 'cleared') return `Cleared persist task: ${task}`
+  if (status === 'paused' || status === 'blocked') return `Persist goal ${status} (${taskMode}, task retained): ${task}`
+  if (status === 'completed') return `Completed persist task (${taskMode}): ${task}`
+  if (status === 'cleared') return `Cleared persist task (${taskMode}): ${task}`
   if (status === 'exhausted') {
-    return `Persist task reminder budget exhausted (${record.mode}, task retained): ${task}`
+    return `Persist task reminder budget exhausted (${record.mode}, bounded, task retained): ${task}`
   }
-  return `Active persist task (${record.mode}${keep ? ', keep' : ''}, ${record.nudgesRemaining} ${plural(record.nudgesRemaining, 'nudge')} remaining): ${task}`
+  const budget = taskMode === 'bounded'
+    ? `${record.nudgesRemaining} ${plural(record.nudgesRemaining, 'nudge')} remaining`
+    : `${record.nudgesRemaining} initial ${plural(record.nudgesRemaining, 'nudge')} remaining; continuation stays armed`
+  return `Active persist task (${record.mode}, ${taskMode}, ${budget}): ${task}${record.delivery ? `\n${deliveryDirection(record.delivery)}` : ''}`
 }
 
 async function clearPersist(
@@ -501,12 +575,13 @@ async function installPersistRuntime(
       return true
     }
     if (context?.chainId) {
-      if (runtime.state.keep && runtime.reviewedChain !== context.chainId && runtime.requestedReviewChain !== context.chainId && !signal?.aborted) {
+      const requiresReviewAuthorization = getTaskMode(runtime.state) === 'keep'
+      if (requiresReviewAuthorization && runtime.reviewedChain !== context.chainId && runtime.requestedReviewChain !== context.chainId && !signal?.aborted) {
         runtime.requestedReviewChain = context.chainId
-        pendingNudges.set(messages, 'Review the kept goal using persist-review: continue with remaining work, unrelated for this conversation, blocked with the dependency, or complete with verification evidence. Latest user instructions take precedence.')
+        pendingNudges.set(messages, `Review the kept goal using persist-review checkpoint JSON at a meaningful checkpoint; continue when useful work remains, unrelated for this conversation, blocked with a genuine dependency, or complete only with goal-wide verification evidence. Do not review after every tiny edit. Latest user instructions take precedence. ${deliveryDirection(runtime.state.delivery)}`)
         return false
       }
-      if (runtime.reviewedChain !== context.chainId || runtime.reviewOutcome !== 'continue') return true
+      if (requiresReviewAuthorization && (runtime.reviewedChain !== context.chainId || runtime.reviewOutcome !== 'continue')) return true
       context = { ...context, stopHookActive: true }
     }
     const nextState = { ...runtime.state }
@@ -623,10 +698,10 @@ export async function settlePersistDelivery(sessionId: string, chainId: string |
 export function registerPersistSkill(): void {
   registerBundledSkill({
     name: 'persist-review',
-    description: 'Record an explicit persistent-goal review: continue, unrelated, blocked, or complete, followed by evidence.',
+    description: `At meaningful checkpoints or attempted stops use checkpoint JSON: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}. All other fields are strings. delivered means a milestone, not goal completion. Alternatively use continue, unrelated, blocked, or complete followed by evidence. ${TASK_BLOCKER_REVIEW_GUIDANCE} Do not review after every edit.`,
     userInvocable: true,
     async getPromptForCommand(args, context) {
-      const match = args.trim().match(/^(continue|unrelated|blocked|complete)\s+([\s\S]+)$/)
+      const match = args.trim().match(/^(checkpoint|continue|unrelated|blocked|complete)\s+([\s\S]+)$/)
       const sessionId = getSessionId()
       const reviewTranscriptPath = getRuntimeTranscriptPath(context)
       const reviewedGoal = persistRecords.get(sessionId)
@@ -646,7 +721,17 @@ export function registerPersistSkill(): void {
       if (context.agentId || !runtime || !match || !match[2]?.trim() || !context.queryTracking?.chainId) {
         return [{ type: 'text', text: 'Goal review requires an active main-session goal, query identity, outcome and evidence.' }]
       }
-      const reviewedState = { ...runtime.state, reviewEvidence: match[2]!.trim().slice(0, 8000) }
+      let delivery = runtime.state.delivery
+      if (match[1] === 'checkpoint') {
+        try {
+          delivery = advanceDelivery(delivery, parseDeliveryReview(match[2]!))
+        } catch {
+          return [{ type: 'text', text: 'Invalid checkpoint. Supply JSON with kind (advanced|learned|delivered|detoured), phase (implement|integrate|harden), outcome, doneWhen, next, deferred, evidence. Keep outcome and doneWhen until delivered; advance at most one phase on delivery. No continuation authorized.' }]
+        }
+      } else if (match[1] === 'continue' && delivery) {
+        delivery = advanceDelivery(delivery, { ...delivery, kind: 'advanced', evidence: match[2]!.trim().slice(0, 1200) })
+      }
+      const reviewedState = { ...runtime.state, delivery, reviewEvidence: match[2]!.trim().slice(0, 8000) }
       await queuePersistWrite(sessionId, recordFromState(reviewedState), runtime.transcriptPath)
       if (persistRuntime.get(sessionId) !== runtime || getSessionId() !== sessionId) {
         return [{ type: 'text', text: 'Session or goal changed during review; no continuation authorized.' }]
@@ -654,9 +739,22 @@ export function registerPersistSkill(): void {
       runtime.state = reviewedState
       cacheState(sessionId, reviewedState)
       if (match[1] === 'complete') {
+        if (getTaskMode(runtime.state) === 'task' && !runtime.state.delivery) {
+          return [{
+            type: 'text',
+            text: 'Task mode completion needs a meaningful delivery checkpoint with a substantial outcome, doneWhen condition, and concrete evidence. Record it with persist-review checkpoint, or use /persist complete as an explicit manual override. The task heartbeat remains active.',
+          }]
+        }
         return [{ type: 'text', text: await completePersist(sessionId, runtime.transcriptPath) }]
       }
       if (match[1] === 'blocked') {
+        if (getTaskMode(runtime.state) === 'task') {
+          const blocker = parseTaskBlocker(match[2]!)
+          if (!blocker) {
+            return [{ type: 'text', text: `Task mode remains active. ${TASK_BLOCKER_REVIEW_GUIDANCE}` }]
+          }
+          runtime.state = { ...runtime.state, reviewEvidence: JSON.stringify(blocker) }
+        }
         const record = { ...recordFromState(runtime.state), status: 'blocked' as const }
         await queuePersistWrite(sessionId, record, runtime.transcriptPath)
         persistRecords.set(sessionId, record)
@@ -665,7 +763,7 @@ export function registerPersistSkill(): void {
         return [{ type: 'text', text: 'Goal blocked and retained. Use /persist resume when the blocker is resolved.' }]
       }
       runtime.reviewedChain = context.queryTracking.chainId
-      runtime.reviewOutcome = match[1] as 'continue' | 'unrelated' | 'blocked'
+      runtime.reviewOutcome = match[1] === 'checkpoint' ? 'continue' : match[1] as 'continue' | 'unrelated' | 'blocked'
       return [{ type: 'text' as const, text: `Goal review recorded: ${match[1]}. Original goal retained.` }]
       })
     },
@@ -673,9 +771,9 @@ export function registerPersistSkill(): void {
   registerBundledSkill({
     name: 'persist',
     description:
-      'Keep a bounded reminder on the current task so work does not stop prematurely.',
+      'Keep a bounded reminder, retain a kept goal, or run an ordinary task with in-process continuation until verified completion.',
     argumentHint:
-      '[plan] [keep] [--nudges N] <task> | status | pause | resume | clear | complete',
+      'task [plan] [--nudges N] <goal> | [plan] [keep] [--nudges N] <task> | status | pause | resume | clear | complete',
     userInvocable: true,
     disableModelInvocation: true,
     async getPromptForCommand(args, context) {
@@ -735,6 +833,7 @@ export function registerPersistSkill(): void {
         task: parsed.options.task,
         mode: parsed.options.mode,
         keep: parsed.options.keep,
+        taskMode: parsed.options.taskMode,
         nudgesRemaining: parsed.options.nudges,
         nudgesSent: 0,
         status: 'active',
@@ -756,13 +855,15 @@ export function registerPersistSkill(): void {
         planText =
           'Your first response must define the persistent goal, describe the current state, and list concrete completion criteria before work begins. Ask the user only questions that materially affect the work. This lightweight planning step does not enter the CLI plan mode; after the user responds, execute the task.'
       }
-      const keepText = parsed.options.keep
-        ? ' This is a kept goal: it remains active until explicit completion through persist-review complete with evidence or /persist complete. Do not infer completion or clear it from prose. --nudges sets the initial reminder count, not a keep-mode limit.'
-        : ` This goal is stored durably across restart and resume. Automatic follow-up is bounded to ${parsed.options.nudges} ${plural(parsed.options.nudges, 'nudge')}; exhaustion retains the goal without further automatic reminders.`
+      const modeText = parsed.options.taskMode === 'task'
+        ? ` This is task mode. The in-process Stop-hook heartbeat is armed now and restored on session resume. It continues beyond the initial ${parsed.options.nudges}-${plural(parsed.options.nudges, 'nudge')} budget while useful work remains, rather than yielding after a small step. Define a substantial outcome and doneWhen condition, work through implementation and integration, and use persist-review at meaningful checkpoints—not after every tiny edit. Complete only with concrete goal-wide verification evidence. Explicit /persist pause, /persist complete, /persist clear, persist-review blocked, aborts, provider/API failures, and genuine unworkable blockers stop continuation.`
+        : parsed.options.taskMode === 'keep'
+          ? ' This is a kept goal: it remains active until explicit completion through persist-review complete with evidence or /persist complete. Do not infer completion or clear it from prose. --nudges sets the initial reminder count, not a keep-mode limit.'
+          : ` This goal is stored durably across restart and resume. Automatic follow-up is bounded to ${parsed.options.nudges} ${plural(parsed.options.nudges, 'nudge')}; exhaustion retains the goal without further automatic reminders.`
       return [
         {
           type: 'text',
-          text: `# Active persist task\n\nTask:\n<user_task>\n${escapeXml(parsed.options.task)}\n</user_task>\n\n${planText} Keep this task in mind across the current turn. Before stopping, inspect what remains, verify the actual runtime path, and run the relevant tests.${keepText} For either mode, record completion with evidence or record a genuine blocker using persist-review. Kept goals continue automatically only while useful work remains and the latest user instruction permits it.`,
+          text: `# Active persist task (${parsed.options.taskMode})\n\nTask:\n<user_task>\n${escapeXml(parsed.options.task)}\n</user_task>\n\n${planText} Keep this task in mind across the current turn. ${deliveryDirection()}${modeText} For every mode, record completion with evidence or record a genuine blocker using persist-review. Continuation modes proceed automatically only while useful work remains and the latest user instruction permits it.`,
         },
       ]
       })

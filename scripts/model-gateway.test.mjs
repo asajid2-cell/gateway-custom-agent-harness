@@ -40,6 +40,9 @@ import {
   openCodeGoEffortLevels,
 } from './opencode-go.mjs'
 import {
+  openCodeZenHeaders,
+} from './opencode-zen.mjs'
+import {
   GATEWAY_QUERY_SOURCE_HEADER,
   COMPACTION_RUNTIME_TOOL_CONTRACT,
   gatewayQuerySource,
@@ -2663,6 +2666,112 @@ test('emits translated usage in the final Anthropic stream event', async () => {
   assert.equal(response.ended, true)
 })
 
+test('completes a queued-peer follow-up when Codex emits output_text.done without deltas', async () => {
+  const peerText = 'Authorized peer collaboration from Peer\\nB_OWNS_B'
+  const request = anthropicToCodex({
+    stream: true,
+    system: 'coordination verifier',
+    messages: [
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'call-peer',
+          name: 'Skill',
+          input: { skill: 'gateway-peers', args: 'send {"text":"B_OWNS_B"}' },
+        }],
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'call-peer',
+          content: '{"ok":true,"state":"queued"}',
+        }],
+      },
+      { role: 'user', content: peerText },
+    ],
+  }, 'gpt-5.6-luna')
+
+  assert.deepEqual(request.input, [
+    {
+      type: 'function_call',
+      call_id: 'call-peer',
+      name: 'Skill',
+      arguments: '{"skill":"gateway-peers","args":"send {\\"text\\":\\"B_OWNS_B\\"}"}',
+    },
+    {
+      type: 'function_call_output',
+      call_id: 'call-peer',
+      output: '{"ok":true,"state":"queued"}',
+    },
+    {
+      role: 'user',
+      content: [{ type: 'input_text', text: peerText }],
+    },
+  ])
+
+  const events = [
+    { type: 'response.created' },
+    { type: 'response.in_progress' },
+    { type: 'response.output_item.added', item: { type: 'message' } },
+    { type: 'response.content_part.added', part: { type: 'output_text' } },
+    { type: 'response.output_text.done', text: 'B_OWNS_B' },
+    { type: 'response.content_part.done' },
+    { type: 'response.output_item.done', item: { type: 'message' } },
+    {
+      type: 'response.completed',
+      response: {
+        status: 'completed',
+        output: [],
+        usage: { input_tokens: 7, output_tokens: 1 },
+      },
+    },
+  ]
+
+  for (const streaming of [true, false]) {
+    const response = new CaptureResponse()
+    const upstream = upstreamFromEvents(events)
+    if (streaming) {
+      await relayCodexStream(response, upstream, 'gateway-gpt-terra')
+      assert.equal(responseEvents(response).some(event => event.type === 'message_stop'), true)
+      assert.equal(response.text().includes('B_OWNS_B'), true)
+    } else {
+      await relayCodexResponse(response, upstream, 'gateway-gpt-terra', null, true)
+      assert.equal(JSON.parse(response.text()).content[0].text, 'B_OWNS_B')
+    }
+    assert.equal(response.ended, true)
+  }
+})
+
+for (const streaming of [true, false]) test(`finishes a completed Codex summary without waiting for transport EOF (streaming=${streaming})`, async () => {
+  let cancelled = false
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode([
+        { type: 'response.output_text.delta', delta: 'SUMMARY_COMPLETE' },
+        { type: 'response.completed', response: { usage: { input_tokens: 100, output_tokens: 4 } } },
+      ].map(event => `data: ${JSON.stringify(event)}\n\n`).join('')))
+      // The provider has finished the response but keeps the connection open.
+    },
+    cancel() { cancelled = true },
+  })
+  const response = new CaptureResponse()
+  let timer
+  try {
+    await Promise.race([
+      streaming
+        ? relayCodexStream(response, { body }, 'gateway-gpt-sol')
+        : relayCodexResponse(response, { body }, 'gateway-gpt-sol', null, true),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Completed summary waited for EOF')), 250) }),
+    ])
+    assert.equal(response.ended, true)
+    if (streaming) assert.equal(responseEvents(response).some(event => event.type === 'message_stop'), true)
+    else assert.equal(JSON.parse(response.text()).content[0].text, 'SUMMARY_COMPLETE')
+    assert.equal(cancelled, true)
+  } finally { clearTimeout(timer) }
+})
+
 test('ends with an Anthropic error when Codex ends before response.completed', async () => {
   const response = new CaptureResponse()
   await relayCodexStream(
@@ -3418,10 +3527,100 @@ test('builds OpenCode Go Chat Completions requests and forwards images', () => {
   assert.equal(request.stream, true)
 })
 
+test('OpenCode Go and Zen session headers preserve auth and reject CRLF', () => {
+  for (const headers of [
+    openCodeGoHeaders('responses', 'synthetic-key', false, 'session-ok'),
+    openCodeGoHeaders('chat-completions', 'synthetic-key', false, 'session-ok'),
+    openCodeGoHeaders('anthropic-messages', 'synthetic-key', false, 'session-ok'),
+    openCodeZenHeaders('synthetic-key', false, 'session-ok'),
+  ]) {
+    assert.equal(headers['x-opencode-session'], 'session-ok')
+    assert.equal(headers['user-agent'], 'gateway-model-gateway/0.1')
+  }
+  assert.equal(openCodeGoHeaders('responses', 'synthetic-key', false, 'bad\r\nX-Leak: yes')['x-opencode-session'], undefined)
+  assert.equal(openCodeZenHeaders('synthetic-key', false, 'bad\r\nX-Leak: yes')['x-opencode-session'], undefined)
+  assert.equal(openCodeGoHeaders('responses', 'synthetic-key').authorization, 'Bearer synthetic-key')
+  assert.equal(openCodeGoHeaders('chat-completions', 'synthetic-key').authorization, 'Bearer synthetic-key')
+  assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['x-api-key'], 'synthetic-key')
+  assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['anthropic-version'], '2023-06-01')
+  assert.equal(JSON.stringify(openCodeGoHeaders('responses', 'synthetic-key')).includes('synthetic-key'), true)
+})
+
+test('forwards OpenCode session identity by precedence and keeps it across retries', async () => {
+  await withGatewayAndFakeOpenCode({
+    handler: async (req, res, state) => {
+      const body = await requestJson(req)
+      state.requests.push({
+        session: req.headers['x-opencode-session'],
+        authorization: req.headers.authorization,
+        userAgent: req.headers['user-agent'],
+        requestId: body.metadata?.request_id,
+      })
+      if (state.requests.length === 1) {
+        res.writeHead(503, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ error: { message: 'temporarily unavailable' } }))
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ id: 'session-test', choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }))
+    },
+    gatewayEnv: {
+      CLAUDE_CODE_SESSION_ID: 'env-session',
+      MODEL_GATEWAY_UPSTREAM_RETRIES: '1',
+      MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS: '1',
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        metadata: { session_id: 'metadata-session', request_id: 'precedence' },
+        messages: [{ role: 'user', content: 'identity' }],
+      }, { 'x-opencode-session': 'incoming-session' })
+      assert.equal(result.status, 200)
+      assert.deepEqual(state.requests.map(request => request.session), ['incoming-session', 'incoming-session'])
+      assert.match(state.requests[0].authorization, /^Bearer /)
+      assert.equal(state.requests[0].userAgent, 'gateway-model-gateway/0.1')
+
+      const second = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        metadata: { session_id: 'metadata-session', request_id: 'metadata' },
+        messages: [{ role: 'user', content: 'identity' }],
+      })
+      assert.equal(second.status, 200)
+      assert.equal(state.requests.at(-1).session, 'metadata-session')
+
+      const third = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        metadata: { user_id: JSON.stringify({ session_id: 'json-session' }), request_id: 'json' },
+        messages: [{ role: 'user', content: 'identity' }],
+      })
+      assert.equal(third.status, 200)
+      assert.equal(state.requests.at(-1).session, 'json-session')
+
+      const fourth = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        metadata: { request_id: 'env' },
+        messages: [{ role: 'user', content: 'identity' }],
+      })
+      assert.equal(fourth.status, 200)
+      assert.equal(state.requests.at(-1).session, 'env-session')
+
+      const separate = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        metadata: { session_id: 'separate-conversation' },
+        messages: [{ role: 'user', content: 'identity' }],
+      })
+      assert.equal(separate.status, 200)
+      assert.equal(state.requests.at(-1).session, 'separate-conversation')
+    },
+  })
+})
+
 test('uses protocol-specific OpenCode Go authentication headers', () => {
   assert.equal(openCodeGoHeaders('responses', 'synthetic-key').authorization, 'Bearer synthetic-key')
   assert.equal(openCodeGoHeaders('chat-completions', 'synthetic-key').authorization, 'Bearer synthetic-key')
   assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['x-api-key'], 'synthetic-key')
+  assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['anthropic-version'], '2023-06-01')
+  assert.equal(JSON.stringify(openCodeGoHeaders('responses', 'synthetic-key')).includes('synthetic-key'), true)
   assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['anthropic-version'], '2023-06-01')
   assert.equal(JSON.stringify(openCodeGoHeaders('responses', 'synthetic-key')).includes('synthetic-key'), true)
 })

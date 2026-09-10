@@ -23,6 +23,25 @@ test('launcher diagnostics use an explicit safe-field allowlist', async () => {
   assert.match(script, /scripts\\effort-capabilities\.json/)
 })
 
+test('launcher forwards the full Gateway model catalog with economical role defaults', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  assert.match(script, /else \{ 'medium' \}/)
+  assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'/)
+  assert.match(script, /MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'/)
+  assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-gpt-luna'/)
+  assert.match(script, /MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-luna'/)
+  assert.match(script, /\$GatewayModelOptions = @\(\$CapabilityCatalog\.gatewayModelOptions\)/)
+  assert.doesNotMatch(script, /ApprovedGatewayModels/)
+  assert.doesNotMatch(script, /Where-Object \{[\s\S]*\$_\.value -in/)
+
+  const catalog = JSON.parse(await readFile(new URL('./effort-capabilities.json', import.meta.url), 'utf8'))
+  const options = catalog.gatewayModelOptions
+  assert.ok(options.some(option => option.value === 'gateway-gpt-terra'))
+  assert.ok(options.some(option => option.value === 'gateway-ds-flash'))
+  assert.ok(options.some(option => option.value === 'gateway-ds-pro'))
+  assert.ok(options.some(option => option.value.startsWith('gateway-opencode-')))
+})
+
 test('runtime diagnostic writer excludes exception text and records exit code', async () => {
   const source = await readFile(new URL('../src/utils/gracefulShutdown.ts', import.meta.url), 'utf8')
   const start = source.indexOf('function recordGatewayFailure(')

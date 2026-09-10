@@ -31,13 +31,17 @@ export function openCodeZenEndpoint(protocol) {
     : 'chat/completions'}`
 }
 
-export function openCodeZenHeaders(apiKey, stream = false) {
-  return {
+export function openCodeZenHeaders(apiKey, stream = false, sessionId = '') {
+  const headers = {
     authorization: `Bearer ${apiKey}`,
     'content-type': 'application/json',
     accept: stream ? 'text/event-stream' : 'application/json',
     'user-agent': 'gateway-model-gateway/0.1',
   }
+  if (typeof sessionId === 'string' && sessionId && /^[\u0020-\u007e\u0080-\u00ff]+$/.test(sessionId)) {
+    headers['x-opencode-session'] = sessionId
+  }
+  return headers
 }
 
 export function isOpenCodeZenProtocol(value) {

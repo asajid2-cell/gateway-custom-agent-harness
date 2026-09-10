@@ -52,6 +52,23 @@ test('compaction cache-sharing attempts abort when the provider never resolves',
   assert.equal(parent.signal.aborted, false)
 })
 
+test('compaction cache-sharing retains a response that keeps producing output', async () => {
+  const parent = new AbortController()
+  const result = await runCompactionCacheSharingAttempt(
+    parent,
+    async (_controller, onOutput) => {
+      for (let i = 0; i < 5; i++) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+        onOutput()
+      }
+      return 'complete summary'
+    },
+    30,
+  )
+  assert.equal(result, 'complete summary')
+  assert.equal(parent.signal.aborted, false)
+})
+
 test('compaction cache-sharing deadlines return even if the operation ignores abort', async () => {
   const parent = new AbortController()
   const started = performance.now()

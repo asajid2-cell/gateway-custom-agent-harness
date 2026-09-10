@@ -1,0 +1,458 @@
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
+import { createConnection, createServer, type Server } from 'node:net'
+import { join } from 'node:path'
+import { lock } from './lockfile.js'
+import {
+  GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
+  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema,
+  type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
+  type GatewayInboundPolicy,
+} from './gatewaySessionProtocol.js'
+
+const execFileAsync = promisify(execFile)
+
+const directoryChecks = new Map<string, Promise<void>>()
+function validatePrivateDirectory(directory: string): Promise<void> {
+  const pending = directoryChecks.get(directory)
+  if (pending) return pending
+  const check = checkPrivateDirectory(directory).finally(() => { directoryChecks.delete(directory) })
+  directoryChecks.set(directory, check)
+  return check
+}
+
+async function checkPrivateDirectory(directory: string): Promise<void> {
+  const stat = await lstat(directory)
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid session directory')
+  if (process.platform !== 'win32') {
+    if (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) throw new Error('Session directory must be private')
+    return
+  }
+  const script = `$ErrorActionPreference='Stop'; $acl=Get-Acl -LiteralPath $env:GATEWAY_DIRECTORY_CHECK; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if($owner -ne $sid){exit 2}; foreach($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) { if($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($sid,'S-1-5-18','S-1-5-32-544')) {exit 3} }`
+  try {
+    await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      env: { ...process.env, GATEWAY_DIRECTORY_CHECK: directory }, timeout: 10000, maxBuffer: 4096, windowsHide: true,
+    })
+  } catch { throw new Error('Session directory must have a private Windows ACL') }
+}
+
+export async function sendGatewayHookMessage(env: NodeJS.ProcessEnv, toSessionId: string, text: string): Promise<unknown> {
+  const directory = env.GATEWAY_PEER_DIRECTORY
+  const sessionId = env.GATEWAY_PEER_SESSION
+  const runtimeId = env.GATEWAY_PEER_RUNTIME
+  const token = env.GATEWAY_PEER_TOKEN
+  if (!directory || !sessionId || !runtimeId || !token) throw new Error('No parent runtime capability')
+  const sender = await readRegistration(directory, sessionId)
+  const supplied = Buffer.from(token)
+  const expected = Buffer.from(sender.token)
+  if (sender.peer.runtimeId !== runtimeId || supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error('Parent capability expired')
+  const target = await readRegistration(directory, toSessionId)
+  const message = gatewayPeerMessageSchema.parse({ id: randomUUID(), fromSessionId: sessionId, fromRuntimeId: runtimeId, toSessionId, text, summary: text.slice(0, 200), createdAt: new Date().toISOString() })
+  try {
+    return await callGatewayPeer(target.peer.endpoint, { type: 'message', token: target.token, senderToken: token, message })
+  } catch {
+    return { ok: false, state: 'unknown', id: message.id, reason: 'Acknowledgement unavailable; check receipt before sending another copy.' }
+  }
+}
+
+// JSON can expand one control character to six ASCII bytes (\\u0000).
+const RESPONSE_TIMEOUT_MS = 15000
+const MAX_FRAME = MAX_PEER_MESSAGE_BYTES * 6 + 8192
+const MAX_INBOX_BYTES = (MAX_PEER_QUEUE * 2 + MAX_PEER_HISTORY) * MAX_FRAME
+const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+async function atomicJson(path: string, value: unknown): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`
+  const handle = await open(temporary, 'wx', 0o600)
+  try {
+    try {
+      await handle.writeFile(JSON.stringify(value))
+      await handle.sync()
+    } finally { await handle.close() }
+    await rename(temporary, path)
+  } finally { await unlink(temporary).catch(() => {}) }
+}
+
+export async function callGatewayPeer(endpoint: string, request: unknown): Promise<unknown> {
+  const frame = Buffer.from(`${JSON.stringify(request)}\n`)
+  if (frame.length > MAX_FRAME) throw new Error('Peer message exceeds the transport size limit')
+  return new Promise((resolve, reject) => {
+    const socket = createConnection(endpoint)
+    let response = Buffer.alloc(0)
+    const fail = () => { socket.destroy(); reject(new Error('Gateway session is unavailable')) }
+    socket.setTimeout(RESPONSE_TIMEOUT_MS, fail)
+    socket.on('error', fail)
+    socket.on('connect', () => socket.write(frame))
+    socket.on('data', chunk => {
+      response = Buffer.concat([response, chunk])
+      if (response.length > MAX_FRAME) return fail()
+      const end = response.indexOf(10)
+      if (end < 0) return
+      socket.destroy()
+      try { resolve(JSON.parse(response.subarray(0, end).toString('utf8'))) }
+      catch { reject(new Error('Invalid Gateway peer response')) }
+    })
+    socket.on('end', () => { if (response.indexOf(10) < 0) fail() })
+  })
+}
+
+async function readRegistration(directory: string, sessionId: string): Promise<{ peer: GatewayPeer; token: string }> {
+  if (!idPattern.test(sessionId)) throw new Error('Invalid session ID')
+  await validatePrivateDirectory(directory)
+  const path = join(directory, `${sessionId}.json`)
+  const before = await lstat(path)
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error('Invalid session registration')
+  const handle = await open(path, 'r')
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino || stat.size > 16384 || (process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) throw new Error('Invalid session registration')
+    const value = JSON.parse(await handle.readFile('utf8'))
+    const peer = gatewayPeerSchema.parse(value.peer)
+    if (peer.sessionId !== sessionId || typeof value.token !== 'string' || !/^[a-f0-9]{64}$/.test(value.token)) throw new Error('Invalid session registration')
+    const expectedEndpoint = process.platform === 'win32'
+      ? `\\\\.\\pipe\\gateway-${peer.runtimeId}`
+      : join(directory, `${peer.runtimeId}.sock`)
+    if (peer.endpoint !== expectedEndpoint) throw new Error('Invalid session endpoint')
+    return { peer, token: value.token }
+  } finally { await handle.close() }
+}
+
+export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]> {
+  let entries: string[]
+  try { entries = await readdir(directory) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
+  const peers: GatewayPeer[] = []
+  for (const entry of entries) {
+    if (!entry.endsWith('.json') || !idPattern.test(entry.slice(0, -5))) continue
+    try {
+      const { peer, token } = await readRegistration(directory, entry.slice(0, -5))
+      const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token }) as { runtimeId?: string }
+      if (response.runtimeId === peer.runtimeId) peers.push(peer)
+    } catch { /* Stale or inaccessible registrations are not live sessions. */ }
+  }
+  return peers
+}
+
+export class GatewaySessionTransport {
+  readonly peer: GatewayPeer
+  private readonly token = randomBytes(32).toString('hex')
+  private server: Server | undefined
+  private closing: Promise<void> | undefined
+  private starting: Promise<void> | undefined
+  private isClosing = false
+  private records: GatewayInboxRecord[] = []
+  private history: import('./gatewaySessionProtocol.js').GatewayPeerHistoryEntry[] = []
+  private chain: Promise<unknown> = Promise.resolve()
+  private policy: GatewayInboundPolicy
+  private readonly bursts = new Map<string, number[]>()
+  private readonly idleSubscribers = new Map<string, string>()
+
+  constructor(private readonly options: {
+    directory: string
+    sessionId: string
+    name: string
+    cwd: string
+    purpose?: string
+    policy?: GatewayInboundPolicy
+    onInboxChanged?: () => void
+  }) {
+    const runtimeId = randomUUID()
+    this.peer = gatewayPeerSchema.parse({
+      protocol: GATEWAY_SESSION_PROTOCOL, sessionId: options.sessionId, runtimeId,
+      name: options.name, cwd: options.cwd, purpose: options.purpose ?? '',
+      pid: process.pid, startedAt: new Date().toISOString(), status: 'idle',
+      endpoint: process.platform === 'win32' ? `\\\\.\\pipe\\gateway-${runtimeId}` : join(options.directory, `${runtimeId}.sock`),
+    })
+    this.policy = options.policy ?? 'accept'
+  }
+
+  private get registrationPath(): string { return join(this.options.directory, `${this.peer.sessionId}.json`) }
+  private get inboxPath(): string { return join(this.options.directory, `${this.peer.sessionId}.inbox`) }
+  private serial<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.isClosing) return Promise.reject(new Error('Gateway transport is closing or closed'))
+    const next = this.chain.then(operation, operation)
+    this.chain = next.catch(() => {})
+    return next
+  }
+  private async persist(records = this.records, policy = this.policy, history = this.history): Promise<void> {
+    await atomicJson(this.inboxPath, { policy, records, history })
+  }
+
+  historyEntries(): readonly GatewayPeerHistoryEntry[] { return structuredClone(this.history) }
+
+  private addHistory(entry: GatewayPeerHistoryEntry): void {
+    this.history = [...this.history, entry].slice(-MAX_PEER_HISTORY)
+  }
+
+  start(): Promise<void> {
+    if (this.isClosing) return Promise.reject(new Error('Gateway transport is closing or closed'))
+    return this.starting ??= this.startOnce()
+  }
+
+  private async startOnce(): Promise<void> {
+    let created = false
+    try {
+      await mkdir(this.options.directory, { mode: 0o700 })
+      created = true
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+    if (created && process.platform === 'win32') {
+      const script = `$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:GATEWAY_DIRECTORY_CHECK -AclObject $acl`
+      try {
+        await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+          env: { ...process.env, GATEWAY_DIRECTORY_CHECK: this.options.directory }, timeout: 10000, maxBuffer: 4096, windowsHide: true,
+        })
+      } catch { throw new Error('Could not create private session directory') }
+    }
+    await validatePrivateDirectory(this.options.directory)
+    // A live registration is never overwritten. The exclusive claim also
+    // prevents two launches from racing between discovery and publication.
+    const releaseClaim = await lock(this.registrationPath, {
+      realpath: false, stale: 10000, retries: { retries: 3, minTimeout: 100, maxTimeout: 500 },
+    })
+    try {
+      const existing = await listGatewayPeers(this.options.directory)
+      if (existing.some(peer => peer.sessionId === this.peer.sessionId)) throw new Error('Gateway session is already running')
+      try {
+        const handle = await open(this.inboxPath, 'r')
+        let raw: unknown
+        try {
+          const stat = await handle.stat()
+          if (!stat.isFile() || stat.size > MAX_INBOX_BYTES) throw new Error('Invalid inbox size')
+          raw = JSON.parse(await handle.readFile('utf8'))
+        } finally { await handle.close() }
+        const inbox = gatewayInboxSchema.parse(raw)
+        if (inbox.records.some(record => record.message.toSessionId !== this.peer.sessionId) || new Set(inbox.records.map(record => record.message.id)).size !== inbox.records.length) throw new Error('Invalid inbox records')
+        this.records = inbox.records
+        this.policy = inbox.policy
+        this.history = inbox.history ?? []
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      this.server = createServer(socket => {
+        let buffer = Buffer.alloc(0)
+        let handled = false
+        socket.setTimeout(2000, () => socket.destroy())
+        socket.on('error', () => {})
+        socket.on('data', chunk => {
+          if (handled) return
+          buffer = Buffer.concat([buffer, chunk])
+          if (buffer.length > MAX_FRAME) { handled = true; socket.destroy(); return }
+          const newline = buffer.indexOf(10)
+          if (newline < 0) return
+          handled = true
+          // A complete request may wait behind durable inbox writes. The short
+          // timeout above applies only while receiving its frame.
+          socket.setTimeout(RESPONSE_TIMEOUT_MS)
+          let request: any
+          try { request = JSON.parse(buffer.subarray(0, newline).toString('utf8')) }
+          catch { socket.end(`${JSON.stringify({ ok: false, reason: 'Invalid request' })}\n`); return }
+          // Start registration checks together, but reserve mutation order now.
+          // Otherwise every queued message pays for a separate PowerShell ACL check.
+          const sender = this.authenticateSender(request).then(value => ({ value }), () => ({ value: undefined }))
+          void this.serial(async () => {
+            let response: unknown
+            try {
+              const authenticated = await sender
+              if (request.type !== 'ping' && !authenticated.value) throw new Error('Invalid sender')
+              response = await this.handle(request, authenticated.value)
+            }
+            catch { response = { ok: false, reason: 'Invalid or unauthorized peer request' } }
+            socket.end(`${JSON.stringify(response)}\n`)
+          }).catch(() => socket.destroy())
+        })
+      })
+      await new Promise<void>((resolve, reject) => {
+        this.server!.once('error', reject)
+        this.server!.listen(this.peer.endpoint, resolve)
+      })
+      await atomicJson(this.registrationPath, { peer: this.peer, token: this.token })
+    } catch (error) {
+      this.server?.close()
+      throw error
+    } finally { await releaseClaim() }
+  }
+
+  private async authenticateSender(request: any): Promise<{ peer: GatewayPeer; token: string } | undefined> {
+    if (typeof request?.token !== 'string' || request.token !== this.token) throw new Error('Unauthorized')
+    if (request.type === 'ping') return undefined
+    return readRegistration(this.options.directory, request.type === 'message' ? request.message?.fromSessionId : request.fromSessionId)
+  }
+
+  private async handle(request: any, authenticatedSender?: { peer: GatewayPeer; token: string }): Promise<unknown> {
+    if (typeof request?.token !== 'string') throw new Error('Unauthorized')
+    const supplied = Buffer.from(request.token)
+    const expected = Buffer.from(this.token)
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error('Unauthorized')
+    if (request.type === 'ping') return { ok: true, runtimeId: this.peer.runtimeId }
+    if (request.type === 'watch_idle') {
+      const sender = authenticatedSender ?? await readRegistration(this.options.directory, request.fromSessionId)
+      if (sender.peer.runtimeId !== request.fromRuntimeId || sender.token !== request.senderToken || sender.peer.sessionId === this.peer.sessionId) throw new Error('Invalid subscriber')
+      if (this.peer.status === 'idle') return { ok: true, state: 'already-idle' }
+      if (this.idleSubscribers.size >= MAX_PEER_QUEUE && !this.idleSubscribers.has(sender.peer.sessionId)) throw new Error('Subscription limit')
+      this.idleSubscribers.set(sender.peer.sessionId, sender.peer.runtimeId)
+      return { ok: true, state: 'watching', runtimeId: this.peer.runtimeId }
+    }
+    if (request.type === 'receipt') {
+      const sender = authenticatedSender ?? await readRegistration(this.options.directory, request.fromSessionId)
+      if (sender.peer.runtimeId !== request.fromRuntimeId || sender.token !== request.senderToken) throw new Error('Invalid sender')
+      const record = this.records.find(record => record.message.id === request.id && record.message.fromSessionId === sender.peer.sessionId)
+      return { ok: true, id: request.id, state: record?.state ?? 'unknown', meaning: 'delivered means transcript-persisted, not task completion' }
+    }
+    if (request.type !== 'message') throw new Error('Unsupported request')
+    const message = gatewayPeerMessageSchema.parse(request.message)
+    if (message.toSessionId !== this.peer.sessionId || message.fromSessionId === this.peer.sessionId) throw new Error('Invalid recipient')
+    const sender = authenticatedSender ?? await readRegistration(this.options.directory, message.fromSessionId)
+    if (sender.peer.runtimeId !== message.fromRuntimeId || request.senderToken !== sender.token) throw new Error('Invalid sender')
+    const previous = this.records.find(record => record.message.id === message.id)
+    if (previous) {
+      if (JSON.stringify(previous.message) !== JSON.stringify(message)) throw new Error('Message ID collision')
+      return { ok: true, state: previous.state, id: message.id }
+    }
+    if (this.policy === 'refuse') return { ok: false, reason: 'Recipient refuses messages' }
+    const now = Date.now()
+    const recent = (this.bursts.get(message.fromRuntimeId) ?? []).filter(time => time > now - 60_000)
+    if (recent.length >= 10) return { ok: false, reason: 'Rate limit reached; do not resend immediately' }
+    if (this.records.filter(record => record.state === 'queued' || record.state === 'held').length >= MAX_PEER_QUEUE) return { ok: false, reason: 'Recipient inbox is full' }
+    if (Buffer.byteLength(message.text, 'utf8') > MAX_PEER_MESSAGE_BYTES) throw new Error('Message too large')
+    const state = this.policy === 'hold' ? 'held' : 'queued'
+    const record: GatewayInboxRecord = { message, senderName: sender.peer.name, state, receivedAt: new Date().toISOString() }
+    const completed = this.records.filter(item => item.state === 'delivered' || item.state === 'refused').slice(-MAX_PEER_QUEUE)
+    const next = [...completed, ...this.records.filter(item => item.state === 'queued' || item.state === 'held'), record]
+    const previousHistory = this.history
+    this.addHistory({ direction: 'received', status: state, message, peerName: sender.peer.name, recordedAt: new Date().toISOString() })
+    try {
+      await this.persist(next)
+    } catch (error) {
+      this.history = previousHistory
+      throw error
+    }
+    this.records = next
+    for (const [runtimeId, times] of this.bursts) {
+      if (!times.some(time => time > now - 60_000)) this.bursts.delete(runtimeId)
+    }
+    recent.push(now)
+    this.bursts.set(message.fromRuntimeId, recent)
+    this.options.onInboxChanged?.()
+    return { ok: true, state: record.state, id: message.id }
+  }
+
+  hookEnvironment(): NodeJS.ProcessEnv {
+    return { GATEWAY_PEER_DIRECTORY: this.options.directory, GATEWAY_PEER_SESSION: this.peer.sessionId, GATEWAY_PEER_RUNTIME: this.peer.runtimeId, GATEWAY_PEER_TOKEN: this.token }
+  }
+
+  inbox(): readonly GatewayInboxRecord[] { return structuredClone(this.records) }
+
+  async send(toSessionId: string, text: string, summary: string, replyTo?: string): Promise<unknown> {
+    const target = await readRegistration(this.options.directory, toSessionId)
+    const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
+      id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
+      toSessionId, text, summary, replyTo, createdAt: new Date().toISOString(),
+    })
+    // Persist the identity before sending: a lost acknowledgement must not
+    // turn a retry into a new task with a different message ID.
+    await this.serial(async () => {
+      const history = [...this.history, { direction: 'sent' as const, status: 'unknown' as const, message, peerName: target.peer.name, recordedAt: new Date().toISOString() }].slice(-MAX_PEER_HISTORY)
+      await this.persist(this.records, this.policy, history)
+      this.history = history
+    })
+    let receipt: any
+    try {
+      receipt = await callGatewayPeer(target.peer.endpoint, { type: 'message', token: target.token, senderToken: this.token, message })
+      if (receipt?.ok !== false && (receipt?.ok !== true || receipt.id !== message.id || !['held', 'queued', 'delivered', 'refused'].includes(receipt.state))) throw new Error('Invalid receipt')
+    } catch {
+      return { ok: false, state: 'unknown', id: message.id, reason: 'Delivery acknowledgement unavailable. Check receipt before taking further action; do not send a new copy.' }
+    }
+    let historySaved = true
+    try {
+      await this.serial(async () => {
+        const history = this.history.map(entry => entry.direction === 'sent' && entry.message.id === message.id ? { ...entry, status: receipt.ok === false ? 'refused' as const : receipt.state, ...(receipt.ok === false ? { error: String(receipt.reason ?? 'refused').slice(0, 500) } : {}) } : entry)
+        await this.persist(this.records, this.policy, history)
+        this.history = history
+      })
+    } catch { historySaved = false }
+    return { ...receipt, id: message.id, historySaved, meaning: 'queued/held means inbox acceptance; delivered means transcript-persisted, not task completion' }
+  }
+
+  async receipt(toSessionId: string, id: string): Promise<unknown> {
+    if (!idPattern.test(id)) throw new Error('Invalid message ID')
+    const target = await readRegistration(this.options.directory, toSessionId)
+    const receipt = await callGatewayPeer(target.peer.endpoint, { type: 'receipt', token: target.token, senderToken: this.token, fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId, id }) as any
+    if (receipt?.ok !== true || receipt.id !== id || !['unknown', 'held', 'queued', 'delivered', 'refused'].includes(receipt.state)) throw new Error('Invalid receipt')
+    if (receipt.state !== 'unknown') await this.serial(async () => {
+      const history = this.history.map(entry => entry.direction === 'sent' && entry.message.id === id && entry.message.toSessionId === toSessionId ? { ...entry, status: receipt.state, error: undefined } : entry)
+      await this.persist(this.records, this.policy, history)
+      this.history = history
+    })
+    return receipt
+  }
+
+  async watchIdle(toSessionId: string): Promise<unknown> {
+    const target = await readRegistration(this.options.directory, toSessionId)
+    return callGatewayPeer(target.peer.endpoint, { type: 'watch_idle', token: target.token, senderToken: this.token, fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId })
+  }
+
+  async setPolicy(policy: GatewayInboundPolicy, withdraw?: () => { ids: ReadonlySet<string>; rollback: () => void; commit: () => void }): Promise<void> {
+    await this.serial(async () => {
+      if (!['accept', 'hold', 'refuse'].includes(policy)) throw new Error('Invalid inbound policy')
+      const withdrawal = policy === 'accept' ? undefined : withdraw?.()
+      const next: GatewayInboxRecord[] = this.records.map(record => record.state !== 'held' && !(record.state === 'queued' && withdrawal?.ids.has(record.message.id)) ? record : {
+        ...record, state: policy === 'accept' ? 'queued' : policy === 'refuse' ? 'refused' : 'held',
+      })
+      const states = new Map(next.map(record => [record.message.id, record.state]))
+      const history = this.history.map(entry => entry.direction === 'received' && states.has(entry.message.id) ? { ...entry, status: states.get(entry.message.id)! } : entry)
+      try { await this.persist(next, policy, history) }
+      catch (error) { withdrawal?.rollback(); throw error }
+      this.records = next
+      this.history = history
+      this.policy = policy
+      withdrawal?.commit()
+      this.options.onInboxChanged?.()
+    })
+  }
+
+  async acknowledge(id: string): Promise<void> {
+    await this.serial(async () => {
+      const record = this.records.find(record => record.message.id === id)
+      if (!record || record.state !== 'queued') return
+      const next: GatewayInboxRecord[] = this.records.map(item => item === record ? { ...item, state: 'delivered' } : item)
+      const history = this.history.map(entry => entry.direction === 'received' && entry.message.id === id ? { ...entry, status: 'delivered' as const } : entry)
+      await this.persist(next, this.policy, history)
+      this.records = next
+      this.history = history
+    })
+  }
+
+  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status'>>): Promise<void> {
+    const subscribers = await this.serial(async () => {
+      const next = gatewayPeerSchema.parse({ ...this.peer, ...values })
+      await atomicJson(this.registrationPath, { peer: next, token: this.token })
+      const becameIdle = this.peer.status !== 'idle' && next.status === 'idle'
+      Object.assign(this.peer, next)
+      const subscribers = becameIdle ? [...this.idleSubscribers] : []
+      if (becameIdle) this.idleSubscribers.clear()
+      return subscribers
+    })
+    // Outbound requests must not hold the inbox chain: peers can notify each other.
+    for (const [sessionId, runtimeId] of subscribers) {
+      try {
+        const target = await readRegistration(this.options.directory, sessionId)
+        if (target.peer.runtimeId === runtimeId) await this.send(sessionId, `Session ${this.peer.sessionId} is now idle. This one-shot subscription has ended.`, 'Session became idle')
+      } catch { /* Offline subscribers are not resumed or retried automatically. */ }
+    }
+  }
+
+  close(): Promise<void> {
+    if (this.closing) return this.closing
+    this.isClosing = true
+    this.closing = (async () => {
+      await this.starting?.catch(() => {})
+      await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
+      await this.chain
+      try {
+        const current = await readRegistration(this.options.directory, this.peer.sessionId)
+        if (current.peer.runtimeId === this.peer.runtimeId) await unlink(this.registrationPath)
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    })()
+    return this.closing
+  }
+}

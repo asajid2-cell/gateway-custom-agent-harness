@@ -33,7 +33,7 @@ test('metadata and goal UI retain session identity and fullscreen wiring', async
   assert.match(dialog, /saveSessionName\(sessionId, newName, fullPath\)/)
   assert.match(dialog, /placeholder="Unnamed session"/)
   assert.match(dialog, /saving \|\| closing.current/)
-  assert.match(dialog, /teammate \|\| !newName/)
+  assert.match(dialog, /!newName \|\| newName.length > 200/)
   assert.match(prompt, /useSetPromptOverlayDialog\(isFullscreenEnvEnabled\(\) \? promptOverlayDialog/)
   assert.match(footer, /useSyncExternalStore\(subscribePersist, getCurrentPersistRecord/)
   assert.match(dialog, /controlPersistGoal\(action, appStateStore.setState\)/)
@@ -141,13 +141,14 @@ test('native rename appends both resume metadata records to the captured transcr
   }
 })
 
-test('inline rename saves typed spaces on Escape and closes exactly once', async () => {
+for (const save of [true, false]) test(`inline rename ${save ? 'saves on Enter' : 'cancels on Escape'} and closes exactly once`, async () => {
   const original = { id: getSessionId(), project: getSessionProjectDir(), directory: getSessionResumeDirectory() }
   const directory = await mkdtemp(join(tmpdir(), 'rename-input-'))
   const id = asSessionId('00000000-0000-4000-8000-000000000099')
   const previous = process.env.CLAUDE_CODE_NO_FLICKER
   process.env.CLAUDE_CODE_NO_FLICKER = '0'
   switchSession(id, directory)
+  saveSessionName(id, 'Previous name', join(directory, `${id}.jsonl`))
   const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24, isTTY: true })
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} })
   let closed = 0
@@ -158,15 +159,16 @@ test('inline rename saves typed spaces on Escape and closes exactly once', async
   })
   try {
     await new Promise(resolve => setTimeout(resolve, 100))
-    stdin.write('Reliable session name')
-    await new Promise(resolve => setTimeout(resolve, 100))
     assert.equal(closed, 0)
-    stdin.write('\x1b')
+    stdin.write('\x15')
+    await new Promise(resolve => setTimeout(resolve, 80))
+    stdin.write('Reliable session name' + (save ? '\r' : '\x1b'))
     await new Promise(resolve => setTimeout(resolve, 150))
     assert.equal(closed, 1)
     const records = (await readFile(join(directory, `${id}.jsonl`), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-    assert.equal(records.filter(record => record.type === 'custom-title').length, 1)
-    assert.equal(records.find(record => record.type === 'custom-title').customTitle, 'Reliable session name')
+    const titles = records.filter(record => record.type === 'custom-title')
+    assert.equal(titles.length, save ? 2 : 1)
+    assert.equal(titles.at(-1).customTitle, save ? 'Reliable session name' : 'Previous name')
   } finally {
     app.unmount()
     switchSession(original.id, original.project, original.directory)
@@ -189,7 +191,7 @@ test(`metadata dialog scrolls and closes at ${columns} columns, fullscreen=${ful
   const transcriptPath = join(directory, `${getSessionId()}.jsonl`)
   await writePersistSessionRecord({
     version: 1, task: `${'Goal detail line\n'.repeat(40)}END_OF_GOAL`,
-    mode: 'work', keep: false, nudgesRemaining: 0, nudgesSent: 1,
+    mode: 'work', keep: false, taskMode: 'bounded', nudgesRemaining: 0, nudgesSent: 1,
     status: 'exhausted', initialPlanningResponseAllowed: false,
   }, transcriptPath)
   await restorePersistForCurrentSession(() => {}, transcriptPath)

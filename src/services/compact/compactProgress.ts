@@ -52,16 +52,29 @@ export function createCompactionContext(context: ToolUseContext): {
   const abortController = createChildAbortController(context.abortController)
   const timeoutMs = getCompactionTimeoutMs()
   let timedOut = false
-  const timer = setTimeout(() => {
+  const expire = () => {
     timedOut = true
     abortController.abort(new Error(ERROR_MESSAGE_COMPACTION_TIMEOUT))
-  }, timeoutMs)
+  }
+  const timer = setTimeout(expire, timeoutMs)
+  const hardTimer = setTimeout(expire, timeoutMs * 3)
   timer.unref?.()
+  hardTimer.unref?.()
+  let responseLength = 0
 
   return {
-    context: { ...context, abortController },
+    context: {
+      ...context,
+      abortController,
+      setResponseLength: update => {
+        const nextLength = typeof update === 'function' ? update(responseLength) : update
+        if (nextLength > responseLength && !abortController.signal.aborted) timer.refresh()
+        responseLength = nextLength
+        context.setResponseLength?.(update)
+      },
+    },
     didTimeout: () => timedOut,
-    cleanup: () => clearTimeout(timer),
+    cleanup: () => { clearTimeout(timer); clearTimeout(hardTimer) },
   }
 }
 

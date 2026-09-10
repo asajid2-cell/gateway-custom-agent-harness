@@ -62,11 +62,12 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
   }, [sessionId])
 
   const closing = useRef(false)
-  const handleSubmit = useCallback(async () => {
-    const newName = name.trim()
+  const handleSubmit = useCallback(async (submittedName: string) => {
+    const newName = submittedName.trim()
     if (saving || closing.current) return
-    if (teammate || !newName) {
-      onDone()
+    if (teammate) { onDone(); return }
+    if (!newName || newName.length > 200) {
+      setSaveError('Name must contain 1–200 characters.')
       return
     }
     if (getSessionId() !== sessionId || getTranscriptPath() !== fullPath) {
@@ -105,7 +106,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
     }
   }, [appStateStore, fullPath, name, onDone, saving, sessionId, teammate])
 
-  const handleCancel = useCallback(() => { void handleSubmit() }, [handleSubmit])
+  const handleCancel = useCallback(() => { if (!saving && !closing.current) { closing.current = true; onDone() } }, [onDone, saving])
   useInput((_input, key) => {
     if (key.escape) handleCancel()
     if (key.pageDown) scrollRef.current?.scrollBy(detailHeight)
@@ -146,7 +147,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
             value={name}
             placeholder="Unnamed session"
             onChange={setName}
-            onSubmit={() => void handleSubmit()}
+            onSubmit={value => void handleSubmit(value)}
             onExit={handleCancel}
             focus={!saving && !teammate}
             showCursor={!saving && !teammate}
@@ -196,7 +197,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
           {!teammate && (
             <KeyboardShortcutHint shortcut="Enter" action={saving ? 'saving' : 'save'} />
           )}
-          <Text dimColor>Esc save & close{goal ? ' · PgUp/PgDn details' : ''}</Text>
+          <Text dimColor>Esc cancel{goal ? ' · PgUp/PgDn details' : ''}</Text>
         </Byline>
       </Box>
     </Dialog>

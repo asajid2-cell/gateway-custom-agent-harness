@@ -48,6 +48,43 @@ test('compact heartbeat stop prevents emissions after completion', async () => {
   assert.equal(events.length, countAfterStop)
 })
 
+test('real output progress extends compaction idle deadline, heartbeat does not', async () => {
+  const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+  process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '30'
+  const parent = new AbortController()
+  const operation = createCompactionContext({ abortController: parent, setResponseLength: () => {} })
+  try {
+    for (let i = 0; i < 5; i++) {
+      await wait(10)
+      operation.context.setResponseLength(length => length + 1)
+    }
+    assert.equal(operation.didTimeout(), false)
+    await wait(45)
+    assert.equal(operation.didTimeout(), true)
+    assert.equal(parent.signal.aborted, false)
+  } finally {
+    operation.cleanup()
+    if (previous === undefined) delete process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+    else process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = previous
+  }
+})
+
+test('continuous output still reaches the compaction hard deadline', async () => {
+  const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+  process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '20'
+  const operation = createCompactionContext({ abortController: new AbortController() })
+  const output = setInterval(() => operation.context.setResponseLength(length => length + 1), 5)
+  try {
+    await wait(85)
+    assert.equal(operation.didTimeout(), true)
+  } finally {
+    clearInterval(output)
+    operation.cleanup()
+    if (previous === undefined) delete process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+    else process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = previous
+  }
+})
+
 test('compaction timeout aborts only the child context and cleans up', async () => {
   const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
   process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '10'

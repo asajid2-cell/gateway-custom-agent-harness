@@ -36,7 +36,11 @@ $ClaudeRunner = if ($env:CC_CLAUDE_RUNNER_OVERRIDE) {
 } else {
   (Get-Command bun.exe -ErrorAction Stop).Source
 }
-$ClaudeScript = Join-Path $Root 'dist\cli.js'
+$ClaudeScript = if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
+  [IO.Path]::GetFullPath($env:CC_CLAUDE_SCRIPT_OVERRIDE)
+} else {
+  Join-Path $Root 'dist\cli.js'
+}
 $CapabilityCatalogPath = Join-Path $Root 'scripts\effort-capabilities.json'
 if (-not (Test-Path -LiteralPath $CapabilityCatalogPath -PathType Leaf)) {
   throw "Effort capability catalog is missing: $CapabilityCatalogPath"
@@ -102,7 +106,7 @@ function Resolve-GatewayModel {
   return $Value
 }
 $Model = Resolve-GatewayModel -Value $RequestedModel
-$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { 'high' }
+$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { 'medium' }
 $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
 $ClaudeArgs = @($args)
@@ -598,6 +602,9 @@ function Test-ClaudeArtifactFresh {
 # when the compiled harness is older than its source or build inputs; this keeps
 # fresh terminals current without paying the full Bun build cost on every launch.
 if (-not (Test-ClaudeArtifactFresh)) {
+  if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
+    throw 'Selected candidate is missing or stale; build it explicitly before launch.'
+  }
   Push-Location $Root
   try {
     Write-LaunchDiagnostic 'build-start'
@@ -696,10 +703,10 @@ $env:CLAUDE_CODE_GATEWAY_PROVENANCE = @{
   cwd_actual = $LaunchDirectory
   launch_nonce = $env:TANDEM_BRANCH_PROVIDER_LAUNCH_NONCE
 } | ConvertTo-Json -Compress
-$env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-luna'
-$env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-sol'
-$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'
-$env:MODEL_GATEWAY_SUBAGENT_MODEL = $Model
+$env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'
+$env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'
+$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-gpt-luna'
+$env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-luna'
 # Keep gateway-backed cc on the standard native harness compaction path.
 # Session-memory compaction is a separate summary producer and can replace
 # compactConversation() without making a provider request, which makes it
@@ -719,6 +726,7 @@ $env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = '1'
 $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
 $env:MODEL_GATEWAY_LOG_TIMING = '1'
+$env:MODEL_GATEWAY_LOG_EVENT_SHAPE = if ($env:MODEL_GATEWAY_CAPTURE_EVENT_SHAPE -eq '1') { '1' } else { $null }
 
 try {
   $ScopedSettingsPath = Join-Path `
