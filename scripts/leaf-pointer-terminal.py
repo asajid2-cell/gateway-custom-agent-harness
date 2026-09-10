@@ -18,6 +18,8 @@ from winpty import PtyProcess
 parser = argparse.ArgumentParser()
 parser.add_argument('cli', type=Path)
 parser.add_argument('--fullscreen', action='store_true')
+parser.add_argument('--mux-report-filter', action='store_true')
+parser.add_argument('--standard-cpr-only', action='store_true')
 parser.add_argument('--probe-full-tui', action='store_true')
 parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
@@ -71,6 +73,8 @@ class Screen(pyte.Screen):
     reply = lambda self, text: None
     def report_device_status(self, mode, **kwargs):
         if mode == 6:
+            if args.mux_report_filter and not kwargs.get('private'): return
+            if args.standard_cpr_only and kwargs.get('private'): return
             private = '?' if kwargs.get('private') else ''
             self.reply(f'\x1b[{private}{self.cursor.y + 1};{self.cursor.x + 1}R')
     def report_device_attributes(self, mode=0, **kwargs):
