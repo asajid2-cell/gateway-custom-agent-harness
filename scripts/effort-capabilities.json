@@ -40,6 +40,7 @@
     "kimi-k2.6": [],
     "deepseek-v4-pro": ["high", "max"],
     "deepseek-v4-flash": ["low", "high", "max"],
+    "deepseek-v4.1-flash": ["low", "high", "max"],
     "hy3": ["none", "low", "high"],
     "minimax-m3": [],
     "minimax-m2.7": [],
@@ -64,6 +65,7 @@
     "gateway-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "gateway-ds-flash": ["low", "medium", "high"],
     "gateway-ds-pro": ["low", "medium", "high"],
+    "gateway-ds-4.1-flash": ["low", "medium", "high"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-glm-5.3-flash": ["low", "high", "max"],
@@ -78,6 +80,7 @@
     "gateway-opencode-kimi-k2.6": [],
     "gateway-opencode-deepseek-v4-pro": ["high", "max"],
     "gateway-opencode-deepseek-v4-flash": ["low", "high", "max"],
+    "gateway-opencode-deepseek-v4.1-flash": ["low", "high", "max"],
     "gateway-opencode-hy3": ["none", "low", "high"],
     "gateway-opencode-minimax-m3": [],
     "gateway-opencode-minimax-m2.7": [],
@@ -100,6 +103,7 @@
     "claude-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
     "claude-ds-flash": ["low", "medium", "high"],
     "claude-ds-pro": ["low", "medium", "high"],
+    "claude-ds-4.1-flash": ["low", "medium", "high"],
     "claude-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-opencode-mimo-v2.5-pro": [],
@@ -113,6 +117,7 @@
     "claude-opencode-kimi-k2.6": [],
     "claude-opencode-deepseek-v4-pro": ["high", "max"],
     "claude-opencode-deepseek-v4-flash": ["low", "high", "max"],
+    "claude-opencode-deepseek-v4.1-flash": ["low", "high", "max"],
     "claude-opencode-hy3": ["none", "low", "high"],
     "claude-opencode-minimax-m3": [],
     "claude-opencode-minimax-m2.7": [],
@@ -160,6 +165,11 @@
       "description": "DeepSeek - v4 Pro"
     },
     {
+      "value": "gateway-ds-4.1-flash",
+      "label": "DeepSeek v4.1 Flash",
+      "description": "DeepSeek - v4.1 Flash"
+    },
+    {
       "value": "gateway-opencode-gpt-5.6-luna",
       "label": "OpenCode GPT 5.6 Luna",
       "description": "OpenCode - GPT 5.6 Luna"
@@ -198,6 +208,11 @@
       "value": "gateway-opencode-deepseek-v4-pro",
       "label": "OpenCode DeepSeek v4 Pro",
       "description": "OpenCode - DeepSeek v4 Pro"
+    },
+    {
+      "value": "gateway-opencode-deepseek-v4.1-flash",
+      "label": "OpenCode DeepSeek v4.1 Flash",
+      "description": "OpenCode - DeepSeek v4.1 Flash"
     },
     {
       "value": "gateway-opencode-grok-4.5",
@@ -307,6 +322,7 @@
     "gateway-gpt-astra": ["gpt-6-astra", "claude-gpt-astra"],
     "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],
     "gateway-ds-pro": ["deepseek-v4-pro", "claude-ds-pro"],
+    "gateway-ds-4.1-flash": ["deepseek-v4.1-flash", "claude-ds-4.1-flash"],
     "gateway-opencode-gpt-5.6-luna": [
       "opencode-go/gpt-5.6-luna",
       "claude-opencode-gpt-5.6-luna"
@@ -342,6 +358,10 @@
     "gateway-opencode-deepseek-v4-pro": [
       "opencode-go/deepseek-v4-pro",
       "claude-opencode-deepseek-v4-pro"
+    ],
+    "gateway-opencode-deepseek-v4.1-flash": [
+      "opencode-go/deepseek-v4.1-flash",
+      "claude-opencode-deepseek-v4.1-flash"
     ],
     "gateway-opencode-grok-4.5": [
       "opencode-go/grok-4.5",

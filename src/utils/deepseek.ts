@@ -7,6 +7,7 @@ export const DEEPSEEK_ANTHROPIC_BASE_URL =
 export const DEEPSEEK_V4_PRO_MODEL = 'deepseek-v4-pro'
 export const DEEPSEEK_V4_PRO_1M_MODEL = `${DEEPSEEK_V4_PRO_MODEL}[1m]`
 export const DEEPSEEK_V4_FLASH_MODEL = 'deepseek-v4-flash'
+export const DEEPSEEK_V4_1_FLASH_MODEL = 'deepseek-v4.1-flash'
 export const DEEPSEEK_DEFAULT_MODEL = DEEPSEEK_V4_PRO_1M_MODEL
 export const DEEPSEEK_SMALL_FAST_MODEL = DEEPSEEK_V4_FLASH_MODEL
 

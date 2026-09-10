@@ -133,6 +133,7 @@ const DEFAULT_MODELS = {
   'gpt-6-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
   'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
   'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
+  'deepseek-v4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash', hidden: true },
   ...Object.fromEntries(
     OPENCODE_GO_MODEL_IDS.map(model => [
       `opencode-go/${model}`,
@@ -144,7 +145,7 @@ const DEFAULT_MODELS = {
         effortWireMap: openCodeGoEffortWireMap(model),
         hidden: true,
         ...(model === 'hy3' ? { supportsTools: false } : {}),
-        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
           ? { supportsForcedToolChoice: false }
           : {}),
       },
@@ -189,7 +190,7 @@ const DEFAULT_MODELS = {
         effortLevels: openCodeGoEffortLevels(model),
         effortWireMap: openCodeGoEffortWireMap(model),
         ...(model === 'hy3' ? { supportsTools: false } : {}),
-        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
           ? { supportsForcedToolChoice: false }
           : {}),
       },
@@ -201,6 +202,7 @@ const DEFAULT_MODELS = {
   'gateway-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS },
   'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
   'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
+  'gateway-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash' },
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -210,6 +212,7 @@ const DEFAULT_MODELS = {
   'claude-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
   'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
   'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
+  'claude-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash', hidden: true },
   ...Object.fromEntries(
     OPENCODE_ZEN_MODEL_IDS.map(model => [
       `claude-opencode-${model}`,
@@ -235,7 +238,7 @@ const DEFAULT_MODELS = {
         effortWireMap: openCodeGoEffortWireMap(model),
         hidden: true,
         ...(model === 'hy3' ? { supportsTools: false } : {}),
-        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
+        ...(['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v4.1-flash', 'qwen3.8-max', 'qwen3.7-max', 'qwen3.7-plus', 'qwen3.6-plus'].includes(model)
           ? { supportsForcedToolChoice: false }
           : {}),
       },

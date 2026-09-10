@@ -31,6 +31,7 @@ export const OPENCODE_GO_ROUTES = {
   'kimi-k2.6': 'chat-completions',
   'deepseek-v4-pro': 'chat-completions',
   'deepseek-v4-flash': 'chat-completions',
+  'deepseek-v4.1-flash': 'chat-completions',
   'mimo-v2.5': 'chat-completions',
   'mimo-v2.5-pro': 'chat-completions',
   'hy3': 'chat-completions',
