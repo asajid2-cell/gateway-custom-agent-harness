@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream'
 import { render, Box, Text, useInput } from '../src/ink.ts'
 import instances from '../src/ink/instances.ts'
 import { nodeCache } from '../src/ink/node-cache.ts'
-import { LeafCarousel, LeafWorkspacePanel } from '../src/components/LeafWorkspaceDialog.tsx'
+import { LeafCarousel } from '../src/components/LeafWorkspaceDialog.tsx'
 import { SessionEditControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
 import { AppStateProvider } from '../src/state/AppState.tsx'
 import type { LeafView } from '../src/utils/leafWorkspace.ts'
@@ -46,77 +46,31 @@ async function terminal(content: React.ReactNode, columns = 100) {
   const click = async (label: string) => { const p = point(label); mouse(0, p); mouse(0, p, true); await settle() }
   return { app, ink, stdin, stdout, point, mouse, click, close: () => { app.unmount(); stdin.destroy(); stdout.destroy() } }
 }
-function fixtures(count: number): { views: LeafView[]; sent: string[][] } {
-  const sent = Array.from({ length: count }, () => [] as string[])
-  const views = sent.map((messages, index) => ({ rootSessionId: 'root', member: { number: index + 1, name: `Chat ${index + 1}`, sessionId: `leaf-${index}` }, output: [`OUTPUT_${index + 1}`], draft: '', scrollOffset: 0, process: { getState: () => 'idle', getPermissions: () => [], send: (text: string) => messages.push(text) } })) as unknown as LeafView[]
-  return { views, sent }
+function fixtures(count: number): { views: LeafView[] } {
+  const views = Array.from({ length: count }, (_, index) => ({ rootSessionId: 'root', member: { number: index + 1, name: `Chat ${index + 1}`, sessionId: `leaf-${index}` }, draft: '', process: { getState: () => 'idle' } })) as LeafView[]
+  return { views }
 }
 
-export async function exerciseRealLeafTerminal(views: LeafView[]): Promise<void> {
-  let closed = false
-  const t = await terminal(<LeafWorkspacePanel views={views} onDone={() => { closed = true }} />)
+for (const columns of [40, 100]) test(`carousel pointer and wheel select full sessions at ${columns} columns; Tab never switches`, async () => {
+  const { views } = fixtures(5)
+  let selected: string | undefined = 'leaf-0'
+  function Host() {
+    const [active, setActive] = useState<string | undefined>(selected)
+    return <LeafCarousel views={views} activeId={active} onSelect={id => { selected = id; setActive(id) }} />
+  }
+  const t = await terminal(<Host />, columns)
   try {
-    for (let index = 0; index < views.length; index++) {
-      await t.click('All ' + (views.length + 1))
-      await t.click(`${views[index]!.member.number} ${views[index]!.member.name} [${views[index]!.process.getState()}]`)
-      t.stdin.write(index === 0 ? 'TERMINAL_FIRST_LEAF' : index === 1 ? 'TERMINAL_SECOND_LEAF' : `TERMINAL_LEAF_${index + 1}`)
-      await settle(); t.stdin.write('\r'); await settle()
-    }
-    t.stdin.write('\x1b'); await settle()
-    assert.equal(closed, true)
-  } finally { t.close() }
-}
-
-for (const columns of [40, 100]) test(`pointer and wheel switch independent drafts at ${columns} columns; Tab never switches`, async () => {
-  const { views, sent } = fixtures(5)
-  let closes = 0
-  const t = await terminal(<LeafWorkspacePanel views={views} onDone={() => { closes++ }} />, columns)
-  try {
-    t.stdin.write('alpha'); await settle()
     t.stdin.write('\t'); await settle()
-    assert.equal(closes, 0)
-    assert.equal(views[0]!.draft, 'alpha')
+    assert.equal(selected, 'leaf-0')
     await t.click('All 6')
     await t.click('2 Chat 2 [idle]')
-    t.stdin.write('beta'); await settle()
-    assert.equal(views[1]!.draft, 'beta')
-    const p = t.point('2 Chat 2')
-    t.mouse(64, p); await settle()
-    assert.match(textOf(t.ink.rootNode), /alpha/)
-    t.stdin.write('\r'); await settle()
-    assert.deepEqual(sent, [['alpha'], [], [], [], []])
-    await t.click('All 6'); await t.click('2 Chat 2 [idle]')
-    assert.match(textOf(t.ink.rootNode), /beta/)
-    t.stdin.write('\r'); await settle()
-    assert.deepEqual(sent, [['alpha'], ['beta'], [], [], []])
-    t.stdin.write('\x1b'); await settle()
-    assert.equal(closes, 1)
-  } finally { t.close() }
-})
-
-test('short bracketed paste does not leave a leaf input unable to submit', async () => {
-  const { views, sent } = fixtures(1)
-  const t = await terminal(<LeafWorkspacePanel views={views} onDone={() => {}} />)
-  try {
-    t.stdin.write('\x1b[200~hello\x1b[201~'); await settle()
-    t.stdin.write('\r'); await settle()
-    assert.deepEqual(sent, [['hello']])
-  } finally { t.close() }
-})
-
-test('leaf rename Escape cancels without closing the workspace or losing its draft', async () => {
-  const { views } = fixtures(1)
-  let closes = 0
-  const t = await terminal(<LeafWorkspacePanel views={views} onDone={() => { closes++ }} />)
-  try {
-    t.stdin.write('unsent draft'); await settle()
-    await t.click('✎ Rename')
-    assert.match(textOf(t.ink.rootNode), /Enter saves/)
-    t.stdin.write('\x1b')
-    await waitForScreen(() => !textOf(t.ink.rootNode).includes('Enter saves'))
-    assert.doesNotMatch(textOf(t.ink.rootNode), /Enter saves/)
-    assert.match(textOf(t.ink.rootNode), /unsent draft/)
-    assert.equal(closes, 0)
+    assert.equal(selected, 'leaf-1')
+    t.mouse(64, t.point('2 Chat 2')); await settle()
+    assert.equal(selected, 'leaf-0')
+    await t.click('All 6')
+    const { getLeafRootName } = await import('../src/utils/leafWorkspace.ts')
+    await t.click(getLeafRootName())
+    assert.equal(selected, undefined)
   } finally { t.close() }
 })
 
@@ -147,6 +101,34 @@ test('plain cursor reports are consumed only during an explicit Windows calibrat
   assert.match(JSON.stringify(during), /cursorPosition/)
   assert.doesNotMatch(JSON.stringify(before), /cursorPosition/)
   assert.doesNotMatch(JSON.stringify(after), /cursorPosition/)
+})
+
+test('terminal handoff suspends and restores both input listener modes exactly once', async () => {
+  const t = await terminal(<Text>Input handoff</Text>)
+  let deliveries = 0
+  const data = () => { deliveries++ }
+  const readable = () => { deliveries++ }
+  t.stdin.on('data', data)
+  t.stdin.on('readable', readable)
+  try {
+    const dataListeners = t.stdin.listeners('data')
+    const readableListeners = t.stdin.listeners('readable')
+    for (let cycle = 0; cycle < 5; cycle++) {
+      t.ink.suspendStdin()
+      assert.equal(t.stdin.listenerCount('data'), 0)
+      assert.equal(t.stdin.listenerCount('readable'), 0)
+      t.stdin.emit('data', 'LEAF_ONLY')
+      t.stdin.emit('readable')
+      assert.equal(deliveries, 0)
+      t.ink.resumeStdin()
+      assert.deepEqual(t.stdin.listeners('data'), dataListeners)
+      assert.deepEqual(t.stdin.listeners('readable'), readableListeners)
+    }
+  } finally {
+    t.stdin.off('data', data)
+    t.stdin.off('readable', readable)
+    t.close()
+  }
 })
 
 test('pencil click survives a repaint between press and release without stealing typing', async () => {

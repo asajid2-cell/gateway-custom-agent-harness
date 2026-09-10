@@ -38,6 +38,11 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     }
     const transfer = input.match(/^return\s+(\S+)\s+([\s\S]+)$/)
     if (transfer) {
+      const { isInteractiveLeaf, requestLeafWorkspace } = await import('../utils/leafTerminal.js')
+      if (isInteractiveLeaf()) {
+        onDone(await requestLeafWorkspace<string>('return', [transfer[1], transfer[2]]), { display: 'system' })
+        return null
+      }
       const { getSessionId } = await import('../bootstrap/state.js')
       const { getClaudeConfigHomeDir } = await import('../utils/envUtils.js')
       const { readLeafFamily } = await import('../utils/leafFamily.js')
@@ -90,7 +95,7 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     }
     const nested = input.match(/^fork\s+(\S+)(?:\s+([\s\S]+))?$/)
     const options = { model: context.options?.mainLoopModel, effort: context.getAppState?.().effortValue as import('../utils/leafFamily.js').LeafMember['effort'] }
-    if (nested) await createLeaf(nested[2]?.trim(), nested[1] === 'original' ? undefined : nested[1], undefined, options)
+    if (nested) await createLeaf(nested[2]?.trim(), nested[1], undefined, options)
     else if (input === 'fork') await createLeaf(undefined, undefined, undefined, options)
     else if (input === 'new' || input.startsWith('new ')) await createLeaf(input.slice(3).trim() || undefined, undefined, undefined, { ...options, fresh: true })
     else if (!input || input === 'list') {

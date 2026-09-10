@@ -25,6 +25,7 @@ import {
   type MuxMetadataResult,
 } from '../utils/muxSessionMetadata.js'
 import { isTeammate } from '../utils/teammate.js'
+import { isInteractiveLeaf, requestLeafWorkspace } from '../utils/leafTerminal.js'
 
 type Props = {
   readonly onDone: () => void
@@ -80,6 +81,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
     setSaveError(undefined)
     try {
       saveSessionName(sessionId, newName, fullPath)
+      if (isInteractiveLeaf()) await requestLeafWorkspace('renamed', [newName])
       const bridgeSessionId = appStateStore.getState().replBridgeSessionId
       if (bridgeSessionId) {
         const tokenOverride = getBridgeTokenOverride()

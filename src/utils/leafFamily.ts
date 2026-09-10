@@ -45,7 +45,13 @@ async function mutateFamily<T>(path: string, rootSessionId: string, mutate: (fam
     const handle = await open(temporary, 'wx', 0o600)
     try { await handle.writeFile(JSON.stringify(family)); await handle.sync() }
     finally { await handle.close() }
-    await rename(temporary, path)
+    for (let attempt = 0; ; attempt++) {
+      try { await rename(temporary, path); break }
+      catch (error) {
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '') || attempt >= 5) throw error
+        await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)))
+      }
+    }
     return result
   } finally {
     await unlink(temporary).catch(() => {})

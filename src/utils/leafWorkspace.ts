@@ -8,35 +8,63 @@ import { asSessionId } from '../types/ids.js'
 import { getCwd } from './cwd.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { createFork } from '../commands/branch/branch.js'
-import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, loadTranscriptFromFile, saveSessionName } from './sessionStorage.js'
+import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, saveSessionName } from './sessionStorage.js'
 import { addLeafMember, readLeafFamily, updateLeafMember, type LeafMember } from './leafFamily.js'
 import { LeafProcess } from './leafProcess.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
+import { getLeafSnapshot, isInteractiveLeaf, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
+import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 
-export type LeafView = { rootSessionId: string; member: LeafMember; process: LeafProcess; output: string[]; draft: string; scrollOffset: number }
-const views = new Map<string, LeafView>()
+export type LeafView = { rootSessionId: string; member: LeafMember; process: Pick<LeafProcess, 'getState' | 'checkpoint' | 'setModel' | 'setEffort'>; draft: string }
+type OwnedLeafView = LeafView & { process: LeafProcess }
+const views = new Map<string, OwnedLeafView>()
 const ownerReleases = new Map<string, () => Promise<void>>()
 const listeners = new Set<() => void>()
 const selected = new Map<string, string>()
-const launches = new Map<string, Promise<LeafView>>()
-export function selectedLeafId(): string | undefined { return selected.get(getSessionId()) }
+const launches = new Map<string, Promise<OwnedLeafView>>()
+export function selectedLeafId(): string | undefined { return isInteractiveLeaf() ? getSessionId() : selected.get(getSessionId()) }
+export function getLeafRootName(): string { return getLeafSnapshot()?.rootName || getCurrentSessionTitle(getSessionId()) || 'Original' }
 export function selectLeaf(sessionId?: string): void {
+  if (isInteractiveLeaf()) { void requestLeafWorkspace('select', [sessionId]).catch(() => {}); return }
   const root = getSessionId()
-  if (sessionId) {
-    if (!getLeafViews().some(view => view.member.sessionId === sessionId)) throw new Error('Unknown leaf')
-    selected.set(root, sessionId)
-  } else selected.delete(root)
+  const view = sessionId ? views.get(sessionId) : undefined
+  if (sessionId && (!view || view.rootSessionId !== root)) throw new Error('Unknown leaf')
+  if (sessionId) selected.set(root, sessionId)
+  else selected.delete(root)
+  focusLeafTerminal(view?.process)
   publish()
 }
+let contextReturn: ((id: string, text: string) => Promise<string>) | undefined
+export function registerLeafContextReturn(handler: (id: string, text: string) => Promise<string>): () => void {
+  contextReturn = handler
+  return () => { if (contextReturn === handler) contextReturn = undefined }
+}
 let revision = 0
-function publish(): void { revision++; for (const listener of listeners) listener() }
+function publish(): void {
+  revision++
+  for (const listener of listeners) listener()
+  if (isInteractiveLeaf()) return
+  const snapshot = { rootSessionId: getSessionId(), rootName: getLeafRootName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  for (const view of views.values()) {
+    if (view.rootSessionId === getSessionId() && !['closed', 'failed'].includes(view.process.getState())) {
+      try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
+    }
+  }
+}
+subscribeLeafSnapshot(() => { revision++; for (const listener of listeners) listener() })
 export function subscribeLeafWorkspace(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener) } }
 export function leafWorkspaceRevision(): number { return revision }
-export function getLeafViews(): LeafView[] { return [...views.values()].filter(view => view.rootSessionId === getSessionId()) }
+export function getLeafViews(): LeafView[] {
+  if (isInteractiveLeaf()) return (getLeafSnapshot()?.members ?? []).map(({ member, state }) => ({
+    rootSessionId: getLeafSnapshot()!.rootSessionId, member, draft: member.draft ?? '',
+    process: { getState: () => state, checkpoint: (name?: string) => requestLeafWorkspace('checkpoint', [member.sessionId, name]), setModel: (model: string) => requestLeafWorkspace('model', [member.sessionId, model]), setEffort: (effort: string) => requestLeafWorkspace('effort', [member.sessionId, effort]) },
+  }))
+  return [...views.values()].filter(view => view.rootSessionId === getSessionId())
+}
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
 
-function launch(member: LeafMember, rootSessionId: string): Promise<LeafView> {
+function launch(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
   const pending = launches.get(member.sessionId)
   if (pending) return pending
   const launching = launchOnce(member, rootSessionId).finally(() => launches.delete(member.sessionId))
@@ -44,46 +72,46 @@ function launch(member: LeafMember, rootSessionId: string): Promise<LeafView> {
   return launching
 }
 
-async function launchOnce(member: LeafMember, rootSessionId: string): Promise<LeafView> {
+async function launchOnce(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
   const existing = views.get(member.sessionId)
   if (existing && !['closed', 'failed'].includes(existing.process.getState())) return existing
   const release = await lock(`${member.transcriptPath}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 })
   let releasePromise: Promise<void> | undefined
   const releaseOwner = () => releasePromise ??= release()
   ownerReleases.set(member.sessionId, releaseOwner)
-  const output: string[] = []
   let hasTranscript = member.forkMessageId !== null
   if (!hasTranscript) {
     try { hasTranscript = (await readFile(member.transcriptPath, 'utf8')).split('\n').filter(line => line.trim()).some(line => { const entry = JSON.parse(line); return entry.type === 'user' || entry.type === 'assistant' }) }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await releaseOwner(); ownerReleases.delete(member.sessionId); throw error } }
   }
-  if (hasTranscript) {
-    try {
-      const history = await loadTranscriptFromFile(member.transcriptPath)
-      for (const message of history.messages) {
-        if (message.type !== 'user' && message.type !== 'assistant') continue
-        const content = message.message.content
-        const text = typeof content === 'string' ? content : content.filter(block => block.type === 'text').map(block => block.text).join('\n')
-        if (text) output.push(`${message.type === 'user' ? 'You' : 'Assistant'}: ${text}`)
-      }
-      output.splice(0, Math.max(0, output.length - 200))
-    } catch (error) { await releaseOwner(); ownerReleases.delete(member.sessionId); throw error }
-  }
-  const processArgs = [process.argv[1]!, '--print', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json', '--permission-prompt-tool', 'stdio', ...(hasTranscript ? ['--resume', member.transcriptPath] : ['--session-id', member.sessionId])]
+  const processArgs = [process.argv[1]!, ...(hasTranscript ? ['--resume', member.sessionId] : ['--session-id', member.sessionId])]
   if (member.model) processArgs.push('--model', member.model)
-  const child = new LeafProcess({ executable: process.execPath, args: processArgs, cwd: member.cwd ?? getCwd(), env: { ...process.env, GATEWAY_LEAF_SESSION: member.sessionId },
+  if (member.effort) processArgs.push('--effort', member.effort)
+  const child = new LeafProcess({ executable: process.execPath, args: processArgs, cwd: member.cwd ?? getCwd(), env: {
+    ...process.env, GATEWAY_LEAF_SESSION: member.sessionId, GATEWAY_INTERACTIVE_LEAF: '1',
+    GATEWAY_LEAF_TRANSCRIPT: member.transcriptPath,
+    GATEWAY_LEAF_DRAFT: existing?.draft ?? member.draft ?? '',
+    GATEWAY_LEAF_COLUMNS: String(process.stdout.columns || 80), GATEWAY_LEAF_ROWS: String(process.stdout.rows || 24),
+  }, interactive: true,
     onState: publish,
-    onExit: () => { void releaseOwner().catch(() => {}) },
-    onEvent: event => {
-      if (event.type === 'assistant') {
-        const content = (event.message as { content?: { type: string; text?: string }[] } | undefined)?.content
-        for (const block of content ?? []) if (block.type === 'text' && block.text) output.push(block.text)
-        if (output.length > 200) output.splice(0, output.length - 200)
-      }
+    onExit: () => {
+      const current = [...views.values()].find(view => view.process === child)
+      const id = current?.member.sessionId ?? member.sessionId
+      if (selected.get(rootSessionId) === id && getSessionId() === rootSessionId) selectLeaf()
+      void (ownerReleases.get(id)?.() ?? releaseOwner()).catch(() => {})
       publish()
     },
+    onEvent: () => {},
+    onTerminal: message => {
+      if (message.type === 'leaf-output') renderLeafTerminal(child, message.epoch, message.data)
+      if (message.type === 'leaf-state' && message.draft !== undefined) {
+        const view = [...views.values()].find(view => view.process === child)
+        if (view) view.draft = message.draft
+      }
+      if (message.type === 'leaf-request') void handleLeafRequest(child, member.sessionId, rootSessionId, message)
+    },
   })
-  const view = { rootSessionId, member, process: child, output, draft: existing?.draft ?? member.draft ?? '', scrollOffset: existing?.scrollOffset ?? member.scrollOffset ?? 0 }
+  const view: OwnedLeafView = { rootSessionId, member, process: child, draft: existing?.draft ?? member.draft ?? '' }
   views.set(member.sessionId, view)
   publish()
   try {
@@ -92,13 +120,96 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Le
     if (member.effort) await child.setEffort(member.effort)
   }
   catch (error) { await child.close(); await releaseOwner(); ownerReleases.delete(member.sessionId); publish(); throw error }
+  publish()
   return view
 }
 
+const requestQueues = new WeakMap<LeafProcess, Promise<void>>()
+function handleLeafRequest(child: LeafProcess, sourceId: string, root: string, message: Extract<LeafTerminalMessage, { type: 'leaf-request' }>): Promise<void> {
+  const request = (requestQueues.get(child) ?? Promise.resolve()).then(() => executeLeafRequest(child, sourceId, root, message))
+  requestQueues.set(child, request.catch(() => {}))
+  return request
+}
+async function executeLeafRequest(child: LeafProcess, sourceId: string, root: string, message: Extract<LeafTerminalMessage, { type: 'leaf-request' }>): Promise<void> {
+  try {
+    const source = [...views.values()].find(view => view.process === child)
+    if (getSessionId() !== root || !source || source.rootSessionId !== root) throw new Error('Leaf family changed')
+    sourceId = source.member.sessionId
+    const [id, value, third, fourth] = message.args as any[]
+    let result: unknown
+    switch (message.action) {
+      case 'identity': {
+        if (id === sourceId) break
+        if (typeof id !== 'string' || typeof value !== 'string' || id === root || views.has(id)) throw new Error('Session already open')
+        const release = await lock(`${value}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 })
+        try {
+          const family = await readLeafFamily(familyPath(root), root)
+          const member = family.members.some(member => member.sessionId === id)
+            ? await updateLeafMember(familyPath(root), root, id, { status: 'open' })
+            : await addLeafMember(familyPath(root), root, {
+              sessionId: id, parentSessionId: sourceId, name: source.member.name,
+              transcriptPath: value, forkMessageId: null, cwd: source.member.cwd,
+              model: source.member.model, effort: source.member.effort,
+            })
+          await updateLeafMember(familyPath(root), root, sourceId, { status: 'closed' })
+          await ownerReleases.get(sourceId)?.()
+          ownerReleases.delete(sourceId)
+          views.delete(sourceId)
+          source.member = member
+          views.set(id, source)
+          let released: Promise<void> | undefined
+          ownerReleases.set(id, () => released ??= release())
+          if (selected.get(root) === sourceId) selected.set(root, id)
+          publish()
+        } catch (error) { await release(); throw error }
+        break
+      }
+      case 'select': selectLeaf(id); break
+      case 'create': {
+        const view = await createLeaf(id, value, third, fourth)
+        result = view.member
+        break
+      }
+      case 'return':
+        if (!contextReturn) throw new Error('Original session unavailable')
+        result = await contextReturn(id, value)
+        break
+      case 'restore': await restoreLeafWorkspace(); break
+      case 'change': await changeLeaf(id, value); break
+      case 'file': await fileLeaf(id, value); break
+      case 'goal': result = await setLeafGoal(id, value); break
+      case 'settings': await saveLeafSettings(id, value); break
+      case 'renamed': {
+        const view = views.get(sourceId)!
+        view.member = await updateLeafMember(familyPath(root), root, sourceId, { name: String(id) })
+        publish()
+        break
+      }
+      case 'checkpoint': case 'model': case 'effort': {
+        const view = getLeafViews().find(item => item.member.sessionId === id)
+        if (!view) throw new Error('Unknown leaf')
+        if (message.action === 'checkpoint') await view.process.checkpoint(value)
+        else if (message.action === 'model') await view.process.setModel(value)
+        else await view.process.setEffort(value)
+        break
+      }
+      default: throw new Error('Unknown workspace action')
+    }
+    child.terminal({ type: 'leaf-response', id: message.id, ok: true, value: result })
+  } catch {
+    try { child.terminal({ type: 'leaf-response', id: message.id, ok: false }) } catch { /* Closing the originating session needs no reply. */ }
+  }
+}
+
 export async function createLeaf(name?: string, parentSessionId?: string, worktree?: string, options: { fresh?: boolean; model?: string; effort?: LeafMember['effort'] } = {}): Promise<LeafView> {
+  if (isInteractiveLeaf()) {
+    const member = await requestLeafWorkspace<LeafMember>('create', [name, parentSessionId ?? getSessionId(), worktree, options])
+    return getLeafViews().find(view => view.member.sessionId === member.sessionId)!
+  }
   const root = getSessionId()
-  const parent = parentSessionId ? getLeafViews().find(view => view.member.sessionId === parentSessionId) : undefined
-  if (parentSessionId && (!parent || (!options.fresh && parent.process.getState() !== 'idle'))) throw new Error('Parent leaf must be open and idle to copy context')
+  const fromRoot = !parentSessionId || parentSessionId === 'original' || parentSessionId === root
+  const parent = fromRoot ? undefined : getLeafViews().find(view => view.member.sessionId === parentSessionId)
+  if (!fromRoot && !parent) throw new Error('Parent leaf must be open to copy context')
   let cwd = parent?.member.cwd ?? getCwd()
   if (worktree) {
     const git = promisify(execFile)
@@ -128,6 +239,7 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
 }
 
 export async function restoreLeafWorkspace(): Promise<void> {
+  if (isInteractiveLeaf()) return
   const root = getSessionId()
   const family = await readLeafFamily(familyPath(root), root)
   const failures: unknown[] = []
@@ -138,6 +250,7 @@ export async function restoreLeafWorkspace(): Promise<void> {
 }
 
 export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace('change', [sessionId, patch])
   const root = getSessionId()
   const view = views.get(sessionId)
   if (view && view.rootSessionId !== root) throw new Error('Leaf belongs to another family')
@@ -176,6 +289,7 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
 }
 
 export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace('file', [sessionId, tag])
   const { recursivelySanitizeUnicode } = await import('./sanitization.js')
   const normalized = recursivelySanitizeUnicode(tag).trim()
   if (!normalized || normalized.length > 200) throw new Error('Tag must contain 1–200 characters')
@@ -210,6 +324,7 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
 }
 
 export async function setLeafGoal(sessionId: string, args: string): Promise<string> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace('goal', [sessionId, args])
   const { parsePersistArgs } = await import('../skills/bundled/persist.js')
   const { readPersistSessionRecord, writePersistSessionRecord } = await import('./sessionStorage.js')
   const parsed = parsePersistArgs(args)
@@ -250,6 +365,7 @@ export async function setLeafGoal(sessionId: string, args: string): Promise<stri
 }
 
 export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<LeafMember>, 'model' | 'effort'>): Promise<void> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace('settings', [sessionId, patch])
   const view = getLeafViews().find(item => item.member.sessionId === sessionId)
   if (!view) throw new Error('Unknown leaf')
   view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, sessionId, patch)
@@ -257,7 +373,9 @@ export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<Le
 }
 
 export async function saveLeafDraft(view: LeafView): Promise<void> {
-  view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, view.member.sessionId, { draft: view.draft, scrollOffset: view.scrollOffset })
+  const owned = views.get(view.member.sessionId)
+  if (owned && !['closed', 'failed'].includes(owned.process.getState())) await owned.process.syncDraft()
+  view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, view.member.sessionId, { draft: view.draft })
 }
 
 registerCleanup(async () => { await Promise.all([...views.values()].map(async view => {

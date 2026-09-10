@@ -2,7 +2,8 @@ import React, { useState } from 'react'
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { PassThrough } from 'node:stream'
-import { render } from '../src/ink.ts'
+import { render, Box } from '../src/ink.ts'
+import { LeafSessionBar } from '../src/components/LeafWorkspaceDialog.tsx'
 import instances from '../src/ink/instances.ts'
 import { nodeCache } from '../src/ink/node-cache.ts'
 import { dispatchClick } from '../src/ink/hit-test.ts'
@@ -23,7 +24,7 @@ function findLabel(node: DOMElement, label: string): DOMElement | undefined {
   return textOf(node) === label && nodeCache.has(node) ? node : undefined
 }
 
-export async function exercisePromptWorkspace(views: import('../src/utils/leafWorkspace.ts').LeafView[] = []): Promise<void> {
+async function exercisePromptWorkspace(): Promise<void> {
   const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
   const savedFullscreen = process.env.CLAUDE_CODE_NO_FLICKER
   process.env.CLAUDE_CODE_USE_GATEWAY = '1'
@@ -39,7 +40,7 @@ export async function exercisePromptWorkspace(views: import('../src/utils/leafWo
   const representativeMessages = [{ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'representative status content' }], usage: { input_tokens: 6300, output_tokens: 9, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }] as any[]
   const assertFooterGeometry = () => {
     const root = (instances.get(stdout as any) as unknown as { rootNode: DOMElement }).rootNode
-    for (const [label, minimumWidth] of [['Sessions', 8], [`All ${views.length + 1}`, 5]] as const) {
+    for (const [label, minimumWidth] of [['Sessions', 8], ['All 1', 5]] as const) {
       const node = findLabel(root, label)
       assert.ok(node, `${label} label must render`)
       const rect = nodeCache.get(node!)
@@ -54,14 +55,14 @@ export async function exercisePromptWorkspace(views: import('../src/utils/leafWo
     const [input, setInput] = useState('ORIGINAL_DRAFT')
     currentDraft = input
     const state = getDefaultAppState()
-    return <PromptInput {...{
+    return <Box flexDirection="column"><PromptInput {...{
       debug: false, ideSelection: undefined, toolPermissionContext: state.toolPermissionContext, setToolPermissionContext: noop,
-      apiKeyStatus: 'valid', commands: [], agents: [], isLoading: false, verbose: false, messages: representativeMessages, onAutoUpdaterResult: noop, autoUpdaterResult: null,
+      apiKeyStatus: 'valid', commands: [{ name: 'fixture', type: 'local-jsx', description: 'Fixture command', load: async () => ({ call: async () => null }) }], agents: [], isLoading: false, verbose: false, messages: representativeMessages, onAutoUpdaterResult: noop, autoUpdaterResult: null,
       input, onInputChange: setInput, mode: 'prompt', onModeChange: noop, stashedPrompt: undefined, setStashedPrompt: noop, submitCount: 0,
       onShowMessageSelector: noop, mcpClients: [], pastedContents: {}, setPastedContents: noop, vimMode: 'INSERT', setVimMode: noop,
       showBashesDialog: false, setShowBashesDialog: noop, onExit: noop, getToolUseContext: () => ({}), onSubmit: async (text: string) => { submitted.push(text) },
       isSearchingHistory: false, setIsSearchingHistory: noop, helpOpen: false, setHelpOpen: noop,
-    } as any} />
+    } as any} /><LeafSessionBar /></Box>
   }
   const { selectLeaf } = await import('../src/utils/leafWorkspace.ts')
   selectLeaf()
@@ -81,38 +82,15 @@ export async function exercisePromptWorkspace(views: import('../src/utils/leafWo
       assert.equal(dispatchClick(root, rect.x, rect.y), true)
       await new Promise(resolve => setTimeout(resolve, 150))
     }
-    await click(`All ${views.length + 1}`)
+    await click('All 1')
     assert.ok(textOf(root).includes('All sessions'), 'Expanded session picker must render')
-    if (views.length) await click(`${views[0]!.member.number} ${views[0]!.member.name} [${views[0]!.process.getState()}]`)
-    else await click('Close list')
+    await click('Close list')
     stdout.columns = 60
     stdout.emit('resize')
     await new Promise(resolve => setTimeout(resolve, 150))
     assert.equal(currentDraft, 'ORIGINAL_DRAFT appended')
-    if (views.length > 0) {
-      for (let index = 0; index < views.length; index++) {
-        const marker = index === 0 ? 'TERMINAL_FIRST_LEAF' : index === 1 ? 'TERMINAL_SECOND_LEAF' : `TERMINAL_LEAF_${index + 1}`
-        stdin.write(marker)
-        await new Promise(resolve => setTimeout(resolve, 150))
-        assert.equal(views[index].draft, marker, `Leaf ${index + 1} must show its own draft before submission`)
-        stdin.write('\r')
-        await new Promise(resolve => setTimeout(resolve, 150))
-        if (index + 1 < views.length) {
-          await click(`All ${views.length + 1}`)
-          const next = views[index + 1]!
-          await click(`${next.member.number} ${next.member.name} [${next.process.getState()}]`)
-        } else stdin.write('\x1b')
-        await new Promise(resolve => setTimeout(resolve, 150))
-      }
-    }
-    assert.equal(currentDraft, 'ORIGINAL_DRAFT appended', 'Leaf typing and submission must not alter original input')
-    const closeDeadline = Date.now() + 10000
-    while (textOf(root).includes('wheel switches')) {
-      assert.equal(textOf(root).includes('Drafts could not be saved'), false, 'Workspace exit must save all leaf drafts')
-      if (Date.now() > closeDeadline) throw new Error('Workspace did not return to original prompt after saving drafts')
-      await new Promise(resolve => setTimeout(resolve, 25))
-    }
-    await new Promise(resolve => setTimeout(resolve, 150))
+    assertFooterGeometry()
+    assert.equal(textOf(root).includes('All sessions'), false, 'Session picker must close without replacing the prompt')
     stdin.write(' after')
     await new Promise(resolve => setTimeout(resolve, 150))
     assert.equal(currentDraft, 'ORIGINAL_DRAFT appended after')
@@ -120,6 +98,13 @@ export async function exercisePromptWorkspace(views: import('../src/utils/leafWo
     await new Promise(resolve => setTimeout(resolve, 500))
     assert.equal(currentDraft, 'ORIGINAL_DRAFT appended after pasted世界')
     assert.deepEqual(submitted, ['ORIGINAL_DRAFT appended after pasted世界'])
+    stdin.write('\x15')
+    await new Promise(resolve => setTimeout(resolve, 150))
+    stdin.write('/fixture')
+    await new Promise(resolve => setTimeout(resolve, 500))
+    stdin.write('\r')
+    await new Promise(resolve => setTimeout(resolve, 300))
+    assert.equal(submitted.filter(text => text === '/fixture').length, 1, 'One Enter must submit an exact slash command once')
   } finally {
     app?.unmount()
     stdin.destroy()
@@ -131,4 +116,4 @@ export async function exercisePromptWorkspace(views: import('../src/utils/leafWo
   }
 }
 
-test('actual prompt footer opens leaves and returns to original draft', { timeout: 15000 }, () => exercisePromptWorkspace())
+test('session picker preserves the normal prompt draft and paste submission', { timeout: 15000 }, () => exercisePromptWorkspace())

@@ -2,6 +2,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child
 import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import killTree from 'tree-kill'
+import type { LeafTerminalMessage, LeafSnapshot } from './leafTerminal.js'
 
 export type LeafPermission = { id: string; tool: string; input: Record<string, unknown> }
 export type LeafProcessState = 'starting' | 'idle' | 'running' | 'awaiting-approval' | 'closed' | 'failed'
@@ -23,6 +24,8 @@ export class LeafProcess {
     onEvent: (event: Record<string, unknown>) => void
     onState: (state: LeafProcessState) => void
     onExit?: () => void
+    interactive?: boolean
+    onTerminal?: (message: LeafTerminalMessage) => void
   }) {}
 
   private setState(state: LeafProcessState): void { this.state = state; this.options.onState(state) }
@@ -43,7 +46,7 @@ export class LeafProcess {
     if (this.closing) throw new Error('Leaf is closing or closed')
     if (this.child) throw new Error('Leaf process already started')
     this.setState('starting')
-    const child = spawn(this.options.executable, this.options.args, { cwd: this.options.cwd, env: this.options.env, stdio: 'pipe', windowsHide: true })
+    const child = spawn(this.options.executable, this.options.args, { cwd: this.options.cwd, env: this.options.env, stdio: this.options.interactive ? ['pipe', 'pipe', 'pipe', 'ipc'] : 'pipe', windowsHide: true }) as ChildProcessWithoutNullStreams
     this.child = child
     this.closed = new Promise(resolve => child.once('close', resolve))
     child.stderr.on('data', () => {}) // Provider exceptions can contain credentials; never forward raw stderr.
@@ -55,6 +58,28 @@ export class LeafProcess {
       this.setState(this.state === 'failed' ? 'failed' : code === 0 ? 'closed' : 'failed')
       this.options.onExit?.()
     })
+    if (this.options.interactive) {
+      child.stdout.resume() // Synchronous fd writes during shutdown are not terminal frames.
+      child.on('message', (raw: unknown) => {
+        if (this.state === 'closed' || this.state === 'failed') return
+        const message = raw as LeafTerminalMessage
+        if (!message || typeof message !== 'object') return
+        if (message.type === 'leaf-state') this.setState(message.state)
+        if (message.type === 'leaf-control-response') {
+          const pending = this.controls.get(message.id)
+          if (pending) {
+            clearTimeout(pending.timer)
+            this.controls.delete(message.id)
+            if (message.ok) pending.resolve()
+            else pending.reject(new Error('Leaf rejected control request'))
+          }
+        }
+        this.options.onTerminal?.(message)
+      })
+      await this.control({ subtype: 'initialize' })
+      if (this.state === 'starting') this.setState('idle')
+      return
+    }
     // Some print-mode launchers require redirected stdin to contain data before
     // they start the child CLI. keep_alive is a valid stream-json input frame
     // that the CLI ignores, so it unblocks that check without initializing a
@@ -86,7 +111,10 @@ export class LeafProcess {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.controls.delete(id); reject(new Error('Leaf control timed out')); this.fail() }, 60000)
       this.controls.set(id, { resolve, reject, timer })
-      try { this.write({ type: 'control_request', request_id: id, request }) }
+      try {
+        if (this.options.interactive) this.terminal({ type: 'leaf-control', id, request: request as import('./leafTerminal.js').LeafTerminalControl })
+        else this.write({ type: 'control_request', request_id: id, request })
+      }
       catch (error) { clearTimeout(timer); this.controls.delete(id); reject(error) }
     })
   }
@@ -122,7 +150,16 @@ export class LeafProcess {
     if (event.type === 'result') this.setState(this.permissions.size ? 'awaiting-approval' : 'idle')
   }
 
+  terminal(message: LeafTerminalMessage): void {
+    if (this.closing || !this.child?.connected || ['closed', 'failed'].includes(this.state)) throw new Error('Leaf terminal is not running')
+    this.child.send(message, error => { if (error && !this.closing) this.fail() })
+  }
+  focus(active: boolean, epoch: number, columns: number, rows: number): void { this.terminal({ type: 'leaf-focus', active, epoch, columns, rows }) }
+  input(data: string): void { this.terminal({ type: 'leaf-input', data }) }
+  snapshot(snapshot: LeafSnapshot): void { this.terminal({ type: 'leaf-snapshot', snapshot }) }
+
   send(text: string): void {
+    if (this.options.interactive) throw new Error('Interactive leaves receive terminal input, not headless messages')
     if (this.state !== 'idle') throw new Error('Leaf is not idle')
     this.write({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, session_id: '' })
     this.setState('running')
@@ -136,6 +173,7 @@ export class LeafProcess {
     this.setState(this.permissions.size ? 'awaiting-approval' : 'running')
   }
 
+  syncDraft(): Promise<void> { return this.control({ subtype: 'leaf_draft' }) }
   checkpoint(name?: string): Promise<void> { return this.control({ subtype: 'leaf_checkpoint', name }) }
   setModel(model: string): Promise<void> { return this.control({ subtype: 'set_model', model }) }
   setEffort(effort: string): Promise<void> { return this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: effort } }) }
@@ -175,7 +213,10 @@ export class LeafProcess {
     if (!child) return
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
-      if (child.exitCode === null && child.signalCode === null) child.stdin.end()
+      if (child.exitCode === null && child.signalCode === null) {
+        if (this.options.interactive && child.connected) child.send({ type: 'leaf-control', id: randomUUID(), request: { subtype: 'shutdown' } }, () => {})
+        else child.stdin.end()
+      }
       const graceful = await Promise.race([
         this.closed.then(() => true),
         new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 2000) }),
