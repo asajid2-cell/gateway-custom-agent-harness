@@ -2266,6 +2266,33 @@ test('HTTP boundary keeps omitted-stream DeepSeek fallback JSON', async () => {
   })
 })
 
+test('DeepSeek v4.1 Flash uses the canonical direct model ID', async () => {
+  await withGatewayAndFakeDeepSeek({
+    handler: async (req, res, state) => {
+      state.requests.push(await requestJson(req))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'msg-ds-v41',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'deepseek-v41-ok' }],
+        stop_reason: 'end_turn',
+      }))
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-ds-4.1-flash',
+        stream: false,
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'v4.1' }],
+      })
+      assert.equal(result.status, 200)
+      assert.equal(JSON.parse(result.body).content[0].text, 'deepseek-v41-ok')
+      assert.equal(state.requests[0].model, 'deepseek-flash')
+    },
+  })
+})
+
 test('DeepSeek native summary requests receive an inert gateway contract', async () => {
   await withGatewayAndFakeDeepSeek({
     handler: async (req, res, state) => {
@@ -3507,6 +3534,42 @@ test('OpenCode request headers default to JSON and opt into SSE explicitly', () 
   assert.equal(openCodeGoHeaders('responses', 'synthetic-key', true).accept, 'text/event-stream')
 })
 
+test('keeps OpenCode tool results adjacent to the assistant tool call', () => {
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'inspect this' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call-1', name: 'read', input: { path: 'x' } }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call-1', content: 'done' },
+          { type: 'text', text: 'Now summarize it.' },
+        ],
+      },
+    ],
+  }, 'deepseek-v4-flash')
+
+  assert.deepEqual(request.messages.slice(1).map(message => message.role), ['user', 'assistant', 'tool', 'user'])
+  assert.deepEqual(request.messages[2], {
+    role: 'assistant',
+    content: null,
+    tool_calls: [{
+      id: 'call-1',
+      type: 'function',
+      function: { name: 'read', arguments: '{"path":"x"}' },
+    }],
+  })
+  assert.deepEqual(request.messages[3], {
+    role: 'tool',
+    tool_call_id: 'call-1',
+    content: 'done',
+  })
+  assert.deepEqual(request.messages[4], {
+    role: 'user',
+    content: [{ type: 'text', text: 'Now summarize it.' }],
+  })
+})
+
 test('builds OpenCode Go Chat Completions requests and forwards images', () => {
   const request = anthropicToOpenCodeChat(
     {
@@ -4077,6 +4140,7 @@ test('keeps OpenCode effort capabilities model-specific', () => {
   assert.deepEqual(openCodeGoEffortLevels('qwen3.7-plus'), [])
   assert.deepEqual(openCodeGoEffortLevels('deepseek-v4-flash'), ['low', 'high', 'max'])
   assert.deepEqual(openCodeGoEffortLevels('deepseek-v4-pro'), ['high', 'max'])
+  assert.deepEqual(openCodeGoEffortLevels('deepseek-v4.1-flash'), ['low', 'high', 'max'])
 })
 
 test('does not forward unsupported OpenCode max or xhigh', () => {

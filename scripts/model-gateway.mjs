@@ -131,9 +131,10 @@ const DEFAULT_MODELS = {
   'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
   'gpt-6-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
-  'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
-  'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
-  'deepseek-v4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash', hidden: true },
+  'deepseek-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
+  'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
+  'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', effortLevels: ['low', 'high', 'max'], hidden: true },
+  'deepseek-v4.1-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
   ...Object.fromEntries(
     OPENCODE_GO_MODEL_IDS.map(model => [
       `opencode-go/${model}`,
@@ -200,9 +201,9 @@ const DEFAULT_MODELS = {
   'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
   'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS },
   'gateway-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS },
-  'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash' },
-  'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro' },
-  'gateway-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash' },
+  'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'] },
+  'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', effortLevels: ['low', 'high', 'max'] },
+  'gateway-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'] },
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -210,9 +211,9 @@ const DEFAULT_MODELS = {
   'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
   'claude-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
-  'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', hidden: true },
-  'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', hidden: true },
-  'claude-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-v4.1-flash', hidden: true },
+  'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
+  'claude-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', effortLevels: ['low', 'high', 'max'], hidden: true },
+  'claude-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
   ...Object.fromEntries(
     OPENCODE_ZEN_MODEL_IDS.map(model => [
       `claude-opencode-${model}`,

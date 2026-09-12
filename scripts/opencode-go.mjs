@@ -323,14 +323,21 @@ function appendChatMessage(messages, message) {
   }
 
   // Preserve the provider-required order: an assistant tool-call message must
-  // be immediately followed by its tool result(s). Do not emit a synthetic
-  // empty user message for Anthropic's tool_result-only user turn.
-  if (content.length || toolCalls.length) {
-    const converted = { role, content: content.length ? chatContent(content) : null }
-    if (toolCalls.length) converted.tool_calls = toolCalls
+  // be immediately followed by its tool result(s). Anthropic can attach text or
+  // other ordinary blocks to the same user turn as tool_result blocks; emitting
+  // that ordinary user message first would leave the assistant tool call
+  // unmatched at the Chat Completions boundary.
+  const converted = content.length || toolCalls.length
+    ? { role, content: content.length ? chatContent(content) : null }
+    : null
+  if (toolCalls.length) {
+    converted.tool_calls = toolCalls
     messages.push(converted)
+    if (toolResults.length) messages.push(...toolResults)
+  } else {
+    if (toolResults.length) messages.push(...toolResults)
+    if (converted) messages.push(converted)
   }
-  messages.push(...toolResults)
 }
 
 function chatToolChoice(choice) {

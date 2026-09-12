@@ -91,15 +91,21 @@ test('press-and-hold opens all sessions without selecting on release', async () 
   } finally { t.close() }
 })
 
-test('plain cursor reports are consumed only during an explicit Windows calibration', async () => {
+test('cursor position reports never become prompt keys', async () => {
   const { expectStandardCursorPosition, parseMultipleKeypresses, INITIAL_STATE } = await import('../src/ink/parse-keypress.ts')
   expectStandardCursorPosition(false)
-  const before = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
+  for (const report of ['\x1b[?19;9;1R', '\x1b[19;9;1R', '\x1b[21;18;1R']) {
+    const [parsed] = parseMultipleKeypresses(INITIAL_STATE, report)
+    assert.equal(parsed[0]?.kind, 'response', report)
+    assert.equal(parsed[0]?.response.type, 'cursorPosition')
+  }
+
+  const plain = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
   expectStandardCursorPosition(true)
   const during = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
   const after = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
   assert.match(JSON.stringify(during), /cursorPosition/)
-  assert.doesNotMatch(JSON.stringify(before), /cursorPosition/)
+  assert.doesNotMatch(JSON.stringify(plain), /cursorPosition/)
   assert.doesNotMatch(JSON.stringify(after), /cursorPosition/)
 })
 

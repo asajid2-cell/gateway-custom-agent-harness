@@ -39,6 +39,8 @@ test('launcher forwards the full Gateway model catalog with economical role defa
   assert.ok(options.some(option => option.value === 'gateway-gpt-terra'))
   assert.ok(options.some(option => option.value === 'gateway-ds-flash'))
   assert.ok(options.some(option => option.value === 'gateway-ds-pro'))
+  assert.ok(options.some(option => option.value === 'gateway-ds-4.1-flash'))
+  assert.ok(options.some(option => option.value === 'gateway-opencode-deepseek-v4.1-flash'))
   assert.ok(options.some(option => option.value.startsWith('gateway-opencode-')))
 })
 
