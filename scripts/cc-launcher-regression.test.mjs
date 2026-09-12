@@ -25,7 +25,13 @@ test('launcher diagnostics use an explicit safe-field allowlist', async () => {
 
 test('launcher forwards the full Gateway model catalog with economical role defaults', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
-  assert.match(script, /else \{ 'medium' \}/)
+  assert.match(script, /function Resolve-DefaultGatewayEffort \{/)
+  assert.match(script, /\$levels -contains 'medium'/)
+  assert.match(script, /\$levels -contains 'high'/)
+  assert.match(script, /return \[string\]\$levels\[0\]/)
+  assert.match(script, /\$Effort = Resolve-DefaultGatewayEffort -Value \$Model/)
+  assert.match(script, /-not \[string\]::IsNullOrWhiteSpace\(\$Effort\) -and/)
+  assert.doesNotMatch(script, /else \{ 'medium' \}/)
   assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'/)
   assert.match(script, /MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'/)
   assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-gpt-luna'/)

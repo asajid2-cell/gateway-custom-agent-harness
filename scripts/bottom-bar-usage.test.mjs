@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   formatBottomBarUsage,
+  formatEffortSegment,
   formatSessionResumeCommand,
   getContextUsageValues,
   getGatewayProviderLabel,
@@ -57,7 +58,7 @@ test('bottom bar identifies Gateway providers without inventing quota data', () 
   assert.equal(getGatewayProviderLabel('gateway-opencode-mimo-v2.5-free'), 'OpenCode')
   assert.match(
     formatBottomBarUsage('gateway-gpt-luna', null, 200_000),
-    /Codex · model gateway-gpt-luna · usage unavailable · context unavailable$/,
+    /Codex · model gateway-gpt-luna · effort auto · usage unavailable · context unavailable$/,
   )
   assert.match(
     formatBottomBarUsage(
@@ -73,4 +74,24 @@ test('bottom bar identifies Gateway providers without inventing quota data', () 
     ),
     /weekly 80% left$/,
   )
+})
+
+test('bottom bar reports the real per-session effort, not a constant', () => {
+  // low|high|max models: undefined means nothing is sent, so show auto.
+  assert.equal(formatEffortSegment('gateway-ds-4.1-flash', undefined), 'effort auto')
+  assert.equal(formatEffortSegment('gateway-ds-4.1-flash', 'low'), 'effort low')
+  assert.equal(formatEffortSegment('gateway-ds-4.1-flash', 'high'), 'effort high')
+  assert.equal(formatEffortSegment('gateway-ds-4.1-flash', 'max'), 'effort max')
+  // medium is not native to the DeepSeek ladder and clamps to high at send time.
+  assert.equal(formatEffortSegment('gateway-ds-4.1-flash', 'medium'), 'effort high')
+
+  // Changing the value changes the rendered segment.
+  const low = formatBottomBarUsage('gateway-ds-4.1-flash', null, 200_000, undefined, null, 'low')
+  const max = formatBottomBarUsage('gateway-ds-4.1-flash', null, 200_000, undefined, null, 'max')
+  assert.match(low, /effort low · usage unavailable/)
+  assert.match(max, /effort max · usage unavailable/)
+  assert.notEqual(low, max)
+
+  // Models without a native ladder expose no effort control at all.
+  assert.equal(formatEffortSegment('gateway-opencode-mimo-v2.5-pro', 'high'), null)
 })

@@ -106,7 +106,36 @@ function Resolve-GatewayModel {
   return $Value
 }
 $Model = Resolve-GatewayModel -Value $RequestedModel
-$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { 'medium' }
+
+# Each Gateway model implements only its provider-native effort ladder. Pick
+# the launch default from that ladder so a fresh session starts on a level the
+# provider accepts, rather than a non-native value that silently clamps at send
+# time. Models with no native ladder get no --effort at all.
+function Resolve-DefaultGatewayEffort {
+  param([string]$Value)
+
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return $null
+  }
+  foreach ($alias in $CapabilityCatalog.gatewayAliases.PSObject.Properties) {
+    if ($alias.Name -ieq $Value) {
+      $levels = @($alias.Value)
+      if ($levels.Count -eq 0) {
+        return $null
+      }
+      if ($levels -contains 'medium') {
+        return 'medium'
+      }
+      if ($levels -contains 'high') {
+        return 'high'
+      }
+      return [string]$levels[0]
+    }
+  }
+  return $null
+}
+
+$Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { $null }
 $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
 $ClaudeArgs = @($args)
@@ -314,6 +343,11 @@ if ($null -ne $ExplicitEffort) {
   $Effort = $ExplicitEffort
   $EffortWasExplicit = $true
 }
+# Resolve the model-native default only after --model is known. $Effort stays
+# $null for models with no native ladder, in which case --effort is omitted.
+if ([string]::IsNullOrWhiteSpace($Effort)) {
+  $Effort = Resolve-DefaultGatewayEffort -Value $Model
+}
 
 function Test-HasPrintInput {
   param([string[]]$Arguments)
@@ -455,6 +489,7 @@ $AutoRestartAttempts = if ($IsResume) { 1 } else { 0 }
 $SettingsEnableUltracode = $CallerSettings.ultracode -eq $true
 if (
   -not $HasEffortArgument -and
+  -not [string]::IsNullOrWhiteSpace($Effort) -and
   ($EffortWasExplicit -or -not $IsResume) -and
   ($EffortWasExplicit -or -not $SettingsEnableUltracode)
 ) {

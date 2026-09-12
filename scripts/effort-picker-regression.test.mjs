@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import {
@@ -7,6 +8,7 @@ import {
   resolveGatewayEffortAfterModelSwitch,
 } from '../src/utils/model/gatewayEffortState.ts'
 import { getGatewayNativeEffortLevels } from '../src/utils/model/gatewayEffortCapabilities.ts'
+import { getAppliedEffortLevel, getDisplayedEffortLevel } from '../src/utils/effort.ts'
 
 test('5.6 model switching preserves the full native ladder', () => {
   const lunaLevels = getGatewayNativeEffortLevels('gateway-gpt-luna')
@@ -60,4 +62,28 @@ test('ultracode cycles as a harness control', () => {
 
   assert.equal(cycleGatewayEffort('max', 'right', flashLevels), 'ultracode')
   assert.equal(cycleGatewayEffort('ultracode', 'right', flashLevels), 'low')
+})
+
+test('the effort notification folds so the footer tracks the real session value', async () => {
+  const source = await readFile(
+    new URL('../src/components/PromptInput/PromptInput.tsx', import.meta.url),
+    'utf8',
+  )
+  const start = source.indexOf("key: 'effort-level'")
+  assert.ok(start >= 0, 'the effort notification must be registered')
+  const block = source.slice(start, source.indexOf('});', start))
+  assert.match(
+    block,
+    /fold: \(_previous, incoming\) => incoming/,
+    'without a fold a same-key re-add is dropped and the footer text never updates',
+  )
+})
+
+test('applied effort stays undefined when nothing is sent, displayed falls back to high', () => {
+  // DeepSeek/OpenCode native ladder is low|high|max: undefined means no
+  // effort parameter is sent, medium is not native and clamps to high.
+  assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', undefined), undefined)
+  assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', 'max'), 'max')
+  assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', 'medium'), 'high')
+  assert.equal(getDisplayedEffortLevel('gateway-ds-4.1-flash', undefined), 'high')
 })
