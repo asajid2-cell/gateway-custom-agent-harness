@@ -1,11 +1,6 @@
 import { calculateContextPercentages } from './context.js'
 import { quotePowerShellLiteral } from './shell/powershellQuote.js'
 import { formatTokens } from './format.js'
-import {
-  type EffortValue,
-  getAppliedEffortLevel,
-  modelSupportsEffort,
-} from './effort.js'
 
 export type CurrentUsage = {
   input_tokens: number
@@ -75,36 +70,16 @@ export function formatSessionResumeCommand(
   return `cd ${quotePowerShellLiteral(directory)}; & cc --resume ${sessionId}`
 }
 
-/**
- * The real per-session effort: the provider-native level this session will
- * send, or `auto` when no effort parameter is sent for this model. Returns
- * null for models that expose no effort control at all.
- */
-export function formatEffortSegment(
-  model: string,
-  effortValue: EffortValue | undefined,
-): string | null {
-  if (!modelSupportsEffort(model)) return null
-  const level = getAppliedEffortLevel(model, effortValue)
-  return `effort ${level ?? 'auto'}`
-}
-
 export function formatBottomBarUsage(
   model: string,
   usage: CurrentUsage | null,
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
   codexQuota?: CodexQuotaDisplay | null,
-  effortValue?: EffortValue,
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
   const weeklyRemaining = getWeeklyRemainingPercent(weekly)
   const parts = [getGatewayProviderLabel(model), `model ${model}`]
-
-  const effortSegment = formatEffortSegment(model, effortValue)
-  if (effortSegment) {
-    parts.push(effortSegment)
-  }
 
   if (codexQuota && getGatewayProviderLabel(model) === 'Codex') {
     parts.push(`Codex remaining ${codexQuota.remainingPercent}%`)

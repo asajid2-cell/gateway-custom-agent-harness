@@ -1,0 +1,174 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import test from 'node:test'
+
+import { deriveSessionPurpose, formatGatewayPeerLine } from '../src/utils/gatewaySessionProtocol.ts'
+
+const user = content => ({ type: 'user', message: { content } })
+
+test('session intent comes from the opening request, not the truncated display name', () => {
+  assert.equal(
+    deriveSessionPurpose([user('Work on the archive project: migrate the audio key queue')]),
+    'Work on the archive project: migrate the audio key queue',
+  )
+  // Whitespace is collapsed so a multi-line paste stays one readable line.
+  assert.equal(deriveSessionPurpose([user('line one\n\n   line two')]), 'line one line two')
+  // Array content blocks are joined; non-text blocks contribute nothing.
+  assert.equal(
+    deriveSessionPurpose([user([{ type: 'text', text: 'first' }, { type: 'tool_use', name: 'x' }, { type: 'text', text: 'second' }])]),
+    'first second',
+  )
+})
+
+test('intent ignores everything that is not a real request from the user', () => {
+  const messages = [
+    { type: 'assistant', message: { content: 'I will start' } },
+    { type: 'user', isMeta: true, message: { content: 'meta reminder should not become intent' } },
+    { type: 'user', isSidechain: true, message: { content: 'subagent chatter' } },
+    user(''),
+    user('the actual request'),
+  ]
+  assert.equal(deriveSessionPurpose(messages), 'the actual request')
+})
+
+test('intent falls back rather than advertising an empty purpose', () => {
+  assert.equal(deriveSessionPurpose([], 'Claude Code'), 'Claude Code')
+  assert.equal(deriveSessionPurpose(undefined, '  spaced   name '), 'spaced name')
+  assert.equal(deriveSessionPurpose([], ''), '')
+  // The schema caps purpose at 1000 characters.
+  assert.equal(deriveSessionPurpose([user('x'.repeat(5000))]).length, 1000)
+})
+
+test('discovery lines lead with what a session is doing', () => {
+  const line = formatGatewayPeerLine({
+    status: 'running',
+    name: 'Friendly pickle greeting',
+    purpose: 'migrating the archive audio key queue',
+    cwd: 'C:/work/archive',
+    sessionId: '11111111-1111-4111-8111-111111111111',
+  })
+  assert.ok(line.startsWith('[running] migrating the archive audio key queue'), line)
+  assert.match(line, /11111111-1111-4111-8111-111111111111/)
+  assert.match(line, /C:\/work\/archive/)
+
+  // A session that has stated nothing still reads as a session, never a blank.
+  const unstated = formatGatewayPeerLine({
+    status: 'idle', name: 'Session 4', purpose: '', cwd: 'C:/w', sessionId: 's',
+  })
+  assert.match(unstated, /\[idle\] Session 4/)
+  assert.doesNotMatch(formatGatewayPeerLine({ status: 'idle', name: '', purpose: '', cwd: 'C:/w', sessionId: 's' }), /\[\] |^\[idle\]\s*$/)
+})
+
+test('every session records an intent on registration', async () => {
+  const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
+  assert.match(hook, /import \{ deriveSessionPurpose \} from '\.\.\/utils\/gatewaySessionProtocol\.js'/)
+  // Seeded at start; the name/status refresh must never clobber a declaration.
+  assert.match(hook, /const purpose = runtime\.transport\.peer\.purpose\.trim\(\) \? runtime\.transport\.peer\.purpose : sessionPurposeSeed\(sessionMessages, name\)/)
+  assert.match(hook, /await runtime\.transport\.update\(\{ name: latest\.current\.name, status:[^}]*purpose \}\)/)
+  // The live status effect updates name and status only.
+  assert.match(hook, /transport\.update\(\{ name, status: status === 'busy'/)
+  assert.doesNotMatch(hook, /transport\.update\(\{ name, status: status === 'busy'[^)]*purpose/)
+
+  const transport = await readFile(new URL('../src/utils/gatewaySessionTransport.ts', import.meta.url), 'utf8')
+  // A restart keeps the intent it already advertised instead of blanking it.
+  assert.match(transport, /if \(typeof raw\?\.peer\?\.purpose === 'string'\) this\.peer\.purpose = raw\.peer\.purpose\.slice\(0, 1000\)/)
+})
+
+test('a leaf is legible on the shared bus instead of looking like its parent', async () => {
+  const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
+  // A forked leaf carries its parent's history, so the label must win outright.
+  assert.match(hook, /const label = process\.env\.GATEWAY_LEAF_LABEL/)
+  assert.match(hook, /if \(label\) return label\.replace\(\/\\s\+\/g, ' '\)\.trim\(\)\.slice\(0, 1000\)/)
+  assert.match(hook, /return deriveSessionPurpose\(messages, name\)/)
+
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  assert.match(workspace, /GATEWAY_LEAF_LABEL: `Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{rootSessionId\}\)`/)
+})
+
+test('sessions can declare their intent and see each other doing it', async () => {
+  const command = await readFile(new URL('../src/commands/gateway-sessions.ts', import.meta.url), 'utf8')
+  // Declaring intent is explicit and bounded.
+  assert.match(command, /input === 'purpose' \|\| input\.startsWith\('purpose '\)/)
+  assert.match(command, /await runtime\.transport\.update\(\{ purpose: text \}\)/)
+  assert.match(command, /Purpose must be 1000 characters or fewer/)
+  // Discovery leads with intent and separates this session from the others.
+  assert.match(command, /This session:\\n\$\{render\(self\)\}/)
+  assert.match(command, /Other live sessions \(\$\{others\.length\}\)/)
+  assert.match(command, /formatGatewayPeerLine/)
+
+  const panel = await readFile(new URL('../src/components/GatewaySessionsDialog.tsx', import.meta.url), 'utf8')
+  assert.match(panel, /\{peer\.purpose\.trim\(\) \|\| peer\.name\}/)
+})
+
+test('the peer skill reports why it failed and teaches intent-first discovery', async () => {
+  const skill = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
+  // One blanket message made a bad address, an offline peer and malformed JSON
+  // indistinguishable, which is why peer messaging read as broken.
+  assert.doesNotMatch(skill, /catch \{[\s\S]{0,200}invalid input, unavailable peer, or transport error/)
+  assert.match(skill, /Peer operation failed: \$\{reason \|\| 'unavailable peer or transport error'\}/)
+  assert.match(skill, /input === 'purpose'\)/)
+  assert.match(skill, /input\.startsWith\('purpose '\)/)
+  assert.match(skill, /await runtime\.transport\.update\(\{ purpose: text \}\)/)
+  assert.match(skill, /formatGatewayPeerLine/)
+})
+
+// Importing the real formatter pulls the CLI module graph (~8s), which is not
+// worth paying to prove that bundled guidance survives a character clip.
+test('the listing shows a bundled skill in full and still caps third-party ones', { timeout: 60_000 }, async () => {
+  // Asserted against the real formatter, not string positions. A per-entry clip
+  // applied to bundled skills silently deleted the gateway-peers collaboration
+  // protocol, so this pins the exemption as behaviour: bundled guidance must
+  // survive, and the cap must still protect the listing from one verbose
+  // third-party description.
+  const { formatCommandsWithinBudget, MAX_LISTING_DESC_CHARS } = await import(
+    '../src/tools/SkillTool/prompt.ts'
+  )
+  const long = 'coordination guidance '.repeat(40)
+  const render = (source, loadedFrom) =>
+    formatCommandsWithinBudget([
+      { type: 'prompt', name: 'sample', description: long, source, loadedFrom },
+    ])
+
+  const bundled = render('bundled', 'bundled')
+  assert.ok(
+    !bundled.includes('\u2026'),
+    'a bundled description is never clipped by the per-entry cap',
+  )
+  assert.ok(bundled.includes(long), 'every word of the bundled guidance reaches the listing')
+
+  const plugin = render('plugin', 'plugin')
+  assert.ok(
+    plugin.includes('\u2026'),
+    'a third-party description is still clipped to protect the listing',
+  )
+  assert.ok(
+    plugin.length <= MAX_LISTING_DESC_CHARS + 10,
+    `third-party entry stays near the cap, got ${plugin.length}`,
+  )
+})
+
+test('the peer skill teaches coordination before it lists its arguments', async () => {
+  const skill = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
+  // No apostrophes, so a plain match extracts the literal description.
+  const description = skill.match(/description: '([^']*)'/)?.[1] ?? ''
+  // What a session must learn from the listing alone: peers exist, discover
+  // them, and settle ownership by talking rather than through a ledger.
+  assert.match(description, /Other live sessions share this workspace/)
+  assert.match(description, /list peers and their stated intent/)
+  assert.match(description, /agree who owns which files/)
+  assert.match(description, /worktree/)
+  // The lesson: there is no central authority to appeal to.
+  assert.match(description, /no lock service or merge bot/)
+  // Leading with the teaching, not the argument reference.
+  assert.ok(
+    description.indexOf('Other live sessions') < description.indexOf('Arguments:'),
+    'the argument list must not come before the collaboration protocol',
+  )
+})
+
+test('discovery hands back the next move instead of leaving coordination implied', async () => {
+  const command = await readFile(new URL('../src/commands/gateway-sessions.ts', import.meta.url), 'utf8')
+  assert.match(command, /Coordination is conversation: \/sessions send <id> <message> to talk to one, agree who owns which files/)
+  const skill = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
+  assert.match(skill, /Coordination is conversation: send JSON \{toSessionId,text,summary\}/)
+})

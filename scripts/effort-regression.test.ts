@@ -580,9 +580,9 @@ test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsEffort('claude-gpt-astra'), true)
   assert.equal(modelSupportsMaxEffort('claude-gpt-astra'), true)
   assert.equal(modelSupportsEffort('claude-ds-pro'), true)
-  assert.equal(modelSupportsMaxEffort('claude-ds-pro'), false)
+  assert.equal(modelSupportsMaxEffort('claude-ds-pro'), true)
   assert.equal(modelSupportsEffort('claude-ds-flash'), true)
-  assert.equal(modelSupportsMaxEffort('claude-ds-flash'), false)
+  assert.equal(modelSupportsMaxEffort('claude-ds-flash'), true)
   assert.equal(modelSupportsEffort('gateway-opencode-glm-5.3-flash'), true)
   assert.equal(modelSupportsMaxEffort('gateway-opencode-glm-5.3-flash'), true)
   assert.equal(modelSupportsEffort('claude-openrouter-anthropic%2Fclaude'), true)
@@ -620,7 +620,11 @@ test('DeepSeek exposes only its real effort levels', () => {
   )
   assert.deepEqual(
     getSupportedEffortLevels('claude-ds-pro'),
-    ['low', 'medium', 'high', 'ultracode'],
+    ['low', 'high', 'max', 'ultracode'],
+  )
+  assert.deepEqual(
+    getSupportedEffortLevels('claude-ds-flash'),
+    ['low', 'high', 'max', 'ultracode'],
   )
   assert.deepEqual(
     getSupportedEffortLevels('gateway-opencode-glm-5.3-flash'),

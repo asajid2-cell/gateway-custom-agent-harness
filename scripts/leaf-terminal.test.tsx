@@ -91,6 +91,95 @@ test('press-and-hold opens all sessions without selecting on release', async () 
   } finally { t.close() }
 })
 
+test('inline mouse ownership is selective: controls consume, content passes through', async () => {
+  let controlClicks = 0
+  let contentClicks = 0
+  let contentMouseDowns = 0
+  let contentMouseUps = 0
+  let wheelEvents = 0
+  let hovered = false
+  function Host() {
+    return <Box flexDirection="column">
+      <Box onClick={() => { controlClicks++ }} onMouseDown={() => { controlClicks += 10 }}>
+        <Text>CONTROL</Text>
+      </Box>
+      <Box onClick={() => { contentClicks++ }} onMouseDown={() => { contentMouseDowns++ }} onMouseUp={() => { contentMouseUps++ }}>
+        <Text>CONTENT</Text>
+      </Box>
+      <Box onWheel={event => { wheelEvents++; event.stopImmediatePropagation() }}>
+        <Text>WHEEL</Text>
+      </Box>
+      <Box onMouseEnter={() => { hovered = true }} onMouseLeave={() => { hovered = false }}>
+        <Text>HOVER</Text>
+      </Box>
+    </Box>
+  }
+  const t = await terminal(<Host />)
+  try {
+    const control = t.point('CONTROL')
+    t.mouse(0, control); t.mouse(0, control, true); await settle()
+    assert.equal(controlClicks, 11, 'a matching control press/release is consumed and clicked')
+
+    const content = t.point('CONTENT')
+    t.mouse(0, content); t.mouse(0, content, true); await settle()
+    assert.equal(contentMouseDowns, 1, 'ordinary inline press reaches the normal input path')
+    assert.equal(contentMouseUps, 1, 'ordinary inline release reaches the normal input path')
+    assert.equal(contentClicks, 1, 'ordinary inline content remains clickable through the fallback path')
+
+    const wheel = t.point('WHEEL')
+    t.mouse(64, wheel); await settle()
+    assert.equal(wheelEvents, 1, 'a wheel handler claims only its own inline event')
+
+    const ordinaryWheel = t.point('CONTENT')
+    t.mouse(65, ordinaryWheel); await settle()
+    assert.equal(wheelEvents, 1, 'a wheel over ordinary content is not swallowed by Gateway')
+
+    const hover = t.point('HOVER')
+    t.mouse(35, hover); await settle()
+    assert.equal(hovered, true, 'passive hover state is still updated')
+    assert.equal((t.ink as any).inlinePress, null, 'passive hover does not create a claimed press')
+  } finally { t.close() }
+})
+
+test('inline press cannot activate a replacement control after repaint', async () => {
+  let opens = 0
+  let redraw!: () => void
+  function Host() {
+    const [label, setLabel] = useState('FIRST')
+    redraw = () => setLabel(value => value === 'FIRST' ? 'SECOND' : 'FIRST')
+    return label === 'FIRST'
+      ? <Box onClick={() => { opens++ }}><Text>FIRST</Text></Box>
+      : <Box onClick={() => { opens++ }}><Text>SECOND</Text></Box>
+  }
+  const t = await terminal(<Host />)
+  try {
+    const p = t.point('FIRST')
+    t.mouse(0, p); await settle()
+    redraw(); await settle()
+    t.ink.repaint(); await settle()
+    t.mouse(0, p, true); await settle()
+    assert.equal(opens, 0, 'a stale press must not click newly rendered content')
+  } finally { t.close() }
+})
+
+test('inline press is cancelled by a resize before release', async () => {
+  let opens = 0
+  function Host() {
+    return <Box onClick={() => { opens++ }}><Text>RESIZE CONTROL</Text></Box>
+  }
+  const t = await terminal(<Host />)
+  try {
+    const p = t.point('RESIZE CONTROL')
+    t.mouse(0, p); await settle()
+    t.stdout.columns = 90
+    t.stdout.rows = 30
+    t.stdout.emit('resize')
+    await settle()
+    t.mouse(0, p, true); await settle()
+    assert.equal(opens, 0, 'a press must not click after resize invalidates its frame')
+  } finally { t.close() }
+})
+
 test('cursor position reports never become prompt keys', async () => {
   const { expectStandardCursorPosition, parseMultipleKeypresses, INITIAL_STATE } = await import('../src/ink/parse-keypress.ts')
   expectStandardCursorPosition(false)
@@ -100,6 +189,14 @@ test('cursor position reports never become prompt keys', async () => {
     assert.equal(parsed[0]?.response.type, 'cursorPosition')
   }
 
+  // A late CPR reply (probe already timed out or resolved) must still be
+  // classified as a response when its row cannot be a modified F3 sequence,
+  // otherwise the raw report is typed into the composer.
+  for (const late of ['\x1b[16;3R', '\x1b[2;1R', '\x1b[40;120R']) {
+    const [parsed] = parseMultipleKeypresses(INITIAL_STATE, late)
+    assert.equal(parsed[0]?.kind, 'response', late)
+    assert.equal(parsed[0]?.response.type, 'cursorPosition')
+  }
   const plain = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
   expectStandardCursorPosition(true)
   const during = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;2R')
@@ -107,6 +204,18 @@ test('cursor position reports never become prompt keys', async () => {
   assert.match(JSON.stringify(during), /cursorPosition/)
   assert.doesNotMatch(JSON.stringify(plain), /cursorPosition/)
   assert.doesNotMatch(JSON.stringify(after), /cursorPosition/)
+
+  // A dual-query probe (private + plain DSR) draws two replies for one
+  // matcher. The private reply must not spend the expectation, so the plain
+  // reply that follows is classified as a response instead of being typed
+  // into the composer as a modified F3 key.
+  expectStandardCursorPosition(true)
+  const [dualPrivate] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[?12;4R')
+  const [dualPlain] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;7R')
+  const [dualAfter] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[1;7R')
+  assert.equal(dualPrivate[0]?.response?.type, 'cursorPosition')
+  assert.equal(dualPlain[0]?.response?.type, 'cursorPosition')
+  assert.notEqual(dualAfter[0]?.response?.type, 'cursorPosition')
 })
 
 test('terminal handoff suspends and restores both input listener modes exactly once', async () => {

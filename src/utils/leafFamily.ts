@@ -23,6 +23,31 @@ const familySchema = z.object({
 export type LeafMember = z.infer<typeof memberSchema>
 export type LeafFamily = z.infer<typeof familySchema>
 
+/**
+ * Resolve a user-facing leaf reference to a member. Accepts an exact session
+ * ID, a member number (`1`), a numbered name (`1:fork`), or a name (exact
+ * case-insensitive match, then a unique case-insensitive substring). Ambiguous
+ * references resolve to undefined so no caller ever acts on the wrong leaf.
+ */
+export function resolveLeafMember(members: readonly LeafMember[], reference: string): LeafMember | undefined {
+  const ref = reference.trim()
+  if (!ref) return undefined
+  const byId = members.find(member => member.sessionId === ref)
+  if (byId) return byId
+  const numbered = ref.match(/^(\d+)(?::([\s\S]*))?$/)
+  if (numbered) {
+    const member = members.find(item => item.number === Number(numbered[1]))
+    if (!member) return undefined
+    const name = numbered[2]?.trim()
+    return !name || member.name.toLowerCase() === name.toLowerCase() ? member : undefined
+  }
+  const lower = ref.toLowerCase()
+  const exact = members.filter(member => member.name.toLowerCase() === lower)
+  if (exact.length === 1) return exact[0]
+  const partial = members.filter(member => member.name.toLowerCase().includes(lower))
+  return partial.length === 1 ? partial[0] : undefined
+}
+
 export async function readLeafFamily(path: string, rootSessionId: string): Promise<LeafFamily> {
   try {
     const family = familySchema.parse(JSON.parse(await readFile(path, 'utf8')))

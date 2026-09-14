@@ -1,15 +1,16 @@
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { access, readFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { getSessionId } from '../bootstrap/state.js'
 import { asSessionId } from '../types/ids.js'
 import { getCwd } from './cwd.js'
+import { checkHasTrustDialogAccepted } from './config.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { createFork } from '../commands/branch/branch.js'
-import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, saveSessionName } from './sessionStorage.js'
-import { addLeafMember, readLeafFamily, updateLeafMember, type LeafMember } from './leafFamily.js'
+import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscriptPathForSession, saveSessionName } from './sessionStorage.js'
+import { addLeafMember, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
 import { LeafProcess } from './leafProcess.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
@@ -64,6 +65,117 @@ export function getLeafViews(): LeafView[] {
 }
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
 
+async function currentFamily(): Promise<LeafFamily> {
+  const root = getSessionId()
+  return readLeafFamily(familyPath(root), root)
+}
+
+/** Members of the current family, from the parent's file or a leaf's snapshot. */
+export async function listLeafMembers(): Promise<LeafMember[]> {
+  if (isInteractiveLeaf()) return (getLeafSnapshot()?.members ?? []).map(entry => entry.member)
+  return (await currentFamily()).members
+}
+
+/**
+ * Resolve a leaf reference (session ID, number, `N:name`, or name) against the
+ * current family. Deterministic and side-effect free, so callers never need an
+ * agent turn to locate a leaf.
+ */
+export async function resolveLeafRef(reference: string): Promise<LeafMember | undefined> {
+  return resolveLeafMember(await listLeafMembers(), reference)
+}
+
+/** Human/model readable family listing with live process state where known. */
+export async function listLeaves(): Promise<string> {
+  const members = await listLeafMembers()
+  if (!members.length) return 'No leafs in this family.'
+  const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
+  return members.map(member => {
+    const state = states.get(member.sessionId) ?? member.status
+    const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
+    return `#${member.number} ${member.name} [${state}] ${member.sessionId}${settings ? ` ${settings}` : ''}`
+  }).join('\n')
+}
+
+export const LEAF_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode'] as const
+
+async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  let view = views.get(member.sessionId)
+  if (view && view.rootSessionId !== getSessionId()) view = undefined
+  if (!view || ['closed', 'failed'].includes(view.process.getState())) {
+    if (member.status !== 'open') throw new Error(`Leaf #${member.number} ${member.name} is ${member.status}`)
+    view = await launch(member, getSessionId())
+  }
+  return { member, view }
+}
+
+/** Hand a leaf a turn. Runs in the leaf's own REPL; the parent stays put. */
+export async function sendLeafMessage(reference: string, text: string): Promise<string> {
+  const message = text.trim()
+  if (!message) throw new Error('Message required')
+  if (message.length > 64000) throw new Error('Message too large')
+  if (isInteractiveLeaf()) {
+    const member = await resolveLeafRef(reference)
+    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    return requestLeafWorkspace<string>('send', [member.sessionId, message])
+  }
+  const { member, view } = await requireLeafView(reference)
+  const state = view.process.getState()
+  if (state === 'running') throw new Error(`Leaf #${member.number} ${member.name} is running; wait for its turn to finish`)
+  if (state === 'awaiting-approval') throw new Error(`Leaf #${member.number} ${member.name} is waiting for permission`)
+  await view.process.deliver(message)
+  return `Delivered to leaf #${member.number} ${member.name} (${member.sessionId}).`
+}
+
+export async function interruptLeaf(reference: string): Promise<string> {
+  if (isInteractiveLeaf()) {
+    const member = await resolveLeafRef(reference)
+    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    return requestLeafWorkspace<string>('interrupt', [member.sessionId])
+  }
+  const { member, view } = await requireLeafView(reference)
+  await view.process.interrupt()
+  return `Interrupted leaf #${member.number} ${member.name}.`
+}
+
+export async function checkpointLeaf(reference: string, name?: string): Promise<string> {
+  if (isInteractiveLeaf()) {
+    const member = await resolveLeafRef(reference)
+    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    return requestLeafWorkspace<string>('checkpoint', [member.sessionId, name])
+  }
+  const { member, view } = await requireLeafView(reference)
+  await view.process.checkpoint(name)
+  return `Checkpointed leaf #${member.number} ${member.name}.`
+}
+
+export async function configureLeaf(reference: string, patch: { model?: string; effort?: string }): Promise<string> {
+  if (patch.effort !== undefined && !(LEAF_EFFORT_LEVELS as readonly string[]).includes(patch.effort)) throw new Error('Invalid effort')
+  if (patch.model === undefined && patch.effort === undefined) throw new Error('Model or effort required')
+  if (isInteractiveLeaf()) {
+    const member = await resolveLeafRef(reference)
+    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    return requestLeafWorkspace<string>('configure', [member.sessionId, patch])
+  }
+  const { member, view } = await requireLeafView(reference)
+  if (view.process.getState() !== 'idle') throw new Error('Leaf must be idle before its settings change')
+  if (patch.model !== undefined) await view.process.setModel(patch.model)
+  if (patch.effort !== undefined) await view.process.setEffort(patch.effort)
+  await saveLeafSettings(member.sessionId, patch.model !== undefined ? { model: patch.model } : { effort: patch.effort as LeafMember['effort'] })
+  return `Leaf #${member.number} ${member.name} ${patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`} updated and saved for restart.`
+}
+
+/** Pull selected context from a leaf into the original session transcript. */
+export async function returnLeafContext(reference: string, text: string): Promise<string> {
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('return', [member.sessionId, text])
+  if (!contextReturn) throw new Error('Original session unavailable')
+  return contextReturn(member.sessionId, text)
+}
+
 function launch(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
   const pending = launches.get(member.sessionId)
   if (pending) return pending
@@ -90,6 +202,13 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
   const child = new LeafProcess({ executable: process.execPath, args: processArgs, cwd: member.cwd ?? getCwd(), env: {
     ...process.env, GATEWAY_LEAF_SESSION: member.sessionId, GATEWAY_INTERACTIVE_LEAF: '1',
     GATEWAY_LEAF_TRANSCRIPT: member.transcriptPath,
+    // The leaf inherits this session's trust decision; it cannot answer a
+    // dialog before it mounts, so an unanswered trust prompt would wedge start.
+    GATEWAY_LEAF_TRUSTED: checkHasTrustDialogAccepted() ? '1' : '0',
+    // A leaf registers on the same peer bus as any session. Without a label it
+    // would advertise its source transcript's opening prompt and look like a
+    // duplicate of its parent; this says what it actually is and who owns it.
+    GATEWAY_LEAF_LABEL: `Leaf ${member.number}: ${member.name} (of session ${rootSessionId})`,
     GATEWAY_LEAF_DRAFT: existing?.draft ?? member.draft ?? '',
     GATEWAY_LEAF_COLUMNS: String(process.stdout.columns || 80), GATEWAY_LEAF_ROWS: String(process.stdout.rows || 24),
   }, interactive: true,
@@ -178,7 +297,14 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       case 'change': await changeLeaf(id, value); break
       case 'file': await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
+      // A leaf reporting its own model/effort only persists them. Applying
+      // settings must go through 'configure' so the parent drives the child
+      // rather than the child echoing a control request back to itself.
       case 'settings': await saveLeafSettings(id, value); break
+      case 'configure': result = await configureLeaf(id, value); break
+      case 'send': result = await sendLeafMessage(id, value); break
+      case 'interrupt': result = await interruptLeaf(id); break
+      case 'list': result = await listLeaves(); break
       case 'renamed': {
         const view = views.get(sourceId)!
         view.member = await updateLeafMember(familyPath(root), root, sourceId, { name: String(id) })
@@ -209,7 +335,16 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   const root = getSessionId()
   const fromRoot = !parentSessionId || parentSessionId === 'original' || parentSessionId === root
   const parent = fromRoot ? undefined : getLeafViews().find(view => view.member.sessionId === parentSessionId)
-  if (!fromRoot && !parent) throw new Error('Parent leaf must be open to copy context')
+  // A source that is not an open leaf is still forkable: any session whose
+  // transcript exists on disk can seed a leaf. Refusing it here is what made
+  // "fork this session into a leaf" unreliable for anything but a live leaf.
+  let source: { sessionId: string; transcriptPath: string } | undefined
+  if (!fromRoot && !parent) {
+    const transcriptPath = getTranscriptPathForSession(parentSessionId!)
+    try { await access(transcriptPath) }
+    catch { throw new Error(`No session or open leaf matches ${parentSessionId}`) }
+    source = { sessionId: parentSessionId!, transcriptPath }
+  }
   let cwd = parent?.member.cwd ?? getCwd()
   if (worktree) {
     const git = promisify(execFile)
@@ -224,7 +359,7 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   await flushSessionStorage()
   if (parent && !options.fresh) await parent.process.checkpoint()
   const freshId = randomUUID()
-  const fork = options.fresh ? undefined : await createFork(undefined, parent ? { sessionId: parent.member.sessionId, transcriptPath: parent.member.transcriptPath } : undefined)
+  const fork = options.fresh ? undefined : await createFork(undefined, parent ? { sessionId: parent.member.sessionId, transcriptPath: parent.member.transcriptPath } : source)
   if (getSessionId() !== root) throw new Error('Session changed before leaf creation')
   const member = await addLeafMember(familyPath(root), root, {
     sessionId: fork?.sessionId ?? freshId, parentSessionId: parent?.member.sessionId ?? root,

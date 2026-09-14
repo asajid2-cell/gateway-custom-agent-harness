@@ -213,18 +213,29 @@ async function startGatewayForTest(env) {
   let stderr = ''
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', chunk => { stderr += chunk })
-  const deadline = Date.now() + 5000
+  // This loop is event-driven on the healthy path: it returns as soon as the
+  // listen line lands, and fails immediately if the child exits. The deadline
+  // only bounds "alive but not yet listening", so a generous value costs a
+  // healthy run nothing while a 5s ceiling turned host load into a fixture
+  // failure ("Gateway did not start") that said nothing about the gateway.
+  const deadline = Date.now() + 30000
+  const fail = async message => {
+    // Await the kill: the caller's try/finally has not been entered yet, so a
+    // throw here would otherwise strand a listening child for the whole run.
+    child.kill()
+    await Promise.race([once(child, 'exit'), new Promise(resolve => setTimeout(resolve, 2000))])
+    throw new Error(message)
+  }
   while (Date.now() < deadline) {
     if (stderr.includes('model-gateway listening on ')) {
       const match = stderr.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/)
-      if (!match) throw new Error(`Gateway announced an invalid address: ${stderr}`)
+      if (!match) await fail(`Gateway announced an invalid address: ${stderr}`)
       return { child, port: Number(match[1]), getStderr: () => stderr }
     }
     if (child.exitCode !== null) throw new Error(`Gateway exited: ${stderr}`)
     await new Promise(resolve => setTimeout(resolve, 10))
   }
-  child.kill()
-  throw new Error(`Gateway did not start: ${stderr}`)
+  await fail(`Gateway did not start: ${stderr}`)
 }
 
 async function stopChild(child) {
@@ -903,20 +914,60 @@ async function assertGatewayBoundedResult({ handler, env = {}, expectedStatus, e
   })
 }
 
+/**
+ * Wall-clock assertions in this file must not measure the host machine.
+ *
+ * These tests pin small timeouts so the suite stays fast, which made absolute
+ * bounds like `elapsed < 250` fail on healthy runs. A correct retry costs ~80ms
+ * while the failure being guarded — falling through to the consumer timeout —
+ * costs the full consumer timeout, so a loaded machine only had to add ~250ms of
+ * scheduling jitter to bridge the gap. The suite then went red under load and
+ * green when idle, which teaches the reader to ignore it, and a real regression
+ * in that gap would have been waved through as "just the timing thing".
+ *
+ * `path` is what a correct run costs and `fallback` is the consumer timeout it
+ * must never reach. The midpoint keeps the assertion discriminating while
+ * leaving room for jitter, and the guard refuses a fixture whose two outcomes
+ * are too close together to tell apart.
+ */
+function assertCompletedBeforeFallback(elapsed, { label, path, fallback }) {
+  assert.ok(
+    fallback > path * 2,
+    `"${label}" cannot separate success from failure: a ${path}ms path against a ${fallback}ms consumer fallback`,
+  )
+  const budget = (path + fallback) / 2
+  assert.ok(
+    elapsed < budget,
+    `${label}: ${Math.round(elapsed)}ms exceeded the ${Math.round(budget)}ms budget (correct path ~${path}ms, consumer fallback ${fallback}ms)`,
+  )
+}
+
 // A narrow HTTP-boundary fixture: it talks to the real standalone Gateway and
 // a local fake Responses provider. The temporary auth file contains only
 // synthetic credentials and is removed by the fixture teardown.
 test('HTTP boundary rejects an empty upstream stream before committing 200', async () => {
   const result = await assertGatewayBoundedResult({
     handler: emptyCodexHandler,
-    gatewayEnv: { MODEL_GATEWAY_LOG_TIMING: '1' },
+    // The previous bound here was `elapsed < 2000` against a 1000ms consumer
+    // timeout, so a gateway that hung until the consumer deadline would have
+    // passed. Widen the fixture's timeout so reaching it is unmistakable, and
+    // measure against the midpoint rather than an absolute number.
+    gatewayEnv: { MODEL_GATEWAY_LOG_TIMING: '1', MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000' },
     expectedStatus: 502,
     expected: response => {
       assert.equal(parseGatewayError(response.body).message, 'Codex stream ended before response.completed')
       assert.equal(hasMessageStop(response.body), false)
     },
   })
-  assert.ok(result.elapsed < 2000)
+  // The provider ends the stream immediately, so a correct run costs only the
+  // child's one-time lazy init (~800ms, paid by this fixture's first request).
+  // The alternative to a prompt 502 is hanging until the 3000ms consumer
+  // timeout, which this must never reach.
+  assertCompletedBeforeFallback(result.elapsed, {
+    label: 'empty upstream stream',
+    path: 800,
+    fallback: 3000,
+  })
   const timing = lastTimingLine(result.stderr)
   assert.ok(timing, result.stderr)
   assert.equal(timingFields(timing).outcome, 'error')
@@ -949,7 +1000,13 @@ test('HTTP boundary enforces the upstream timeout and cleans up the request', as
       assert.equal(parseGatewayError(response.body).message, 'Gateway upstream request timed out')
     },
   })
-  assert.ok(result.elapsed < 2000)
+  // The 40ms upstream timeout must end the call, not the 1000ms consumer
+  // timeout that would catch it if the upstream deadline were not enforced.
+  assertCompletedBeforeFallback(result.elapsed, {
+    label: 'upstream timeout enforcement',
+    path: 40,
+    fallback: 1000,
+  })
   const timing = timingFields(lastTimingLine(result.stderr))
   assert.equal(timing.outcome, 'upstream-error')
   assert.equal(timing.error_class, 'timeout')
@@ -1709,7 +1766,7 @@ test('Codex pre-output retry re-arms the upstream header timeout', async () => {
       MODEL_GATEWAY_UPSTREAM_RETRY_MAX_MS: '1',
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '500',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '2000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -1717,9 +1774,21 @@ test('Codex pre-output retry re-arms the upstream header timeout', async () => {
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /Gateway upstream request timed out/)
-      assert.ok(elapsed < 250, `Codex retry used a stale timeout window: ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'Codex retry re-arm',
+        // Two 40ms attempt windows plus a 1ms backoff. The second attempt must
+        // get its own header timeout, so a correct run pays both; the failure
+        // is falling through to the 2000ms consumer timeout below.
+        path: 2 * 40 + 1,
+        fallback: 2000,
+      })
       assert.deepEqual(state.requests, [1, 2])
-      assert.equal(state.requestAborted || state.responseClosed, true)
+      // A bounded wait, not a bare synchronous check. The bare form asserted
+      // something weaker than it looked: not that the gateway cancels the
+      // upstream request, but that the cancellation event had already
+      // propagated to the fake server within the same tick. Under load it had
+      // not, so a healthy run went red.
+      assert.equal(await waitForUpstreamCancellation(state), true)
     },
   })
 })
@@ -2089,7 +2158,7 @@ test('HTTP boundary replays a synthetic compaction-sized request without false 2
   const requestBody = compactionSizedBody()
   const result = await withGatewayAndFakeCodex({
     upstreamHandler: healthyCodexHandler,
-    gatewayEnv: { MODEL_GATEWAY_LOG_TIMING: '1' },
+    gatewayEnv: { MODEL_GATEWAY_LOG_TIMING: '1', MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '4000' },
     run: async gateway => {
       const started = performance.now()
       const response = await postGateway(gateway.port, requestBody)
@@ -2105,7 +2174,13 @@ test('HTTP boundary replays a synthetic compaction-sized request without false 2
   })
   assert.equal(result.response.status, 200)
   assert.equal(hasMessageStop(result.response.body), true)
-  assert.ok(result.elapsed < 2000)
+  // A healthy compaction-sized replay must complete well before the consumer
+  // deadline; reaching it at all would mean the request never finished.
+  assertCompletedBeforeFallback(result.elapsed, {
+    label: 'compaction-sized replay',
+    path: 40,
+    fallback: 4000,
+  })
   const timing = timingFields(lastTimingLine(result.stderr))
   assert.equal(timing.outcome, 'success')
   assert.ok(Number(timing.bytes) > 0)
@@ -2363,7 +2438,10 @@ test('a stalled compaction upstream is bounded and cancelled before HTTP 200', a
     gatewayEnv: {
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
+      // Wide enough that the assertion below separates "bounded by the attempt
+      // timeout" from "reached the consumer timeout"; a correct run never waits
+      // for this value, so a green run is not slowed by it.
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000',
       MODEL_GATEWAY_UPSTREAM_RETRIES: '1',
     },
     run: async ({ gateway, state }) => {
@@ -2380,7 +2458,13 @@ test('a stalled compaction upstream is bounded and cancelled before HTTP 200', a
       )
       assert.equal(result.status, 504)
       assert.match(result.body, /Gateway upstream request timed out/)
-      assert.ok(elapsed < 500, `stalled compaction took ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'stalled compaction',
+        // Two 40ms attempt windows plus a 1ms backoff, versus the 3000ms
+        // consumer timeout this must never reach.
+        path: 2 * 40 + 1,
+        fallback: 3000,
+      })
       assert.equal(await waitForUpstreamCancellation(state, 500), true)
       assert.equal(result.body.includes('event:'), false)
     },
@@ -2399,7 +2483,7 @@ test('HTTP boundary bounds a DeepSeek error body that never completes', async ()
     gatewayEnv: {
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1500',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -2410,7 +2494,13 @@ test('HTTP boundary bounds a DeepSeek error body that never completes', async ()
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /DeepSeek upstream request timed out/)
-      assert.ok(elapsed < 500, `DeepSeek error extraction remained open for ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'DeepSeek error body bound',
+        // The 40ms attempt timeout must cut the open body; the 3000ms consumer
+        // timeout is what a run that never bounds it would reach.
+        path: 40,
+        fallback: 3000,
+      })
       assert.equal(await waitForUpstreamCancellation(state), true)
     },
   })
@@ -3294,7 +3384,7 @@ test('OpenCode pre-output retry re-arms the upstream header timeout', async () =
       MODEL_GATEWAY_UPSTREAM_RETRY_MAX_MS: '1',
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '500',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '2000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -3306,9 +3396,20 @@ test('OpenCode pre-output retry re-arms the upstream header timeout', async () =
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /Gateway upstream request timed out/)
-      assert.ok(elapsed < 250, `retry used a stale timeout window: ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'OpenCode retry re-arm',
+        // Two 40ms attempt windows plus a 1ms backoff; the retry must re-arm
+        // its own header timeout rather than fall through to the consumer one.
+        path: 2 * 40 + 1,
+        fallback: 2000,
+      })
       assert.deepEqual(state.requests, [1, 2])
-      assert.equal(state.requestAborted || state.responseClosed, true)
+      // A bounded wait, not a bare synchronous check. The bare form asserted
+      // something weaker than it looked: not that the gateway cancels the
+      // upstream request, but that the cancellation event had already
+      // propagated to the fake server within the same tick. Under load it had
+      // not, so a healthy run went red.
+      assert.equal(await waitForUpstreamCancellation(state), true)
     },
   })
 })
@@ -3331,7 +3432,11 @@ test('OpenCode consumer disconnect during malformed retry backoff does not crash
         model: 'gateway-opencode-glm-5.3-flash',
         stream: true,
         messages: [{ role: 'user', content: 'disconnect during retry' }],
-      }, 25)
+        // Abort only once the first upstream attempt has been observed, as the
+        // Codex case above does. Without the readiness predicate this test
+        // measured the host: under load the consumer left before the gateway's
+        // first attempt reached the fixture, so `0 !== 1` failed a healthy run.
+      }, 25, () => state.requests.length > 0)
       assert.equal(result.disconnected, true)
       await new Promise(resolve => setTimeout(resolve, 300))
       assert.equal(gateway.child.exitCode, null, gateway.getStderr())
@@ -3401,7 +3506,7 @@ test('HTTP boundary bounds an OpenCode retry that never returns headers', async 
       MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS: '1',
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1500',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -3413,7 +3518,13 @@ test('HTTP boundary bounds an OpenCode retry that never returns headers', async 
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /Gateway upstream request timed out/)
-      assert.ok(elapsed < 500, `retry remained open for ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'OpenCode retry deadline',
+        // Two 40ms attempt windows plus a 1ms backoff, against the 3000ms
+        // consumer timeout.
+        path: 2 * 40 + 1,
+        fallback: 3000,
+      })
       assert.deepEqual(state.requests, [1, 2])
       assert.equal(await waitForUpstreamCancellation(state), true)
     },
@@ -3431,7 +3542,7 @@ test('OpenCode has a bounded upstream request deadline even when the provider st
     },
     gatewayEnv: {
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -3443,7 +3554,13 @@ test('OpenCode has a bounded upstream request deadline even when the provider st
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /Gateway upstream request timed out/)
-      assert.ok(elapsed < 500, `OpenCode request remained open for ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'OpenCode upstream deadline',
+        // The 40ms upstream timeout ends the stalled request; the 3000ms
+        // consumer timeout is the fall-through this guards.
+        path: 40,
+        fallback: 3000,
+      })
       assert.equal(await waitForUpstreamCancellation(state), true)
     },
   })
@@ -3466,7 +3583,7 @@ test('HTTP boundary bounds OpenCode transient-400 body classification', async ()
       MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS: '1',
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
       MODEL_GATEWAY_RETRY_ATTEMPT_TIMEOUT_MS: '40',
-      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1500',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '3000',
     },
     run: async ({ gateway, state }) => {
       const started = performance.now()
@@ -3478,7 +3595,13 @@ test('HTTP boundary bounds OpenCode transient-400 body classification', async ()
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
       assert.match(result.body, /OpenCode Go upstream request timed out/)
-      assert.ok(elapsed < 500, `400 classification remained open for ${Math.round(elapsed)}ms`)
+      assertCompletedBeforeFallback(elapsed, {
+        label: 'OpenCode 400 body classification',
+        // The 40ms attempt timeout must end the open 400 body; the 3000ms
+        // consumer timeout is the fall-through this guards.
+        path: 40,
+        fallback: 3000,
+      })
       assert.deepEqual(state.requests, [1])
       assert.equal(await waitForUpstreamCancellation(state), true)
     },

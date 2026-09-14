@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Server } from 'node:net'
 import { join } from 'node:path'
 import { lock } from './lockfile.js'
@@ -101,8 +101,26 @@ export async function callGatewayPeer(endpoint: string, request: unknown): Promi
 async function readRegistration(directory: string, sessionId: string): Promise<{ peer: GatewayPeer; token: string }> {
   if (!idPattern.test(sessionId)) throw new Error('Invalid session ID')
   await validatePrivateDirectory(directory)
+  return readRegistrationUnchecked(directory, sessionId)
+}
+
+/**
+ * The registration read without the directory ACL check. Validation costs a
+ * PowerShell spawn on Windows and is per-directory, not per-file, so callers
+ * that read many registrations validate once up front instead of paying it for
+ * every peer in the directory.
+ */
+async function readRegistrationUnchecked(directory: string, sessionId: string): Promise<{ peer: GatewayPeer; token: string }> {
   const path = join(directory, `${sessionId}.json`)
-  const before = await lstat(path)
+  // A missing registration is the ordinary "that session is not live" case, not
+  // a corrupt one. Reporting the raw ENOENT leaked a config path and read as a
+  // transport bug, which is why session comms looked broken.
+  let before
+  try { before = await lstat(path) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No live session ${sessionId}; run /sessions list to see current peers`)
+    throw error
+  }
   if (!before.isFile() || before.isSymbolicLink()) throw new Error('Invalid session registration')
   const handle = await open(path, 'r')
   try {
@@ -123,11 +141,16 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
   let entries: string[]
   try { entries = await readdir(directory) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
+  const candidates = entries.filter(entry => entry.endsWith('.json') && idPattern.test(entry.slice(0, -5)))
+  if (candidates.length === 0) return []
+  // Validate the directory once for the whole listing. A stale registration is
+  // the common case here, and the check is a PowerShell spawn on Windows: doing
+  // it per file made discovery cost ~350ms per registration on disk.
+  try { await validatePrivateDirectory(directory) } catch { return [] }
   const peers: GatewayPeer[] = []
-  for (const entry of entries) {
-    if (!entry.endsWith('.json') || !idPattern.test(entry.slice(0, -5))) continue
+  for (const entry of candidates) {
     try {
-      const { peer, token } = await readRegistration(directory, entry.slice(0, -5))
+      const { peer, token } = await readRegistrationUnchecked(directory, entry.slice(0, -5))
       const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token }) as { runtimeId?: string }
       if (response.runtimeId === peer.runtimeId) peers.push(peer)
     } catch { /* Stale or inaccessible registrations are not live sessions. */ }
@@ -228,6 +251,13 @@ export class GatewaySessionTransport {
         this.policy = inbox.policy
         this.history = inbox.history ?? []
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      // A session that restarts keeps the intent it already declared or derived.
+      // Without this the registration is rewritten blank on every launch, so a
+      // stated purpose silently disappeared the moment the session reconnected.
+      try {
+        const raw = JSON.parse(await readFile(this.registrationPath, 'utf8')) as { peer?: { purpose?: unknown } }
+        if (typeof raw?.peer?.purpose === 'string') this.peer.purpose = raw.peer.purpose.slice(0, 1000)
+      } catch { /* No prior registration, or it is unreadable: intent starts empty. */ }
       this.server = createServer(socket => {
         let buffer = Buffer.alloc(0)
         let handled = false

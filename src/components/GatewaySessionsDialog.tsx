@@ -30,8 +30,8 @@ export function GatewaySessionsDialog({ onDone }: { onDone: () => void }): React
     <Text bold>Gateway sessions — Escape closes; R refreshes; I toggles inbox</Text>
     <Text>PgUp/PgDn pages; A accept / H hold / F refuse incoming messages</Text>
     {!runtime && <Text>Communication is not active in this runtime.</Text>}
-    {inbox ? records.slice(page * pageSize, (page + 1) * pageSize).map(record => <Box key={record.message.id} flexDirection="column"><Text>{record.state}: {record.senderName} — {record.message.summary}</Text><Text>{record.message.id}</Text></Box>) : peers.slice(page * pageSize, (page + 1) * pageSize).map(peer => <Box key={peer.sessionId} flexDirection="column"><Text>{peer.name} [{peer.status}]</Text><Text>{peer.sessionId}</Text><Text dimColor>{peer.cwd}</Text></Box>)}
-    <Text dimColor>Use /sessions send &lt;session-id&gt; &lt;message&gt;; /sessions history &lt;title&gt;</Text>
+    {inbox ? records.slice(page * pageSize, (page + 1) * pageSize).map(record => <Box key={record.message.id} flexDirection="column"><Text>{record.state}: {record.senderName} — {record.message.summary}</Text><Text>{record.message.id}</Text></Box>) : peers.slice(page * pageSize, (page + 1) * pageSize).map(peer => <Box key={peer.sessionId} flexDirection="column"><Text>[{peer.status}] {peer.purpose.trim() || peer.name}</Text><Text dimColor>{peer.name} · {peer.sessionId}</Text><Text dimColor>{peer.cwd}</Text></Box>)}
+    <Text dimColor>Use /sessions purpose &lt;intent&gt; to say what this session is working on; /sessions send &lt;id|leaf&gt; &lt;message&gt;</Text>
     {error && <Text>{error}</Text>}
   </Box>
 }

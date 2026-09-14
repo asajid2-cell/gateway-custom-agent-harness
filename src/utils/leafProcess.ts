@@ -109,7 +109,13 @@ export class LeafProcess {
   private control(request: Record<string, unknown>): Promise<void> {
     const id = randomUUID()
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.controls.delete(id); reject(new Error('Leaf control timed out')); this.fail() }, 60000)
+      // A bare "timed out" made a wedged leaf indistinguishable from a slow one.
+      // The first handshake only stalls when the REPL never mounted, which in a
+      // leaf means a startup dialog is still waiting for a terminal that has none.
+      const timeout = this.options.interactive && request.subtype === 'initialize'
+        ? 'Leaf did not reach its input loop; a startup dialog may be waiting (is this workspace trusted?)'
+        : 'Leaf control timed out'
+      const timer = setTimeout(() => { this.controls.delete(id); reject(new Error(timeout)); this.fail() }, 60000)
       this.controls.set(id, { resolve, reject, timer })
       try {
         if (this.options.interactive) this.terminal({ type: 'leaf-control', id, request: request as import('./leafTerminal.js').LeafTerminalControl })
@@ -163,6 +169,18 @@ export class LeafProcess {
     if (this.state !== 'idle') throw new Error('Leaf is not idle')
     this.write({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, session_id: '' })
     this.setState('running')
+  }
+
+  /**
+   * Deliver a message to a leaf. Headless leaves receive a stream-json user
+   * turn; interactive leaves receive the text through their own REPL input so
+   * the turn runs inside the leaf instead of a parent-owned queue. Unlike
+   * `input`, delivery is not gated on terminal focus.
+   */
+  deliver(text: string): Promise<void> {
+    if (!this.options.interactive) { this.send(text); return Promise.resolve() }
+    if (this.state !== 'idle') throw new Error('Leaf is not idle')
+    return this.control({ subtype: 'leaf_prompt', prompt: text })
   }
 
   approve(id: string, allow: boolean): void {

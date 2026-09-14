@@ -27,6 +27,16 @@ const requests = new Map<string, { resolve: (value: any) => void; reject: (error
 let controls: ((request: LeafTerminalControl) => Promise<void>) | undefined
 const pendingControls: Extract<LeafTerminalMessage, { type: 'leaf-control' }>[] = []
 let initialDraft = ''
+let deliverInput: ((data: string) => void) | undefined
+
+/**
+ * Feed text into the leaf's own REPL regardless of terminal focus. The parent
+ * uses this to hand a leaf a turn while the human stays on another session.
+ */
+export function writeLeafInput(data: string): void {
+  if (!deliverInput) throw new Error('Leaf input channel is unavailable')
+  deliverInput(data)
+}
 
 export function isInteractiveLeaf(): boolean { return process.env.GATEWAY_INTERACTIVE_LEAF === '1' && typeof process.send === 'function' }
 export function getLeafSnapshot(): LeafSnapshot | undefined { return snapshot }
@@ -80,6 +90,14 @@ export async function installLeafTerminal(): Promise<void> {
   })
   Object.defineProperty(process, 'stdin', { configurable: true, value: input })
   Object.defineProperty(process, 'stdout', { configurable: true, value: output })
+  // A background leaf is paused by leaf-focus; delivery wakes its REPL without
+  // stealing the parent's rendering (unfocused frames are dropped upstream).
+  deliverInput = data => {
+    instances.get(process.stdout)?.resume()
+    input.setRawMode(true)
+    input.resume()
+    input.write(data)
+  }
   const stderr = Object.assign(new Writable({ write(chunk, _encoding, callback) { output.write(chunk, callback) } }), { isTTY: true, fd: 2 })
   Object.defineProperty(process, 'stderr', { configurable: true, value: stderr })
   // A leaf needs a repaintable viewport; the original can retain its inline scrollback.

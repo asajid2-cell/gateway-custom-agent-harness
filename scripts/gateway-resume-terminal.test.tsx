@@ -18,8 +18,7 @@ let diagnosticOutput = ''
 let observedFailure: unknown
 const postSwitch = process.env.GATEWAY_RESUME_POST_SWITCH === '1'
 
-// Install the failure before REPL is imported. Copy the real module's exports so
-// this test only replaces the one hook used by the resume path.
+// Build-time globals the bundled CLI normally receives from `bun build`.
 ;(globalThis as any).MACRO = {
   VERSION: '1.0.0-test',
   BUILD_TIME: 'test',
@@ -33,6 +32,26 @@ const postSwitch = process.env.GATEWAY_RESUME_POST_SWITCH === '1'
 const hooksModule = await import('../src/utils/hooks.js')
 const releaseNotesModule = await import('../src/utils/releaseNotes.js')
 const autoUpdaterModule = await import('../src/utils/autoUpdater.js')
+const persistModule = await import('../src/skills/bundled/persist.js')
+
+// Module mocks are process-global and cannot be unregistered: mock.restore()
+// leaves mock.module() in place, and a later mock.module() for the same
+// specifier does not displace the first. Every file sharing this test process
+// therefore keeps whatever is registered here, which forces two rules:
+//
+//  - the real functions are captured by value before mocking. Registering a
+//    mock rebinds the namespace entry, so calling through `hooksModule.fn` or
+//    `persistModule.fn` would re-enter the mock and recurse until the stack
+//    blows.
+//  - the injected failure is gated on `injectFailure`, true only while this
+//    file's own resume is in flight. Installing it unconditionally is what made
+//    unrelated suites fail, because they run the real resume and session-end
+//    paths through these same mocks.
+const realExecuteSessionEndHooks = hooksModule.executeSessionEndHooks
+const realRestorePersistForCurrentSession = persistModule.restorePersistForCurrentSession
+
+let injectFailure = false
+
 mock.module('../src/utils/autoUpdater.js', () => ({
   ...autoUpdaterModule,
   getLatestVersion: async () => null,
@@ -43,15 +62,17 @@ mock.module('../src/utils/releaseNotes.js', () => ({
 }))
 mock.module('../src/utils/hooks.js', () => ({
   ...hooksModule,
-  executeSessionEndHooks: async () => { if (!postSwitch) throw new Error(injectedFailure) },
+  executeSessionEndHooks: async (...args: any[]) => {
+    if (injectFailure && !postSwitch) throw new Error(injectedFailure)
+    return (realExecuteSessionEndHooks as (...a: any[]) => Promise<void>)(...args)
+  },
   processSessionStartHooks: async () => [],
 }))
-const persistModule = await import('../src/skills/bundled/persist.js')
 mock.module('../src/skills/bundled/persist.js', () => ({
   ...persistModule,
   restorePersistForCurrentSession: async (...args: any[]) => {
-    if (postSwitch) throw new Error(injectedFailure)
-    return persistModule.restorePersistForCurrentSession(...args)
+    if (injectFailure && postSwitch) throw new Error(injectedFailure)
+    return (realRestorePersistForCurrentSession as (...a: any[]) => Promise<void>)(...args)
   },
 }))
 
@@ -139,8 +160,13 @@ test('mounted REPL releases a claimed target writer when resume hooks fail', { t
     const originalSessionId = getSessionId()
     stdin.write('/gateway-resume-test')
     await new Promise(resolve => setTimeout(resolve, 100))
+    injectFailure = true
     stdin.write('\r')
-    await waitFor(() => observedFailure !== undefined)
+    try {
+      await waitFor(() => observedFailure !== undefined)
+    } finally {
+      injectFailure = false
+    }
     assert.equal((observedFailure as Error).message, injectedFailure)
     assert.equal(getSessionId(), postSwitch ? targetId : originalSessionId, 'failure must retain the appropriate committed session identity')
 
@@ -165,6 +191,8 @@ test('mounted REPL releases a claimed target writer when resume hooks fail', { t
   } finally {
     app.unmount()
     globalThis.fetch = originalFetch
+    // The module mocks above cannot be undone; they stay behaviourally real
+    // because injection is off outside this test's resume window.
     const { runCleanupFunctions } = await import('../src/utils/cleanupRegistry.ts')
     await runCleanupFunctions()
     for (const key of ['TEST_ENABLE_SESSION_PERSISTENCE', 'GATEWAY_RESUME_TEST_TARGET_ID', 'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_USE_GATEWAY', 'CLAUDE_CODE_NO_FLICKER', 'DEMO_VERSION', 'DISABLE_AUTOUPDATER']) {

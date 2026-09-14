@@ -3,9 +3,23 @@ import { getSessionId } from '../bootstrap/state.js'
 import { getCwd } from '../utils/cwd.js'
 import { GatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
 import { gatewayMessageIds } from '../utils/gatewaySessionDelivery.js'
+import { deriveSessionPurpose } from '../utils/gatewaySessionProtocol.js'
 import type { Message } from '../types/message.js'
 import { logForDebugging } from '../utils/debug.js'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
+
+/**
+ * A leaf announces itself on the shared bus instead of looking like a stray
+ * sibling session. The label wins outright rather than falling back to the
+ * transcript: a forked leaf carries its parent's history, so deriving from
+ * messages would advertise the parent's opening prompt and make the leaf
+ * indistinguishable from the session it was forked from.
+ */
+function sessionPurposeSeed(messages: Message[] | undefined, name: string): string {
+  const label = process.env.GATEWAY_LEAF_LABEL
+  if (label) return label.replace(/\s+/g, ' ').trim().slice(0, 1000)
+  return deriveSessionPurpose(messages, name)
+}
 
 export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiting', sessionMessages: Message[] | undefined): void {
   const sessionId = getSessionId()
@@ -22,7 +36,10 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
       await runtime.start(gatewayMessageIds(sessionMessages ?? []))
       if (disposed || getSessionId() !== sessionId) return
       runtimeRef.current = runtime
-      await runtime.transport.update({ name: latest.current.name, status: latest.current.status === 'busy' ? 'running' : latest.current.status === 'waiting' ? 'awaiting-approval' : 'idle' })
+      // Seed intent only while it is unstated. An explicit declaration outranks
+      // the derived one, and a later name/status refresh must never clobber it.
+      const purpose = runtime.transport.peer.purpose.trim() ? runtime.transport.peer.purpose : sessionPurposeSeed(sessionMessages, name)
+      await runtime.transport.update({ name: latest.current.name, status: latest.current.status === 'busy' ? 'running' : latest.current.status === 'waiting' ? 'awaiting-approval' : 'idle', purpose })
     }).catch(() => { logForDebugging('Gateway session communication could not start.') })
     const close = async () => {
       disposed = true

@@ -3,7 +3,8 @@ import { getSessionId } from '../bootstrap/state.js'
 import type { Message } from '../types/message.js'
 import { useAppState, useSetAppState } from '../state/AppState.js'
 import { useMainLoopModel } from './useMainLoopModel.js'
-import { isInteractiveLeaf, registerLeafTerminalControls, requestLeafWorkspace, sendLeafTerminal } from '../utils/leafTerminal.js'
+import { isInteractiveLeaf, registerLeafTerminalControls, requestLeafWorkspace, sendLeafTerminal, writeLeafInput } from '../utils/leafTerminal.js'
+import { PASTE_END, PASTE_START } from '../ink/termio/csi.js'
 import { flushSessionStorage, getTranscriptPath, recordTranscript, saveSessionName } from '../utils/sessionStorage.js'
 import { parseEffortValue } from '../utils/effort.js'
 import { registerLeafContextReturn } from '../utils/leafWorkspace.js'
@@ -55,6 +56,15 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
         case 'apply_flag_settings': {
           const value = parseEffortValue((request.settings as { effortLevel?: string })?.effortLevel)
           setAppState(state => ({ ...state, effortValue: value }))
+          return
+        }
+        case 'leaf_prompt': {
+          // The parent hands this leaf a turn. It runs in this REPL, not in a
+          // parent-owned queue, so the leaf keeps its own transcript and rules.
+          const prompt = typeof request.prompt === 'string' ? request.prompt : ''
+          if (!prompt.trim()) throw new Error('Empty leaf prompt')
+          if (latest.current.status !== 'idle') throw new Error('Leaf is not idle')
+          writeLeafInput(prompt.includes('\n') ? `${PASTE_START}${prompt}${PASTE_END}\r` : `${prompt}\r`)
           return
         }
         case 'interrupt': latest.current.interrupt(); return

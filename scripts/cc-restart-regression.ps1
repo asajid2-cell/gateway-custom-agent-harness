@@ -5,6 +5,20 @@ $fakeRunner = Join-Path $PSScriptRoot 'cc-restart-fake-runner.cmd'
 $state = Join-Path $env:TEMP "cc-restart-regression-$PID.state"
 Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
 
+# The launcher rebuilds the harness whenever the compiled artifact is older than
+# its sources, and that build is dispatched through the runner - which this
+# scenario replaces with a fake whose whole job is to exit 42. A plain source
+# edit therefore turned into "Claude harness build failed with exit code 42"
+# instead of the launcher behaviour under test. The scenario never executes the
+# compiled artifact, so mark the freshness precondition it does need (a built
+# harness on disk) rather than let a staleness check fail the run.
+$artifact = Join-Path $root 'dist\cli.js'
+$artifactItem = Get-Item -LiteralPath $artifact -ErrorAction SilentlyContinue
+$artifactWriteTime = if ($artifactItem) { $artifactItem.LastWriteTimeUtc } else { $null }
+if ($artifactItem) {
+  $artifactItem.LastWriteTimeUtc = [DateTime]::UtcNow
+}
+
 function Invoke-Launcher([string[]]$Arguments) {
   $env:CC_CLAUDE_RUNNER_OVERRIDE = $fakeRunner
   $env:CC_FAKE_RUNNER_STATE = $state
@@ -94,4 +108,9 @@ try {
   Remove-Item Env:CC_SKIP_GATEWAY_START -ErrorAction SilentlyContinue
   Remove-Item Env:TANDEM_GATEWAY_CODEX_HOME -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
+  # Put the artifact's timestamp back so this scenario cannot make a genuinely
+  # stale harness look current for the next real launch.
+  if ($artifactItem -and $artifactWriteTime) {
+    $artifactItem.LastWriteTimeUtc = $artifactWriteTime
+  }
 }
