@@ -105,6 +105,37 @@ test('interactive cc launches the harness without a PowerShell output pipeline',
   assert.equal(script.includes('Tee-Object -FilePath $ClaudeCrashLog'), false)
 })
 
+test('launcher answers the workspace-trust question per process, and can be opted out', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // Defaulted only when unset, so CLAUDE_CODE_TRUST_CWD=0 restores the prompt.
+  assert.match(
+    script,
+    /if \(\[string\]::IsNullOrWhiteSpace\(\$env:CLAUDE_CODE_TRUST_CWD\)\) \{\s*\$env:CLAUDE_CODE_TRUST_CWD = '1'\s*\}/,
+    'the trust opt-in must not clobber an explicit value',
+  )
+
+  // The grant has to be read where trust is decided, or the dialog still shows
+  // and the rest of the codebase (hooks, plugins, MCP approval) disagrees with
+  // a launcher that skipped it.
+  const config = await readFile(new URL('../src/utils/config.ts', import.meta.url), 'utf8')
+  assert.match(
+    config,
+    /function computeTrustDialogAccepted\(\): boolean \{\s*(?:\/\/[^\n]*\n|\s)*\s*if \(isEnvTruthy\(process\.env\.CLAUDE_CODE_TRUST_CWD\)\) \{\s*return true\s*\}/,
+    'computeTrustDialogAccepted must honor the launcher opt-in',
+  )
+  // Nothing may be written: the grant is per-process, which is the whole
+  // difference between this and persisting hasTrustDialogAccepted.
+  const gate = config.slice(
+    config.indexOf('function computeTrustDialogAccepted'),
+    config.indexOf('const config = getGlobalConfig()', config.indexOf('function computeTrustDialogAccepted')),
+  )
+  assert.equal(
+    /saveGlobalConfig|saveCurrentProjectConfig/.test(gate),
+    false,
+    'the opt-in must not persist a trust grant',
+  )
+})
+
 test('interactive cc skips the full build when the compiled harness is fresh', async () => {
   const script = await readFile(scriptPath, 'utf8')
   assert.match(script, /function Test-ClaudeArtifactFresh\s*\{[\s\S]*Get-ChildItem[\s\S]*LastWriteTimeUtc/)

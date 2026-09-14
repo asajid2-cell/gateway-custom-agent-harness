@@ -749,6 +749,20 @@ $env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-luna'
 $env:DISABLE_CLAUDE_CODE_SM_COMPACT = '1'
 $env:ENABLE_CLAUDE_CODE_SM_COMPACT = $null
 
+# Trust the directory this session starts in, without writing a trust grant
+# to the global config. The dialog exists to warn about reading and executing
+# code in a checkout you did not open deliberately; every directory this
+# launcher starts in is one the user chose, and at the home directory the
+# answer is never persisted (TrustDialog keeps it session-only, because
+# trusting home would implicitly trust every checkout underneath it), so the
+# same question repeats on every launch. Leaves inherit this through
+# GATEWAY_LEAF_TRUSTED, which they need — a modal in a leaf blocks its control
+# handshake and the leaf start times out. Set CLAUDE_CODE_TRUST_CWD=0 before
+# launching to get the prompt back.
+if ([string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_TRUST_CWD)) {
+  $env:CLAUDE_CODE_TRUST_CWD = '1'
+}
+
 $env:CLAUDE_CODE_ALWAYS_ENABLE_EFFORT = '1'
 $env:MODEL_GATEWAY_EFFORT_CAPABILITIES = (
   $CapabilityCatalog.gatewayAliases | ConvertTo-Json -Compress
