@@ -156,11 +156,19 @@ test('interactive cc avoids the Defender-blocked nested encoded launcher', async
   assert.equal(script.includes('$NestedEncoded'), false)
   assert.doesNotMatch(
     script,
-    /\$NestedCommand\s*=\s*['"]& powershell\.exe[\s\S]*-EncodedCommand/,
+    /\$KeysafeCommand\s*=\s*['"]& powershell\.exe[\s\S]*-EncodedCommand/,
   )
   assert.match(
     script,
-    /\$NestedCommand\s*=\s*'& '\s*\+[\s\S]*\$Keysafe\.Replace/,
-    'the second credential should be injected by invoking keysafe directly in the existing child',
+    /\$KeysafeCommand\s*=\s*'& '\s*\+[\s\S]*\$Keysafe\.Replace/,
+    'each optional credential should be injected by invoking keysafe directly in the existing child',
+  )
+  // Every optional provider must be wrapped the same way, and the env-var name
+  // must come from the provider table rather than being hardcoded per provider,
+  // so adding a provider cannot silently skip its key injection.
+  assert.match(
+    script,
+    /\$OptionalKeyProviders\s*=\s*@\([\s\S]*Credential\s*=\s*'opencode-go'[\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
+    'optional providers should be declared in one table',
   )
 })

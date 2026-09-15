@@ -788,10 +788,34 @@ try {
   )
   $ClaudeArgs += @('--settings', $ScopedSettingsPath)
 
-  # Start the Gateway through a short-lived keysafe child. OpenCode is included
-  # only when its vault record is present, and the value never becomes an argument
-  # or file.
+  # Start the Gateway through a short-lived keysafe child. Optional providers are
+  # included only when their vault record is present, and no value ever becomes an
+  # argument or file.
   $GatewayCommand = 'node "' + $GatewaySupervisor + '" --port ' + [string]$Port
+  # Build the keysafe chain from the inside out. Each optional provider wraps the
+  # command accumulated so far, so the Gateway inherits one more environment
+  # variable per layer and every key stays out of arguments, files, and logs.
+  # Keysafe injects a single record per child, which is why this nests rather
+  # than passing multiple secrets to one invocation. Do not convert this into a
+  # nested powershell.exe -EncodedCommand chain: Defender blocks that shape.
+  $KeysafeCommand = $GatewayCommand
+  $OptionalKeyProviders = @(
+    @{ Credential = 'opencode-go'; EnvVar = 'OPENCODE_API_KEY' }
+    @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
+  )
+  foreach ($Provider in $OptionalKeyProviders) {
+    if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ('.keysafe\' + $Provider.Credential + '.cred')) -PathType Leaf)) {
+      continue
+    }
+    $KeysafeCommand = '& ' +
+      ("'" + $Keysafe.Replace("'", "''") + "'") +
+      ' run ' + $Provider.Credential +
+      ' -EnvVar ' + $Provider.EnvVar +
+      ' -Command ' +
+      ("'" + ([string]$KeysafeCommand).Replace("'", "''") + "'") +
+      '; exit $LASTEXITCODE'
+  }
+  # DeepSeek is the base layer and is always required.
   $GatewayArgumentList = @(
     '-NoProfile'
     '-ExecutionPolicy'
@@ -803,34 +827,8 @@ try {
     '-EnvVar'
     'DEEPSEEK_API_KEY'
     '-Command'
-    ($GatewayCommand)
+    $KeysafeCommand
   )
-  if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\opencode-go.cred') -PathType Leaf) {
-    # Keysafe injects one record per child. Invoke the second keysafe script in
-    # the first keysafe child so the Gateway inherits both variables without
-    # exposing either value in an argument, file, or log. Do not create a nested
-    # powershell.exe -EncodedCommand chain: Defender blocks that launcher shape.
-    $NestedCommand = '& ' +
-      ("'" + $Keysafe.Replace("'", "''") + "'") +
-      ' run opencode-go -EnvVar OPENCODE_API_KEY -Command ' +
-      ("'" + $GatewayCommand.Replace("'", "''") + "'") +
-      '; exit $LASTEXITCODE'
-    # The common Start-Process argument quoting below wraps this complete
-    # nested command exactly once.
-    $GatewayArgumentList = @(
-      '-NoProfile'
-      '-ExecutionPolicy'
-      'Bypass'
-      '-File'
-      $Keysafe
-      'run'
-      'ds'
-      '-EnvVar'
-      'DEEPSEEK_API_KEY'
-      '-Command'
-      $NestedCommand
-    )
-  }
 
   # Start-Process serializes ArgumentList items into a native command line.
   # Quote the one outer -Command value so spaces and nested switches remain

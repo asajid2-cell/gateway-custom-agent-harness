@@ -66,6 +66,11 @@
     "gateway-ds-flash": ["low", "high", "max"],
     "gateway-ds-pro": ["low", "high", "max"],
     "gateway-ds-4.1-flash": ["low", "high", "max"],
+    "gateway-amd-ds-v4-flash": ["low", "high", "max"],
+    "gateway-amd-ds-v4-flash-vision-exp": ["low", "high", "max"],
+    "gateway-amd-qwen3.8-flash-next": ["low", "high", "max"],
+    "gateway-amd-qwen3.8-27b": ["low", "high", "max"],
+    "gateway-amd-minicpm5-2b": ["low", "high", "max"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-glm-5.3-flash": ["low", "high", "max"],
@@ -168,6 +173,31 @@
       "value": "gateway-ds-4.1-flash",
       "label": "DeepSeek v4.1 Flash",
       "description": "DeepSeek - v4.1 Flash"
+    },
+    {
+      "value": "gateway-amd-ds-v4-flash-vision-exp",
+      "label": "AMD DeepSeek v4 Flash Vision",
+      "description": "AMD Radeon - v4 Flash Vision (reads images)"
+    },
+    {
+      "value": "gateway-amd-qwen3.8-flash-next",
+      "label": "AMD Qwen3.8 Flash Next",
+      "description": "AMD Radeon - Qwen3.8 Flash Next (reads images)"
+    },
+    {
+      "value": "gateway-amd-qwen3.8-27b",
+      "label": "AMD Qwen3.8 27B",
+      "description": "AMD Radeon - Qwen3.8 27B (reads images)"
+    },
+    {
+      "value": "gateway-amd-ds-v4-flash",
+      "label": "AMD DeepSeek v4 Flash",
+      "description": "AMD Radeon - v4 Flash (text only)"
+    },
+    {
+      "value": "gateway-amd-minicpm5-2b",
+      "label": "AMD MiniCPM5 2B",
+      "description": "AMD Radeon - MiniCPM5 2B (text only)"
     },
     {
       "value": "gateway-opencode-gpt-5.6-luna",

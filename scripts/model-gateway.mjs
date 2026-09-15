@@ -50,6 +50,11 @@ const CODEX_ENDPOINT =
   process.env.CODEX_RESPONSES_URL || 'https://chatgpt.com/backend-api/codex/responses'
 const DEEPSEEK_ENDPOINT =
   process.env.DEEPSEEK_API_URL || 'https://api.deepseek.com/anthropic/v1/messages'
+// AMD Radeon Cloud speaks the Anthropic Messages protocol on /v1/messages with
+// an x-api-key header, but is a separate provider with its own key and model
+// namespace, so it gets its own backend rather than riding on DEEPSEEK_ENDPOINT.
+const AMD_RADEON_ENDPOINT =
+  process.env.AMD_RADEON_API_URL || 'https://developer.amd.com.cn/radeon/api/v1/messages'
 const CODEX_REASONING_EFFORT =
   process.env.MODEL_GATEWAY_CODEX_REASONING_EFFORT || 'max'
 const CODEX_SYSTEM_INSTRUCTION =
@@ -204,6 +209,16 @@ const DEFAULT_MODELS = {
   'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'] },
   'gateway-ds-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', effortLevels: ['low', 'high', 'max'] },
   'gateway-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'] },
+  // AMD Radeon Cloud. `upstream` carries the provider's exact casing — the
+  // Anthropic body is forwarded as-is, so a lowercased name would 404.
+  // Verified live against the Radeon API: these four answer on /v1/messages.
+  // Only the two *-Vision-Exp / Qwen entries accept image input; the text-only
+  // pair reject an image block with 400 rather than silently ignoring it.
+  'gateway-amd-ds-v4-flash': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash', effortLevels: ['low', 'high', 'max'] },
+  'gateway-amd-ds-v4-flash-vision-exp': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash-Vision-Exp', effortLevels: ['low', 'high', 'max'] },
+  'gateway-amd-qwen3.8-flash-next': { backend: 'amd-radeon', upstream: 'Qwen3.8-Flash-Next', effortLevels: ['low', 'high', 'max'] },
+  'gateway-amd-qwen3.8-27b': { backend: 'amd-radeon', upstream: 'Qwen3.8-27B', effortLevels: ['low', 'high', 'max'] },
+  'gateway-amd-minicpm5-2b': { backend: 'amd-radeon', upstream: 'MiniCPM5-2B', effortLevels: ['low', 'high', 'max'] },
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -272,6 +287,7 @@ function loadModels() {
     if (
       value.backend !== 'codex' &&
       value.backend !== 'deepseek' &&
+      value.backend !== 'amd-radeon' &&
       value.backend !== 'opencode-go' &&
       value.backend !== 'opencode-zen'
     ) {
@@ -2992,7 +3008,28 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
   }
 }
 
-async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
+// Providers that speak the Anthropic Messages protocol verbatim: the request
+// body is forwarded unchanged apart from effort normalization, and the reply is
+// relayed as-is. DeepSeek and AMD Radeon Cloud both fit, so they share this path
+// rather than maintaining two copies of the same relay.
+const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
+  deepseek: {
+    label: 'DeepSeek',
+    endpoint: DEEPSEEK_ENDPOINT,
+    keyEnv: 'DEEPSEEK_API_KEY',
+    backend: 'deepseek',
+  },
+  'amd-radeon': {
+    label: 'AMD Radeon',
+    endpoint: AMD_RADEON_ENDPOINT,
+    keyEnv: 'AMD_API_KEY',
+    backend: 'amd-radeon',
+  },
+}
+
+async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, providerName) {
+  const provider = ANTHROPIC_PASSTHROUGH_PROVIDERS[providerName]
+  const label = provider.label
   const querySource = gatewayQuerySource(req)
   let body
   try {
@@ -3015,17 +3052,17 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   }, MODELS[modelName], querySource)
   rawBody = Buffer.from(JSON.stringify(body))
   const wantsStream = body.stream === true
-  const trace = createGatewayTrace({ model: modelName, backend: 'deepseek', protocol: 'anthropic-messages' })
+  const trace = createGatewayTrace({ model: modelName, backend: provider.backend, protocol: 'anthropic-messages' })
   const control = createRequestControl(req, res, trace)
-  const apiKey = process.env.DEEPSEEK_API_KEY
+  const apiKey = process.env[provider.keyEnv]
   if (!apiKey) {
-    anthropicError(res, 401, 'DeepSeek API key is not configured')
+    anthropicError(res, 401, `${label} API key is not configured`)
     trace.finish('auth-error', null, 401)
     control.cleanup()
     return
   }
 
-  const upstreamUrl = new URL(DEEPSEEK_ENDPOINT)
+  const upstreamUrl = new URL(provider.endpoint)
   upstreamUrl.search = requestUrl.search
 
   let upstream
@@ -3033,14 +3070,14 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
     body,
     providerRequest: body,
     model: modelName,
-    backend: 'deepseek',
+    backend: provider.backend,
     protocol: 'anthropic-messages',
     querySource,
   })
   control.startUpstream()
   try {
     upstream = await fetchWithRetry({
-      provider: 'DeepSeek',
+      provider: label,
       url: upstreamUrl,
       options: {
         method: 'POST',
@@ -3054,7 +3091,7 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   } catch (error) {
     trace.markError(error)
     const status = control.signal.aborted ? control.statusFor(error) : 502
-    anthropicError(res, status, status === 504 ? 'DeepSeek upstream request timed out' : 'DeepSeek connection failed')
+    anthropicError(res, status, status === 504 ? `${label} upstream request timed out` : `${label} connection failed`)
     trace.finish('upstream-error', error, status)
     control.cleanup()
     return
@@ -3066,7 +3103,7 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
     try {
       detail = await safeUpstreamResponseError(
         upstream,
-        'DeepSeek',
+        label,
         apiKey,
         {
           signal: control.signal,
@@ -3080,8 +3117,8 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
         res,
         boundedStatus,
         boundedStatus === 504
-          ? 'DeepSeek upstream request timed out'
-          : 'DeepSeek provider error',
+          ? `${label} upstream request timed out`
+          : `${label} provider error`,
       )
       trace.finish('upstream-http-error', error, boundedStatus)
       control.cleanup()
@@ -3107,7 +3144,7 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   } catch (error) {
     trace.markError(error)
     if (!res.headersSent) {
-      anthropicError(res, 502, error instanceof Error ? error.message : 'DeepSeek stream failed')
+      anthropicError(res, 502, error instanceof Error ? error.message : `${label} stream failed`)
     } else {
       finishAnthropicStreamWithError(res, error)
     }
@@ -3115,6 +3152,10 @@ async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
   } finally {
     control.cleanup()
   }
+}
+
+async function handleDeepSeek(req, res, requestUrl, rawBody, modelName) {
+  await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'deepseek')
 }
 
 function safeLogValue(value) {
@@ -3226,9 +3267,11 @@ export function modelsResponse() {
           ? 'codex'
           : backend === 'deepseek'
             ? 'deepseek'
-            : backend === 'opencode-zen'
-              ? 'opencode-zen'
-              : 'opencode-go',
+            : backend === 'amd-radeon'
+              ? 'amd-radeon'
+              : backend === 'opencode-zen'
+                ? 'opencode-zen'
+                : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
       effort_levels: Array.isArray(MODELS[id].effortLevels)
         ? [...MODELS[id].effortLevels]
@@ -3300,6 +3343,17 @@ const server = http.createServer(async (req, res) => {
   }
   if (route.backend === 'opencode-zen') {
     await handleOpenCodeZen(body, req, res, modelName, route)
+    return
+  }
+  if (route.backend === 'amd-radeon') {
+    if (typeof route.upstream === 'string' && route.upstream !== modelName) {
+      try {
+        const obj = JSON.parse(rawBody.toString('utf8'))
+        obj.model = route.upstream
+        rawBody = Buffer.from(JSON.stringify(obj))
+      } catch { /* malformed body: let the handler surface the real error */ }
+    }
+    await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'amd-radeon')
     return
   }
 
