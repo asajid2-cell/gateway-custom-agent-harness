@@ -3713,6 +3713,78 @@ test('builds OpenCode Go Chat Completions requests and forwards images', () => {
   assert.equal(request.stream, true)
 })
 
+test('Chat Completions keeps images returned inside a tool result', () => {
+  // A Read of a screenshot comes back as a tool_result whose content array
+  // holds the image. Chat Completions tool messages carry a plain string, so
+  // the image has to be hoisted into a following user message; flattening it
+  // to text told the model an image existed but never let it see one.
+  const request = anthropicToOpenCodeChat(
+    {
+      system: 'system',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'x.png' } }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tool-1',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'BBB' } },
+            ],
+          }],
+        },
+      ],
+    },
+    'kimi-k3',
+  )
+
+  const toolMessage = request.messages.find(m => m.role === 'tool')
+  assert.equal(toolMessage.tool_call_id, 'tool-1')
+  assert.doesNotMatch(String(toolMessage.content), /image attachment/)
+
+  const imageMessage = request.messages.find(
+    m => m.role === 'user' && Array.isArray(m.content) && m.content.some(b => b.type === 'image_url'),
+  )
+  assert.ok(imageMessage, 'the tool-result image must survive as an image_url block')
+  assert.equal(imageMessage.content[0].image_url.url, 'data:image/png;base64,BBB')
+})
+
+test('Responses keeps images returned inside a tool result attached to the call', () => {
+  const request = anthropicToOpenCodeResponses(
+    {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'x.png' } }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'tool-1',
+            content: [
+              { type: 'text', text: 'screenshot' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'CCC' } },
+            ],
+          }],
+        },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+
+  const output = request.input.find(item => item.type === 'function_call_output')
+  assert.deepEqual(output.output, [
+    { type: 'input_text', text: 'screenshot' },
+    { type: 'input_image', image_url: 'data:image/png;base64,CCC' },
+  ])
+})
+
 test('OpenCode Go and Zen session headers preserve auth and reject CRLF', () => {
   for (const headers of [
     openCodeGoHeaders('responses', 'synthetic-key', false, 'session-ok'),

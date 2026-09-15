@@ -150,9 +150,30 @@ function blockText(block) {
   return String(block ?? '')
 }
 
+// A Chat Completions `role: 'tool'` message carries a plain string, so an image
+// in a tool result cannot stay where it is: it has to come out of the tool
+// message and be re-attached to the conversation as a following user message.
+// Flattening it to text instead (the previous behaviour) told the model an
+// image existed but never let it see one, so a Read of a screenshot was
+// permanently unreadable on this protocol. Returns the text and the images
+// separately; callers decide where the images go.
 function toolOutput(content, isError = false) {
-  const value = Array.isArray(content) ? content.map(blockText).join('') : blockText(content)
-  return isError ? `[tool error]\n${value}` : value
+  if (!Array.isArray(content)) {
+    const value = blockText(content)
+    return { text: isError ? `[tool error]\n${value}` : value, images: [] }
+  }
+  const images = []
+  const texts = []
+  for (const block of content) {
+    if (block?.type === 'image') {
+      images.push({ type: 'image_url', image_url: { url: imageUrl(block) } })
+      continue
+    }
+    const text = blockText(block)
+    if (text) texts.push(text)
+  }
+  const value = texts.join('')
+  return { text: isError ? `[tool error]\n${value}` : value, images }
 }
 
 function responsesContent(role, blocks) {
@@ -206,10 +227,22 @@ function appendResponsesMessage(input, message) {
     }
     if (block?.type === 'tool_result') {
       flush()
+      // The Responses protocol accepts a content array here, so an image in a
+      // tool result stays attached to the call that produced it.
+      const { text, images } = toolOutput(
+        block.content ?? block.output ?? '',
+        block.is_error === true,
+      )
+      const output = images.length
+        ? [
+            ...(text ? [{ type: 'input_text', text }] : []),
+            ...images.map(image => ({ type: 'input_image', image_url: image.image_url.url })),
+          ]
+        : text
       input.push({
         type: 'function_call_output',
         call_id: block.tool_use_id || block.id || `call_${randomUUID().replaceAll('-', '')}`,
-        output: toolOutput(block.content ?? block.output ?? '', block.is_error === true),
+        output,
       })
       continue
     }
@@ -295,6 +328,7 @@ function appendChatMessage(messages, message) {
   const content = []
   const toolCalls = []
   const toolResults = []
+  const toolImages = []
 
   for (const block of blocks) {
     if (block?.type === 'tool_use') {
@@ -306,11 +340,16 @@ function appendChatMessage(messages, message) {
       continue
     }
     if (block?.type === 'tool_result') {
+      const { text, images } = toolOutput(
+        block.content ?? block.output ?? '',
+        block.is_error === true,
+      )
       toolResults.push({
         role: 'tool',
         tool_call_id: block.tool_use_id || block.id || '',
-        content: toolOutput(block.content ?? block.output ?? '', block.is_error === true),
+        content: text,
       })
+      toolImages.push(...images)
       continue
     }
     if (
@@ -330,12 +369,17 @@ function appendChatMessage(messages, message) {
   const converted = content.length || toolCalls.length
     ? { role, content: content.length ? chatContent(content) : null }
     : null
+  // Images that came out of tool results. They follow the tool messages they
+  // belong to, so the model reads them as the output of the call it just made,
+  // and stay ahead of any ordinary user text on the same turn.
   if (toolCalls.length) {
     converted.tool_calls = toolCalls
     messages.push(converted)
     if (toolResults.length) messages.push(...toolResults)
+    if (toolImages.length) messages.push({ role: 'user', content: toolImages })
   } else {
     if (toolResults.length) messages.push(...toolResults)
+    if (toolImages.length) messages.push({ role: 'user', content: toolImages })
     if (converted) messages.push(converted)
   }
 }
