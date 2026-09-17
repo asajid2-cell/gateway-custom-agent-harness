@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import {
   anthropicToCodex,
   codexPromptCacheKeyForBody,
+  codexRequestVariants,
   codexUsageToAnthropic,
   relayCodexStream,
   relayCodexResponse,
@@ -2704,6 +2705,116 @@ test('keeps unsupported documents visible as a compact text marker', () => {
   ])
 })
 
+test('a server-side web_search is declared as Codex hosted search, not a function', () => {
+  // Passing this through as a function handed the model a `web_search` nothing
+  // executed - the model called it and the agent stalled. Codex has a native
+  // hosted tool (verified live: real web_search_call items with live queries).
+  const request = anthropicToCodex(
+    {
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'search' }] }],
+      tools: [
+        { type: 'web_search_20250305', name: 'web_search', max_uses: 8 },
+        { name: 'Read', description: 'read files', input_schema: { type: 'object' } },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+
+  assert.deepEqual(request.tools, [
+    { type: 'web_search' },
+    {
+      type: 'function',
+      name: 'Read',
+      description: 'read files',
+      parameters: { type: 'object' },
+    },
+  ])
+})
+
+test('hosted tools with no Codex counterpart are dropped, not faked as functions', () => {
+  const request = anthropicToCodex(
+    {
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [
+        { type: 'web_fetch_20250910', name: 'web_fetch' },
+        { name: 'Read', description: 'read files', input_schema: { type: 'object' } },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+
+  assert.equal(request.tools.length, 1)
+  assert.equal(request.tools[0].name, 'Read')
+})
+
+test('schema compaction leaves the hosted declaration byte-identical', () => {
+  // The compact variant must not diverge from the fallback variant here, or the
+  // Codex prompt cache partitions between them.
+  const request = anthropicToCodex(
+    {
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'search' }] }],
+      tools: [
+        { type: 'web_search_20250305', name: 'web_search' },
+        { name: 'Other', description: 'a long description', input_schema: { type: 'object' } },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+  const variants = codexRequestVariants(request)
+  assert.ok(variants.length > 1, 'expected a compact variant to be produced')
+  for (const variant of variants) {
+    assert.deepEqual(variant.tools[0], { type: 'web_search' })
+  }
+})
+
+test('a hosted web search surfaces as the Anthropic server-tool pair', () => {
+  const message = codexResponseToAnthropic(
+    {
+      id: 'resp-1',
+      status: 'completed',
+      output: [
+        {
+          type: 'web_search_call',
+          id: 'ws_1',
+          status: 'completed',
+          action: { type: 'search', queries: ['cmpu 328 alberta'] },
+        },
+        { type: 'message', phase: 'final_answer', content: [{ type: 'output_text', text: 'See https://example.test/a' }] },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+
+  assert.deepEqual(message.content[0], {
+    type: 'server_tool_use',
+    id: 'ws_1',
+    name: 'web_search',
+    input: { query: 'cmpu 328 alberta' },
+  })
+  assert.equal(message.content[1].type, 'web_search_tool_result')
+  assert.equal(message.content[1].tool_use_id, 'ws_1')
+  assert.equal(message.content[2].type, 'text')
+  // A hosted search is server-side, so the turn still belongs to the model.
+  assert.equal(message.stop_reason, 'end_turn')
+})
+
+test('pre-search commentary is not echoed as a second assistant message', () => {
+  const message = codexResponseToAnthropic(
+    {
+      id: 'resp-2',
+      status: 'completed',
+      output: [
+        { type: 'message', phase: 'commentary', content: [{ type: 'output_text', text: 'Searching now.' }] },
+        { type: 'message', phase: 'final_answer', content: [{ type: 'output_text', text: 'The answer.' }] },
+      ],
+    },
+    'gpt-5.6-luna',
+  )
+
+  assert.equal(message.content.length, 1)
+  assert.equal(message.content[0].text, 'The answer.')
+})
+
 test('preserves historical server-tool calls and results', () => {
   const request = anthropicToCodex(
     {
@@ -3247,6 +3358,39 @@ test('OpenCode native compaction requests preserve tools and requested effort', 
   })
 })
 
+
+test('HTTP boundary answers 400 for a level the route does not implement', async () => {
+  // GLM 5.3 Flash implements low|high|max. Requesting medium must fail loudly
+  // with the accepted values — the previous behavior rewrote it to high, so the
+  // caller believed a level was in effect that never was.
+  await withGatewayAndFakeOpenCode({
+    handler: async (req, res, state) => {
+      state.requests.push(await requestJson(req))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'glm-flash-effort',
+        choices: [{ message: { content: 'ok', tool_calls: [] }, finish_reason: 'stop' }],
+      }))
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-opencode-glm-5.3-flash',
+        stream: false,
+        max_tokens: 16,
+        output_config: { effort: 'medium' },
+        messages: [{ role: 'user', content: 'effort check' }],
+      })
+      assert.equal(result.status, 400)
+      // The message is JSON-encoded, so the quoting around the level is escaped.
+      const message = JSON.parse(result.body).error.message
+      assert.match(message, /Effort "medium" is not supported by this model/)
+      assert.match(message, /supported effort values are: low, high, max/)
+      assert.doesNotMatch(message, /ultracode/)
+      // Nothing may reach the provider: a rejected request is not half-sent.
+      assert.equal(state.requests.length, 0)
+    },
+  })
+})
 
 test('gateway exposes canonical routes with Astra metadata and provider-qualified OpenCode aliases', () => {
   const response = modelsResponse()
@@ -4338,25 +4482,33 @@ test('keeps OpenCode effort capabilities model-specific', () => {
   assert.deepEqual(openCodeGoEffortLevels('deepseek-v4.1-flash'), ['low', 'high', 'max'])
 })
 
-test('does not forward unsupported OpenCode max or xhigh', () => {
-  const maxNormalized = normalizeGatewayEffort(
-    { output_config: { effort: 'max' } },
-    { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+test('rejects an unsupported level rather than forwarding a different one', () => {
+  // The user asked for max; the route implements low|medium|high. Rewriting to
+  // high would run a different level than requested without saying so.
+  assert.throws(
+    () => normalizeGatewayEffort(
+      { output_config: { effort: 'max' } },
+      { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+    ),
+    /Effort "max" is not supported by this model; supported effort values are: low, medium, high/,
   )
-  const xhighNormalized = normalizeGatewayEffort(
-    { reasoning: { effort: 'xhigh' } },
-    { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+  assert.throws(
+    () => normalizeGatewayEffort(
+      { reasoning: { effort: 'xhigh' } },
+      { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+    ),
+    /Effort "xhigh" is not supported/,
   )
-  assert.equal(maxNormalized.output_config.effort, 'high')
-  assert.equal(xhighNormalized.reasoning.effort, 'high')
 })
 
-test('clamps unsupported OpenCode medium level to high', () => {
-  const normalized = normalizeGatewayEffort(
-    { output_config: { effort: 'medium' } },
-    { backend: 'opencode-go', effortLevels: ['low', 'high'] },
+test('rejects a level the route does not implement, naming the ones it does', () => {
+  assert.throws(
+    () => normalizeGatewayEffort(
+      { output_config: { effort: 'medium' } },
+      { backend: 'opencode-go', effortLevels: ['low', 'high'] },
+    ),
+    /Effort "medium" is not supported by this model; supported effort values are: low, high/,
   )
-  assert.equal(normalized.output_config.effort, 'high')
 })
 
 test('does not invent native effort levels for an explicitly unverified route', () => {
@@ -4371,12 +4523,16 @@ test('does not invent native effort levels for an explicitly unverified route', 
   assert.equal(Object.hasOwn(normalized.reasoning, 'effort'), false)
 })
 
-test('removes unsupported native max rather than forwarding a false enum', () => {
-  const normalized = normalizeGatewayEffort(
-    { output_config: { effort: 'max' } },
-    { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+test('refuses an unsupported native max instead of forwarding a false enum', () => {
+  // Silently dropping to high would be the same class of lie as forwarding the
+  // raw enum: the caller believes max is in effect either way.
+  assert.throws(
+    () => normalizeGatewayEffort(
+      { output_config: { effort: 'max' } },
+      { backend: 'opencode-go', effortLevels: ['low', 'medium', 'high'] },
+    ),
+    /Effort "max" is not supported/,
   )
-  assert.equal(normalized.output_config.effort, 'high')
 })
 
 // This sentinel prevents a passing suite that silently exercises no OpenCode tests.

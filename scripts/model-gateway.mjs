@@ -27,6 +27,14 @@ import {
   isOpenCodeZenProtocol,
 } from './opencode-zen.mjs'
 import {
+  COMMANDCODE_MODEL_IDS,
+  COMMANDCODE_ROUTES,
+  commandCodeEffortLevels,
+  commandCodeEndpoint,
+  commandCodeGatewayId,
+  commandCodeHeaders,
+} from './commandcode.mjs'
+import {
   gatewayCatalogDrift,
   ASTRA_EFFORT_LEVELS,
   GPT_LUNA_EFFORT_LEVELS,
@@ -211,14 +219,36 @@ const DEFAULT_MODELS = {
   'gateway-ds-4.1-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'] },
   // AMD Radeon Cloud. `upstream` carries the provider's exact casing — the
   // Anthropic body is forwarded as-is, so a lowercased name would 404.
-  // Verified live against the Radeon API: these four answer on /v1/messages.
-  // Only the two *-Vision-Exp / Qwen entries accept image input; the text-only
-  // pair reject an image block with 400 rather than silently ignoring it.
-  'gateway-amd-ds-v4-flash': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash', effortLevels: ['low', 'high', 'max'] },
-  'gateway-amd-ds-v4-flash-vision-exp': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash-Vision-Exp', effortLevels: ['low', 'high', 'max'] },
-  'gateway-amd-qwen3.8-flash-next': { backend: 'amd-radeon', upstream: 'Qwen3.8-Flash-Next', effortLevels: ['low', 'high', 'max'] },
-  'gateway-amd-qwen3.8-27b': { backend: 'amd-radeon', upstream: 'Qwen3.8-27B', effortLevels: ['low', 'high', 'max'] },
-  'gateway-amd-minicpm5-2b': { backend: 'amd-radeon', upstream: 'MiniCPM5-2B', effortLevels: ['low', 'high', 'max'] },
+  // Effort levels below are probe-verified per model against the live Radeon
+  // API (2026-09-16), not assumed: the router and each model disagree, so one
+  // shared ladder would send values that 400. DeepSeek-V4-Flash accepts the
+  // full enum; the two Qwen models accept only low/medium/xhigh and reject
+  // high/max/minimal outright; MiniCPM5-2B accepts only low/medium/high.
+  // Only the *-Vision-Exp / Qwen entries accept image input.
+  'gateway-amd-ds-v4-flash': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash', effortLevels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] },
+  // Delisted upstream: the Radeon API answers /v1/models without it and returns
+  // 404 model_not_found on every request. No effort ladder can be verified for a
+  // model that does not answer, so this route advertises none.
+  'gateway-amd-ds-v4-flash-vision-exp': { backend: 'amd-radeon', upstream: 'DeepSeek-V4-Flash-Vision-Exp', effortLevels: [] },
+  'gateway-amd-qwen3.8-flash-next': { backend: 'amd-radeon', upstream: 'Qwen3.8-Flash-Next', effortLevels: ['low', 'medium', 'xhigh'] },
+  'gateway-amd-qwen3.8-27b': { backend: 'amd-radeon', upstream: 'Qwen3.8-27B', effortLevels: ['low', 'medium', 'xhigh'] },
+  'gateway-amd-minicpm5-2b': { backend: 'amd-radeon', upstream: 'MiniCPM5-2B', effortLevels: ['low', 'medium', 'high'] },
+  // Command Code. The provider fronts third-party models behind one Bearer key
+  // and its OSS models only answer on /provider/v1/chat/completions (the
+  // Anthropic endpoint rejects them by name), so this backend speaks chat
+  // completions. `upstream` carries the provider's exact id — `deepseek/deepseek-v4.1-flash`,
+  // `meituan/LongCat-2.0:free` — which is not derivable from the Gateway name.
+  ...Object.fromEntries(
+    COMMANDCODE_MODEL_IDS.map(model => [
+      commandCodeGatewayId(model),
+      {
+        backend: 'commandcode',
+        upstream: model,
+        protocol: COMMANDCODE_ROUTES[model],
+        effortLevels: commandCodeEffortLevels(model),
+      },
+    ]),
+  ),
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -289,7 +319,8 @@ function loadModels() {
       value.backend !== 'deepseek' &&
       value.backend !== 'amd-radeon' &&
       value.backend !== 'opencode-go' &&
-      value.backend !== 'opencode-zen'
+      value.backend !== 'opencode-zen' &&
+      value.backend !== 'commandcode'
     ) {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} has an invalid backend`)
     }
@@ -315,12 +346,15 @@ function loadModels() {
         ? { upstream: value.upstream }
         : value.backend === 'codex' ||
             value.backend === 'opencode-go' ||
-            value.backend === 'opencode-zen'
+            value.backend === 'opencode-zen' ||
+            value.backend === 'commandcode'
           ? { upstream: name }
           : {}),
       ...(value.backend === 'opencode-go' || value.backend === 'opencode-zen'
         ? { protocol: value.protocol }
-        : {}),
+        : value.backend === 'commandcode'
+          ? { protocol: 'chat-completions' }
+          : {}),
       ...(Array.isArray(value.effortLevels)
         ? { effortLevels: value.effortLevels.filter(level => NATIVE_EFFORT_LEVELS.includes(level)) }
         : {}),
@@ -1011,6 +1045,46 @@ function appendAnthropicMessage(input, message) {
   }
 }
 
+/**
+ * Resolve the caller's requested effort against the route's own ladder.
+ *
+ * Returns the value to send, or `undefined` when no effort parameter may be
+ * sent. `ultracode` is the one deliberate translation: it is a harness control
+ * with no provider enum, so it resolves to the highest level the route does
+ * implement. Any other value the route does not implement is a hard error —
+ * the caller asked for a specific level and quietly sending a different one
+ * (the previous `high` substitution) changed the request behind their back.
+ */
+export function resolveGatewayEffortForRoute(requested, route) {
+  const levels = Array.isArray(route?.effortLevels)
+    ? route.effortLevels
+    : ['low', 'medium', 'high']
+  if (requested === 'ultracode') {
+    return levels.includes('ultra')
+      ? 'ultra'
+      : levels.includes('max')
+        ? 'max'
+        : levels.includes('high')
+          ? 'high'
+          : undefined
+  }
+  if (levels.includes(requested)) return requested
+  const supported = levels.length > 0 ? levels.join(', ') : 'none'
+  throw new UnsupportedEffortError(requested, supported)
+}
+
+export class UnsupportedEffortError extends Error {
+  constructor(requested, supported) {
+    super(
+      `Effort ${JSON.stringify(requested)} is not supported by this model; supported effort values are: ${supported}. ` +
+        'Pick one of these levels, or unset the effort to use the provider default.',
+    )
+    this.name = 'UnsupportedEffortError'
+    this.requested = requested
+    this.supported = supported
+  }
+}
+
 export function normalizeGatewayEffort(body, route, querySource) {
   if (
     isNativeSummaryRequest(querySource) ||
@@ -1034,21 +1108,7 @@ export function normalizeGatewayEffort(body, route, querySource) {
   const requested = body?.output_config?.effort || body?.reasoning?.effort
   if (!requested) return body
 
-  const levels = Array.isArray(route?.effortLevels)
-    ? route.effortLevels
-    : ['low', 'medium', 'high']
-  let effort = requested
-  if (requested === 'ultracode') {
-    effort = levels.includes('ultra')
-      ? 'ultra'
-      : levels.includes('max')
-        ? 'max'
-        : levels.includes('high')
-          ? 'high'
-          : undefined
-  } else if (!levels.includes(requested)) {
-    effort = levels.includes('high') ? 'high' : undefined
-  }
+  const effort = resolveGatewayEffortForRoute(requested, route)
 
   const outputConfig = body.output_config
     ? { ...body.output_config }
@@ -1147,12 +1207,8 @@ export function anthropicToCodex(body, upstreamModel, querySource) {
   // Claude's subagent requests may set these even when the parent request does
   // not, so forwarding them makes Agent calls fail while the parent succeeds.
   if (body.tools?.length) {
-    request.tools = body.tools.map(tool => ({
-      type: 'function',
-      name: tool.name,
-      description: tool.description || '',
-      parameters: tool.input_schema || { type: 'object' },
-    }))
+    const tools = body.tools.map(codexToolFromAnthropic).filter(Boolean)
+    if (tools.length) request.tools = tools
   }
 
   if (body.tool_choice === 'auto' || body.tool_choice === 'none' || body.tool_choice === 'any') {
@@ -1171,6 +1227,51 @@ export function anthropicToCodex(body, upstreamModel, querySource) {
 
 const CORE_TOOL_NAME_PATTERN =
   /^(read|write|edit|bash|glob|grep|skill|task|agent|todo|askuser)/i
+
+// Anthropic's server-side tools have to be re-addressed to Codex's own hosted
+// equivalents. Muse/experimental hosted types Codex has no counterpart for are
+// dropped rather than translated into a function call nothing would execute.
+const CODEX_HOSTED_WEB_SEARCH = { type: 'web_search' }
+const CODEX_UNSUPPORTED_HOSTED_TYPES = new Set(['web_fetch', 'code_execution'])
+
+/**
+ * Translate one Anthropic tool declaration to its Codex form.
+ *
+ * The default is a client-executed function, which is right for every ordinary
+ * tool. `web_search_20250305` is not ordinary: it is a *server-side* tool that
+ * the provider runs itself. Passing it through as a function handed the model a
+ * `web_search` function that nothing on either side ever executed, so the model
+ * dutifully called it and the agent stalled with nothing to run. Codex has a
+ * native `web_search` hosted tool - verified live: it returns real
+ * `web_search_call` items with live queries and citations - so the declaration
+ * maps onto that instead.
+ */
+function isUnsupportedHostedTool(tool) {
+  if (typeof tool?.type !== 'string') return false
+  for (const unsupported of CODEX_UNSUPPORTED_HOSTED_TYPES) {
+    if (tool.type === unsupported || tool.type.startsWith(`${unsupported}_`)) {
+      return true
+    }
+  }
+  return false
+}
+
+// Hosted tools carry no `name`/`parameters`, so the schema-compaction helpers
+// must leave them exactly as declared.
+function isCodexHostedTool(tool) {
+  return tool?.type === CODEX_HOSTED_WEB_SEARCH.type
+}
+
+function codexToolFromAnthropic(tool) {
+  if (tool?.type === 'web_search_20250305') return { ...CODEX_HOSTED_WEB_SEARCH }
+  if (isUnsupportedHostedTool(tool)) return null
+  return {
+    type: 'function',
+    name: tool.name,
+    description: tool.description || '',
+    parameters: tool.input_schema || { type: 'object' },
+  }
+}
 
 function slimCodexSchema(value) {
   if (Array.isArray(value)) return value.map(slimCodexSchema)
@@ -1195,7 +1296,9 @@ function contextFallbackRequests(request) {
   if (!Array.isArray(request.tools) || request.tools.length === 0) return []
 
   const slimTools = compactCodexTools(request)
-  const coreTools = slimTools.filter(tool => CORE_TOOL_NAME_PATTERN.test(tool.name))
+  const coreTools = slimTools.filter(
+    tool => isCodexHostedTool(tool) || CORE_TOOL_NAME_PATTERN.test(tool.name),
+  )
   const variants = [{ ...request, tools: slimTools }]
   if (coreTools.length && coreTools.length < slimTools.length) {
     variants.push({ ...request, tools: coreTools })
@@ -1204,11 +1307,15 @@ function contextFallbackRequests(request) {
 }
 
 function compactCodexTools(request) {
-  return request.tools.map(tool => ({
-    ...tool,
-    description: '',
-    parameters: slimCodexSchema(tool.parameters),
-  }))
+  return request.tools.map(tool =>
+    isCodexHostedTool(tool)
+      ? tool
+      : {
+          ...tool,
+          description: '',
+          parameters: slimCodexSchema(tool.parameters),
+        },
+  )
 }
 
 function boundedToolDescription(value, limit = 320) {
@@ -1240,6 +1347,10 @@ function safeCodexSchema(value) {
 
 function balancedCodexTools(request) {
   return request.tools.map(tool => {
+    // The hosted declaration is a bare type tag with nothing to compact, and
+    // rewriting it would make the compact variant differ from the fallback
+    // variant, partitioning the Codex prompt cache.
+    if (isCodexHostedTool(tool)) return tool
     const isCoreTool = CORE_TOOL_NAME_PATTERN.test(String(tool.name || ''))
     return {
       ...tool,
@@ -1256,7 +1367,7 @@ function balancedCodexTools(request) {
   })
 }
 
-function codexRequestVariants(request, nativeCompaction = false) {
+export function codexRequestVariants(request, nativeCompaction = false) {
   // Native harness compaction deliberately carries the canonical tool catalog
   // for cache/protocol compatibility. Do not let a gateway-side schema mode or
   // context fallback rewrite that request and create a second compact policy.
@@ -1477,6 +1588,49 @@ function codexEventShape(event) {
   process.stderr.write(`model-gateway event-shape ${fields.join(' ')}\n`)
 }
 
+// Codex splits its output by `phase`. Only the final answer is user-facing;
+// the pre-search commentary would otherwise be emitted as ordinary assistant
+// text alongside the answer that supersedes it.
+function codexIsInterimMessage(item) {
+  return typeof item?.phase === 'string' && item.phase !== 'final_answer'
+}
+
+// Codex reports a hosted web search as an output item whose `action` carries
+// the queries it ran. The merged multi-query form is what Claude's per-search
+// result shape expects, and the result URLs arrive only inside the final
+// answer text (the `annotations` array is always empty), so the text is passed
+// through verbatim and rendered as-is.
+function codexWebSearchQueries(item) {
+  const action = item?.action
+  if (!action || typeof action !== 'object') return []
+  if (Array.isArray(action.queries)) {
+    return action.queries.filter(q => typeof q === 'string' && q.length > 0)
+  }
+  return typeof action.query === 'string' && action.query.length > 0
+    ? [action.query]
+    : []
+}
+
+function codexWebSearchResult(item) {
+  const queries = codexWebSearchQueries(item)
+  const query = queries.join(' ')
+  return {
+    contentBlock: {
+      type: 'server_tool_use',
+      id: item.id,
+      name: 'web_search',
+      input: { query },
+    },
+    resultBlock: {
+      type: 'web_search_tool_result',
+      tool_use_id: item.id,
+      content: queries.length
+        ? queries.map(q => ({ type: 'web_search_result', title: q, url: '' }))
+        : [],
+    },
+  }
+}
+
 function codexOutputMessageFromEvent(event) {
   if (event?.type === 'response.output_text.done') {
     if (typeof event.text === 'string') return event.text
@@ -1545,6 +1699,9 @@ export function codexResponseToAnthropic(response, model) {
   let hasToolUse = false
   for (const item of Array.isArray(response.output) ? response.output : []) {
     if (item?.type === 'message') {
+      // Pre-search commentary is dropped: the final answer supersedes it, and
+      // both would otherwise appear as separate assistant text blocks.
+      if (codexIsInterimMessage(item)) continue
       for (const part of Array.isArray(item.content) ? item.content : []) {
         if (part?.type === 'output_text' && typeof part.text === 'string' && part.text) {
           content.push({ type: 'text', text: part.text })
@@ -1560,6 +1717,11 @@ export function codexResponseToAnthropic(response, model) {
         input: parseCodexFunctionArguments(item.arguments),
       })
       hasToolUse = true
+    } else if (item?.type === 'web_search_call') {
+      // A hosted search is server-side, so it is not a tool the caller must run
+      // and must not set stop_reason=tool_use - the turn is still the model's.
+      const { contentBlock, resultBlock } = codexWebSearchResult(item)
+      content.push(contentBlock, resultBlock)
     }
   }
 
@@ -1598,9 +1760,19 @@ export async function relayCodexResponse(
       let completed = null
       let text = ''
       const toolCalls = new Map()
+      const webSearches = new Map()
+      let messagePhase = null
       const handleEvent = event => {
         codexEventShape(event)
+        if (
+          event.type === 'response.output_item.added' &&
+          event.item?.type === 'message'
+        ) {
+          messagePhase = event.item.phase ?? null
+          return
+        }
         if (event.type === 'response.output_text.delta') {
+          if (codexIsInterimMessage({ phase: messagePhase })) return
           const delta = typeof event.delta === 'string'
             ? event.delta
             : typeof event.part?.text === 'string'
@@ -1610,11 +1782,22 @@ export async function relayCodexResponse(
           return
         }
         if (event.type === 'response.output_text.done') {
-          if (!text) text = codexOutputMessageFromEvent(event)
+          if (!text && !codexIsInterimMessage({ phase: messagePhase })) {
+            text = codexOutputMessageFromEvent(event)
+          }
+          return
+        }
+        if (
+          event.type === 'response.output_item.done' &&
+          event.item?.type === 'web_search_call'
+        ) {
+          webSearches.set(event.item.id, event.item)
           return
         }
         if (event.type === 'response.output_item.done' && event.item?.type === 'message') {
-          if (!text) text = codexOutputMessageFromEvent(event)
+          if (!text && !codexIsInterimMessage(event.item)) {
+            text = codexOutputMessageFromEvent(event)
+          }
           return
         }
         if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
@@ -1679,12 +1862,13 @@ export async function relayCodexResponse(
         }
       }
       if (!completed) throw new Error('Codex stream ended before response.completed')
-      if (!completed.output?.length && (text || toolCalls.size)) {
+      if (!completed.output?.length && (text || toolCalls.size || webSearches.size)) {
         completed = {
           ...completed,
           output: [
             ...(text ? [{ type: 'message', content: [{ type: 'output_text', text }] }] : []),
             ...toolCalls.values(),
+            ...webSearches.values(),
           ],
         }
       }
@@ -2041,6 +2225,10 @@ export async function relayCodexStream(
   let buffer = ''
   let streamStarted = false
   let pendingTool = null
+  // Codex streams its pre-search commentary and its final answer as two
+  // `message` items. Both arrive as `response.output_text.delta`, which carries
+  // no phase, so the delta has to be attributed to whichever message is open.
+  let messagePhase = null
 
   const startStream = () => {
     if (streamStarted) return
@@ -2105,6 +2293,22 @@ export async function relayCodexStream(
     return true
   }
 
+  // Emit a completed hosted web search as the server-tool pair the Anthropic
+  // contract expects. This is what makes the search visible to the caller as a
+  // search rather than as unexplained latency before the answer.
+  const emitWebSearch = item => {
+    startStream()
+    closeActive()
+    sawOutput = true
+    trace?.markOutput()
+    const { contentBlock, resultBlock } = codexWebSearchResult(item)
+    for (const block of [contentBlock, resultBlock]) {
+      sendEvent(res, 'content_block_start', { index: contentIndex, content_block: block })
+      sendEvent(res, 'content_block_stop', { index: contentIndex })
+      contentIndex += 1
+    }
+  }
+
   control?.setStreamErrorFinalizer(() => {
     if (streamStarted) closeActive()
   })
@@ -2113,6 +2317,9 @@ export async function relayCodexStream(
     if (sawOutput || !response?.output) return
     for (const item of response.output) {
       if (item.type === 'message') {
+        // The final answer supersedes the pre-search commentary, so the
+        // fallback emits only that rather than both.
+        if (codexIsInterimMessage(item)) continue
         for (const part of item.content || []) {
           if (part.type === 'output_text' && part.text) {
             openText()
@@ -2129,19 +2336,35 @@ export async function relayCodexStream(
           delta: { type: 'input_json_delta', partial_json: item.arguments || '{}' },
         })
       }
+      // `web_search_call` is deliberately not replayed here: it is emitted when
+      // its `.done` event arrives, and replaying it would run the search twice.
     }
   }
 
   const handleEvent = event => {
     codexEventShape(event)
     const type = event?.type
+    if (
+      type === 'response.output_item.added' &&
+      event.item?.type === 'message'
+    ) {
+      messagePhase = event.item.phase ?? null
+      return
+    }
     if (type === 'response.output_item.added' && event.item?.type === 'function_call') {
       // Metadata alone is not usable output. Buffer it until arguments arrive
       // so a provider timeout cannot commit an incomplete Anthropic message.
       pendingTool = event.item
       return
     }
+    if (type === 'response.output_item.done' && event.item?.type === 'web_search_call') {
+      emitWebSearch(event.item)
+      return
+    }
     if (type === 'response.output_text.delta') {
+      // Pre-search commentary is not the answer. Emitting it as assistant text
+      // would show the user a message that the final answer then repeats.
+      if (codexIsInterimMessage({ phase: messagePhase })) return
       const text = typeof event.delta === 'string' ? event.delta : ''
       if (!text) return
       openText()
@@ -2152,7 +2375,7 @@ export async function relayCodexStream(
       return
     }
     if (type === 'response.output_text.done') {
-      if (!activeText && typeof event.text === 'string' && event.text) {
+      if (!codexIsInterimMessage({ phase: messagePhase }) && !activeText && typeof event.text === 'string' && event.text) {
         openText()
         sendEvent(res, 'content_block_delta', {
           index: contentIndex,
@@ -2162,7 +2385,7 @@ export async function relayCodexStream(
       return
     }
     if (type === 'response.output_item.done' && event.item?.type === 'message') {
-      if (!activeText) {
+      if (!codexIsInterimMessage(event.item) && !activeText) {
         const text = codexOutputText(event.item)
         if (text) {
           openText()
@@ -2172,6 +2395,7 @@ export async function relayCodexStream(
           })
         }
       }
+      messagePhase = null
       return
     }
     if (type === 'response.function_call_arguments.delta') {
@@ -2922,6 +3146,91 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
   }
 }
 
+async function handleCommandCode(body, req, res, modelName, route) {
+  const wantsStream = body.stream === true
+  const trace = createGatewayTrace({ model: modelName, backend: 'commandcode', protocol: route.protocol })
+  const control = createRequestControl(req, res, trace)
+  const querySource = gatewayQuerySource(req)
+  const apiKey = process.env.COMMANDCODE_API_KEY
+  if (!apiKey) {
+    anthropicError(res, 401, 'Command Code API key is not configured')
+    trace.finish('auth-error', null, 401)
+    control.cleanup()
+    return
+  }
+
+  let request
+  try {
+    const toolSafeBody = stripUnsupportedOpenCodeToolChoice(
+      stripUnsupportedOpenCodeTools(body, route),
+      route,
+    )
+    const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
+    request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    logRequestShape({
+      body: normalizedBody,
+      providerRequest: request,
+      model: modelName,
+      backend: 'commandcode',
+      protocol: route.protocol,
+      querySource,
+    })
+  } catch (error) {
+    anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
+    trace.finish('invalid-request', error, 400)
+    control.cleanup()
+    return
+  }
+
+  try {
+    control.startUpstream()
+    const upstream = await fetchWithRetry({
+      provider: 'Command Code',
+      url: commandCodeEndpoint(),
+      options: {
+        method: 'POST',
+        headers: commandCodeHeaders(apiKey, wantsStream),
+        body: JSON.stringify(request),
+        signal: control.signal,
+      },
+      control,
+      trace,
+    })
+    if (!upstream.ok) {
+      const detail = await safeUpstreamResponseError(
+        upstream,
+        'Command Code',
+        apiKey,
+        { signal: control.signal, timeoutMs: RETRY_RESPONSE_TIMEOUT_MS },
+      )
+      await upstream.body?.cancel().catch(() => {})
+      const status = upstream.status >= 500 ? 502 : upstream.status
+      anthropicError(res, status, detail)
+      trace.finish('upstream-http-error', null, status)
+      return
+    }
+
+    const relayOptions = { signal: control.signal, throwPreOutput: true }
+    if (wantsStream) {
+      await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
+    } else {
+      await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+    }
+    trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
+  } catch (error) {
+    trace.markError(error)
+    if (!res.headersSent) {
+      const status = control.signal.aborted ? control.statusFor(error) : 502
+      anthropicError(res, status, control.signal.aborted ? 'Command Code upstream request timed out' : redactSecret(errorMessage(error), apiKey))
+    } else if (wantsStream) {
+      finishAnthropicStreamWithError(res, error)
+    }
+    trace.finish('request-error', error, res.statusCode)
+  } finally {
+    control.cleanup()
+  }
+}
+
 async function handleOpenCodeZen(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
   const sessionId = upstreamSessionId(req, body)
@@ -3038,18 +3347,23 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
     anthropicError(res, 400, error instanceof Error ? error.message : 'Invalid JSON')
     return
   }
-  body = normalizeGatewayEffort({
-    ...body,
-    system: appendRuntimeToolContract(body.system, querySource),
-    messages: Array.isArray(body.messages)
-      ? body.messages.map(message => ({
-          ...message,
-          content: message.role === 'assistant'
-            ? sanitizeStaleToolCapabilityContent(message.content)
-            : sanitizeLegacyCompactionContent(message.content),
-        }))
-      : body.messages,
-  }, MODELS[modelName], querySource)
+  try {
+    body = normalizeGatewayEffort({
+      ...body,
+      system: appendRuntimeToolContract(body.system, querySource),
+      messages: Array.isArray(body.messages)
+        ? body.messages.map(message => ({
+            ...message,
+            content: message.role === 'assistant'
+              ? sanitizeStaleToolCapabilityContent(message.content)
+              : sanitizeLegacyCompactionContent(message.content),
+          }))
+        : body.messages,
+    }, MODELS[modelName], querySource)
+  } catch (error) {
+    anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
+    return
+  }
   rawBody = Buffer.from(JSON.stringify(body))
   const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: provider.backend, protocol: 'anthropic-messages' })
@@ -3269,9 +3583,11 @@ export function modelsResponse() {
             ? 'deepseek'
             : backend === 'amd-radeon'
               ? 'amd-radeon'
-              : backend === 'opencode-zen'
-                ? 'opencode-zen'
-                : 'opencode-go',
+              : backend === 'commandcode'
+                ? 'commandcode'
+                : backend === 'opencode-zen'
+                  ? 'opencode-zen'
+                  : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
       effort_levels: Array.isArray(MODELS[id].effortLevels)
         ? [...MODELS[id].effortLevels]
@@ -3343,6 +3659,10 @@ const server = http.createServer(async (req, res) => {
   }
   if (route.backend === 'opencode-zen') {
     await handleOpenCodeZen(body, req, res, modelName, route)
+    return
+  }
+  if (route.backend === 'commandcode') {
+    await handleCommandCode(body, req, res, modelName, route)
     return
   }
   if (route.backend === 'amd-radeon') {

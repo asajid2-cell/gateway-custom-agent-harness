@@ -81,6 +81,15 @@ export function effortLevelsForOpenCodeZenModel(model) {
   return levels ? [...levels] : []
 }
 
+export const COMMANDCODE_EFFORT_LEVELS = Object.fromEntries(
+  Object.entries(CATALOG.commandcode || {}).map(([model, levels]) => [model, [...levels]]),
+)
+
+export function effortLevelsForCommandCodeModel(model) {
+  const levels = COMMANDCODE_EFFORT_LEVELS[model]
+  return levels ? [...levels] : []
+}
+
 export function effortWireMapForOpenCodeModel(model) {
   if (model === 'hy3') return { none: 'no_think' }
   return {}

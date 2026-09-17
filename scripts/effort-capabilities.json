@@ -25,6 +25,17 @@
       "defaultVerbosity": "low"
     }
   },
+  "gatewayWebSearch": {
+    "serverToolModels": [
+      "gateway-ds-flash",
+      "gateway-ds-pro",
+      "gateway-ds-4.1-flash",
+      "gateway-gpt-luna",
+      "gateway-gpt-sol",
+      "gateway-gpt-astra",
+      "gateway-gpt-terra"
+    ]
+  },
   "opencodeGo": {
     "gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -58,6 +69,12 @@
     "nemotron-3.5-lightning-free": [],
     "muse-spark-1.2-contributor-free": []
   },
+  "commandcode": {
+    "deepseek/deepseek-v4.1-flash": ["low", "medium", "high", "xhigh", "max"],
+    "meituan/LongCat-2.0:free": ["low", "medium", "high", "xhigh", "max"],
+    "poolside/laguna-s-2.1-free": ["low", "medium", "high", "xhigh", "max"],
+    "inclusionai/ling-3.0-flash-sante:free": ["low", "medium", "high", "xhigh", "max"]
+  },
   "gatewayAliases": {
     "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -66,11 +83,15 @@
     "gateway-ds-flash": ["low", "high", "max"],
     "gateway-ds-pro": ["low", "high", "max"],
     "gateway-ds-4.1-flash": ["low", "high", "max"],
-    "gateway-amd-ds-v4-flash": ["low", "high", "max"],
-    "gateway-amd-ds-v4-flash-vision-exp": ["low", "high", "max"],
-    "gateway-amd-qwen3.8-flash-next": ["low", "high", "max"],
-    "gateway-amd-qwen3.8-27b": ["low", "high", "max"],
-    "gateway-amd-minicpm5-2b": ["low", "high", "max"],
+    "gateway-amd-ds-v4-flash": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    "gateway-amd-ds-v4-flash-vision-exp": [],
+    "gateway-amd-qwen3.8-flash-next": ["low", "medium", "xhigh"],
+    "gateway-amd-qwen3.8-27b": ["low", "medium", "xhigh"],
+    "gateway-amd-minicpm5-2b": ["low", "medium", "high"],
+    "gateway-commandcode-deepseek-v4.1-flash": ["low", "medium", "high", "xhigh", "max"],
+    "gateway-commandcode-longcat-2.0-free": ["low", "medium", "high", "xhigh", "max"],
+    "gateway-commandcode-laguna-s-2.1-free": ["low", "medium", "high", "xhigh", "max"],
+    "gateway-commandcode-ling-3.0-flash-sante-free": ["low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-glm-5.3-flash": ["low", "high", "max"],
@@ -198,6 +219,26 @@
       "value": "gateway-amd-minicpm5-2b",
       "label": "AMD MiniCPM5 2B",
       "description": "AMD Radeon - MiniCPM5 2B (text only)"
+    },
+    {
+      "value": "gateway-commandcode-deepseek-v4.1-flash",
+      "label": "Command Code DeepSeek v4.1 Flash",
+      "description": "Command Code - DeepSeek v4.1 Flash"
+    },
+    {
+      "value": "gateway-commandcode-longcat-2.0-free",
+      "label": "Command Code LongCat 2.0 (free)",
+      "description": "Command Code - LongCat 2.0, free"
+    },
+    {
+      "value": "gateway-commandcode-laguna-s-2.1-free",
+      "label": "Command Code Laguna S 2.1 (free)",
+      "description": "Command Code - Laguna S 2.1, free"
+    },
+    {
+      "value": "gateway-commandcode-ling-3.0-flash-sante-free",
+      "label": "Command Code Ling 3.0 Flash (free)",
+      "description": "Command Code - Ling 3.0 Flash Sante, free"
     },
     {
       "value": "gateway-opencode-gpt-5.6-luna",
@@ -346,6 +387,23 @@
     }
   ],
   "gatewayModelAliases": {
+    "gateway-commandcode-deepseek-v4.1-flash": [
+      "commandcode-ds-4.1-flash",
+      "commandcode-deepseek-v4.1-flash",
+      "commandcode/deepseek-v4.1-flash"
+    ],
+    "gateway-commandcode-longcat-2.0-free": [
+      "commandcode-longcat-2.0-free",
+      "commandcode/meituan/LongCat-2.0:free"
+    ],
+    "gateway-commandcode-laguna-s-2.1-free": [
+      "commandcode-laguna-s-2.1-free",
+      "commandcode/poolside/laguna-s-2.1-free"
+    ],
+    "gateway-commandcode-ling-3.0-flash-sante-free": [
+      "commandcode-ling-3.0-flash-sante-free",
+      "commandcode/inclusionai/ling-3.0-flash-sante:free"
+    ],
     "gateway-gpt-luna": ["gpt-5.6-luna", "claude-gpt-luna"],
     "gateway-gpt-sol": ["gpt-5.6-sol", "claude-gpt-sol"],
     "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
