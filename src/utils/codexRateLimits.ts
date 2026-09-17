@@ -1,5 +1,6 @@
 import { closeSync, openSync, readdirSync, readSync, statSync, type Dirent } from 'node:fs'
 import { open, readdir, stat, type FileHandle } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -90,6 +91,12 @@ export function quotaFromRateLimits(value: unknown, asof = Date.now()): CodexQuo
     resetsSecondary: secondary?.resetsAt ?? null,
     asof,
   }
+}
+
+function codexExecutable(): string {
+  return process.platform === 'win32'
+    ? join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'npm', 'codex.cmd')
+    : 'codex'
 }
 
 export function getCodexHome(): string {
@@ -289,6 +296,75 @@ export async function readCodexQuotaFromSource(
     if (quota) return quota
   }
   return null
+}
+
+export async function readCodexQuota(): Promise<CodexQuota | null> {
+  const child = spawn(codexExecutable(), ['app-server', '--listen', 'stdio://'], {
+    shell: process.platform === 'win32',
+    env: { ...process.env, CODEX_HOME: getCodexHome() },
+    stdio: ['pipe', 'pipe', 'ignore'],
+  })
+
+  return await new Promise(resolve => {
+    let buffer = ''
+    let initialized = false
+    let finished = false
+    const timeout = setTimeout(() => finish(null), 10_000)
+
+    const finish = (quota: CodexQuota | null) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timeout)
+      child.kill()
+      resolve(quota)
+    }
+
+    const send = (message: Record<string, unknown>) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`)
+    }
+
+    child.on('error', () => finish(null))
+    child.stdout.on('data', chunk => {
+      buffer += chunk.toString()
+      let newlineIndex = buffer.indexOf('\n')
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim()
+        buffer = buffer.slice(newlineIndex + 1)
+        newlineIndex = buffer.indexOf('\n')
+        if (!line) continue
+
+        let message: unknown
+        try {
+          message = JSON.parse(line)
+        } catch {
+          continue
+        }
+        if (!isObject(message)) continue
+        const id = finiteNumber(message.id)
+        if (id === 1 && !initialized) {
+          initialized = true
+          send({ method: 'initialized', params: {} })
+          send({ method: 'account/rateLimits/read', id: 2, params: {} })
+        } else if (id === 2) {
+          const result = isObject(message.result) ? message.result : null
+          finish(result ? quotaFromRateLimits(result) : null)
+          return
+        }
+      }
+    })
+
+    send({
+      method: 'initialize',
+      id: 1,
+      params: {
+        clientInfo: {
+          name: 'gateway-footer',
+          title: 'Gateway footer quota reader',
+          version: '1.0.0',
+        },
+      },
+    })
+  })
 }
 
 export function isCodexGatewayModel(model: string): boolean {
