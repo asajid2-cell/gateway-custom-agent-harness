@@ -28,7 +28,11 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
   const runtimeRef = useRef<GatewaySessionRuntime | undefined>(undefined)
   const closing = useRef<Promise<void>>(Promise.resolve())
   useEffect(() => {
-    if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1') return
+    // Interactive leaves belong to a leaf family, not the global session bus.
+    // Registering them here made a leaf visible beside unrelated sessions
+    // (including other products) and let model-directed peer traffic escape its
+    // family. Parent/leaf communication uses the leaf IPC channel instead.
+    if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1' || process.env.GATEWAY_INTERACTIVE_LEAF === '1') return
     const runtime = new GatewaySessionRuntime(sessionId, getCwd(), name)
     let disposed = false
     const started = closing.current.then(async () => {

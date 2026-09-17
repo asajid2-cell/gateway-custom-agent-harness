@@ -12,6 +12,22 @@ export type LeafTerminalControl = { subtype: string; [key: string]: unknown }
 export type LeafTerminalMessage =
   | { type: 'leaf-output'; epoch: number; data: string }
   | { type: 'leaf-state'; state: LeafProcessState; draft?: string }
+  | {
+      /**
+       * The leaf's own answer to a peer message, sent the moment the answer
+       * exists rather than when the whole turn ends. Without this a peer waits
+       * for the leaf to finish everything it was already doing, which is the
+       * "no proper awareness" complaint.
+       *
+       * `question` is the peer text being answered, so the parent can match the
+       * answer to the right ask. Several questions can be in flight at once now
+       * that a running leaf takes them immediately, and "oldest still owed"
+       * would answer the wrong asker when the leaf replies out of order.
+       */
+      type: 'leaf-answered'
+      question: string
+      answer: string
+    }
   | { type: 'leaf-request'; id: string; action: string; args: unknown[] }
   | { type: 'leaf-response'; id: string; ok: boolean; value?: unknown }
   | { type: 'leaf-control'; id: string; request: LeafTerminalControl }
@@ -27,15 +43,21 @@ const requests = new Map<string, { resolve: (value: any) => void; reject: (error
 let controls: ((request: LeafTerminalControl) => Promise<void>) | undefined
 const pendingControls: Extract<LeafTerminalMessage, { type: 'leaf-control' }>[] = []
 let initialDraft = ''
-let deliverInput: ((data: string) => void) | undefined
+let wakeInput: (() => void) | undefined
 
 /**
- * Feed text into the leaf's own REPL regardless of terminal focus. The parent
- * uses this to hand a leaf a turn while the human stays on another session.
+ * Bring the leaf's REPL back to life without typing anything into it.
+ *
+ * A leaf that is not focused is paused, so its own command queue only drains
+ * once the REPL is rendering again. Delivering a peer message through the queue
+ * - rather than as keystrokes - is what keeps its "not the user" marking, but
+ * that message still needs this nudge to run, or it sits there until the human
+ * happens to focus the leaf. Nothing is written to the input, so the message is
+ * never mistaken for something the person typed.
  */
-export function writeLeafInput(data: string): void {
-  if (!deliverInput) throw new Error('Leaf input channel is unavailable')
-  deliverInput(data)
+export function wakeLeafInput(): void {
+  if (!wakeInput) throw new Error('Leaf input channel is unavailable')
+  wakeInput()
 }
 
 export function isInteractiveLeaf(): boolean { return process.env.GATEWAY_INTERACTIVE_LEAF === '1' && typeof process.send === 'function' }
@@ -90,13 +112,14 @@ export async function installLeafTerminal(): Promise<void> {
   })
   Object.defineProperty(process, 'stdin', { configurable: true, value: input })
   Object.defineProperty(process, 'stdout', { configurable: true, value: output })
-  // A background leaf is paused by leaf-focus; delivery wakes its REPL without
-  // stealing the parent's rendering (unfocused frames are dropped upstream).
-  deliverInput = data => {
+  // A background leaf is paused by leaf-focus; a delivery wakes its REPL
+  // without stealing the parent's rendering (unfocused frames are dropped
+  // upstream). No input is written - the message goes through the queue so it
+  // keeps its "not the user" attribution.
+  wakeInput = () => {
     instances.get(process.stdout)?.resume()
     input.setRawMode(true)
     input.resume()
-    input.write(data)
   }
   const stderr = Object.assign(new Writable({ write(chunk, _encoding, callback) { output.write(chunk, callback) } }), { isTTY: true, fd: 2 })
   Object.defineProperty(process, 'stderr', { configurable: true, value: stderr })

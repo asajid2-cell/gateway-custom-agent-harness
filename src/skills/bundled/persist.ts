@@ -117,10 +117,26 @@ export function subscribePersist(listener: () => void): () => void {
   persistListeners.add(listener)
   return () => { persistListeners.delete(listener) }
 }
+/**
+ * Whether this session may hold a durable goal of its own.
+ *
+ * A leaf is a scoped work conversation its parent owns, not a second main
+ * session. Letting one carry a goal makes it run a Stop-hook heartbeat that
+ * continues the leaf after every answer - visible as stall feedback arriving
+ * in a leaf nobody assigned a goal to, and as the leaf pursuing "random stock
+ * goals" its transcript never shows the person setting. A leaf's work is
+ * bounded by the parent's goal and by the message that started it.
+ */
+export function canHoldPersistGoal(): boolean {
+  return process.env.GATEWAY_INTERACTIVE_LEAF !== '1'
+}
+
 export function getCurrentPersistRecord(): PersistSessionRecord | undefined {
+  if (!canHoldPersistGoal()) return undefined
   return persistRecords.get(getSessionId())
 }
 export function getPersistGoalContext(): string | undefined {
+  if (!canHoldPersistGoal()) return undefined
   const record = getCurrentPersistRecord()
   if (!record || record.status === 'completed' || record.status === 'cleared') return undefined
   if (record.status === 'paused' || record.status === 'blocked') return `Stored goal (${record.status}): ${escapeXml(record.task)}. Do not automatically pursue it. Wait for /persist resume; the current conversation takes precedence.`
@@ -650,6 +666,13 @@ export async function restorePersistForCurrentSession(
   transcriptPath = getTranscriptPath(),
 ): Promise<PersistSessionRecord | null> {
   const sessionId = getSessionId()
+  // Refused here as well as at the callers, so no future startup path can arm a
+  // leaf's heartbeat just by reaching for the restore.
+  if (!canHoldPersistGoal()) {
+    detachPersistRuntime(sessionId)
+    removeFunctionHook(setAppState, sessionId, 'Stop', getPersistHookId(sessionId))
+    return null
+  }
   return serializePersistOperation(sessionId, async () => {
   detachOtherPersistRuntimes(sessionId)
   const record = await loadPersistRecord(sessionId, transcriptPath)
@@ -706,6 +729,12 @@ export function registerPersistSkill(): void {
       const reviewTranscriptPath = getRuntimeTranscriptPath(context)
       const reviewedGoal = persistRecords.get(sessionId)
       const reviewedRuntime = persistRuntime.get(sessionId)
+      // Reviewing a goal needs one to review. A leaf has none by design, and
+      // the old path let a leaf's first checkpoint invent a goal's continuation
+      // authority instead of refusing.
+      if (!canHoldPersistGoal()) {
+        return [{ type: 'text' as const, text: 'This is a leaf: it holds no durable goal to review. Report the checkpoint to the parent session instead; the parent owns the goal.' }]
+      }
       return serializePersistOperation<ContentBlockParam[]>(sessionId, async () => {
       if (getSessionId() !== sessionId || persistRecords.get(sessionId)?.task !== reviewedGoal?.task || (reviewedRuntime && persistRuntime.get(sessionId) !== reviewedRuntime)) {
         return [{ type: 'text', text: 'Goal changed before review; review the current goal instead.' }]
@@ -782,6 +811,14 @@ export function registerPersistSkill(): void {
           {
             type: 'text',
             text: '/persist is available only in the main session.',
+          },
+        ]
+      }
+      if (!canHoldPersistGoal()) {
+        return [
+          {
+            type: 'text',
+            text: 'A leaf does not hold a durable goal. Its work is bounded by the message that started it and by the goal its parent is pursuing; report back instead of arming a goal here.',
           },
         ]
       }

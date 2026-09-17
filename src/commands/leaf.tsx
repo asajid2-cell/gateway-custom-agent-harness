@@ -3,7 +3,7 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|checkpoint <leaf> [name]|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|close|reopen|archive|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|checkpoint <leaf> [name]|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -153,9 +153,12 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     } else if (input === 'new' || input.startsWith('new ')) {
       await workspace.createLeaf(input.slice(3).trim() || undefined, undefined, undefined, { ...options, fresh: true })
     } else if (!input) {
+      // Bare `/leaf` is the guided surface: it loads the roster but starts no
+      // process, so opening one stays a deliberate click. `/leaf <args>` below
+      // is unchanged - the argument grammar is the passthrough.
       await workspace.restoreLeafWorkspace()
-      const { LeafCreateMenu } = await import('../components/LeafWorkspaceDialog.js')
-      return <LeafCreateMenu onDone={() => onDone()} model={options.model} effort={options.effort} />
+      const { LeafMenu } = await import('../components/LeafWorkspaceDialog.js')
+      return <LeafMenu onDone={result => onDone(result ?? '', { display: 'system' })} model={options.model} effort={options.effort} />
     } else {
       onDone(`Usage: /leaf ${USAGE}`, { display: 'system' })
       return null

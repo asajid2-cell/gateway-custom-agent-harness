@@ -7,8 +7,10 @@ import type { AppState } from '../src/state/AppState.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
 import { getSessionId } from '../src/bootstrap/state.ts'
 import {
+  canHoldPersistGoal,
   decidePersistStop,
   drainPersistWrites,
+  getPersistGoalContext,
   parsePersistArgs,
   registerPersistSkill,
   restorePersistForCurrentSession,
@@ -255,4 +257,54 @@ test('task runtime continues after budget, restores, and stops on pause, block, 
   await harness.review.getPromptForCommand('complete Focused runtime acceptance passed with the connected workflow and stop conditions', context)
   assert.equal((await readPersistSessionRecord(path))?.status, 'completed')
   assert.equal(harness.getHooks().length, 0)
+})
+
+/**
+ * A leaf is a scoped work conversation its parent owns, not a second main
+ * session. Observed failure: a leaf whose parent had NO goal of its own still
+ * ran five "Persist task heartbeat" stop hooks against a goal ("testing leafs")
+ * that appears nowhere in the conversation the person had with it.
+ */
+test('a leaf cannot hold, inject, or restore a durable goal', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-leaf-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'leaf.jsonl')
+  const savedLeaf = process.env.GATEWAY_INTERACTIVE_LEAF
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+
+  // A goal record set for the leaf by its parent - the legitimate direction.
+  await writePersistSessionRecord({
+    version: 1, task: 'testing leafs', mode: 'work', keep: false, taskMode: 'task',
+    nudgesRemaining: 0, nudgesSent: 5, status: 'active', initialPlanningResponseAllowed: false,
+  }, path)
+
+  try {
+    process.env.GATEWAY_INTERACTIVE_LEAF = '1'
+    assert.equal(canHoldPersistGoal(), false)
+
+    // No stop-hook heartbeat, and no goal text in the leaf's system prompt.
+    await restorePersistForCurrentSession(harness.setAppState, path)
+    assert.equal(harness.getHooks().length, 0, 'a leaf must not arm a persist stop hook')
+    assert.equal(getPersistGoalContext(), undefined, 'a leaf must not inject a durable goal')
+
+    // Neither skill can start one from inside the leaf.
+    const command = await harness.command.getPromptForCommand('task testing leafs', { setAppState: harness.setAppState, transcriptPath: path } as unknown as ToolUseContext)
+    assert.match(JSON.stringify(command), /does not hold a durable goal/)
+    const review = await harness.review.getPromptForCommand('checkpoint {"kind":"learned","phase":"implement","outcome":"x","doneWhen":"y","next":"z","deferred":[],"evidence":"e"}', { setAppState: harness.setAppState, transcriptPath: path, queryTracking: { chainId: 'leaf-chain', depth: 1, stopHookActive: true } } as unknown as ToolUseContext)
+    assert.match(JSON.stringify(review), /holds no durable goal to review/)
+    assert.equal(harness.getHooks().length, 0, 'a refused review must not arm a hook either')
+    // The parent's own record is untouched by the leaf refusing to use it.
+    assert.equal((await readPersistSessionRecord(path))?.nudgesSent, 5)
+  } finally {
+    if (savedLeaf === undefined) delete process.env.GATEWAY_INTERACTIVE_LEAF
+    else process.env.GATEWAY_INTERACTIVE_LEAF = savedLeaf
+  }
+
+  // The same record in an ordinary session still restores and injects, so the
+  // guard is about leaves and not about goals written for a leaf.
+  const ordinary = createHarness()
+  await restorePersistForCurrentSession(ordinary.setAppState, path)
+  assert.equal(ordinary.getHooks().length, 1)
+  assert.match(getPersistGoalContext() ?? '', /testing leafs/)
 })

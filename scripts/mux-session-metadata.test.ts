@@ -31,9 +31,15 @@ test('metadata and goal UI retain session identity and fullscreen wiring', async
   const footer = await readFile(new URL('../src/components/PromptInput/PromptInputFooter.tsx', import.meta.url), 'utf8')
   assert.match(dialog, /onSessionSwitch\(\(\) => onDone\(\)\)/)
   assert.match(dialog, /saveSessionName\(sessionId, newName, fullPath\)/)
-  assert.match(dialog, /placeholder="Unnamed session"/)
+  // The field starts empty and advertises the current name as its placeholder,
+  // so what the user types is exactly what gets saved instead of appending to
+  // the previous name.
+  assert.match(dialog, /placeholder=\{existingName \|\| 'Unnamed session'\}/)
+  assert.match(dialog, /const \[name, setName\] = useState\(''\)/)
   assert.match(dialog, /saving \|\| closing.current/)
-  assert.match(dialog, /!newName \|\| newName.length > 200/)
+  // Empty submit keeps the current name; only an over-long name is an error.
+  assert.match(dialog, /if \(!newName\) \{ closing\.current = true; onDone\(\); return \}/)
+  assert.match(dialog, /if \(newName\.length > 200\)/)
   assert.match(prompt, /useSetPromptOverlayDialog\(isFullscreenEnvEnabled\(\) \? promptOverlayDialog/)
   assert.match(footer, /useSyncExternalStore\(subscribePersist, getCurrentPersistRecord/)
   assert.match(dialog, /controlPersistGoal\(action, appStateStore.setState\)/)

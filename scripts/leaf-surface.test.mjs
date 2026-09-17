@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { resolveLeafMember } from '../src/utils/leafFamily.ts'
 import { parseForkRequest } from '../src/commands/leaf.tsx'
+import { leafFamilyReference, resolveLeafSource, rootReference } from '../src/utils/leafWorkspace.ts'
 
 const member = (number, name, sessionId) => ({
   sessionId,
@@ -104,17 +109,50 @@ test('a leaf that never reaches its input loop says why instead of just timing o
 
 test('parents and leaves reach each other through the interactive channel', async () => {
   const processSource = await readFile(new URL('../src/utils/leafProcess.ts', import.meta.url), 'utf8')
-  assert.match(processSource, /deliver\(text: string\): Promise<void>/)
+  assert.match(processSource, /deliver\(text: string\): Promise<boolean>/)
   assert.match(processSource, /subtype: 'leaf_prompt'/)
+  // A leaf that cannot take a message holds it rather than dropping it, and
+  // keeps arrival order.
+  assert.match(processSource, /private readonly inbox/)
+  assert.match(processSource, /private queue\(text: string\)/)
+  assert.match(processSource, /private pump\(\): void/)
+  assert.match(processSource, /private drainInbox\(\): void/)
+  // A running leaf takes the message now: its own REPL queues it and the turn
+  // drains it at the next step boundary, which is what makes a peer answer
+  // mid-turn. Only a permission dialog is ineligible, because it owns the input.
+  assert.match(processSource, /private canTakeMessage\(\): boolean/)
+  assert.match(processSource, /return this\.state === 'idle' \|\| this\.state === 'running'/)
+  assert.match(processSource, /if \(!this\.canTakeMessage\(\)\) return this\.queue\(text\)/)
 
   const terminalSource = await readFile(new URL('../src/utils/leafTerminal.ts', import.meta.url), 'utf8')
-  assert.match(terminalSource, /export function writeLeafInput/)
-  assert.match(terminalSource, /deliverInput = data =>/)
+  // Delivery wakes a paused leaf's queue but must not type into its input: text
+  // written to stdin is framed as the person's own message.
+  assert.match(terminalSource, /export function wakeLeafInput/)
+  assert.match(terminalSource, /wakeInput = \(\) =>/)
   assert.match(terminalSource, /\.resume\(\)/)
+  assert.doesNotMatch(terminalSource, /input\.write\(data\)/)
+  // The leaf reports its answer as soon as it exists, on its own message.
+  assert.match(terminalSource, /type: 'leaf-answered'/)
 
   const hookSource = await readFile(new URL('../src/hooks/useLeafTerminalSession.ts', import.meta.url), 'utf8')
   assert.match(hookSource, /case 'leaf_prompt':/)
-  assert.match(hookSource, /writeLeafInput\(/)
+  // A peer's turn is queued with its origin, not typed in. Keystrokes reach the
+  // turn boundary with no origin, and that path announces the text as "the user
+  // sent a new message" and tells the model it MUST address it.
+  assert.match(hookSource, /if \(!prompt\.trim\(\)\) throw new Error\('Empty leaf prompt'\)/)
+  assert.match(hookSource, /prompt\.startsWith\(PEER_PROMPT_PREFIX\)/)
+  assert.match(hookSource, /origin: \{ kind: 'gateway-peer' \}/)
+  assert.match(hookSource, /import \{ enqueue \} from '\.\.\/utils\/messageQueueManager\.js'/)
+  assert.match(hookSource, /wakeLeafInput\(\)/)
+  assert.doesNotMatch(hookSource, /writeLeafInput/)
+  assert.doesNotMatch(hookSource, /PASTE_START/)
+  assert.doesNotMatch(hookSource, /if \(latest\.current\.status !== 'idle'\) throw new Error\('Leaf is not idle'\)/)
+  // The leaf answers mid-turn rather than at turn end, and marks a message that
+  // also calls a tool as "still working" instead of as an answer.
+  assert.match(hookSource, /const found = peerAnswerFor\(messages, pending\)/)
+  assert.match(hookSource, /sendLeafTerminal\(\{ type: 'leaf-answered', question: found\.question, answer: found\.answer \}\)/)
+  assert.match(hookSource, /A busy root takes a leaf's message/)
+  assert.match(hookSource, /if \(latest\.current\.status === 'busy'\) \{[\s\S]{0,400}enqueue\(\{/)
 
   const workspaceSource = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   assert.match(workspaceSource, /case 'send': result = await sendLeafMessage/)
@@ -123,18 +161,111 @@ test('parents and leaves reach each other through the interactive channel', asyn
   assert.match(workspaceSource, /case 'settings': await saveLeafSettings/)
 })
 
+test('a reply is routed back to whoever asked, not left in the leaf', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // The send is recorded at dispatch and reported when the turn ends; without
+  // the record a reply is only visible to whoever opens the leaf next. The
+  // origin is explicit because a sibling's send is relayed by the root, so the
+  // process handling it is not the session that asked.
+  assert.match(workspace, /function expectLeafReply\(view: LeafView, message: string, origin\?: string\)/)
+  assert.match(workspace, /case 'send': result = await sendLeafMessage\(id, value, \{ sessionId: sourceId \}\)/)
+  assert.match(workspace, /function forgetExpectedReply\(sessionId: string, message: string\)/)
+  assert.match(workspace, /async function reportLeafReplies\(view: OwnedLeafView, child: LeafProcess\)/)
+  assert.match(workspace, /await reportLeafReply\(item, view, answer\)/)
+  assert.match(workspace, /if \(current && child\.getState\(\) === 'idle'\) void reportLeafReplies\(current, child\)/)
+  // The answer is read from the turn that just ended, not guessed.
+  assert.match(workspace, /async function lastLeafTurnText/)
+  // A sibling's reply goes back through the send path, so it is labelled too.
+  assert.match(workspace, /await sendLeafMessage\(item\.source, text\)/)
+})
+
+test('an answer reported mid-turn is routed now, and not sent again at turn end', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // Reporting only at idle made a peer wait for the leaf's whole turn. The leaf
+  // now reports the answer when it has one, and this routes it on.
+  assert.match(workspace, /async function reportEarlyLeafAnswers\(view: OwnedLeafView, question: string, answer: string\)/)
+  assert.match(workspace, /if \(message\.type === 'leaf-answered'\) \{[\s\S]{0,200}reportEarlyLeafAnswers\(view, message\.question, message\.answer\)/)
+  // The answer names the question it answers, and this matches it to the asker.
+  // Two questions can be in flight at once now that a running leaf takes each
+  // as it arrives, and a leaf may answer them out of order - "oldest still
+  // owed" would hand the second asker the first asker's answer.
+  assert.match(workspace, /const item = pending\.find\(candidate => candidate\.message\.includes\(question\)\) \?\? pending\[0\]!/)
+  // Taking it off the books here is what stops the end-of-turn report from
+  // answering the same question a second time.
+  assert.match(workspace, /function takeExpectedReply\(sessionId: string, message: string\)/)
+  assert.match(workspace, /takeExpectedReply\(id, item\.message\)/)
+  // The seam drives the real matcher and bookkeeping rather than bypassing them.
+  assert.match(workspace, /export function deliverLeafAnswerForTesting\(sessionId: string, question: string, answer: string\)/)
+})
+
+test('every peer-delivered turn is marked as coming from a session, not the user', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  assert.match(workspace, /export const PEER_PROMPT_PREFIX = '\[message from another session, not the user\]\\n'/)
+  // The parent labels the turn it hands over, and the reply it routes back.
+  assert.match(workspace, /await view\.process\.deliver\(`\$\{PEER_PROMPT_PREFIX\}\$\{message\}`\)/)
+  // The label is text, and the turn boundary rewrites the text around it, so
+  // the answer is found by the id the question arrived under. Matching on the
+  // marker instead never fires: the framing puts it behind a system-reminder.
+  assert.match(workspace, /export function peerAnswerFor\(/)
+  assert.match(workspace, /message\?\.attachment\?\.source_uuid === oldest\.uuid \|\|/)
+  assert.match(workspace, /message\?\.type === 'user' && message\.uuid === oldest\.uuid/)
+  assert.doesNotMatch(workspace, /startsWith\(PEER_PROMPT_PREFIX\)\) questionIndex/)
+
+  const hook = await readFile(new URL('../src/hooks/useLeafTerminalSession.ts', import.meta.url), 'utf8')
+  // The leaf fills in the label for any sender that omitted it, so the marker
+  // is present on every peer turn regardless of which side dispatched it.
+  assert.match(hook, /import \{ PEER_PROMPT_PREFIX, peerAnswerFor, registerLeafContextNotify, registerLeafContextReturn, type PendingPeerQuestion \}/)
+  assert.match(hook, /const marked = prompt\.startsWith\(PEER_PROMPT_PREFIX\) \? prompt : `\$\{PEER_PROMPT_PREFIX\}\$\{prompt\}`/)
+  // The label alone is not enough. A peer turn typed into the input reaches the
+  // turn boundary with no origin, and that path opens "The user sent a new
+  // message while you were working" and closes "you MUST address the user's
+  // message above" - the marker would survive as text inside a frame that has
+  // already called it the person's. Carrying the peer origin is what makes the
+  // framing agree with the label, so both are asserted together.
+  assert.match(hook, /enqueue\(\{[\s\S]{0,260}origin: \{ kind: 'gateway-peer' \}/)
+  assert.match(hook, /enqueue\(\{[\s\S]{0,200}isMeta: true/)
+  assert.doesNotMatch(hook, /writeLeafInput/)
+  assert.doesNotMatch(hook, /PASTE_START/)
+  // The up-path and the root's receiver already mark their turns; the marker
+  // must not regress into an unmarked user turn on either side.
+  assert.match(hook, /isMeta: true,[\s\S]{0,40}origin: \{ kind: 'task-notification' \}/)
+})
+
 test('session comms resolves leaf references before falling back to peers', async () => {
   const source = await readFile(new URL('../src/commands/gateway-sessions.ts', import.meta.url), 'utf8')
-  assert.match(source, /resolveLeafRef\(send\[1\]!\)/)
+  assert.match(source, /resolveLeafRef\(target\)/)
   assert.match(source, /sendLeafMessage\(leaf\.sessionId, send\[2\]!\)/)
-  assert.match(source, /runtime\.transport\.send\(send\[1\]!/)
+  assert.match(source, /runtime\.transport\.send\(target, send\[2\]!/)
+})
+
+test('a leaf-shaped address is never retargeted at an unrelated live session', async () => {
+  // The reported bug: a message addressed to a leaf could land on whatever
+  // session happened to answer to the same string. Peer addressing is UUID-only,
+  // so a reference that is not a UUID can only mean a family member, and a
+  // failure to resolve it must be refused rather than re-pointed at the bus.
+  assert.equal(leafFamilyReference('1'), true)
+  assert.equal(leafFamilyReference('2:api hardening'), true)
+  assert.equal(leafFamilyReference('fork'), true)
+  assert.equal(leafFamilyReference('original'), true)
+  assert.equal(leafFamilyReference('11111111-1111-4111-8111-111111111111'), false)
+  assert.equal(leafFamilyReference('  11111111-1111-4111-8111-111111111111  '), false)
+  assert.equal(leafFamilyReference(''), false)
+
+  const source = await readFile(new URL('../src/commands/gateway-sessions.ts', import.meta.url), 'utf8')
+  // A swallowed family read must not fall through to the peer bus.
+  assert.match(source, /catch\(error => \{\s*if \(leafFamilyReference\(target\)\) throw error/)
+  assert.match(source, /else if \(leafFamilyReference\(target\)\) throw new Error\(`No leaf in this family matches/)
+  // The peer transport is reached only for a non-leaf-shaped (session ID) address.
+  assert.match(source, /else result = JSON\.stringify\(await runtime\.transport\.send/)
 })
 
 test('siblings stay mutually visible: state changes republish the family to every leaf', async () => {
   const source = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   // Every idle/running transition republishes, so a leaf sees what its
-  // siblings are doing without polling and without a parent turn.
-  assert.match(source, /onState: publish/)
+  // siblings are doing without polling and without a parent turn. The handler
+  // also reports a finished turn's reply before republishing.
+  assert.match(source, /onState: \(\) => \{[\s\S]{0,200}publish\(\)/)
+  assert.match(source, /if \(current && child\.getState\(\) === 'idle'\) void reportLeafReplies\(current, child\)/)
   assert.match(source, /view\.process\.snapshot\(snapshot\)/)
   // A leaf reads the pushed family (not its own empty view map) and can list it.
   assert.match(source, /if \(isInteractiveLeaf\(\)\) return \(getLeafSnapshot\(\)\?\.members \?\? \[\]\)/)
@@ -165,8 +296,161 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
+})
+
+test('a leaf can reach its parent, not only its siblings', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // The root is a nameable target inside a leaf, so `send original ...` reports
+  // up instead of failing to resolve a member that is not in the family list.
+  assert.match(workspace, /export function rootReference\(reference: string\)/)
+  assert.match(workspace, /ref === 'parent'/)
+  assert.match(workspace, /if \(isInteractiveLeaf\(\) && rootReference\(reference\)\) return notifyLeafParent\(message\)/)
+  assert.match(workspace, /export async function notifyLeafParent/)
+  assert.match(workspace, /case 'notify': \{/)
+
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  assert.match(tool, /return workspace\.notifyLeafParent\(input\.message\)/)
+  // The prompt must state the symmetry, or a leaf never tries it.
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+  assert.match(prompt, /notify: available inside a leaf only/)
+  assert.match(prompt, /Everyone in the family sees everyone else/)
+  // The root registers the receiving end; without it notify has nowhere to land.
+  const hook = await readFile(new URL('../src/hooks/useLeafTerminalSession.ts', import.meta.url), 'utf8')
+  assert.match(hook, /registerLeafContextNotify/)
+})
+
+test('roster is the verb that names the parent, and the prompt says so', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-roster-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { getClaudeConfigHomeDir } = await import('../src/utils/envUtils.ts')
+    const { addLeafMember } = await import('../src/utils/leafFamily.ts')
+    const { listLeaves, familyRoster } = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    await addLeafMember(join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`), root, {
+      sessionId: randomUUID(), parentSessionId: root, name: 'Child', transcriptPath: join(directory, 'child.jsonl'), forkMessageId: randomUUID(),
+    })
+    // The prompt promises a leaf can reach its parent. Only `roster` names it -
+    // so the promise is only true if the prompt points at `roster`.
+    assert.match(await familyRoster(), /^root .* \[this session\] /m)
+    assert.doesNotMatch(await listLeaves(), /^root /m)
+
+    const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+    // Assert the claims, not the backtick escaping: what matters is that the
+    // verb is documented as the family view, that it is named as the way to
+    // reach the parent, and that it is distinguished from `list`.
+    assert.match(prompt, /roster: the family view/)
+    assert.match(prompt, /\[parent\]/)
+    assert.match(prompt, /roster.*shows it its parent|\\`roster\\` shows it its parent/)
+    assert.match(prompt, /which \\`list\\` does not include/)
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('opening is the only thing that starts a leaf process', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const restore = workspace.slice(workspace.indexOf('export async function restoreLeafWorkspace'), workspace.indexOf('export async function openLeaf'))
+  // Restore rebuilds the roster for the UI. If it launches, every mount and
+  // every session switch spawns a process per open member - the background-chat
+  // bug - so this must stay free of launch calls.
+  assert.doesNotMatch(restore, /launch\(/)
+  assert.match(restore, /await readLeafFamily\(familyPath\(root\), root\)/)
+  assert.match(restore, /publish\(\)/)
+
+  const open = workspace.slice(workspace.indexOf('export async function openLeaf'), workspace.indexOf('export async function changeLeaf'))
+  assert.match(open, /await changeLeaf\(member\.sessionId, \{ status: 'open' \}\)/)
+  // changeLeaf launches on status 'open'; a second launch here would double it.
+  assert.doesNotMatch(open, /await launch\(/)
+  assert.match(open, /selectLeaf\(member\.sessionId\)/)
+})
+
+test('the fork source rule picks the leaf on screen, and only says root when told to', () => {
+  const ROOT = 'root-session'
+  const LEAF = 'leaf-session'
+  // The reported bug: with a leaf on screen, a bare fork copied the root and
+  // silently discarded the leaf's context.
+  assert.equal(resolveLeafSource(undefined, ROOT, LEAF), LEAF)
+  assert.equal(resolveLeafSource(undefined, ROOT, undefined), ROOT)
+  // Naming the root still forces the root, even with a leaf selected.
+  assert.equal(resolveLeafSource('original', ROOT, LEAF), ROOT)
+  assert.equal(resolveLeafSource('root', ROOT, LEAF), ROOT)
+  assert.equal(resolveLeafSource('  original  ', ROOT, LEAF), ROOT)
+  // An explicit session ID wins over the selection.
+  assert.equal(resolveLeafSource('other-session', ROOT, LEAF), 'other-session')
+})
+
+test('creating a leaf forks what you are looking at, not the root behind it', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const create = workspace.slice(workspace.indexOf('export async function createLeaf'), workspace.indexOf('/**\n * Rebuild the in-memory view'))
+  assert.match(create, /const resolvedParentId = resolveLeafSource\(parentSessionId, root, selectedLeafId\(\)\)/)
+  // The resolved id, not the raw argument, seeds the fork and the fallback.
+  assert.match(create, /getTranscriptPathForSession\(resolvedParentId\)/)
+  assert.match(create, /source = \{ sessionId: resolvedParentId, transcriptPath \}/)
+})
+
+test('every member can name the conversation the family was forked from', () => {
+  assert.equal(rootReference('original'), true)
+  assert.equal(rootReference('root'), true)
+  assert.equal(rootReference('parent'), true)
+  assert.equal(rootReference('ROOT'), true)
+  assert.equal(rootReference('  parent  '), true)
+  // A leaf name must not be swallowed by the root aliases.
+  assert.equal(rootReference('2'), false)
+  assert.equal(rootReference('api'), false)
+  assert.equal(rootReference(''), false)
+})
+
+test('the leaf menu names choices by goal and keeps the arg grammar as passthrough', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /export function LeafMenu/)
+  assert.match(dialog, /export function LeafCreateWizard/)
+  // Every field the request called out is editable before the single confirm.
+  for (const field of ['Name', 'Worktree', 'Goal', 'Model', 'Effort', 'Create leaf']) {
+    assert.ok(dialog.includes(field), `the create wizard must offer ${field}`)
+  }
+  assert.match(dialog, /const \[fresh, setFresh\] = useState\(false\)/)
+  assert.match(dialog, /setScreen\('create'\)/)
+
+  const command = await readFile(new URL('../src/commands/leaf.tsx', import.meta.url), 'utf8')
+  // Bare `/leaf` is the menu; `/leaf <args>` still hits the grammar.
+  assert.match(command, /const \{ LeafMenu \} = await import\('\.\.\/components\/LeafWorkspaceDialog\.js'\)/)
+  assert.match(command, /return <LeafMenu onDone=/)
+  assert.doesNotMatch(command, /LeafCreateMenu/)
+})
+
+test('archive detaches a leaf without deleting anything', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  // Archiving is detach, not delete: it must reach for the archived status and
+  // must never remove the transcript or the session.
+  assert.match(dialog, /status: action === 'archive' \? 'archived' : 'closed'/)
+  assert.match(dialog, /Archive #\$\{member\.number\} \$\{member\.name\}/)
+  // Detach must not become delete: no file removal anywhere in the menu.
+  assert.doesNotMatch(dialog, /\bunlink\b|\brmSync\b|\brm\(/)
+  // An archived leaf leaves the menu, which is what "detached" means here.
+  assert.match(dialog, /members\?\.filter\(member => member\.status !== 'archived'\)/)
+  assert.match(dialog, /\(members \?\? \[\]\)\.filter\(member => member\.status !== 'archived'\)/)
+
+  // The engine path already releases the process and the owner claim, keeps the
+  // family file entry, and drops it from the live views the carousel reads.
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const change = workspace.slice(workspace.indexOf('export async function changeLeaf'), workspace.indexOf('export async function fileLeaf'))
+  assert.match(change, /await saveLeafDraft\(view\)/)
+  assert.match(change, /await view\.process\.close\(\)/)
+  assert.match(change, /await ownerReleases\.get\(sessionId\)\?\.\(\)/)
+  assert.match(change, /views\.delete\(sessionId\)/)
+  assert.doesNotMatch(change, /unlink|rm\(/)
+
+  // The grammar accepts it with a leaf reference, and the hint says so.
+  const command = await readFile(new URL('../src/commands/leaf.tsx', import.meta.url), 'utf8')
+  assert.match(command, /archive <leaf>/)
+  assert.match(command, /\|archive\|promote/)
 })

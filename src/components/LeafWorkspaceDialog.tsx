@@ -1,9 +1,10 @@
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Box, Text, useInput } from '../ink.js'
-import TextInput from './TextInput.js'
+import { Select } from './CustomSelect/select.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { getLeafRootName, getLeafViews, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, getLeafRootName, getLeafViews, listLeafMembers, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import type { LeafMember } from '../utils/leafFamily.js'
 import { isGatewayMode } from '../utils/model/providers.js'
 
 export function LeafSessionBar(): React.ReactNode {
@@ -12,33 +13,248 @@ export function LeafSessionBar(): React.ReactNode {
   return <Box flexDirection="column" paddingX={2} flexShrink={0}><LeafCarousel views={getLeafViews()} activeId={selectedLeafId()} onSelect={selectLeaf} /></Box>
 }
 
-export function LeafCreateMenu({ onDone, model, effort }: { onDone: () => void; model?: string; effort?: import('../utils/leafFamily.js').LeafMember['effort'] }): React.ReactNode {
+/** Effort choices offered by the wizard; `inherit` keeps the parent's effort. */
+const EFFORT_CHOICES: readonly string[] = ['inherit', ...LEAF_EFFORT_LEVELS]
+
+const MODEL_INHERIT = 'inherit'
+const MODEL_DEFAULT = 'default'
+
+function effortLabel(value: string): string {
+  return value === 'inherit' ? 'Same as me' : value
+}
+
+function modelLabel(value: string): string {
+  if (value === MODEL_DEFAULT) return 'Gateway default'
+  if (value === MODEL_INHERIT) return 'Same as me'
+  return value
+}
+
+/** Enter on a choice row advances to its next value and wraps. */
+function nextIn(values: readonly string[], current: string): string {
+  const index = values.indexOf(current)
+  return values[(index + 1) % values.length] ?? values[0]!
+}
+
+/**
+ * The `/leaf` surface: a guided menu over the leaf family instead of a command
+ * grammar. Bare `/leaf` opens this; `/leaf <args>` still hits the arg grammar.
+ *
+ * Nothing here starts a leaf except "Open", which is the point: leaves used to
+ * relaunch themselves on every mount, which read as random background chats.
+ */
+export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) => void; model?: string; effort?: string }): React.ReactNode {
+  useRegisterOverlay('leaf-menu', true)
+  const [screen, setScreen] = useState<'home' | 'list' | 'create'>('home')
+  const [members, setMembers] = useState<LeafMember[] | undefined>(undefined)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+
+  // Refresh the family roster whenever the workspace publishes a change.
+  useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
+  const reload = () => { void listLeafMembers().then(setMembers).catch(() => setMembers([])) }
+  useEffect(reload, [screen])
+
+  const run = async (label: string, action: () => Promise<string | void>) => {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const result = await action()
+      reload()
+      setNotice(result || label)
+    } catch (failure) {
+      const reason = failure instanceof Error ? failure.message.replace(/\s+/g, ' ').trim() : ''
+      setError(reason || 'That leaf action failed. Saved sessions are retained.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (screen === 'create') {
+    return <LeafCreateWizard
+      members={members}
+      selectedId={selectedLeafId()}
+      rootName={getLeafRootName()}
+      defaultModel={model}
+      defaultEffort={effort}
+      onDone={result => { if (result) void run(result, async () => result); setScreen('home') }}
+      onCancel={() => setScreen('home')}
+    />
+  }
+
+  if (screen === 'list') {
+    const open = members?.filter(member => member.status !== 'archived') ?? []
+    const options = [
+      ...open.map(member => ({
+        value: `open:${member.sessionId}`,
+        label: `Open  #${member.number} ${member.name}`,
+        description: `${member.status}${member.model ? ` · ${member.model}` : ''}${member.effort ? ` · ${member.effort}` : ''}`,
+      })),
+      ...open.map(member => ({
+        value: `close:${member.sessionId}`,
+        label: `Close #${member.number} ${member.name}`,
+        description: 'Stop its process; the transcript and its place in the family are kept',
+      })),
+      ...open.map(member => ({
+        value: `archive:${member.sessionId}`,
+        label: `Archive #${member.number} ${member.name}`,
+        description: 'Detach it from this family and hide it from this menu; the transcript is kept',
+      })),
+      ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
+      { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
+    ]
+    return <Box flexDirection="column">
+      <Text bold>Leaves in this family</Text>
+      <Text dimColor>Opening a leaf is the only thing that starts its process. Closed leaves stay closed until you open them again.</Text>
+      <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
+        if (value === 'back' || value === 'empty') { setScreen('home'); return }
+        const id = value.slice(value.indexOf(':') + 1)
+        const member = members?.find(item => item.sessionId === id)
+        const action = value.slice(0, value.indexOf(':'))
+        void run('', async () => {
+          const workspace = await import('../utils/leafWorkspace.js')
+          if (action === 'open') return workspace.openLeaf(id)
+          await workspace.changeLeaf(id, { status: action === 'archive' ? 'archived' : 'closed' })
+          selectLeaf(undefined)
+          return action === 'archive'
+            ? `Leaf #${member?.number} ${member?.name} archived. It is detached from this family and no longer appears here; its transcript and session are untouched.`
+            : `Leaf #${member?.number} ${member?.name} closed. Its transcript is retained; open it again any time.`
+        })
+      }} />
+      {busy && <Text dimColor>Working…</Text>}
+      {notice && <Text>{notice}</Text>}
+      {error && <Text color="error">{error}</Text>}
+    </Box>
+  }
+
+  const selected = selectedLeafId()
+  const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafRootName()
+  const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
+    { value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' },
+    { value: 'list', label: 'Leaves in this family', description: members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
+    { value: 'exit', label: 'Cancel', description: 'Leave the leaf workspace' },
+  ]
+  return <Box flexDirection="column">
+    <Text bold>Leaves</Text>
+    <Text dimColor>Each leaf is a full independent session. They share your files unless you point one at a separate worktree.</Text>
+    <Text dimColor>Nothing starts until you open it. Creating a leaf forks the session you are looking at: {sourceName}.</Text>
+    <Select options={options} visibleOptionCount={6} onCancel={() => onDone()} onChange={(value: string) => {
+      if (value === 'exit') { onDone(); return }
+      if (value === 'list') { setScreen('list'); return }
+      setError('')
+      setNotice('')
+      setScreen('create')
+    }} />
+    {notice && <Text>{notice}</Text>}
+    {error && <Text color="error">{error}</Text>}
+  </Box>
+}
+
+/**
+ * Create-leaf wizard. Every field is editable before the single confirm, and
+ * the fork source is shown as a choice rather than implied - forking the wrong
+ * conversation was the failure mode when the source was invisible.
+ */
+export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, defaultEffort, onDone, onCancel }: {
+  members?: LeafMember[]
+  selectedId?: string
+  rootName: string
+  defaultModel?: string
+  defaultEffort?: string
+  onDone: (result?: string) => void
+  onCancel: () => void
+}): React.ReactNode {
   useRegisterOverlay('leaf-create', true)
   const [name, setName] = useState('')
-  const [cursor, setCursor] = useState(0)
+  const [fresh, setFresh] = useState(false)
+  const [source, setSource] = useState(selectedId ?? 'root')
+  const [model, setModel] = useState(defaultModel || MODEL_DEFAULT)
+  const [effort, setEffort] = useState(defaultEffort || 'inherit')
+  const [worktree, setWorktree] = useState('')
+  const [goal, setGoal] = useState('')
   const [busy, setBusy] = useState(false)
-  const creating = useRef(false)
   const [error, setError] = useState('')
-  const { columns } = useTerminalSize()
-  const create = async (fresh: boolean, submittedName = name) => {
+  const creating = useRef(false)
+
+  const sources = [
+    { value: 'root', label: rootName, description: selectedId ? 'The original conversation' : 'The current conversation' },
+    ...(members ?? []).filter(member => member.status !== 'archived').map(member => ({
+      value: member.sessionId,
+      label: `#${member.number} ${member.name}`,
+      description: member.status,
+    })),
+  ]
+  const sourceName = sources.find(item => item.value === source)?.label ?? source
+
+  const create = async () => {
     if (creating.current) return
     creating.current = true
     setBusy(true)
+    setError('')
     try {
-      const { createLeaf } = await import('../utils/leafWorkspace.js')
-      await createLeaf(submittedName.trim() || undefined, selectedLeafId(), undefined, { fresh, model, effort })
-      onDone()
-    } catch { setError(fresh ? 'Could not start a new leaf. Saved sessions are retained.' : 'Could not copy context. The source must have a saved conversation and be idle.'); creating.current = false; setBusy(false) }
+      const { createLeaf, setLeafGoal } = await import('../utils/leafWorkspace.js')
+      const parent = source === 'root' ? undefined : source
+      const view = await createLeaf(
+        name.trim() || undefined,
+        parent,
+        worktree.trim() || undefined,
+        { fresh, model: model === MODEL_DEFAULT || model === MODEL_INHERIT ? undefined : model, effort: (effort === 'inherit' ? undefined : effort) as LeafMember['effort'] },
+      )
+      // A goal is recorded through the same path `/leaf goal` uses, so the two
+      // surfaces cannot drift apart.
+      if (goal.trim()) await setLeafGoal(view.member.sessionId, `task ${goal.trim()}`)
+      onDone(`Created ${fresh ? 'a new chat as' : 'a fork of ' + sourceName + ' as'} leaf #${view.member.number} ${view.member.name}. It is open now.`)
+    } catch (failure) {
+      const reason = failure instanceof Error ? failure.message.replace(/\s+/g, ' ').trim() : ''
+      setError(reason || (fresh ? 'Could not start a new leaf. Saved sessions are retained.' : 'Could not fork. The source must have a saved conversation and be idle.'))
+      creating.current = false
+      setBusy(false)
+    }
   }
-  useInput((_input, key) => { if (key.escape && !busy) onDone() })
+
+  useInput((_input, key) => { if (key.escape && !busy) onCancel() })
+
+  const summary = `${fresh ? 'New chat' : `Fork of ${sourceName}`} · ${modelLabel(model)} · ${effortLabel(effort)}`
+  const options: Array<{
+    value: string
+    label: string
+    description?: string
+    type?: 'text' | 'input'
+    onChange?: (value: string) => void
+    placeholder?: string
+    initialValue?: string
+  }> = [
+    { value: 'name', type: 'input', label: 'Name', description: 'Optional — a leaf gets a name like "leaf 3" if you skip this', placeholder: 'leaf name', onChange: setName },
+    { value: 'mode', label: `Start: ${fresh ? 'New chat (empty context)' : `Fork ${sourceName}`}`, description: 'Enter toggles it' },
+    { value: 'source', label: `Fork source: ${sourceName}`, description: 'Which conversation this leaf copies' },
+    { value: 'model', label: `Model: ${modelLabel(model)}`, description: 'Which model the leaf runs' },
+    { value: 'effort', label: `Effort: ${effortLabel(effort)}`, description: 'How hard the leaf thinks' },
+    { value: 'worktree', type: 'input', label: 'Worktree', description: 'Optional path — give the leaf its own copy of the files', placeholder: 'leave empty to share your files', onChange: setWorktree },
+    { value: 'goal', type: 'input', label: 'Goal', description: 'Optional task the leaf is meant to accomplish', placeholder: 'what this leaf is for', onChange: setGoal },
+    { value: 'create', label: busy ? 'Creating…' : `Create leaf — ${summary}`, description: 'Starts the leaf and opens it now' },
+    { value: 'cancel', label: 'Cancel', description: 'Back to the leaf menu' },
+  ]
   return <Box flexDirection="column">
     <Text bold>Create a leaf</Text>
-    <Text>Name (optional):</Text>
-    <TextInput value={name} onChange={setName} onSubmit={value => void create(true, value)} focus={!busy} showCursor={!busy} columns={Math.max(10, columns - 4)} cursorOffset={cursor} onChangeCursorOffset={setCursor} disableEscapeDoublePress />
-    <Box onClick={() => void create(true)}><Text>New chat — start with empty conversation context</Text></Box>
-    <Box onClick={() => void create(false)}><Text>Copy context — fork the current conversation</Text></Box>
-    <Box onClick={() => { if (!busy) onDone() }}><Text>Cancel</Text></Box>
-    <Text dimColor>{busy ? 'Starting session…' : 'Each leaf is a full interactive session. Leaves share files unless you choose a worktree.'}</Text>
+    <Text dimColor>Every leaf is a full interactive session. They share files unless you give one a worktree.</Text>
+    <Text dimColor>Pick a row and press Enter. Name, worktree and goal are typed in place.</Text>
+    <Select
+      options={options}
+      visibleOptionCount={9}
+      layout="expanded"
+      isDisabled={busy}
+      onCancel={() => onCancel()}
+      onChange={(value: string) => {
+        if (busy) return
+        if (value === 'cancel') { onCancel(); return }
+        if (value === 'create') { void create(); return }
+        if (value === 'mode') { setFresh(current => !current); return }
+        if (value === 'source') { setSource(current => nextIn(sources.map(item => item.value), current)); return }
+        if (value === 'model') { setModel(current => nextIn([MODEL_INHERIT, MODEL_DEFAULT], current)); return }
+        if (value === 'effort') { setEffort(current => nextIn(EFFORT_CHOICES, current)); return }
+      }} />
     {error && <Text color="error">{error}</Text>}
   </Box>
 }
@@ -65,7 +281,7 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
   const cycle = (direction: number) => choose(items[(active + direction + items.length) % items.length]?.id)
   return <Box flexDirection="column" flexShrink={0} width="100%">
     {expanded && <Box flexDirection="column" flexShrink={0} borderStyle="single" onWheel={event => { event.stopImmediatePropagation(); setPage(value => Math.max(0, Math.min(Math.ceil(items.length / pageSize) - 1, value + event.deltaY))) }}>
-      <Text bold>All sessions — click to switch</Text>
+      <Text bold>All sessions - click to switch</Text>
       {items.slice(page * pageSize, (page + 1) * pageSize).map(item => <Box key={item.id ?? 'original'} onClick={() => choose(item.id)}><Text inverse={item.id === activeId} wrap="truncate">{item.label}{item.state ? ` [${item.state}]` : ''}</Text></Box>)}
       <Box gap={2}>
         <Box onClick={() => setPage(value => Math.max(0, value - 1))}><Text>Previous</Text></Box>

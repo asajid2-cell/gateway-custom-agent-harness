@@ -74,15 +74,35 @@ test('every session records an intent on registration', async () => {
   assert.match(transport, /if \(typeof raw\?\.peer\?\.purpose === 'string'\) this\.peer\.purpose = raw\.peer\.purpose\.slice\(0, 1000\)/)
 })
 
-test('a leaf is legible on the shared bus instead of looking like its parent', async () => {
+test('a leaf never registers on the shared bus', async () => {
   const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
-  // A forked leaf carries its parent's history, so the label must win outright.
+  // The reported bug: a leaf appeared in /sessions beside unrelated sessions and
+  // peer traffic addressed to it escaped the family. A forked leaf carries its
+  // parent's history, so on the bus it was indistinguishable from the session it
+  // was forked from - registering it at all is what made it addressable. Family
+  // traffic goes over the leaf channel instead.
+  const guard = hook.slice(hook.indexOf('useEffect'), hook.indexOf('new GatewaySessionRuntime'))
+  assert.match(guard, /process\.env\.CLAUDE_CODE_USE_GATEWAY !== '1' \|\| process\.env\.GATEWAY_INTERACTIVE_LEAF === '1'\) return/)
+  // A leaf still carries its own label, so its intent is never derived from the
+  // parent's opening prompt if anything ever reads it back.
   assert.match(hook, /const label = process\.env\.GATEWAY_LEAF_LABEL/)
   assert.match(hook, /if \(label\) return label\.replace\(\/\\s\+\/g, ' '\)\.trim\(\)\.slice\(0, 1000\)/)
   assert.match(hook, /return deriveSessionPurpose\(messages, name\)/)
 
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   assert.match(workspace, /GATEWAY_LEAF_LABEL: `Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{rootSessionId\}\)`/)
+  // The launch comment must not claim bus registration: that is how the guard
+  // above gets reverted by the next reader who trusts the prose.
+  assert.doesNotMatch(workspace, /A leaf registers on the same peer bus as any session/)
+})
+
+test('a leaf inherits no peer capability into its hooks', async () => {
+  const hooks = await readFile(new URL('../src/utils/hooks.ts', import.meta.url), 'utf8')
+  // Hook environment is rebuilt per spawn: an inherited GATEWAY_PEER_* from the
+  // parent would let a leaf's hooks send as that parent to unrelated sessions.
+  assert.match(hooks, /for \(const key of \['GATEWAY_PEER_DIRECTORY', 'GATEWAY_PEER_SESSION', 'GATEWAY_PEER_RUNTIME', 'GATEWAY_PEER_TOKEN', 'GATEWAY_PEER_EXECUTABLE', 'GATEWAY_PEER_CLI'\]\) delete envVars\[key\]/)
+  // And the capability is only re-added for a session that actually registered.
+  assert.match(hooks, /if \(runtime\) Object\.assign\(envVars, runtime\.transport\.hookEnvironment\(\)/)
 })
 
 test('sessions can declare their intent and see each other doing it', async () => {
@@ -110,6 +130,8 @@ test('the peer skill reports why it failed and teaches intent-first discovery', 
   assert.match(skill, /input\.startsWith\('purpose '\)/)
   assert.match(skill, /await runtime\.transport\.update\(\{ purpose: text \}\)/)
   assert.match(skill, /formatGatewayPeerLine/)
+  // A leaf is not on the bus, so the surface must not be advertised inside one.
+  assert.match(skill, /isEnabled: \(\) => process\.env\.GATEWAY_INTERACTIVE_LEAF !== '1'/)
 })
 
 // Importing the real formatter pulls the CLI module graph (~8s), which is not

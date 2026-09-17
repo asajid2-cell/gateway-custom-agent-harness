@@ -92,11 +92,18 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       else {
         // Peer transport needs an exact session ID; a leaf number or name is
         // resolved through the family so session comms addresses leaves too.
-        const { resolveLeafRef, sendLeafMessage } = await import('../utils/leafWorkspace.js')
-        const leaf = await resolveLeafRef(send[1]!).catch(() => undefined)
-        result = leaf
-          ? await sendLeafMessage(leaf.sessionId, send[2]!)
-          : JSON.stringify(await runtime.transport.send(send[1]!, send[2]!, send[2]!.slice(0, 200)))
+        const { leafFamilyReference, resolveLeafRef, sendLeafMessage } = await import('../utils/leafWorkspace.js')
+        const target = send[1]!
+        // A failed family read must not silently become a peer send: that is how
+        // a message addressed to a leaf could be handed to an unrelated live
+        // session. A leaf-shaped reference either resolves here or is refused.
+        const leaf = await resolveLeafRef(target).catch(error => {
+          if (leafFamilyReference(target)) throw error
+          return undefined
+        })
+        if (leaf) result = await sendLeafMessage(leaf.sessionId, send[2]!)
+        else if (leafFamilyReference(target)) throw new Error(`No leaf in this family matches ${JSON.stringify(target)}; nothing was sent. /leaf list shows the family, /sessions list the live sessions`)
+        else result = JSON.stringify(await runtime.transport.send(target, send[2]!, send[2]!.slice(0, 200)))
       }
     }
     onDone(result, { display: 'system' })

@@ -20,6 +20,8 @@ const inputSchema = lazySchema(() =>
         'model',
         'effort',
         'return',
+        'notify',
+        'roster',
       ])
       .describe('Operation to perform on the leaf family'),
     leaf: z
@@ -90,6 +92,11 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'return':
       if (!input.message) throw new Error('Selected context is required to return')
       return workspace.returnLeafContext(requireLeaf(), input.message)
+    case 'notify':
+      if (!input.message) throw new Error('A message is required to notify the parent')
+      return workspace.notifyLeafParent(input.message)
+    case 'roster':
+      return workspace.familyRoster()
   }
 }
 

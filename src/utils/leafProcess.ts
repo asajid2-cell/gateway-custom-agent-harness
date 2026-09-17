@@ -19,16 +19,39 @@ export class LeafProcess {
   private readonly permissions = new Map<string, LeafPermission>()
   private readonly controls = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
   private state: LeafProcessState = 'closed'
+  // Messages handed to a leaf whose input is not free, in arrival order. A leaf
+  // mid-turn takes them directly, so this holds only what a permission dialog
+  // blocked; dropping a message loses work quietly, so it is handed in exactly
+  // once when the input frees up.
+  private readonly inbox: { text: string; resolve: (queued: boolean) => void }[] = []
+  private pumping = false
   constructor(private readonly options: {
     executable: string; args: string[]; cwd: string; env: NodeJS.ProcessEnv
     onEvent: (event: Record<string, unknown>) => void
     onState: (state: LeafProcessState) => void
+    onQueued?: (text: string) => void
     onExit?: () => void
     interactive?: boolean
     onTerminal?: (message: LeafTerminalMessage) => void
   }) {}
 
-  private setState(state: LeafProcessState): void { this.state = state; this.options.onState(state) }
+  private setState(state: LeafProcessState): void {
+    this.state = state
+    this.options.onState(state)
+    // A closed or failed leaf will never run a held message, so its senders are
+    // told now rather than left waiting on a promise that cannot settle.
+    if (state === 'closed' || state === 'failed') this.drainInbox()
+    // A held message runs at the next moment the leaf can take one, and both
+    // idle and running qualify: a running leaf's own REPL accepts text mid-turn
+    // and runs it at its next step boundary, so a held message is answered
+    // without waiting for the whole turn. Only `awaiting-approval` is excluded -
+    // a permission prompt owns the input and the text would go to the dialog.
+    // Pumping from every transition (rather than only from the result event)
+    // also covers a leaf that resumed while a permission was outstanding.
+    else if (state === 'idle' || state === 'running') this.pump()
+  }
+  getPendingCount(): number { return this.inbox.length }
+  getPending(): string[] { return this.inbox.map(item => item.text) }
   getState(): LeafProcessState { return this.state }
   getPermissions(): LeafPermission[] { return structuredClone([...this.permissions.values()]) }
 
@@ -166,21 +189,95 @@ export class LeafProcess {
 
   send(text: string): void {
     if (this.options.interactive) throw new Error('Interactive leaves receive terminal input, not headless messages')
-    if (this.state !== 'idle') throw new Error('Leaf is not idle')
     this.write({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, session_id: '' })
     this.setState('running')
+  }
+
+  /**
+   * Hand a message to a leaf that cannot take one right now, to be delivered
+   * the moment it can.
+   *
+   * A leaf waiting on a permission cannot take a second message, but refusing
+   * it loses the message: the sender is told to "try again later" and nothing
+   * remembers to. Holding it here keeps arrival order, survives the approval
+   * prompt (a leaf waiting on a permission is still a leaf that will finish),
+   * and reports whether the message ran or was dropped, so the sender can be
+   * told.
+   */
+  private queue(text: string): Promise<boolean> {
+    if (['closed', 'failed'].includes(this.state) || this.closing) return Promise.resolve(false)
+    return new Promise<boolean>(resolve => {
+      this.inbox.push({ text, resolve })
+      this.options.onQueued?.(text)
+      this.pump()
+    })
+  }
+
+  /**
+   * Deliver held messages one at a time, as soon as the leaf can take one.
+   * A running leaf qualifies: its REPL accepts the text mid-turn and runs it at
+   * its next step boundary, so a held message is answered without waiting for
+   * the whole turn to end. `pumping` guards against re-entering while this
+   * message's own dispatch flips the state.
+   */
+  private pump(): void {
+    if (this.pumping || this.closing || !this.canTakeMessage()) return
+    const next = this.inbox.shift()
+    if (!next) return
+    this.pumping = true
+    void (async () => {
+      let sent = false
+      try {
+        await this.control({ subtype: 'leaf_prompt', prompt: next.text })
+        sent = true
+      } catch {
+        // The leaf was interrupted or died before the held message ran. A
+        // queued message is a request to deliver later, not a guarantee the
+        // leaf lives that long, so this is a dropped message and not an error.
+      } finally {
+        this.pumping = false
+        next.resolve(sent)
+      }
+      this.pump()
+    })()
+  }
+
+  /**
+   * Whether the leaf's input can take a peer message right now.
+   *
+   * Idle and running both can: a running leaf's REPL queues the text and its
+   * own turn drains it at the next step boundary. `awaiting-approval` cannot -
+   * the permission dialog owns the keyboard, so text written now would answer
+   * the dialog rather than become a turn.
+   */
+  private canTakeMessage(): boolean {
+    return this.state === 'idle' || this.state === 'running'
+  }
+
+  /**
+   * Release every held message when the leaf can no longer take one. Without
+   * this a leaf that dies mid-turn leaves its senders awaiting a promise that
+   * can never settle, which reads as a hang rather than a dropped message.
+   */
+  private drainInbox(): void {
+    for (const held of this.inbox.splice(0)) held.resolve(false)
   }
 
   /**
    * Deliver a message to a leaf. Headless leaves receive a stream-json user
    * turn; interactive leaves receive the text through their own REPL input so
    * the turn runs inside the leaf instead of a parent-owned queue. Unlike
-   * `input`, delivery is not gated on terminal focus.
+   * `input`, delivery is not gated on terminal focus. Resolves true once the
+   * leaf has taken the message, or false if it was dropped without running.
    */
-  deliver(text: string): Promise<void> {
-    if (!this.options.interactive) { this.send(text); return Promise.resolve() }
-    if (this.state !== 'idle') throw new Error('Leaf is not idle')
-    return this.control({ subtype: 'leaf_prompt', prompt: text })
+  deliver(text: string): Promise<boolean> {
+    if (!this.options.interactive) { this.send(text); return Promise.resolve(true) }
+    // A message handed to a running leaf is not held: the leaf's own queue takes
+    // it now and its next step boundary runs it, which is what makes a peer
+    // answer mid-turn instead of after the whole turn.
+    if (!this.canTakeMessage()) return this.queue(text)
+    this.pumping = true
+    return this.control({ subtype: 'leaf_prompt', prompt: text }).then(() => true, () => false).finally(() => { this.pumping = false; this.pump() })
   }
 
   approve(id: string, allow: boolean): void {
