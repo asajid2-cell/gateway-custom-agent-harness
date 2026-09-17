@@ -1,13 +1,12 @@
 import type { EffortLevel, EffortValue, NativeEffortLevel } from '../effort.js'
 
-const FALLBACK_ORDER: NativeEffortLevel[] = [
-  'high',
-  'medium',
-  'low',
-  'minimal',
-  'none',
-]
-
+/**
+ * Normalize a selected value against the model's own ladder. A value the model
+ * does not implement resolves to `undefined`, which means "send no effort
+ * parameter and let the provider default govern" — never a different level.
+ * Substituting a nearby level (the old high/medium/low fallback order) changed
+ * the request in a way the user could neither see nor refuse.
+ */
 export function clampGatewayEffort(
   nativeLevels: readonly NativeEffortLevel[],
   value: EffortValue | undefined,
@@ -15,9 +14,24 @@ export function clampGatewayEffort(
   if (value === undefined || value === 'ultracode' || typeof value === 'number') {
     return value
   }
-  if (nativeLevels.includes(value as NativeEffortLevel)) return value
+  if (!nativeLevels.includes(value as NativeEffortLevel)) return undefined
+  return value
+}
+
+/**
+ * The launch default for a model, mirroring scripts/cc.ps1
+ * Resolve-DefaultGatewayEffort so the picker's "(default)" label and the level a
+ * fresh session actually starts on cannot disagree: prefer medium, then high,
+ * then the model's first (lowest) level. Models with no ladder get no default
+ * because cc.ps1 passes no --effort for them.
+ */
+export function defaultGatewayEffortForLevels(
+  nativeLevels: readonly NativeEffortLevel[],
+): EffortLevel | undefined {
   if (nativeLevels.length === 0) return undefined
-  return FALLBACK_ORDER.find(level => nativeLevels.includes(level))
+  if (nativeLevels.includes('medium')) return 'medium'
+  if (nativeLevels.includes('high')) return 'high'
+  return nativeLevels[0]
 }
 
 export function cycleGatewayEffort(

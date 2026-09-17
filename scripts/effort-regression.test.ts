@@ -636,7 +636,10 @@ test('DeepSeek exposes only its real effort levels', () => {
     getSupportedEffortLevels('gateway-opencode-mimo-v2.5'),
     ['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'],
   )
-  assert.deepEqual(getSupportedEffortLevels('opencode-go/mimo-v2.5'), ['ultracode'])
+  // No native ladder means nothing for `ultracode` to resolve to, so the
+  // control is not offered at all rather than shown as a level that selects
+  // nothing.
+  assert.deepEqual(getSupportedEffortLevels('opencode-go/mimo-v2.5'), [])
   assert.equal(resolveAppliedEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'ultracode')
   assert.equal(resolveAppliedEffort('gateway-opencode-mimo-v2.5', 'ultracode'), 'ultracode')
   assert.equal(resolveProviderEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'max')
@@ -648,7 +651,7 @@ test('DeepSeek exposes only its real effort levels', () => {
   assert.equal(resolveAppliedEffort('gateway-gpt-sol', 'low'), 'low')
   assert.equal(resolveAppliedEffort('gateway-gpt-terra', 'high'), 'high')
 
-  assert.deepEqual(getSupportedEffortLevels('opencode-go/qwen3.7-max'), ['ultracode'])
+  assert.deepEqual(getSupportedEffortLevels('opencode-go/qwen3.7-max'), [])
   assert.deepEqual(
     getSupportedEffortLevels('claude-ultracode'),
     ['low', 'medium', 'high', 'ultracode'],

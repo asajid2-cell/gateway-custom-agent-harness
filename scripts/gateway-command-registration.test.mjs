@@ -14,10 +14,12 @@ const loginSource = await readFile(
 test('gateway login command objects expose the expected interactive names', () => {
   assert.match(loginSource, /command\(\s*'opencodelogin'/)
   assert.match(loginSource, /command\(\s*'deepseeklogin'/)
+  assert.match(loginSource, /command\(\s*'commandcodelogin'/)
   assert.match(loginSource, /type:\s*'local-jsx'/)
 })
 
 test('gateway login commands are included in the built-in command registry', () => {
   assert.match(commandsSource, /\bdeepSeekLoginCommand,\s*[\r\n]\s*effort/)
   assert.match(commandsSource, /\bmodel,\s*[\r\n]\s*openCodeLoginCommand/)
+  assert.match(commandsSource, /\bopenCodeLoginCommand,\s*[\r\n]\s*commandCodeLogin/)
 })

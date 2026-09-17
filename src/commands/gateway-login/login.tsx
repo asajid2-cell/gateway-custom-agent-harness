@@ -21,7 +21,15 @@ function keyPath(keyName: string): string {
 function keyLabel(keyName: string): string {
   if (keyName === 'ds') return 'DeepSeek'
   if (keyName === 'openrouter') return 'OpenRouter'
+  if (keyName === 'commandcode') return 'Command Code'
   return 'OpenCode Go'
+}
+
+function keyCommand(keyName: string): string {
+  if (keyName === 'ds') return 'deepseeklogin'
+  if (keyName === 'openrouter') return 'openrouterlogin'
+  if (keyName === 'commandcode') return 'commandcodelogin'
+  return 'opencodelogin'
 }
 
 async function runKeysafe(
@@ -65,7 +73,7 @@ export const call: LocalJSXCommandCall = async (
     onDone(
       stored
         ? `${keyLabel(keyName)} key is stored in Keysafe. Restart the gateway terminal after changing it.`
-        : `${keyLabel(keyName)} key is not configured. Run /${keyName === 'ds' ? 'deepseeklogin' : keyName === 'openrouter' ? 'openrouterlogin' : 'opencodelogin'} to add it.`,
+        : `${keyLabel(keyName)} key is not configured. Run /${keyCommand(keyName)} to add it.`,
     )
     return null
   }

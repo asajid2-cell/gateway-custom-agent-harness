@@ -435,6 +435,7 @@ test('tmux and pane teammates inherit the complete Gateway route', async () => {
 test('Gateway teammate model resolution is provider-aware', () => {
   assert.match(teammateModelSource, /getAPIProvider\(\)\s*===\s*['"]gateway['"]/)
   assert.match(teammateModelSource, /MODEL_GATEWAY_SUBAGENT_MODEL/)
-  assert.match(teammateModelSource, /gateway-gpt-luna/)
+  // The bare-CLI fallback must sit on a lane that answers, not a Codex lane.
+  assert.match(teammateModelSource, /gateway-ds-4\.1-flash/)
   assert.match(agentModelSource, /parseUserSpecifiedModel/)
 })

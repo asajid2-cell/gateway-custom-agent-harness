@@ -34,8 +34,10 @@ test('launcher forwards the full Gateway model catalog with economical role defa
   assert.doesNotMatch(script, /else \{ 'medium' \}/)
   assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'/)
   assert.match(script, /MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'/)
-  assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-gpt-luna'/)
-  assert.match(script, /MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-luna'/)
+  // Both roles must land on a lane that answers: the Codex lanes measured
+  // 1/10 and 0/10 under 10 concurrent auxiliary calls, the ds lanes 10/10.
+  assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'/)
+  assert.match(script, /MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-ds-4\.1-flash'/)
   assert.match(script, /\$GatewayModelOptions = @\(\$CapabilityCatalog\.gatewayModelOptions\)/)
   assert.doesNotMatch(script, /ApprovedGatewayModels/)
   assert.doesNotMatch(script, /Where-Object \{[\s\S]*\$_\.value -in/)
@@ -171,4 +173,78 @@ test('interactive cc avoids the Defender-blocked nested encoded launcher', async
     /\$OptionalKeyProviders\s*=\s*@\([\s\S]*Credential\s*=\s*'opencode-go'[\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
     'optional providers should be declared in one table',
   )
+})
+
+test('launcher honors the picker-written default model below explicit overrides', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.match(
+    script,
+    /Join-Path \$env:USERPROFILE '\.claude\\gateway-default-model\.txt'/,
+    'the stored default must live in the location the picker writes',
+  )
+  // Priority: MODEL_GATEWAY_DEFAULT (cc-* wrappers) then stored default then
+  // the built-in. --model is applied later and overrides both.
+  assert.match(
+    script,
+    /\$RequestedModel = if \(\$env:MODEL_GATEWAY_DEFAULT\) \{[\s\S]*?\} elseif \(\$StoredDefaultModel\) \{[\s\S]*?\} else \{\s*'gateway-gpt-luna'\s*\}/,
+    'the stored default must sit between the env override and the built-in',
+  )
+  assert.match(
+    script,
+    /if \(\$StoredDefaultModel -notlike 'gateway-\*'\) \{\s*\$StoredDefaultModel = \$null\s*\}/,
+    'a non-gateway id in the state file must not reach the launcher',
+  )
+})
+
+test('an explicit --effort the model lacks fails at launch instead of at request time', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  assert.match(script, /function Assert-GatewayEffortSupported \{/)
+  assert.match(
+    script,
+    /if \(\$levels -notcontains \$Effort\) \{\s*throw "Effort '\$Effort' is not supported by \$Model\. Supported: \$\(\$levels -join ', '\), ultracode"\s*\}/,
+    'an unsupported explicit effort must be refused, naming the values that work',
+  )
+  assert.match(
+    script,
+    /if \(\$EffortWasExplicit -and -not \[string\]::IsNullOrWhiteSpace\(\$Effort\)\) \{\s*Assert-GatewayEffortSupported -Model \$Model -Effort \$Effort\s*\}/,
+    'validation must run only for an explicit effort, before the ladder default is applied',
+  )
+  // The default resolution must stay read-only: a stored/generated default is
+  // chosen from the ladder, so it can never need validation.
+  assert.match(
+    script,
+    /elseif \(\[string\]::IsNullOrWhiteSpace\(\$Effort\)\) \{\s*\$Effort = Resolve-DefaultGatewayEffort -Value \$Model\s*\}/,
+  )
+})
+
+test('the Command Code provider gets its key injected through the same table', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.match(
+    script,
+    /Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY'/,
+    'Command Code must be an optional keysafe provider',
+  )
+})
+
+test('the model picker promotes the focused model to the launch default on f', async () => {
+  const bindings = await readFile(
+    new URL('../src/keybindings/defaultBindings.ts', import.meta.url),
+    'utf8',
+  )
+  const schema = await readFile(
+    new URL('../src/keybindings/schema.ts', import.meta.url),
+    'utf8',
+  )
+  const picker = await readFile(
+    new URL('../src/components/ModelPicker.tsx', import.meta.url),
+    'utf8',
+  )
+  assert.match(
+    bindings,
+    /context: 'ModelPicker',\s*bindings: \{[\s\S]*?f: 'modelPicker:setDefault'/,
+    'f must resolve to the set-default action inside the picker context',
+  )
+  assert.match(schema, /'modelPicker:setDefault'/)
+  assert.match(picker, /"modelPicker:setDefault": \(\) => \{/)
+  assert.match(picker, /setGatewayDefaultModel\(target\)/)
 })

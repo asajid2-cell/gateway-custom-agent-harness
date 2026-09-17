@@ -318,7 +318,14 @@ test(
       launcherRegression,
     ],
     poisonedGatewayEnv({
-      MODEL_GATEWAY_DEFAULT: undefined,
+      // Pin the model tier explicitly. cc.ps1 now resolves the launch model as
+      // MODEL_GATEWAY_DEFAULT > ~/.claude/gateway-default-model.txt > a built-in
+      // default, and that stored file is real per-machine user state. Leaving
+      // it unset made this scenario assert whatever the developer last picked
+      // in the model picker, so it passed or failed by machine rather than by
+      // launcher behaviour. MODEL_GATEWAY_DEFAULT is the tier the cc-* wrappers
+      // set, so pinning it exercises the production path deterministically.
+      MODEL_GATEWAY_DEFAULT: 'gateway-gpt-luna',
       MODEL_GATEWAY_EFFORT: undefined,
     }),
   )

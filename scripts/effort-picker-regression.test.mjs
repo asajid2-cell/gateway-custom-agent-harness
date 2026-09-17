@@ -34,14 +34,19 @@ test('5.6 model switching preserves the full native ladder', () => {
   )
 })
 
-test('GLM 5.3 Flash clamps an unsupported native level to verified high', () => {
+test('GLM 5.3 Flash drops an unsupported native level instead of substituting one', () => {
   const flashLevels = getGatewayNativeEffortLevels('gateway-opencode-glm-5.3-flash')
 
+  // GLM 5.3 Flash implements low|high|max. Asking for medium must resolve to
+  // "send no effort parameter" rather than silently running at high, which the
+  // user never chose and could not see.
   assert.equal(
     resolveGatewayEffortAfterModelSwitch(flashLevels, 'medium', 'medium', 'medium', true),
-    'high',
+    undefined,
   )
-  assert.equal(clampGatewayEffort(flashLevels, 'medium'), 'high')
+  assert.equal(clampGatewayEffort(flashLevels, 'medium'), undefined)
+  // A level the model does implement still passes through unchanged.
+  assert.equal(clampGatewayEffort(flashLevels, 'max'), 'max')
 })
 
 test('switching to a model without native effort removes stale native values', () => {
@@ -79,11 +84,14 @@ test('the effort notification folds so the footer tracks the real session value'
   )
 })
 
-test('applied effort stays undefined when nothing is sent, displayed falls back to high', () => {
+test('applied and displayed effort both report auto when nothing is sent', () => {
   // DeepSeek/OpenCode native ladder is low|high|max: undefined means no
-  // effort parameter is sent, medium is not native and clamps to high.
+  // effort parameter is sent. medium is not native, so it is not applied and
+  // is never reported as the high level it was silently rewritten to.
   assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', undefined), undefined)
   assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', 'max'), 'max')
-  assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', 'medium'), 'high')
-  assert.equal(getDisplayedEffortLevel('gateway-ds-4.1-flash', undefined), 'high')
+  assert.equal(getAppliedEffortLevel('gateway-ds-4.1-flash', 'medium'), undefined)
+  assert.equal(getDisplayedEffortLevel('gateway-ds-4.1-flash', undefined), undefined)
+  assert.equal(getDisplayedEffortLevel('gateway-ds-4.1-flash', 'medium'), undefined)
+  assert.equal(getDisplayedEffortLevel('gateway-ds-4.1-flash', 'max'), 'max')
 })

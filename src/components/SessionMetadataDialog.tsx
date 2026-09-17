@@ -45,9 +45,14 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
   }))
   useEffect(() => onSessionSwitch(() => onDone()), [onDone])
   const teammate = isTeammate()
-  const [name, setName] = useState(() => getCurrentSessionTitle(sessionId) ?? '')
+  // Start empty and show the existing name as the placeholder. Pre-filling with
+  // the cursor at the end meant typing appended to the old name ("My Session"
+  // + "New Name" saved as "My SessionNew Name"), which reads as the rename not
+  // taking effect. An empty field means what you type is what gets saved.
+  const existingName = useState(() => getCurrentSessionTitle(sessionId))[0]
+  const [name, setName] = useState('')
   const inputColumns = Math.max(1, terminalColumns - 10)
-  const [cursorOffset, setCursorOffset] = useState(name.length)
+  const [cursorOffset, setCursorOffset] = useState(0)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | undefined>()
   const [muxResult, setMuxResult] = useState<MuxMetadataResult | undefined>()
@@ -67,7 +72,10 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
     const newName = submittedName.trim()
     if (saving || closing.current) return
     if (teammate) { onDone(); return }
-    if (!newName || newName.length > 200) {
+    // Submitting an untouched (empty) field means "keep the current name" - the
+    // field starts empty by design, so empty is the initial state, not an error.
+    if (!newName) { closing.current = true; onDone(); return }
+    if (newName.length > 200) {
       setSaveError('Name must contain 1–200 characters.')
       return
     }
@@ -147,7 +155,7 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
           <Text>Name:</Text>
           <TextInput
             value={name}
-            placeholder="Unnamed session"
+            placeholder={existingName || 'Unnamed session'}
             onChange={setName}
             onSubmit={value => void handleSubmit(value)}
             onExit={handleCancel}

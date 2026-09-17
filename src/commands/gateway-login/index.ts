@@ -33,6 +33,12 @@ export const openRouterLogin = command(
   'openrouter',
 )
 
+export const commandCodeLogin = command(
+  'commandcodelogin',
+  'Add, replace, inspect, or remove the Command Code API key',
+  'commandcode',
+)
+
 // Compatibility aliases for the original command registry names.
 export const openCodeLoginCommand = openCodeLogin
 export const deepSeekLoginCommand = deepSeekLogin

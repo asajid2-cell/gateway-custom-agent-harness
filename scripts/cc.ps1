@@ -80,7 +80,24 @@ function Resolve-SelectedCodexHome {
 # inherited CODEX_HOME.
 $env:CODEX_HOME = Resolve-SelectedCodexHome
 $Keysafe = Join-Path $env:USERPROFILE '.claude\skills\keysafe\scripts\keysafe.ps1'
-$RequestedModel = if ($env:MODEL_GATEWAY_DEFAULT) { $env:MODEL_GATEWAY_DEFAULT } else { 'gateway-gpt-luna' }
+# The model picker's `f` shortcut writes the last model the user chose to make
+# the default; MODEL_GATEWAY_DEFAULT (set by the cc-* launcher wrappers) and an
+# explicit --model both still outrank it.
+$GatewayDefaultModelPath = Join-Path $env:USERPROFILE '.claude\gateway-default-model.txt'
+$StoredDefaultModel = $null
+if (Test-Path -LiteralPath $GatewayDefaultModelPath -PathType Leaf) {
+  $StoredDefaultModel = (Get-Content -Raw -LiteralPath $GatewayDefaultModelPath).Trim()
+  if ($StoredDefaultModel -notlike 'gateway-*') {
+    $StoredDefaultModel = $null
+  }
+}
+$RequestedModel = if ($env:MODEL_GATEWAY_DEFAULT) {
+  $env:MODEL_GATEWAY_DEFAULT
+} elseif ($StoredDefaultModel) {
+  $StoredDefaultModel
+} else {
+  'gateway-gpt-luna'
+}
 $EffortWasExplicit = -not [string]::IsNullOrWhiteSpace($env:MODEL_GATEWAY_EFFORT)
 $ModelAliases = @{}
 foreach ($canonical in $CapabilityCatalog.gatewayModelAliases.PSObject.Properties) {
@@ -111,28 +128,52 @@ $Model = Resolve-GatewayModel -Value $RequestedModel
 # the launch default from that ladder so a fresh session starts on a level the
 # provider accepts, rather than a non-native value that silently clamps at send
 # time. Models with no native ladder get no --effort at all.
+function Get-GatewayEffortLevels {
+  param([string]$Value)
+
+  foreach ($alias in $CapabilityCatalog.gatewayAliases.PSObject.Properties) {
+    if ($alias.Name -ieq $Value) {
+      return @($alias.Value)
+    }
+  }
+  return @()
+}
+
 function Resolve-DefaultGatewayEffort {
   param([string]$Value)
 
   if ([string]::IsNullOrWhiteSpace($Value)) {
     return $null
   }
-  foreach ($alias in $CapabilityCatalog.gatewayAliases.PSObject.Properties) {
-    if ($alias.Name -ieq $Value) {
-      $levels = @($alias.Value)
-      if ($levels.Count -eq 0) {
-        return $null
-      }
-      if ($levels -contains 'medium') {
-        return 'medium'
-      }
-      if ($levels -contains 'high') {
-        return 'high'
-      }
-      return [string]$levels[0]
-    }
+  $levels = Get-GatewayEffortLevels -Value $Value
+  if ($levels.Count -eq 0) {
+    return $null
   }
-  return $null
+  if ($levels -contains 'medium') {
+    return 'medium'
+  }
+  if ($levels -contains 'high') {
+    return 'high'
+  }
+  return [string]$levels[0]
+}
+
+# An explicit --effort that the model does not implement is refused at launch.
+# Letting it through would store a level the request path has to drop or, worse,
+# would have silently run a different level than the one typed.
+function Assert-GatewayEffortSupported {
+  param([string]$Model, [string]$Effort)
+
+  if ([string]::IsNullOrWhiteSpace($Effort) -or $Effort -ieq 'ultracode') {
+    return
+  }
+  $levels = Get-GatewayEffortLevels -Value $Model
+  if ($levels.Count -eq 0) {
+    throw "Model $Model takes no effort parameter, so --effort $Effort cannot be applied."
+  }
+  if ($levels -notcontains $Effort) {
+    throw "Effort '$Effort' is not supported by $Model. Supported: $($levels -join ', '), ultracode"
+  }
 }
 
 $Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { $null }
@@ -345,7 +386,9 @@ if ($null -ne $ExplicitEffort) {
 }
 # Resolve the model-native default only after --model is known. $Effort stays
 # $null for models with no native ladder, in which case --effort is omitted.
-if ([string]::IsNullOrWhiteSpace($Effort)) {
+if ($EffortWasExplicit -and -not [string]::IsNullOrWhiteSpace($Effort)) {
+  Assert-GatewayEffortSupported -Model $Model -Effort $Effort
+} elseif ([string]::IsNullOrWhiteSpace($Effort)) {
   $Effort = Resolve-DefaultGatewayEffort -Value $Model
 }
 
@@ -714,6 +757,21 @@ $env:CLAUDE_CODE_GATEWAY_BASE_URL = "http://127.0.0.1:$Port"
 $env:CLAUDE_CODE_GATEWAY_TOKEN = $GatewayToken
 $env:CLAUDE_CODE_USE_GATEWAY = '1'
 $env:CLAUDE_GATEWAY_ALLOW_LOOPBACK = '1'
+# Session memory telemetry. cli.tsx starts the sampler only when both the
+# gateway flag above and this directory are present, and the sampler emits a
+# JSONL row per minute (reason=interval) plus one at startup and one at
+# shutdown. Without it a session that ramps commit but never reclaims cannot be
+# told apart from one that is merely large, because working set alone does not
+# show the difference. Rows carry only counters, sizes and cache gauges - never
+# user content - so the directory is safe to leave enabled permanently.
+# Opt out per invocation with $env:CC_DISABLE_MEMORY_TELEMETRY = '1'.
+if ($env:CC_DISABLE_MEMORY_TELEMETRY -ne '1') {
+  $MemoryTelemetryDir = Join-Path $env:LOCALAPPDATA 'Gateway\memory'
+  $env:GATEWAY_MEMORY_TELEMETRY_DIR = $MemoryTelemetryDir
+  if (-not (Test-Path -LiteralPath $MemoryTelemetryDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $MemoryTelemetryDir -Force | Out-Null
+  }
+}
 $env:MODEL_GATEWAY_MODEL = $Model
 $env:CLAUDE_CODE_SUBAGENT_MODEL = $Model
 $env:TANDEM_GATEWAY_PROVENANCE_SOURCE = 'cc.ps1'
@@ -740,8 +798,16 @@ $env:CLAUDE_CODE_GATEWAY_PROVENANCE = @{
 } | ConvertTo-Json -Compress
 $env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'
 $env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'
-$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-gpt-luna'
-$env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-luna'
+# The fast model backs every auxiliary call - WebFetch's summariser, awaySummary,
+# session titles, session search, agent hooks - so a lane that stalls degrades
+# all of them at once. The Codex lanes are not usable for this: measured 10
+# concurrent calls each, gateway-gpt-luna answered 1/10 (med 14.5s) and gpt-astra
+# 0/10, against 10/10 (med 1.0s) for gateway-ds-flash. Keep this on a lane that
+# answers. (Measured 2026-09-17.)
+$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'
+# Subagents do real work, so pick for capability among the lanes that answer.
+# gateway-ds-4.1-flash is the strongest measured here and answered 10/10.
+$env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-ds-4.1-flash'
 # Keep gateway-backed cc on the standard native harness compaction path.
 # Session-memory compaction is a separate summary producer and can replace
 # compactConversation() without making a provider request, which makes it
@@ -802,6 +868,7 @@ try {
   $OptionalKeyProviders = @(
     @{ Credential = 'opencode-go'; EnvVar = 'OPENCODE_API_KEY' }
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
+    @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )
   foreach ($Provider in $OptionalKeyProviders) {
     if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ('.keysafe\' + $Provider.Credential + '.cred')) -PathType Leaf)) {

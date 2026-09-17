@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { access } from 'node:fs/promises'
 import path from 'node:path'
 
-export type GatewayCredentialName = 'opencode-go' | 'ds'
+export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode'
 
 const USER_HOME = process.env.USERPROFILE || process.env.HOME || ''
 const KEYSAFE_SCRIPT = path.join(
