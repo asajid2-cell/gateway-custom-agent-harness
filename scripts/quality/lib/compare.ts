@@ -305,7 +305,20 @@ export function compare(opts: CompareOptions): GateResult {
     worsened,
     incompleteReasons: [],
     counts: statusCounts(opts.result.findings),
+    coverage: opts.result.coverage,
+    completeness: completenessOf(opts.result),
   };
+}
+
+/**
+ * Whether a conclusive run may also claim a complete measurement. Both the
+ * analyzer's assertion and the engine's own arithmetic must hold; either alone
+ * is a label someone could assert into existence.
+ */
+function completenessOf(result: AnalyzerResult): 'complete' | 'incomplete' {
+  return result.complete && coverageIsComplete(result.coverage)
+    ? 'complete'
+    : 'incomplete';
 }
 
 function emptyDispositions(): Record<Disposition, number> {
@@ -336,6 +349,11 @@ function emptyResult(
     worsened: [],
     incompleteReasons: reasons,
     counts: statusCounts(opts.result.findings),
+    coverage: opts.result.coverage,
+    // An INCOMPLETE decision means the run could not vouch for itself, whatever
+    // the arithmetic below happens to say; that is the whole meaning of the
+    // branch, so it is reported as incomplete rather than recomputed.
+    completeness: 'incomplete',
   };
 }
 

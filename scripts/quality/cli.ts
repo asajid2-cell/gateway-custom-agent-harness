@@ -15,8 +15,9 @@ import { spawnSync } from 'node:child_process';
 import type { AnalyzerResult, CandidateIdentity } from './lib/types';
 import {
   computeCandidateIdentity,
+  engineImplementationFiles,
   identityEqual,
-  policyFilesFor,
+  measurementInputs,
   shortIdentity,
 } from './lib/identity';
 import { resolveProfile } from './lib/profile';
@@ -120,9 +121,27 @@ async function executeAnalyzer(args: ParsedArgs): Promise<AnalyzerRun> {
 
   // Identity is computed with this analyzer's declared policy inputs, so a lint
   // threshold edit invalidates a maintainability baseline without the engine
-  // needing to know what a threshold is.
+  // needing to know what a threshold is. The analyzer's own implementation is
+  // folded in too: a declared policy list only covers what someone remembered to
+  // declare, and code that decides which findings exist is policy by another
+  // name. Without it, editing the analyzer re-scored the tree under an unchanged
+  // digest and the baseline still matched.
+  const implementation = engineImplementationFiles(args.repoRoot);
+  if (implementation.length === 0) {
+    // Not fatal, because the engine can legitimately run from a checkout that
+    // does not carry its own source. It must never be silent, though: the whole
+    // point of hashing the implementation is that a change to what is measured
+    // invalidates acceptance, and an empty set means that protection is absent
+    // for this run. Saying so is the difference between a weakened guard and a
+    // guard that looks present.
+    process.stderr.write(
+      'warning: no engine implementation files were found under scripts/quality, ' +
+        'so this run cannot detect a change to the analyzer code that produced it. ' +
+        'Policy inputs alone will be used for the identity digest.\n'
+    );
+  }
   const policyFiles = [
-    ...policyFilesFor(analyzer.id),
+    ...measurementInputs(args.repoRoot, analyzer.id),
     ...(analyzer.policyFiles ?? []),
   ];
   const candidateStart = computeCandidateIdentity(args.repoRoot, policyFiles);

@@ -1,10 +1,10 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import type { CandidateIdentity } from './types';
 import { git, headOid, isCheckoutDirty, listUntrackedFiles } from './git';
 import { fileDigest, sha256Hex, setDigest } from './hash';
 import { POLICY_INPUTS, TOOLCHAIN_INPUTS } from './hash';
-import { readText } from './fsutil';
+import { readText, toPosix, walkFiles } from './fsutil';
 
 /**
  * A candidate is a *state of the working tree*, not a commit.
@@ -71,6 +71,50 @@ export const ANALYZER_POLICY_INPUTS: Record<string, string[]> = {
 
 export function policyFilesFor(analyzer: string): string[] {
   return ANALYZER_POLICY_INPUTS[analyzer] ?? [];
+}
+
+/**
+ * Every source file the engine and its analyzers are implemented in.
+ *
+ * Why hashing the implementation rather than trusting the declared policy list:
+ * a declared input only covers what someone remembered to declare. The analyzer
+ * that decides which findings exist was not covered at all, so editing the code
+ * that emits a finding re-scored the whole tree under an unchanged policyDigest
+ * and the baseline matched - "change the ruler, keep the measurement" was a
+ * silent ratchet bypass, and a candidate could edit the very code that judges
+ * it. Deriving the set from the tree also covers the engine itself, which is the
+ * same defect one level up: this very fix would otherwise not invalidate the
+ * baselines it corrects.
+ *
+ * The whole `scripts/quality` tree is hashed, including the declared policy file
+ * the analyzer already names. Over-covering costs a re-accept; under-covering
+ * costs correctness.
+ */
+export function engineImplementationFiles(repoRoot: string): string[] {
+  // A missing or unreadable quality tree is a real condition (the engine may be
+  // invoked from a checkout that lacks it), so its absence degrades to the
+  // declared inputs rather than throwing during identity computation. The
+  // distinction between "absent" and "walk failed" is not recoverable here and
+  // is not silently swallowed: `assertMeasurementCoverage` reports it, so an
+  // empty result can never pass for a measured one.
+  let files: string[];
+  try {
+    files = walkFiles(join(repoRoot, 'scripts', 'quality')).files;
+  } catch {
+    return [];
+  }
+  return files
+    .map((absolute) => toPosix(relative(repoRoot, absolute)))
+    .filter((rel) => rel.length > 0 && !rel.includes('/.quality/runs/'))
+    .sort();
+}
+
+/** The declared policy inputs plus the implementation that applies them. */
+export function measurementInputs(repoRoot: string, analyzer: string): string[] {
+  return [
+    ...policyFilesFor(analyzer),
+    ...engineImplementationFiles(repoRoot),
+  ];
 }
 
 export function policyDigest(

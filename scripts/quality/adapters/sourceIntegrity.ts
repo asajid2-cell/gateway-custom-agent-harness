@@ -190,7 +190,15 @@ function isUntracked(state: AnalyzerState, relPath: string): boolean {
 
 interface ExtractedEdges {
   runtime: RawEdge[];
+  /** Specifiers seen in a type-only position, whether or not they were excluded. */
   typeOnlyCount: number;
+  /**
+   * Specifiers actually set aside because they were type-only. This is the
+   * number the coverage arithmetic needs; `typeOnlyCount` counts specifiers the
+   * extractor recognized, which can exceed the exclusions when a specifier is
+   * also imported for value and therefore stays a runtime edge.
+   */
+  typeOnlyExcluded: number;
   computedDynamic: RawEdge[];
   /** Non-null when the parser-backed scan threw; the file's edges are unknown. */
   scanFailed: string | null;
@@ -275,6 +283,7 @@ export function extractEdges(source: string, importer: string): ExtractedEdges {
   const runtime: RawEdge[] = [];
   const computedDynamic: RawEdge[] = [];
   const seen = new Set<string>();
+  let excludedTypeOnly = 0;
 
   const masked = maskComments(source);
   const scanResult = scanEdges(source, importer);
@@ -292,7 +301,16 @@ export function extractEdges(source: string, importer: string): ExtractedEdges {
   }
 
   const push = (specifier: string, kind: RawEdge['kind']): void => {
-    if (typeOnlySpecifiers.has(specifier) && kind === 'import-statement') return;
+    if (typeOnlySpecifiers.has(specifier) && kind === 'import-statement') {
+      // A type-only specifier is deliberately not an edge: it carries no runtime
+      // dependency, so treating it as one would invent integrity findings about
+      // imports that cannot execute. But it is a *decision to exclude*, and the
+      // engine's arithmetic has a class for exactly that. Reporting it as a
+      // free-text note instead left the exclusion unaccounted for, so a report
+      // could not show how many specifiers were set aside or why.
+      excludedTypeOnly += 1;
+      return;
+    }
     const key = `${kind}::${specifier}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -327,6 +345,7 @@ export function extractEdges(source: string, importer: string): ExtractedEdges {
   return {
     runtime,
     typeOnlyCount: typeOnlySpecifiers.size,
+    typeOnlyExcluded: excludedTypeOnly,
     computedDynamic,
     scanFailed: scanResult.failed,
   };
@@ -673,7 +692,7 @@ function run(context: AnalyzerContext): AnalyzerResult {
     }
 
     scanned += 1;
-    typeOnlyEdges += extracted.typeOnlyCount;
+    typeOnlyEdges += extracted.typeOnlyExcluded;
     computedDynamicEdges += extracted.computedDynamic.length;
 
     const emit = (edge: RawEdge, classified: ClassifiedEdge): void => {
@@ -729,8 +748,19 @@ function run(context: AnalyzerContext): AnalyzerResult {
     skipReasons,
   };
 
+  // Type-only specifiers are excluded at the EDGE level, while Coverage's
+  // arithmetic is at the FILE level: scanned + skipped + failed must equal
+  // eligible. Folding edge exclusions into `skipped` would break that identity
+  // and report a complete run as not adding up, so the exclusion is reported
+  // through the field the engine added for exactly this - counted, named, and
+  // visibly not a file that went unexamined.
+  const accounted: Coverage = {
+    ...coverage,
+    exclusions: { 'type-only-specifiers': typeOnlyEdges },
+  };
+
   notes.push(`runtime edges evaluated: ${runtimeEdges}`);
-  notes.push(`type-only edges skipped: ${typeOnlyEdges}`);
+  notes.push(`type-only specifiers excluded from the runtime graph: ${typeOnlyEdges}`);
   notes.push(`computed dynamic imports recorded: ${computedDynamicEdges}`);
   notes.push(`runtime roots: ${context.candidateFiles.length} candidate files`);
 
@@ -738,8 +768,8 @@ function run(context: AnalyzerContext): AnalyzerResult {
     analyzer: SOURCE_INTEGRITY_ANALYZER,
     findings: collapseOccurrences(findings),
     errors,
-    coverage,
-    complete: coverageComplete(coverage),
+    coverage: accounted,
+    complete: coverageComplete(accounted),
     notes,
   };
 }

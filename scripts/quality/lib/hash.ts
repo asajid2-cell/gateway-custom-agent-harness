@@ -49,6 +49,12 @@ export function filesDigest(repoRoot: string, candidates: string[]): string {
 export const POLICY_INPUTS = [
   'scripts/build.ts',
   'tsconfig.json',
+  // The runtime-roots manifest declares which files are first-class runtime code,
+  // and its own rationale states that it is hashed into policyDigest and that
+  // widening or narrowing it invalidates accepted baselines. Neither was true
+  // while the manifest had no reader, so a scope change was invisible to the
+  // ratchet. Listed here so the manifest's claim about itself is enforced.
+  '.quality/policy/runtime-roots.json',
 ];
 
 /**

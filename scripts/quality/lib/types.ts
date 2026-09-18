@@ -151,6 +151,19 @@ export interface Coverage {
   failed: number;
   /** Named reasons for anything not scanned. Sum should equal `skipped`. */
   skipReasons: Record<string, number>;
+  /**
+   * Named things deliberately set aside that are counted in a unit OTHER than
+   * `eligible`'s, so they cannot go in `skipReasons`.
+   *
+   * The distinction matters for any analyzer whose scope is two-level. Source
+   * integrity counts FILES in its arithmetic but excludes type-only SPECIFIERS
+   * from its graph; adding a specifier count to `skipReasons` would break
+   * `scanned + skipped + failed === eligible` and report a complete run as not
+   * adding up. Omitting it entirely is worse - it is the silent hole this field
+   * exists to close. Reported and rendered, but never folded into the arithmetic
+   * it does not belong to.
+   */
+  exclusions?: Record<string, number>;
 }
 
 /** The arithmetic an analyzer must satisfy to claim completeness. */
@@ -316,4 +329,18 @@ export interface GateResult {
   }>;
   incompleteReasons: string[];
   counts: Record<string, number>;
+  /**
+   * The coverage the decision was reached from, carried so a gate run can show
+   * that it saw a complete measurement rather than merely reporting a verdict.
+   * Without it a PASS is unreadable: it looks identical whether the analyzer
+   * examined the whole scope or a fraction of it.
+   */
+  coverage: Coverage;
+  /**
+   * `complete` only when the analyzer vouched for coverage AND the engine
+   * re-derived it arithmetically. Reported separately from the decision,
+   * because a PASS can be reached over incomplete measurement when the
+   * incomplete parts happen to carry no findings.
+   */
+  completeness: 'complete' | 'incomplete';
 }

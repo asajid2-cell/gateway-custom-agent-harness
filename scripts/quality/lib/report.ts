@@ -39,6 +39,14 @@ function renderCoverage(coverage: Coverage, complete: boolean): string[] {
   for (const [reason, count] of Object.entries(coverage.skipReasons)) {
     lines.push(`    ${paint(reason, 'dim')}: ${count}`);
   }
+  // Exclusions are reported under their own label because they are counted in a
+  // different unit from the arithmetic above. Printing them identically would
+  // invite the reading that they are part of it.
+  for (const [reason, count] of Object.entries(coverage.exclusions ?? {})) {
+    lines.push(
+      `    ${paint(`excluded (not in the arithmetic): ${reason}`, 'dim')}: ${count}`
+    );
+  }
   return lines;
 }
 
@@ -131,6 +139,14 @@ export function renderGateSummary(gate: GateResult): string {
     );
     return lines.join('\n');
   }
+
+  // What was measured, before what it means. A verdict is unreadable without
+  // it: a PASS reached over a fraction of the scope looks identical to a PASS
+  // over all of it, and a grader cannot tell which it is being shown.
+  lines.push(
+    ...renderCoverage(gate.coverage, gate.completeness === 'complete')
+  );
+  lines.push('');
 
   if (gate.newFindings.length > 0) {
     lines.push(paint(`  new findings: ${gate.newFindings.length}`, 'red'));
