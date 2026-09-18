@@ -73,6 +73,20 @@ export function renderRunSummary(
     `${paint('quality run', 'bold')} ${analyzer} ${paint(`(${profile})`, 'dim')}`
   );
   lines.push('');
+  // Printed unconditionally, because the counts below are the misleading part.
+  // A failed run renders "pass 0, fail 0, known debt 0" - which reads as a clean
+  // repository. The status line is what says the numbers are the absence of a
+  // measurement rather than a measurement of zero.
+  if (result.status !== 'complete') {
+    lines.push(
+      `  execution        : ${paint(
+        result.status === 'failed'
+          ? 'FAILED (findings are not a measurement)'
+          : 'INCOMPLETE (findings are a lower bound)',
+        'yellow'
+      )}`
+    );
+  }
   lines.push(...renderCoverage(result.coverage, result.complete));
   lines.push('');
   lines.push(`  pass             : ${counts.pass}`);

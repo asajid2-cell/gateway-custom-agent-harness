@@ -125,6 +125,11 @@ export function proposeBaseline(
       schemaVersion: BASELINE_SCHEMA_VERSION,
       analyzer,
       policyDigest: candidate.policyDigest,
+      // The epoch this baseline was recorded under. A later measurement change
+      // compares against it rather than assuming the old numbers still mean the
+      // same thing; see lib/migration.ts.
+      measurementDigest: candidate.measurementDigest,
+      recordedEligible: result.coverage.eligible,
       createdAt: new Date().toISOString(),
       candidate,
       findings,

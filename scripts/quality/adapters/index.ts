@@ -9,8 +9,10 @@
 import { registerAnalyzer } from '../lib/registry';
 import { sourceIntegrityAnalyzer } from './sourceIntegrity';
 import { maintainabilityAnalyzer } from './maintainability';
+import { duplicationAnalyzer } from './duplication';
 
 registerAnalyzer(sourceIntegrityAnalyzer);
 registerAnalyzer(maintainabilityAnalyzer);
+registerAnalyzer(duplicationAnalyzer);
 
-export { sourceIntegrityAnalyzer, maintainabilityAnalyzer };
+export { sourceIntegrityAnalyzer, maintainabilityAnalyzer, duplicationAnalyzer };

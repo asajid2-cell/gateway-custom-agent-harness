@@ -1,25 +1,44 @@
 {
-  "version": 1,
+  "version": 2,
   "owner": "gateway-maintainers",
-  "rationale": "This manifest is a protected quality artifact, not scanner configuration. It declares which files are first-class runtime code for the integrity analyzer. It must cover the bundled CLI entry graph, the harness runtime used by cc.cmd/cc.ps1, build tooling, and the quality tooling itself. Widening, narrowing, or exempting a root here is a policy change: it is hashed into policyDigest and invalidates accepted baselines.",
+  "rationale": "ENTRYPOINTS ONLY. This manifest answers exactly one question: from where does a runtime reachability walk start. It is NOT the source universe and NOT an eligibility filter - see .quality/policy/source-universe.json for which files quality tooling may inspect, and which analyzers may inspect them. This file previously carried an `exclude` list and served as scope authority, which dropped globals.d.ts and scripts/quality/fixtures/* from analysis because nothing imports them at runtime. Those files are read critically and carry accepted findings; they were never runtime artifacts, not unreachable code. Widening, narrowing or removing a root here changes what reachability can conclude and is hashed into policyDigest, so it invalidates accepted baselines.",
   "extensions": [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"],
   "roots": [
     {
-      "path": "src",
-      "kind": "product-runtime",
+      "path": "src/entrypoints/cli.tsx",
+      "kind": "cli",
       "owner": "gateway-maintainers",
-      "proof": "Bundled into dist/cli.js from src/entrypoints/cli.tsx by scripts/build.ts (bun build --root=src/entrypoints)."
+      "proof": "package.json main is src/entrypoints/cli.tsx, and bin maps `claude` to dist/cli.js which scripts/build.ts produces from src/entrypoints/cli.tsx via bun build --root=src/entrypoints."
     },
     {
-      "path": "scripts",
-      "kind": "harness-runtime",
+      "path": "scripts/build.ts",
+      "kind": "build",
       "owner": "gateway-maintainers",
-      "proof": "Invoked by package.json scripts and by the cc.cmd -> cc.ps1 -> gateway-supervisor.mjs -> model-gateway.mjs chain."
+      "proof": "package.json script `build` runs `bun run scripts/build.ts`; it is the producer of the shipped bundle."
+    },
+    {
+      "path": "scripts/gateway-supervisor.mjs",
+      "kind": "supervisor",
+      "owner": "gateway-maintainers",
+      "proof": "Reached from cc.cmd -> cc.ps1 -> gateway-supervisor.mjs."
+    },
+    {
+      "path": "scripts/model-gateway.mjs",
+      "kind": "gateway",
+      "owner": "gateway-maintainers",
+      "proof": "The model gateway process itself; spawned by the supervisor chain and by scripts/gateway-deepseek.ps1."
+    },
+    {
+      "path": "scripts/quality/cli.ts",
+      "kind": "quality-cli",
+      "owner": "gateway-maintainers",
+      "proof": "package.json script `quality` runs `bun run scripts/quality/cli.ts`; it is the runtime entrypoint of the quality tooling."
+    },
+    {
+      "path": "scripts/quality/fixtures",
+      "kind": "fixture-harness",
+      "owner": "gateway-maintainers",
+      "proof": "Every fixture spec is executed by `bun test scripts/quality/fixtures` (package.json quality:test); they are runtime code for the quality harness even though they live in a fixture directory."
     }
-  ],
-  "exclude": [
-    "**/node_modules/**",
-    "**/dist/**",
-    "scripts/quality/fixtures/**"
   ]
 }

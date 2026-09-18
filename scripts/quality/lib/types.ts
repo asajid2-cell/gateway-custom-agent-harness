@@ -175,18 +175,75 @@ export function coverageIsComplete(coverage: Coverage): boolean {
   return coverage.scanned + coverage.skipped + coverage.failed === coverage.eligible;
 }
 
+/**
+ * How an analyzer execution ended, as distinct from what it found.
+ *
+ * The permanent engine rule this exists to enforce:
+ *
+ *   ANALYZER INTERNAL EXCEPTIONS MUST NEVER DEGRADE INTO "ZERO FINDINGS".
+ *
+ * The failure it prevents is specific and it has happened here. A traversal
+ * threw; a `catch` around it returned `[]`; the run reported no findings; the
+ * gate saw a smaller finding set than the baseline and reported the debt as
+ * RESOLVED. Nothing in that sequence is a lie at any single step - the bug is
+ * that "the walk failed" and "the walk found nothing" were the same value.
+ *
+ * So execution status is explicit and it is three-valued:
+ *
+ *  - `complete`   : the analyzer finished the work it set out to do. Findings
+ *                   may be reported, and completeness is still checked
+ *                   separately against the coverage arithmetic - this says the
+ *                   run ended, not that it covered everything.
+ *  - `incomplete` : the run ended early or deliberately covered less than its
+ *                   declared scope. Findings are a lower bound, never a clean
+ *                   bill of health. Never a PASS.
+ *  - `failed`     : the run threw, or a component it depends on could not run.
+ *                   Findings MUST be treated as absent rather than as an empty
+ *                   result. Never a PASS, and never a resolution.
+ *
+ * The distinction between `failed` and "completed with zero findings" is the
+ * whole point: an empty finding list is a claim about the code, and a failed run
+ * has made no claim at all.
+ */
+export type ExecutionStatus = 'complete' | 'incomplete' | 'failed';
+
 export interface AnalyzerResult {
   analyzer: string;
   findings: Finding[];
   errors: AnalyzerError[];
   coverage: Coverage;
   /**
+   * How the execution ended. See `ExecutionStatus`.
+   *
+   * Required rather than optional: an analyzer that does not say how it ended
+   * has not made its outcome inspectable, and the safe reading of a missing
+   * status is not "complete".
+   */
+  status: ExecutionStatus;
+  /**
    * True only when coverage can be vouched for arithmetically. An analyzer
    * asserts this, and the gate separately re-derives it from `coverage` so that a
    * wrong assertion cannot become a pass.
+   *
+   * Deliberately kept alongside `status` rather than replaced by it. `status`
+   * answers "did the run end as intended"; `complete` answers "did it cover what
+   * it claimed to". A run can end cleanly having skipped half its scope, and a
+   * run can be failed while its coverage arithmetic happens to add up.
    */
   complete: boolean;
   notes: string[];
+}
+
+/**
+ * The engine's guard for the rule above.
+ *
+ * Called wherever findings are about to be interpreted - never by the analyzer,
+ * because an analyzer cannot be trusted to detect its own swallowed exception.
+ * A `failed` execution yields no findings to reason about, and that is the only
+ * honest reading: absence of evidence is not evidence of absence.
+ */
+export function findingsAreAuthoritative(result: AnalyzerResult): boolean {
+  return result.status === 'complete';
 }
 
 export interface CandidateIdentity {
@@ -194,7 +251,27 @@ export interface CandidateIdentity {
   headDirty: boolean;
   trackedChangesDigest: string;
   relevantUntrackedDigest: string;
+  /**
+   * What we ALLOW. Declared policy inputs: build exemptions, tsconfig, the
+   * runtime-roots manifest, and any analyzer-declared policy file (a lint
+   * config). A change here means the rules changed, so a baseline recorded
+   * under the old rules is no longer a statement about the current ones.
+   */
   policyDigest: string;
+  /**
+   * How we OBSERVE. The engine and analyzer implementation, hashed as a whole
+   * tree.
+   *
+   * Kept separate from `policyDigest` because the two demand different
+   * responses. A policy change asks "do we still tolerate this?"; a measurement
+   * change asks "is the new observation even comparable to the old one?".
+   * Collapsing them made every analyzer edit look like a policy edit, and the
+   * only available answer was to re-record the baseline - which is how an
+   * analyzer bug could erase a thousand pieces of debt without anyone seeing
+   * the list. `lib/migration.ts` exists to make that list visible.
+   */
+  measurementDigest: string;
+  /** What implementation versions EXECUTE the measurement. */
   toolchainDigest: string;
   computedAt: string;
   /**
@@ -216,6 +293,13 @@ export interface RunRecord {
   candidateStable: boolean;
   coverage: Coverage;
   complete: boolean;
+  /**
+   * How the execution ended. Recorded because a run record is read long after
+   * the fact: a reviewer comparing two records needs to know whether an empty
+   * finding list means "nothing was found" or "nothing was measured", and the
+   * counts alone cannot say.
+   */
+  status: ExecutionStatus;
   counts: Record<string, number>;
   errors: AnalyzerError[];
   notes: string[];
@@ -288,9 +372,94 @@ export interface Baseline {
   schemaVersion: 3;
   analyzer: string;
   policyDigest: string;
+  /**
+   * The observation system this baseline was recorded under.
+   *
+   * Optional because baselines written before the field existed have no value
+   * for it, and inventing one would be worse than admitting ignorance: a
+   * fabricated digest would compare equal to the current measurement and the
+   * migration path would silently skip. Absent reads as "unknown epoch", which
+   * forces a migration report rather than a quiet re-record.
+   */
+  measurementDigest?: string;
+  /**
+   * How many entities the analyzer was obliged to consider when this baseline
+   * was recorded.
+   *
+   * Recorded so a migration can tell "the ruler changed" apart from "the ruler
+   * changed AND it is now looking at a different amount of the repository".
+   * Without it, a scope change and a rule change are the same observation - a
+   * different number of findings - and the reviewer cannot know which they are
+   * approving. Optional for the same reason as `measurementDigest`.
+   */
+  recordedEligible?: number | null;
   createdAt: string;
   candidate: CandidateIdentity;
   findings: Record<string, BaselineFinding>;
+}
+
+/**
+ * The result of re-measuring one unchanged tree under a new observation system.
+ *
+ * This exists because "the digest changed, so re-record the baseline" is not a
+ * review - it is a blank cheque. An analyzer change that legitimately collapses
+ * 4,994 findings into 3,100 and an analyzer bug that silently drops 1,894 are
+ * indistinguishable from the outside, and the second is the one that erases
+ * debt. The migration report is the difference: it names what the new system
+ * added, what it removed, what kept its identity but changed shape, and whether
+ * the scope it looked at moved at all.
+ */
+export interface MeasurementMigration {
+  analyzer: string;
+  from: {
+    /** Absent when the baseline predates epoch tracking. */
+    measurementDigest: string | null;
+    policyDigest: string;
+    recordedAt: string;
+    recordedFindings: number;
+    recordedEligible: number | null;
+  };
+  to: {
+    measurementDigest: string;
+    policyDigest: string;
+    measuredFindings: number;
+    measuredEligible: number | null;
+  };
+  /** Present in the new measurement, absent from the old baseline. */
+  added: Finding[];
+  /** Recorded in the old baseline, not observed now. */
+  removed: BaselineFinding[];
+  /**
+   * Same identity on both sides, but the observation changed: occurrences
+   * moved, a metric moved, severity moved. These are the entries a reviewer
+   * must actually read, because they are where a measurement change hides.
+   */
+  changed: Array<{
+    id: string;
+    field: 'occurrences' | 'metric' | 'severity' | 'detail';
+    before: string | number;
+    after: string | number;
+  }>;
+  /** Unchanged on both sides; summarized by count rather than listed. */
+  stableCount: number;
+  /**
+   * Whether the two measurements were taken over the same file set. A scope
+   * change makes every count incomparable, so it is reported first and loudly.
+   */
+  scopeChanged: boolean;
+  /**
+   * True when the only difference is that the old baseline has no epoch
+   * recorded. Nothing can be concluded from a comparison against unknown, so
+   * this is reported as its own state rather than as a clean migration.
+   */
+  unknownEpoch: boolean;
+  /**
+   * A one-line judgement. `comparable` means the new measurement may be
+   * reviewed as a successor; `scope-moved` and `unknown-epoch` mean the
+   * numbers cannot be lined up at all and the reviewer is being asked to
+   * accept something that was not compared.
+   */
+  verdict: 'comparable' | 'scope-moved' | 'unknown-epoch';
 }
 
 export interface MovedFinding {

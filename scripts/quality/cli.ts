@@ -20,6 +20,7 @@ import {
   measurementInputs,
   shortIdentity,
 } from './lib/identity';
+import { measureMigration, renderMigration } from './lib/migration';
 import { resolveProfile } from './lib/profile';
 import {
   expiredWaivers,
@@ -40,7 +41,9 @@ import {
 import { writeJson } from './lib/fsutil';
 import { toSarif } from './lib/sarif';
 import { loadCandidate } from './lib/candidate';
-import { getAnalyzer, listAnalyzers } from './lib/registry';
+import { loadSourceUniverse } from './lib/sourceUniverse';
+import { loadRuntimeRoots } from './lib/runtimeRoots';
+import { getAnalyzer, listAnalyzers, runAnalyzer } from './lib/registry';
 // Registration side effect: importing this module populates the registry.
 import './adapters/index';
 
@@ -119,13 +122,15 @@ async function executeAnalyzer(args: ParsedArgs): Promise<AnalyzerRun> {
 
   const analyzer = getAnalyzer(args.analyzer);
 
-  // Identity is computed with this analyzer's declared policy inputs, so a lint
-  // threshold edit invalidates a maintainability baseline without the engine
-  // needing to know what a threshold is. The analyzer's own implementation is
-  // folded in too: a declared policy list only covers what someone remembered to
-  // declare, and code that decides which findings exist is policy by another
-  // name. Without it, editing the analyzer re-scored the tree under an unchanged
-  // digest and the baseline still matched.
+  // Identity carries two distinct digests, and the distinction is load-bearing.
+  // POLICY is what is allowed (build exemptions, tsconfig, the runtime-roots
+  // manifest, the analyzer's declared lint config). MEASUREMENT is how the
+  // observation is made (the engine and analyzer implementation). A policy
+  // change asks "do we still tolerate this?"; a measurement change asks "is the
+  // new observation comparable to the old one at all?". Folding them together
+  // made every analyzer edit look like a policy edit whose only remedy was
+  // re-recording the baseline, which is how a measurement bug could erase debt
+  // silently. `quality migrate` answers the second question.
   const implementation = engineImplementationFiles(args.repoRoot);
   if (implementation.length === 0) {
     // Not fatal, because the engine can legitimately run from a checkout that
@@ -141,7 +146,7 @@ async function executeAnalyzer(args: ParsedArgs): Promise<AnalyzerRun> {
     );
   }
   const policyFiles = [
-    ...measurementInputs(args.repoRoot, analyzer.id),
+    ...measurementInputs(analyzer.id),
     ...(analyzer.policyFiles ?? []),
   ];
   const candidateStart = computeCandidateIdentity(args.repoRoot, policyFiles);
@@ -160,9 +165,47 @@ async function executeAnalyzer(args: ParsedArgs): Promise<AnalyzerRun> {
 
   const notes: string[] = [...candidateModel.notes];
 
-  const result = await analyzer.run({
+  // SCOPE comes from the source-universe role model, not from the runtime-root
+  // list and not from the raw candidate set. The analyzer declares capabilities
+  // (clone detection, linting, syntax); the manifest says which roles grant them.
+  //
+  // Deriving scope from `candidateModel.files` instead - as this did - meant
+  // every analyzer saw every file in the repository and narrowed by extension
+  // alone. That is indistinguishable from correct right up to the point where a
+  // fixture containing deliberately unresolved imports, or a planted clone, is
+  // measured as production code and blocks a commit. The role model makes the
+  // narrowness a written decision with an owner instead of a side effect.
+  const universe = loadSourceUniverse(args.repoRoot);
+  const eligible = universe.eligibleFor(analyzer.capabilities);
+
+  if (universe.unclassified.length > 0) {
+    // Reported, never dropped. A file that no role claims is a file nobody has
+    // decided how to measure, and silence about it is how it stays unmeasured
+    // while every report says the run was complete.
+    notes.push(
+      `${universe.unclassified.length} file(s) match no source-universe role and ` +
+        `are not eligible for any analyzer: ${universe.unclassified
+          .slice(0, 5)
+          .join(', ')}${universe.unclassified.length > 5 ? ', ...' : ''}`
+    );
+  }
+
+  // RUNTIME ROOTS are entrypoints, reported alongside scope so the two are
+  // visibly different quantities rather than one list doing both jobs.
+  const runtimeRoots = loadRuntimeRoots(args.repoRoot);
+  if (runtimeRoots.unmatchedRoots.length > 0) {
+    notes.push(
+      `${runtimeRoots.unmatchedRoots.length} runtime root(s) matched no file ` +
+        `(dead roots silently change what reachability can conclude): ` +
+        runtimeRoots.unmatchedRoots.join(', ')
+    );
+  }
+
+  const result = await runAnalyzer(analyzer, {
     repoRoot: args.repoRoot,
-    candidateFiles: candidateModel.files,
+    candidateFiles: eligible,
+    universe,
+    runtimeRoots: runtimeRoots.entrypoints,
     absolute: (relativePath) => resolve(args.repoRoot, relativePath),
     trackedFiles: candidateModel.trackedFiles,
     cacheDir: join(args.repoRoot, '.quality', '.cache', analyzer.id),
@@ -487,6 +530,60 @@ function oldestAcceptance(
     .sort()[0] ?? null;
 }
 
+/**
+ * Show what a changed measurement system does to an unchanged tree.
+ *
+ * This is the review that stands between "the analyzer changed" and "the
+ * baseline shrank". It never writes: re-recording stays a separate, deliberate
+ * act, and this command's whole purpose is to make that act informed. Exit code
+ * follows the verdict, so CI can require a comparable migration rather than
+ * merely printing one.
+ */
+async function commandMigrate(args: ParsedArgs): Promise<number> {
+  if (args.analyzer === null) {
+    throw new Error('migrate requires an analyzer name');
+  }
+  const baseline = readBaseline(args.repoRoot, args.analyzer);
+  if (baseline === null) {
+    throw new Error(`no accepted baseline for "${args.analyzer}"`);
+  }
+  const run = await executeAnalyzer(args);
+  const migration = measureMigration({
+    analyzer: args.analyzer,
+    baseline,
+    result: run.result,
+    candidate: run.candidate,
+  });
+
+  process.stdout.write(`${renderMigration(migration)}\n`);
+
+  if (migration.verdict !== 'comparable') {
+    process.stdout.write(
+      '\n  This migration is NOT reviewable as a successor measurement. ' +
+        (migration.verdict === 'unknown-epoch'
+          ? 'The recorded baseline predates epoch tracking, so there is nothing to ' +
+            'compare the new measurement against - every difference would be ' +
+            'reported as new or removed with no way to tell which.\n'
+          : 'The eligible scope moved, so the two finding counts describe ' +
+            'different amounts of the repository and cannot be lined up.\n')
+    );
+    return EXIT.INCOMPLETE;
+  }
+
+  if (migration.removed.length > 0) {
+    process.stdout.write(
+      `\n  ${migration.removed.length} recorded finding(s) are no longer observed. ` +
+        'That is the shape of a stricter measurement AND the shape of a broken ' +
+        'one; confirm which before re-recording.\n'
+    );
+  }
+  process.stdout.write(
+    `\n  To adopt: quality baseline ${args.analyzer} --propose --write ` +
+      '--accepted-by <who> --reason "<why the measurement changed>"\n'
+  );
+  return EXIT.PASS;
+}
+
 function commandAnalyzers(): number {
   process.stdout.write('registered analyzers\n\n');
   for (const analyzer of listAnalyzers()) {
@@ -569,6 +666,7 @@ function usage(): string {
     '  quality run <analyzer> [--profile <name>] [--json <path>] [--quiet]',
     '  quality compare <analyzer> [--json <path>]        discovery only, read-only',
     '  quality gate <analyzer> [--sarif <path>] [--json <path>]',
+    '  quality migrate <analyzer>   what a changed measurement system does to the same tree',
     '  quality baseline <analyzer> --propose [--write] [--accepted-by <n>]',
     '  quality baseline <analyzer> --accept-resolution [--write] [--accepted-by <n>]',
     '  quality baseline --list',
@@ -596,6 +694,8 @@ async function main(): Promise<number> {
       return commandCompare(args);
     case 'gate':
       return commandGate(args);
+    case 'migrate':
+      return commandMigrate(args);
     case 'baseline':
       return commandBaseline(args);
     case 'analyzers':

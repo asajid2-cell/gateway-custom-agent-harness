@@ -33,6 +33,7 @@ export function writeRun(
     candidateStable: input.candidateStable,
     coverage: input.result.coverage,
     complete: input.result.complete,
+    status: input.result.status,
     counts: countFindings(input.result),
     errors: input.result.errors,
     notes: input.result.notes,

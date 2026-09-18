@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "owner": "gateway-maintainers",
+  "rationale": "The floors that decide which repeated blocks are reportable at all. They are policy, not tuning: this file is named in the analyzer's policyFiles and hashed into policyDigest, so raising a floor to make a finding disappear invalidates every accepted baseline and the change has to be re-accepted deliberately. Both floors are passed to the clone detector AND applied to its report, because applying them only afterwards would leave the token floor ineffective downward - the detector would never report a block smaller than the floor baked into its own invocation, so lowering the floor here would silently do nothing.",
+  "minTokens": 50,
+  "minLines": 5,
+  "maxBytes": 16777216,
+  "maxBytesNote": "The detector's own default cutoff is 1 MB and it drops a larger file from its report with no trace - the same silent hole as an unparsable file. The largest eligible file in this repository is 908 KB, i.e. within 10% of that default, so 'we are under it today' is not a reason to leave it in place. Raised to 16 MiB, and any file above it is reported as a coverage FAILURE rather than a skip, so the cutoff can never quietly shrink what was measured.",
+  "minTokensNote": "50 tokens is roughly five to eight lines of real code. Below that, 'duplicate' starts matching idioms that are short because the language is short - a one-line re-export, a two-line guard clause - and a gate that blocks on those is a gate that gets disabled.",
+  "minLinesNote": "The detector requires a block to clear BOTH floors, so a 60-token block written as three dense lines is invisible unless this is set as well. 5 is the detector's conventional default.",
+  "kindNote": "Only exact and identifier-renamed clones block. Type-3 similarity is deliberately not enabled: a gate that blocks on 'these two functions are 85% similar' is a gate people learn to route around, and fuzzy matches need their own rule id and their own acceptance argument before they can block anything.",
+  "scopeNote": "Clones are checked over the whole eligible corpus on every run, never only over changed files. A clone is a relation between two regions, so a changed-files-only scan would report every family whose other copies are unchanged as resolved - the same measurement bug as batching, arrived at from the other direction."
+}

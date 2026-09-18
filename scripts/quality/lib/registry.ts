@@ -1,4 +1,5 @@
 import type { AnalyzerResult } from './types';
+import type { SourceCapability, SourceUniverse } from './sourceUniverse';
 
 /**
  * The analyzer contract.
@@ -9,13 +10,34 @@ import type { AnalyzerResult } from './types';
  * those, the engine is wrong, not the analyzer.
  *
  * Deliberately NOT here: a plugin system, an event bus, a factory, a lifecycle.
- * There are two analyzers. A registry object with a Map is the correct amount of
- * machinery until that stops being true.
+ * A registry object with a Map is the correct amount of machinery until that
+ * stops being true.
  */
 export interface AnalyzerContext {
   repoRoot: string;
-  /** Repo-relative files the analyzer may consider, in stable sorted order. */
+  /**
+   * Repo-relative files this analyzer is ELIGIBLE for, in stable sorted order.
+   *
+   * Derived from the analyzer's declared `capabilities` intersected with the
+   * source-universe role model, never from what happens to be installable or
+   * reachable at runtime. An analyzer cannot widen this by existing: the scope
+   * it can see is written down in `.quality/policy/source-universe.json` as the
+   * set of roles that grant its capabilities.
+   */
   candidateFiles: string[];
+  /** The role model behind `candidateFiles`, for analyzers that report scope. */
+  universe: SourceUniverse;
+  /**
+   * Repo-relative ENTRYPOINTS from which runtime reachability is computed.
+   *
+   * A different question from `candidateFiles` and deliberately not a subset of
+   * it. Entrypoints are where a reachability walk starts; eligibility is what a
+   * walk's results are allowed to be about. A file can be an entrypoint without
+   * being eligible (a launcher in a language this analyzer does not parse) and
+   * eligible without being reachable (a declaration file, a fixture). Merging
+   * the two makes scope narrow silently the moment someone tidies the root list.
+   */
+  runtimeRoots: string[];
   /** Absolute path for a repo-relative path. */
   absolute(relativePath: string): string;
   /** Repo-relative paths git tracks. */
@@ -57,6 +79,17 @@ export interface Analyzer {
    */
   policyFiles?: string[];
   /**
+   * Source-universe capabilities this analyzer needs, which is what determines
+   * the files it is eligible for.
+   *
+   * Required rather than optional with a permissive default: an analyzer with no
+   * declared capabilities has no defined scope, and the safe reading of "no
+   * scope declared" is not "all files". A new analyzer must name what it needs
+   * (usually one of `lint`, `clones`, `syntax`) so that adding it cannot
+   * silently widen what the repository is measured against.
+   */
+  capabilities: SourceCapability[];
+  /**
    * Whether this analyzer analyses file *contents* rather than the file graph.
    *
    * A pure file-graph analyzer (imports, reachability, architecture) should not
@@ -95,6 +128,49 @@ export function getAnalyzer(id: string): Analyzer {
 
 export function listAnalyzers(): Analyzer[] {
   return [...REGISTRY.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/**
+ * Run an analyzer so that an internal exception becomes a FAILED execution
+ * rather than an exception the caller has to interpret.
+ *
+ * This is the engine's side of the permanent rule: an analyzer internal
+ * exception must never degrade into "zero findings". Without this wrapper a
+ * throw propagates, and whatever catches it upstream has to decide what an
+ * empty finding list means - and the tempting answer, `[]`, is the one that
+ * reports the debt as resolved.
+ *
+ * Returning a `failed` result keeps the outcome inside the model where the gate
+ * already knows what to do with it: never a PASS, never a resolution, and the
+ * finding list explicitly not a measurement.
+ */
+export async function runAnalyzer(
+  analyzer: Analyzer,
+  context: AnalyzerContext
+): Promise<AnalyzerResult> {
+  try {
+    return await analyzer.run(context);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      analyzer: analyzer.id,
+      findings: [],
+      errors: [{ kind: 'scan-failure', subject: '<run>', message }],
+      coverage: {
+        eligible: context.candidateFiles.length,
+        scanned: 0,
+        skipped: 0,
+        failed: Math.max(context.candidateFiles.length, 1),
+        skipReasons: { 'analyzer-threw': 1 },
+      },
+      complete: false,
+      status: 'failed',
+      notes: [
+        'the analyzer threw before completing; its finding list is empty ' +
+          'because no measurement was taken, not because nothing was found',
+      ],
+    };
+  }
 }
 
 export function hasAnalyzer(id: string): boolean {

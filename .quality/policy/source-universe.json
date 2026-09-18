@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "owner": "gateway-maintainers",
+  "rationale": "This manifest answers ONE question: which repository files may quality tooling inspect at all. It is the source UNIVERSE. It deliberately does not answer which files are reachable at runtime, which files are bundled, or which files an analyzer is allowed to block on - those are separate questions with separate owners, and collapsing them is how a file stops being measured without anyone deciding that it should. Every file that a commit can introduce and a reviewer can read belongs in exactly one role here; a file matching no role is reported as unclassified rather than silently dropped, because 'we did not measure it' must never look like 'it was fine'. Widening, narrowing or reassigning a role is a policy change: this file is hashed into policyDigest and invalidates accepted baselines.",
+  "extensions": [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx", ".d.ts"],
+  "roles": [
+    {
+      "name": "production-source",
+      "description": "Code that executes when the product runs.",
+      "path": "src",
+      "checks": ["syntax", "format", "lint", "secrets", "complexity", "clones", "import-integrity"],
+      "owner": "gateway-maintainers",
+      "proof": "Bundled into dist/cli.js from src/entrypoints/cli.tsx (package.json main; scripts/build.ts runs bun build --root=src/entrypoints)."
+    },
+    {
+      "name": "declarations",
+      "description": "Ambient type declarations. Nothing executes, but a wrong declaration is a real defect and every file depends on it.",
+      "path": "globals.d.ts",
+      "checks": ["syntax", "format", "lint"],
+      "owner": "gateway-maintainers",
+      "proof": "Included by tsconfig.json and referenced by tsconfig paths; nine @typescript-eslint findings were accepted against it, so it is genuinely inspected code rather than configuration."
+    },
+    {
+      "name": "build-tooling",
+      "description": "Build and release machinery. Its output is the product, so its correctness is product correctness.",
+      "glob": "scripts/*.ts",
+      "checks": ["syntax", "format", "lint", "secrets", "complexity", "clones", "import-integrity"],
+      "owner": "gateway-maintainers",
+      "proof": "Invoked by package.json scripts: build.ts is `bun run build`."
+    },
+    {
+      "name": "quality-fixture",
+      "description": "Fixture TREES and inputs the quality engine builds or reads. Deliberately contains unresolved specifiers, planted duplication and other free-floating constructs, so the engines that judge production source must not judge the file complete - but they are still repository files a reviewer reads and that must parse.",
+      "glob": "scripts/quality/fixtures/**",
+      "checks": ["syntax", "format", "secrets"],
+      "owner": "gateway-maintainers",
+      "proof": "`bun test scripts/quality/fixtures` (package.json quality:test)."
+    },
+    {
+      "name": "quality-tooling",
+      "description": "The quality engine and analyzers themselves.",
+      "path": "scripts/quality",
+      "checks": ["syntax", "format", "lint", "secrets", "complexity", "clones", "import-integrity"],
+      "owner": "gateway-maintainers",
+      "proof": "Run by `bun run quality` (package.json quality/quality:gate scripts). A quality tool that cannot measure itself undercuts its own argument."
+    },
+    {
+      "name": "harness-test",
+      "description": "Test files. They are read critically and can be wrong, but they are not shipped.",
+      "glob": "scripts/**/*.{test,spec}.{ts,tsx,js,mjs,cjs,jsx}",
+      "checks": ["syntax", "format", "lint", "secrets", "clones", "import-integrity"],
+      "owner": "gateway-maintainers",
+      "proof": "Collected by bun test / node --test from the package.json test scripts."
+    },
+    {
+      "name": "harness-tooling",
+      "description": "Operational scripts, supervisors and helpers not covered by a more specific role.",
+      "glob": "scripts/**/*.{ts,tsx,js,mjs,cjs,jsx}",
+      "checks": ["syntax", "format", "lint", "secrets", "complexity", "clones", "import-integrity"],
+      "owner": "gateway-maintainers",
+      "proof": "Reached from the cc.cmd -> cc.ps1 -> gateway-supervisor.mjs -> model-gateway.mjs chain and from package.json quality/test scripts."
+    }
+  ],
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**"
+  ],
+  "unclassified": "report"
+}

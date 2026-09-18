@@ -109,12 +109,40 @@ export function engineImplementationFiles(repoRoot: string): string[] {
     .sort();
 }
 
-/** The declared policy inputs plus the implementation that applies them. */
-export function measurementInputs(repoRoot: string, analyzer: string): string[] {
-  return [
-    ...policyFilesFor(analyzer),
-    ...engineImplementationFiles(repoRoot),
-  ];
+/**
+ * How the measurement is OBSERVED, as distinct from what it ALLOWS.
+ *
+ * The implementation that produces findings is not policy: it does not say what
+ * is tolerable, it says what is visible. Keeping the two digests apart is what
+ * lets `lib/migration.ts` ask "did the observation change, and if so what
+ * changed about it" instead of treating every analyzer edit as a policy edit
+ * whose only remedy is re-recording the baseline.
+ */
+export function measurementDigest(
+  repoRoot: string,
+  extraFiles: string[] = []
+): string {
+  const inputs = [
+    ...new Set([...engineImplementationFiles(repoRoot), ...extraFiles]),
+  ].sort();
+  const parts = inputs.map((rel) => {
+    const text = readText(join(repoRoot, rel));
+    return `${rel}:${text === null ? 'absent' : sha256Hex(text)}`;
+  });
+  // The input LIST is part of the digest, not just the contents. Adding a file
+  // to the measurement system changes what is observed even when every existing
+  // file is byte-identical, and a digest over contents alone would miss it.
+  return sha256Hex(`inputs:${inputs.join(',')}\n${parts.join('\n')}`);
+}
+
+/**
+ * Policy inputs for an analyzer: the declared files plus anything the analyzer
+ * names. Deliberately does NOT include the engine implementation - that is
+ * `measurementDigest`, and folding it in here is what made a measurement change
+ * indistinguishable from a policy change.
+ */
+export function measurementInputs(analyzer: string): string[] {
+  return policyFilesFor(analyzer);
 }
 
 export function policyDigest(
@@ -174,6 +202,7 @@ export function computeCandidateIdentity(
     trackedChangesDigest,
     relevantUntrackedDigest,
     policyDigest: policyDigest(repoRoot, policyFiles),
+    measurementDigest: measurementDigest(repoRoot),
     toolchainDigest: toolchainDigest(repoRoot),
     computedAt: new Date().toISOString(),
     sourceDigest: sha256Hex(
@@ -201,6 +230,7 @@ export function identityEqual(a: CandidateIdentity, b: CandidateIdentity): boole
     a.trackedChangesDigest === b.trackedChangesDigest &&
     a.relevantUntrackedDigest === b.relevantUntrackedDigest &&
     a.policyDigest === b.policyDigest &&
+    a.measurementDigest === b.measurementDigest &&
     a.toolchainDigest === b.toolchainDigest
   );
 }
@@ -211,6 +241,7 @@ export function shortIdentity(identity: CandidateIdentity): string {
     identity.trackedChangesDigest.slice(0, 8),
     identity.relevantUntrackedDigest.slice(0, 8),
     identity.policyDigest.slice(0, 8),
+    identity.measurementDigest.slice(0, 8),
     identity.toolchainDigest.slice(0, 8),
   ].join('/');
 }

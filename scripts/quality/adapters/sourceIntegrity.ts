@@ -10,6 +10,7 @@ import type {
 import { coverageIsComplete } from '../lib/types';
 import type { Analyzer, AnalyzerContext } from '../lib/registry';
 import { isFile, readText } from '../lib/fsutil';
+import { maskComments } from '../lib/sourceText';
 import { loadBuildManifest, type BuildManifest } from '../lib/buildManifest';
 import {
   listResolvedImplementations,
@@ -211,62 +212,15 @@ interface ExtractedEdges {
  * source comments legitimately discuss imports - including `import('../build.ts')`
  * in a doc comment and `require()` in prose. Without masking, the analyzer reports
  * code-shaped text from comments as dependencies.
+ *
+ * Lives in `lib/sourceText.ts` because clone detection needs exactly the same
+ * transformation for a different reason (a comment edited in one copy of a block
+ * must not split it into two families), and a second copy of a ~55-line function
+ * would be a duplicate block inside the tree the duplication analyzer measures.
+ * Re-exported here so the existing call sites and fixtures keep reading it from
+ * the analyzer they were written against.
  */
-export function maskComments(source: string): string {
-  const out = source.split('');
-  let index = 0;
-  let quote: string | null = null;
-
-  while (index < source.length) {
-    const char = source[index];
-    const next = source[index + 1];
-
-    if (quote !== null) {
-      if (char === '\\') {
-        index += 2;
-        continue;
-      }
-      if (char === quote) quote = null;
-      index += 1;
-      continue;
-    }
-
-    if (char === "'" || char === '"' || char === '`') {
-      quote = char;
-      index += 1;
-      continue;
-    }
-
-    if (char === '/' && next === '/') {
-      while (index < source.length && source[index] !== '\n') {
-        out[index] = ' ';
-        index += 1;
-      }
-      continue;
-    }
-
-    if (char === '/' && next === '*') {
-      out[index] = ' ';
-      out[index + 1] = ' ';
-      index += 2;
-      while (index < source.length) {
-        if (source[index] === '*' && source[index + 1] === '/') {
-          out[index] = ' ';
-          out[index + 1] = ' ';
-          index += 2;
-          break;
-        }
-        if (source[index] !== '\n') out[index] = ' ';
-        index += 1;
-      }
-      continue;
-    }
-
-    index += 1;
-  }
-
-  return out.join('');
-}
+export { maskComments } from '../lib/sourceText';
 
 /**
  * Extract import edges.
@@ -770,6 +724,11 @@ function run(context: AnalyzerContext): AnalyzerResult {
     errors,
     coverage: accounted,
     complete: coverageComplete(accounted),
+    // Per-file failures are already counted in `failed`, so the execution itself
+    // completed: it finished the walk it set out to do, having recorded which
+    // files it could not read. `incomplete` reflects that the coverage
+    // arithmetic will not add up to a clean bill of health.
+    status: failed > 0 ? 'incomplete' : 'complete',
     notes,
   };
 }
@@ -809,5 +768,6 @@ export const sourceIntegrityAnalyzer: Analyzer = {
     'ambiguous resolution and untracked artifacts.',
   rules: RULE_DESCRIPTIONS,
   extensions: EXTENSIONS,
+  capabilities: ['import-integrity'],
   run,
 };

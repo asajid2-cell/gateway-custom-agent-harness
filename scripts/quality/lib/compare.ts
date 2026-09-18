@@ -56,6 +56,33 @@ export function compare(opts: CompareOptions): GateResult {
     );
   }
 
+  // A failed execution is checked FIRST and separately from incomplete coverage,
+  // because the two demand different responses and conflating them loses the
+  // distinction that matters most.
+  //
+  // The rule: an analyzer internal exception must never degrade into "zero
+  // findings". A traversal throws, a `catch` returns `[]`, the run reports no
+  // findings - and every later stage reads an empty list as a claim that the
+  // code is clean, so the baseline shrinks and the debt is reported RESOLVED.
+  // Naming a failed run stops that chain at the first link: the finding list is
+  // not a measurement, it is the absence of one, and nothing downstream may
+  // treat it as a resolution.
+  if (opts.result.status === 'failed') {
+    const detail = opts.result.errors
+      .map((error) => `${error.kind}:${error.subject}`)
+      .join(', ');
+    incompleteReasons.push(
+      'analyzer execution FAILED, so its finding list is not a measurement and ' +
+        'must not be read as one (a failed traversal and an empty result are ' +
+        `different facts)${detail ? ` (${detail})` : ''}`
+    );
+  } else if (opts.result.status === 'incomplete') {
+    incompleteReasons.push(
+      'analyzer execution was INCOMPLETE: it ended before finishing the work it ' +
+        'set out to do, so any findings are a lower bound'
+    );
+  }
+
   if (!opts.result.complete) {
     const detail = opts.result.errors
       .map((error) => `${error.kind}:${error.subject}`)
@@ -89,6 +116,22 @@ export function compare(opts: CompareOptions): GateResult {
     incompleteReasons.push(
       'baseline was produced under a different policy digest; what counts as ' +
         'tolerable has changed since it was accepted'
+    );
+  } else if (
+    // A different observation system means the baseline's numbers describe a
+    // different measurement, so comparing them would report every difference
+    // between two rulers as a difference in the code. Blocked here rather than
+    // guessed at; `quality migrate <analyzer>` produces the old-vs-new report
+    // a reviewer needs before re-recording.
+    opts.baseline.measurementDigest !== undefined &&
+    opts.baseline.measurementDigest !== opts.candidateAtStart.measurementDigest
+  ) {
+    incompleteReasons.push(
+      'baseline was recorded by a different measurement system (the analyzer or ' +
+        'engine implementation changed since it was accepted); the two sets of ' +
+        'numbers are not comparable. Run `quality migrate ' +
+        `${opts.analyzer}\` to see what the new system adds, removes and changes, ` +
+        'then re-record deliberately'
     );
   }
 
@@ -311,12 +354,16 @@ export function compare(opts: CompareOptions): GateResult {
 }
 
 /**
- * Whether a conclusive run may also claim a complete measurement. Both the
- * analyzer's assertion and the engine's own arithmetic must hold; either alone
- * is a label someone could assert into existence.
+ * Whether a conclusive run may also claim a complete measurement. All three
+ * must hold: the execution ended as intended, the analyzer asserts coverage, and
+ * the engine's own arithmetic agrees. Any one alone is a label someone could
+ * assert into existence - and a `failed` run has no measurement to complete,
+ * however tidy its coverage arithmetic happens to look.
  */
 function completenessOf(result: AnalyzerResult): 'complete' | 'incomplete' {
-  return result.complete && coverageIsComplete(result.coverage)
+  return result.status === 'complete' &&
+    result.complete &&
+    coverageIsComplete(result.coverage)
     ? 'complete'
     : 'incomplete';
 }

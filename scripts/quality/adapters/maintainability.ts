@@ -290,6 +290,8 @@ function run(context: AnalyzerContext): AnalyzerResult {
         skipReasons: {},
       },
       complete: false,
+      // Nothing ran at all, so there is no measurement to be partial about.
+      status: 'failed',
       notes: ['cannot run without a config'],
     };
   }
@@ -318,6 +320,7 @@ function run(context: AnalyzerContext): AnalyzerResult {
         skipReasons: {},
       },
       complete: false,
+      status: 'failed',
       notes,
     };
   }
@@ -412,6 +415,11 @@ function run(context: AnalyzerContext): AnalyzerResult {
         skipReasons: { 'eslint-not-complete': targetFiles.length },
       },
       complete: false,
+      // `failed`, not `incomplete`: a batch that did not run means ESLint never
+      // produced a result, so the empty finding list is the absence of a
+      // measurement rather than a measurement of zero. Downstream, a failed run
+      // can never be read as a resolution.
+      status: 'failed',
       notes,
     };
   }
@@ -647,6 +655,15 @@ function run(context: AnalyzerContext): AnalyzerResult {
       notLoadedRules.size === 0 &&
       foreignFiles.length === 0 &&
       coverageComplete(coverage, parsed.value.length),
+    // A rule set that did not load is a failed measurement, not an empty one:
+    // the finding list is deliberately blanked above, and without this the blank
+    // list would be read downstream as "the code is clean under these rules".
+    status:
+      notLoadedRules.size > 0 || foreignFiles.length > 0
+        ? 'failed'
+        : failed > 0
+          ? 'incomplete'
+          : 'complete',
     notes,
   };
 }
@@ -817,6 +834,7 @@ export const maintainabilityAnalyzer: Analyzer = {
    * until the gate passes" from being invisible to the baseline.
    */
   policyFiles: [CONFIG_PATH],
+  capabilities: ['lint'],
   contentScoped: true,
   run,
 };

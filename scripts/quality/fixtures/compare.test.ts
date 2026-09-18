@@ -27,6 +27,7 @@ function candidate(overrides: Partial<CandidateIdentity> = {}): CandidateIdentit
     trackedChangesDigest: 'changes-1',
     relevantUntrackedDigest: 'untracked-1',
     policyDigest: POLICY,
+    measurementDigest: 'measurement-1',
     toolchainDigest: 'toolchain-1',
     computedAt: '2026-09-17T00:00:00.000Z',
     sourceDigest: 'source-1',
@@ -81,6 +82,7 @@ function result(
     errors: [],
     coverage: cov,
     complete: overrides.complete ?? true,
+    status: overrides.status ?? 'complete',
     notes: [],
     ...overrides,
   };
@@ -190,6 +192,126 @@ describe('gate fails closed', () => {
       });
       expect(gate.decision).toBe('INCOMPLETE');
       expect(gate.incompleteReasons.join(' ')).toContain('policy digest');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a baseline from a different measurement system is INCOMPLETE', () => {
+    const tree = createFixtureTree();
+    try {
+      // The ruler changed. Comparing the old numbers to the new ones would report
+      // every difference between two rulers as a difference in the code, so the
+      // gate refuses rather than guessing and points at `quality migrate`.
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline: baselineOf(tree.root, [finding()]),
+        result: result([finding()]),
+        candidateAtStart: candidate({ measurementDigest: 'measurement-2' }),
+        candidateAtFinish: candidate({ measurementDigest: 'measurement-2' }),
+        repoRoot: tree.root,
+      });
+      expect(gate.decision).toBe('INCOMPLETE');
+      expect(gate.incompleteReasons.join(' ')).toContain('measurement system');
+      expect(gate.incompleteReasons.join(' ')).toContain('quality migrate');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('an epoch-less baseline is not blocked by the measurement check', () => {
+    const tree = createFixtureTree();
+    try {
+      // Baselines written before epoch tracking existed have no digest to compare,
+      // and inventing one would be worse than admitting ignorance. They are read
+      // as-is; the migration report is what forces a deliberate re-record, and it
+      // reports `unknown-epoch` rather than pretending the comparison happened.
+      const baseline = baselineOf(tree.root, [finding()]);
+      delete (baseline as { measurementDigest?: string }).measurementDigest;
+
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline,
+        result: result([finding()]),
+        candidateAtStart: candidate(),
+        candidateAtFinish: candidate(),
+        repoRoot: tree.root,
+      });
+      expect(gate.decision).toBe('PASS');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a FAILED analyzer is never a pass and never a resolution', () => {
+    const tree = createFixtureTree();
+    try {
+      // The permanent rule, as the artefact: a traversal throws, a `catch`
+      // returns `[]`, and every downstream stage reads an empty finding list as
+      // a claim that the code is clean. Here the baseline holds one finding and
+      // the failed run reports none, so a naive implementation would call it
+      // RESOLVED - the debt would vanish with nobody seeing it.
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline: baselineOf(tree.root, [finding()]),
+        result: result([], { status: 'failed', complete: false }),
+        candidateAtStart: candidate(),
+        candidateAtFinish: candidate(),
+        repoRoot: tree.root,
+      });
+
+      expect(gate.decision).toBe('INCOMPLETE');
+      expect(gate.incompleteReasons.join(' ')).toContain('FAILED');
+      // The finding is NOT reported as resolved. That is the whole assertion:
+      // absence of evidence is not evidence of absence.
+      expect(gate.resolvedFindings).toHaveLength(0);
+      expect(gate.completeness).toBe('incomplete');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('an INCOMPLETE execution is refused even when coverage adds up', () => {
+    const tree = createFixtureTree();
+    try {
+      // A run that ends early having covered its scope cleanly is still not a
+      // clean bill of health: the analyzer said so itself.
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline: baselineOf(tree.root, [finding()]),
+        result: result([finding()], { status: 'incomplete' }),
+        candidateAtStart: candidate(),
+        candidateAtFinish: candidate(),
+        repoRoot: tree.root,
+      });
+
+      expect(gate.decision).toBe('INCOMPLETE');
+      expect(gate.incompleteReasons.join(' ')).toContain('INCOMPLETE');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a status of complete is required for a PASS, not merely asserted coverage', () => {
+    const tree = createFixtureTree();
+    try {
+      // Same findings, same arithmetic, only the status differs. Nothing else
+      // may be able to turn this into a pass.
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline: baselineOf(tree.root, [finding()]),
+        result: result([finding()], { status: 'failed', complete: true }),
+        candidateAtStart: candidate(),
+        candidateAtFinish: candidate(),
+        repoRoot: tree.root,
+      });
+      expect(gate.decision).toBe('INCOMPLETE');
+      expect(gate.completeness).toBe('incomplete');
     } finally {
       tree.cleanup();
     }
