@@ -16,6 +16,7 @@ import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
 import { getLeafSnapshot, isInteractiveLeaf, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
+import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
 
 export type LeafView = { rootSessionId: string; member: LeafMember; process: Pick<LeafProcess, 'getState' | 'checkpoint' | 'setModel' | 'setEffort'>; draft: string }
 type OwnedLeafView = LeafView & { process: LeafProcess }
@@ -264,8 +265,12 @@ async function requireLeafView(reference: string): Promise<{ member: LeafMember;
  * identical to something the person typed, so a leaf reading its own transcript
  * could not tell them apart. The prefix travels with the text, so the
  * distinction survives into the transcript and into what the leaf reads.
+ *
+ * Defined beside the gateway markers and re-exported rather than copied: the
+ * renderer recognises the whole peer family by reading the text, so a second
+ * copy here could drift from the one it tests and silently stop matching.
  */
-export const PEER_PROMPT_PREFIX = '[message from another session, not the user]\n'
+export const PEER_PROMPT_PREFIX = LEAF_PEER_PROMPT_PREFIX
 
 /** Structural view of a leaf transcript message; avoids importing the Message type here. */
 export type LeafTranscriptMessage = {

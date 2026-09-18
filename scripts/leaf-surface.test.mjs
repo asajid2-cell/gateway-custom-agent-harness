@@ -200,7 +200,11 @@ test('an answer reported mid-turn is routed now, and not sent again at turn end'
 
 test('every peer-delivered turn is marked as coming from a session, not the user', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  assert.match(workspace, /export const PEER_PROMPT_PREFIX = '\[message from another session, not the user\]\\n'/)
+  // One definition, re-exported. The renderer recognises the peer family by
+  // reading the text, so a second literal here could drift from the one it
+  // matches on and silently stop labelling leaf turns.
+  assert.match(workspace, /export const PEER_PROMPT_PREFIX = LEAF_PEER_PROMPT_PREFIX/)
+  assert.match(workspace, /import \{ LEAF_PEER_PROMPT_PREFIX \} from '\.\/gatewaySessionProtocol\.js'/)
   // The parent labels the turn it hands over, and the reply it routes back.
   assert.match(workspace, /await view\.process\.deliver\(`\$\{PEER_PROMPT_PREFIX\}\$\{message\}`\)/)
   // The label is text, and the turn boundary rewrites the text around it, so
@@ -229,13 +233,22 @@ test('every peer-delivered turn is marked as coming from a session, not the user
   // The up-path and the root's receiver already mark their turns; the marker
   // must not regress into an unmarked user turn on either side.
   assert.match(hook, /isMeta: true,[\s\S]{0,40}origin: \{ kind: 'task-notification' \}/)
+  // A leaf's report to the root is marked too. Both wires share the bus origin
+  // and the text is what separates them, so a report left unmarked would render
+  // as something the operator typed.
+  assert.match(hook, /const content = `\$\{PEER_PROMPT_PREFIX\}Message from Leaf /)
 })
 
 test('session comms resolves leaf references before falling back to peers', async () => {
   const source = await readFile(new URL('../src/commands/gateway-sessions.ts', import.meta.url), 'utf8')
   assert.match(source, /resolveLeafRef\(target\)/)
   assert.match(source, /sendLeafMessage\(leaf\.sessionId, send\[2\]!\)/)
-  assert.match(source, /runtime\.transport\.send\(target, send\[2\]!/)
+  // The peer branch goes through the same resolver SendMessage uses, so both
+  // entry points accept a name and both refuse an ambiguous one. The raw
+  // transport call here accepted only an exact ID and turned a lookup miss into
+  // a generic failure, which is why the two paths taught different addressing.
+  assert.match(source, /const \{ sendViaGatewayPeer \} = await import\('\.\.\/utils\/gatewayPeerSend\.js'\)/)
+  assert.match(source, /sendViaGatewayPeer\(target, send\[2\]!, send\[2\]!\.slice\(0, 200\)\)/)
 })
 
 test('a leaf-shaped address is never retargeted at an unrelated live session', async () => {
@@ -255,8 +268,10 @@ test('a leaf-shaped address is never retargeted at an unrelated live session', a
   // A swallowed family read must not fall through to the peer bus.
   assert.match(source, /catch\(error => \{\s*if \(leafFamilyReference\(target\)\) throw error/)
   assert.match(source, /else if \(leafFamilyReference\(target\)\) throw new Error\(`No leaf in this family matches/)
-  // The peer transport is reached only for a non-leaf-shaped (session ID) address.
-  assert.match(source, /else result = JSON\.stringify\(await runtime\.transport\.send/)
+  // The peer transport is reached only for a non-leaf-shaped (session ID)
+  // address, and through the shared resolver rather than a raw send.
+  assert.match(source, /sendViaGatewayPeer\(target, send\[2\]!, send\[2\]!\.slice\(0, 200\)\)/)
+  assert.match(source, /outcome\.ok\) throw new Error\(outcome\.message\)/)
 })
 
 test('siblings stay mutually visible: state changes republish the family to every leaf', async () => {

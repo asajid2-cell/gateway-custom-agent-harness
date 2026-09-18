@@ -103,7 +103,17 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
         })
         if (leaf) result = await sendLeafMessage(leaf.sessionId, send[2]!)
         else if (leafFamilyReference(target)) throw new Error(`No leaf in this family matches ${JSON.stringify(target)}; nothing was sent. /leaf list shows the family, /sessions list the live sessions`)
-        else result = JSON.stringify(await runtime.transport.send(target, send[2]!, send[2]!.slice(0, 200)))
+        else {
+          // Same resolver SendMessage uses, so both entry points accept a name
+          // and both refuse an ambiguous one rather than picking a target. The
+          // raw transport call here accepted only an exact ID and surfaced a
+          // lookup miss as a generic failure, which is why the two paths taught
+          // different addressing rules.
+          const { sendViaGatewayPeer } = await import('../utils/gatewayPeerSend.js')
+          const outcome = await sendViaGatewayPeer(target, send[2]!, send[2]!.slice(0, 200))
+          if (!outcome.ok) throw new Error(outcome.message)
+          result = outcome.message
+        }
       }
     }
     onDone(result, { display: 'system' })

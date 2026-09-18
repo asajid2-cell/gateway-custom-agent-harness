@@ -3,7 +3,9 @@ import { getSessionId } from '../bootstrap/state.js'
 import { getCwd } from '../utils/cwd.js'
 import { GatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
 import { gatewayMessageIds } from '../utils/gatewaySessionDelivery.js'
-import { deriveSessionPurpose } from '../utils/gatewaySessionProtocol.js'
+import { registerGatewayPeerStopHook, type PeerStopHookHandle } from '../utils/gatewayPeerStopHook.js'
+import { useSetAppState } from '../state/AppState.js'
+import { appendSessionTopic, deriveSessionPurpose, deriveSessionTopic } from '../utils/gatewaySessionProtocol.js'
 import type { Message } from '../types/message.js'
 import { logForDebugging } from '../utils/debug.js'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
@@ -26,7 +28,10 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
   const latest = useRef({ name, status })
   latest.current = { name, status }
   const runtimeRef = useRef<GatewaySessionRuntime | undefined>(undefined)
+  const stopHookRef = useRef<PeerStopHookHandle | undefined>(undefined)
   const closing = useRef<Promise<void>>(Promise.resolve())
+  // Stable across renders, so registering the hook cannot re-run the effect.
+  const setAppState = useSetAppState()
   useEffect(() => {
     // Interactive leaves belong to a leaf family, not the global session bus.
     // Registering them here made a leaf visible beside unrelated sessions
@@ -40,6 +45,15 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
       await runtime.start(gatewayMessageIds(sessionMessages ?? []))
       if (disposed || getSessionId() !== sessionId) return
       runtimeRef.current = runtime
+      // The Stop hook is the turn-boundary half of delivery. The queue half is
+      // already live inside the runtime; without this a busy session only sees
+      // peer traffic mid-turn, as injection this hook exists to replace.
+      const stopHook = registerGatewayPeerStopHook(setAppState, runtime)
+      if (disposed) {
+        stopHook.remove()
+        return
+      }
+      stopHookRef.current = stopHook
       // Seed intent only while it is unstated. An explicit declaration outranks
       // the derived one, and a later name/status refresh must never clobber it.
       const purpose = runtime.transport.peer.purpose.trim() ? runtime.transport.peer.purpose : sessionPurposeSeed(sessionMessages, name)
@@ -47,6 +61,10 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
     }).catch(() => { logForDebugging('Gateway session communication could not start.') })
     const close = async () => {
       disposed = true
+      // Before the transport closes: a turn ending mid-shutdown would otherwise
+      // fire the callback against a closed inbox.
+      stopHookRef.current?.remove()
+      stopHookRef.current = undefined
       runtime.delivery.close()
       await started
       if (runtimeRef.current === runtime) runtimeRef.current = undefined
@@ -61,4 +79,20 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
   useEffect(() => {
     void runtimeRef.current?.transport.update({ name, status: status === 'busy' ? 'running' : status === 'waiting' ? 'awaiting-approval' : 'idle' }).catch(() => { logForDebugging('Gateway session status update failed.') })
   }, [name, status])
+  // Refresh the advertised topics as the session takes new work. Purpose is
+  // frozen at the opening prompt by design, so without this a session that
+  // moves on (a stack question becoming a 2D-platformer discussion) stayed
+  // discoverable only under the topic it had already finished. Guarded on the
+  // derived topic changing, so this writes once per real request rather than
+  // once per render.
+  const lastTopic = useRef('')
+  useEffect(() => {
+    const runtime = runtimeRef.current
+    if (!runtime) return
+    const topic = deriveSessionTopic(sessionMessages)
+    if (!topic || topic === lastTopic.current) return
+    lastTopic.current = topic
+    const next = appendSessionTopic(runtime.transport.peer.topics, topic)
+    void runtime.transport.update({ topics: next }).catch(() => { logForDebugging('Gateway session topic update failed.') })
+  }, [sessionMessages])
 }

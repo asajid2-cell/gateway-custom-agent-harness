@@ -7,10 +7,14 @@ import { registerCleanup } from './cleanupRegistry.js'
 import { subscribeCommandLifecycle } from './commandLifecycle.js'
 import { onSessionSwitch } from '../bootstrap/state.js'
 
-type Gauge = 'markdownEntries' | 'markdownSourceChars' | 'characterCacheEntries' | 'characterCacheWeight' | 'lineWidthCacheChars' | 'screenCells' | 'screenBufferBytes' | 'charPoolEntries' | 'hyperlinkPoolEntries' | 'stylePoolEntries' | 'styleTransitionEntries' | 'yogaLive' | 'virtualHeightCacheEntries' | 'virtualItemRefEntries' | 'virtualRefCacheEntries' | 'messageEntries' | 'messageTextChars'
+type Gauge = 'markdownEntries' | 'markdownSourceChars' | 'characterCacheEntries' | 'characterCacheWeight' | 'lineWidthCacheChars' | 'screenCells' | 'screenBufferBytes' | 'charPoolEntries' | 'hyperlinkPoolEntries' | 'stylePoolEntries' | 'styleTransitionEntries' | 'yogaLive' | 'virtualHeightCacheEntries' | 'virtualItemRefEntries' | 'virtualRefCacheEntries' | 'messageEntries' | 'messageTextChars' | 'outputOperationEntries' | 'outputOperationPayloadChars' | 'renderPatchEntries' | 'renderPatchPayloadChars' | 'transcriptQueuedEntries' | 'transcriptQueuedPayloadChars' | 'selectionListenerEntries' | 'hoveredNodeEntries' | 'outputMaxOperationEntries' | 'outputMaxOperationPayloadChars'
 const gauges: Partial<Record<Gauge, number>> = {}
 let enabled = false
 const events = { queryEntries: 0, replQueryEnds: 0, compactionChecks: 0, apiStarts: 0, apiEnds: 0, renders: 0 }
+
+export function isMemoryTelemetryEnabled(): boolean {
+  return enabled
+}
 export function memoryEvent(name: keyof typeof events): void {
   if (enabled) events[name]++
 }

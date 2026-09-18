@@ -2,9 +2,76 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
-import { deriveSessionPurpose, formatGatewayPeerLine } from '../src/utils/gatewaySessionProtocol.ts'
+import { appendSessionTopic, deriveSessionPurpose, deriveSessionTopic, formatGatewayPeerLine } from '../src/utils/gatewaySessionProtocol.ts'
 
 const user = content => ({ type: 'user', message: { content } })
+
+test('recent topics describe current work, so a session that pivots stays findable', () => {
+  // The real sequence from a live session whose display name never changed.
+  // Its purpose is fixed to "what is a stack", which is exactly why discovery
+  // could not find the session once it had moved on to 2D platformers.
+  const conversation = [
+    user('what is a stack'),
+    user('ok now we are switching to 2d platformers i just wanna understand how theyre made'),
+    user('and what about art and sprites and the like'),
+  ]
+  assert.equal(deriveSessionTopic(conversation), 'and what about art and sprites and the like')
+
+  let topics = []
+  for (const message of conversation) topics = appendSessionTopic(topics, deriveSessionTopic([message]))
+  const line = formatGatewayPeerLine({
+    status: 'idle', name: 'Explain what a stack is', purpose: 'what is a stack',
+    cwd: 'C:/Users/Ahmed', sessionId: '11111111-1111-4111-8111-111111111111', topics,
+  })
+  // The finding that matters: the platformer work is searchable in the listing.
+  assert.match(line, /recent: .*2d platformers/)
+  assert.match(line, /art and sprites/)
+})
+
+test('a continued-context session reports real work, not its pasted preamble', () => {
+  const preamble = user('This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation. Summary: 1. Primary Request and Intent: the archive work')
+  // Both skip it for the actual request. Purpose skipping it too is the fix for
+  // a real fleet reading: three of seven live sessions advertised a 1000-char
+  // "This session is being continued..." wall as their description, because that
+  // is the first user turn of every resumed session.
+  assert.equal(deriveSessionTopic([preamble]), '')
+  assert.equal(deriveSessionTopic([preamble, user('fix the memory leak in the renderer')]), 'fix the memory leak in the renderer')
+  assert.equal(deriveSessionPurpose([preamble]), '')
+  assert.equal(
+    deriveSessionPurpose([preamble, user('fix the memory leak in the renderer')]),
+    'fix the memory leak in the renderer',
+  )
+  // A preamble that is the only thing available still falls back rather than
+  // advertising a summary as intent.
+  assert.equal(deriveSessionPurpose([preamble], 'Claude Code'), 'Claude Code')
+})
+
+test('topics stay bounded and de-duplicated', () => {
+  let topics = []
+  for (let index = 0; index < 12; index++) topics = appendSessionTopic(topics, `task ${index}`)
+  assert.equal(topics.length, 8)
+  assert.deepEqual(topics.slice(-2), ['task 10', 'task 11'])
+  // Re-stating the current topic refreshes it instead of repeating it.
+  assert.deepEqual(appendSessionTopic(['alpha', 'beta'], 'alpha'), ['beta', 'alpha'])
+  // Empties are never recorded, and a long topic is clipped at a word boundary.
+  assert.deepEqual(appendSessionTopic(['alpha'], '   '), ['alpha'])
+  const clipped = deriveSessionTopic([user('x'.repeat(400))])
+  assert.ok(clipped.length <= 121 && clipped.endsWith('…'), clipped.length)
+})
+
+test('a peer in an older build still reads, because topics are optional', async () => {
+  const { gatewayPeerSchema } = await import('../src/utils/gatewaySessionProtocol.ts')
+  // Registrations written before topics existed must stay live: a schema that
+  // rejected them would drop every peer running the previous build.
+  const legacy = {
+    protocol: 1, sessionId: '11111111-1111-4111-8111-111111111111',
+    runtimeId: '22222222-2222-4222-8222-222222222222', name: 'Claude Code',
+    cwd: 'C:/w', purpose: '', pid: 1, endpoint: '\\\\.\\pipe\\gateway-x',
+    status: 'idle', startedAt: new Date().toISOString(),
+  }
+  assert.doesNotThrow(() => gatewayPeerSchema.parse(legacy))
+  assert.equal(formatGatewayPeerLine(gatewayPeerSchema.parse(legacy)).includes('recent:'), false)
+})
 
 test('session intent comes from the opening request, not the truncated display name', () => {
   assert.equal(
@@ -61,7 +128,7 @@ test('discovery lines lead with what a session is doing', () => {
 
 test('every session records an intent on registration', async () => {
   const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
-  assert.match(hook, /import \{ deriveSessionPurpose \} from '\.\.\/utils\/gatewaySessionProtocol\.js'/)
+  assert.match(hook, /import \{[^}]*deriveSessionPurpose[^}]*\} from '\.\.\/utils\/gatewaySessionProtocol\.js'/)
   // Seeded at start; the name/status refresh must never clobber a declaration.
   assert.match(hook, /const purpose = runtime\.transport\.peer\.purpose\.trim\(\) \? runtime\.transport\.peer\.purpose : sessionPurposeSeed\(sessionMessages, name\)/)
   assert.match(hook, /await runtime\.transport\.update\(\{ name: latest\.current\.name, status:[^}]*purpose \}\)/)

@@ -44,11 +44,19 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
     return registerLeafContextNotify(async (id, text) => {
       const { createUserMessage } = await import('../utils/messages.js')
       const source = (await import('../utils/leafWorkspace.js')).getLeafViews().find(view => view.member.sessionId === id)
-      const content = `Message from Leaf ${source?.member.number ?? '?'}: ${source?.member.name ?? id} (${id}). The leaf runs its own conversation; this is a report it chose to send, not a transcript merge or permission grant.\n\n${text}`
+      // Marked like the down-path, so the family is recognisable from the text
+      // alone: a leaf's report reaching the root's transcript must not read as
+      // something the person typed either.
+      const content = `${PEER_PROMPT_PREFIX}Message from Leaf ${source?.member.number ?? '?'}: ${source?.member.name ?? id} (${id}). The leaf runs its own conversation; this is a report it chose to send, not a transcript merge or permission grant.\n\n${text}`
       // A busy root takes a leaf's message the same way it takes a peer's: the
       // message is queued and the root's own turn drains it at its next step
       // boundary. Appending to state here would leave it unread until the turn
       // ended, which is precisely the "waits for the whole turn" behaviour.
+      //
+      // The bus origin is shared by both wires, so the marker on the text is what
+      // separates them: bus traffic is recognised by its header and held for the
+      // peer Stop hook, while this leaf-marked turn drains at the root's next
+      // step boundary as a leaf's report always has.
       if (latest.current.status === 'busy') {
         enqueue({
           value: content,

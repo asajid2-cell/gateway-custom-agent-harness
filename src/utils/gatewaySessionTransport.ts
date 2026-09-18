@@ -372,6 +372,27 @@ export class GatewaySessionTransport {
 
   inbox(): readonly GatewayInboxRecord[] { return structuredClone(this.records) }
 
+  /**
+   * Inbound requests this session has not answered yet.
+   *
+   * The defect this closes: a message could be read and understood, and then
+   * simply never answered, with nothing anywhere recording that a reply was
+   * owed. A request that arrived with `replyTo` set is itself a reply and owes
+   * nothing, so it is excluded - this exists to surface the first turn of a
+   * conversation, not to make two agents acknowledge each other forever.
+   */
+  outstandingReplies(): readonly { toMessageId: string; toSessionId: string; summary: string; receivedAt: string }[] {
+    const answered = new Set(this.history.filter(entry => entry.direction === 'sent').map(entry => entry.message.replyTo).filter(Boolean) as string[])
+    return this.records
+      .filter(record => record.message.replyTo === undefined && !answered.has(record.message.id))
+      .map(record => ({
+        toMessageId: record.message.id,
+        toSessionId: record.message.fromSessionId,
+        summary: record.message.summary,
+        receivedAt: record.receivedAt,
+      }))
+  }
+
   async send(toSessionId: string, text: string, summary: string, replyTo?: string): Promise<unknown> {
     const target = await readRegistration(this.options.directory, toSessionId)
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
@@ -452,7 +473,7 @@ export class GatewaySessionTransport {
     })
   }
 
-  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status'>>): Promise<void> {
+  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics'>>): Promise<void> {
     const subscribers = await this.serial(async () => {
       const next = gatewayPeerSchema.parse({ ...this.peer, ...values })
       await atomicJson(this.registrationPath, { peer: next, token: this.token })
