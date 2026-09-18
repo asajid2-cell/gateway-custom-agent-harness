@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "owner": "gateway-maintainers",
+  "rationale": "This manifest is a protected quality artifact, not scanner configuration. It declares which files are first-class runtime code for the integrity analyzer. It must cover the bundled CLI entry graph, the harness runtime used by cc.cmd/cc.ps1, build tooling, and the quality tooling itself. Widening, narrowing, or exempting a root here is a policy change: it is hashed into policyDigest and invalidates accepted baselines.",
+  "extensions": [".ts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"],
+  "roots": [
+    {
+      "path": "src",
+      "kind": "product-runtime",
+      "owner": "gateway-maintainers",
+      "proof": "Bundled into dist/cli.js from src/entrypoints/cli.tsx by scripts/build.ts (bun build --root=src/entrypoints)."
+    },
+    {
+      "path": "scripts",
+      "kind": "harness-runtime",
+      "owner": "gateway-maintainers",
+      "proof": "Invoked by package.json scripts and by the cc.cmd -> cc.ps1 -> gateway-supervisor.mjs -> model-gateway.mjs chain."
+    }
+  ],
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "scripts/quality/fixtures/**"
+  ]
+}
