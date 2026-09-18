@@ -27,13 +27,30 @@ export type GatewayPeerSendResult = {
 export async function resolveGatewayPeer(
   address: string,
 ): Promise<{ sessionId: string; label: string } | { error: string }> {
-  const directory = join(getClaudeConfigHomeDir(), 'gateway-sessions')
-  if (SESSION_ID_PATTERN.test(address)) return { sessionId: address, label: address }
   let peers
   try {
+    const directory = join(getClaudeConfigHomeDir(), 'gateway-sessions')
     peers = await listGatewayPeers(directory)
   } catch {
     return { error: 'Could not read the live session registry.' }
+  }
+  // A session ID is exact, but exact is not the same as live. Registration
+  // files outlive the sessions that wrote them - most of the ones on this
+  // machine ping dead - so addressing one by ID used to sail past discovery and
+  // fail later as an ambiguous transport error. Discovery has already pinged
+  // every candidate, so checking membership costs nothing extra.
+  //
+  // Only a conclusive live set can prove an ID dead. An empty set means the
+  // registry could not be consulted (no directory, failed directory check), and
+  // refusing on that would make addressing by ID as unreliable as addressing by
+  // name - so an empty set defers to the transport, which reports the missing
+  // session in its own words.
+  if (SESSION_ID_PATTERN.test(address)) {
+    if (peers.length === 0 || peers.some(peer => peer.sessionId === address)) return { sessionId: address, label: address }
+    const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
+    return {
+      error: `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk. Live sessions: ${available.join(', ')}. Use /sessions list.`,
+    }
   }
   const matches = peers.filter(peer => peer.name === address)
   if (matches.length === 1) {

@@ -81,10 +81,22 @@ export async function callGatewayPeer(endpoint: string, request: unknown): Promi
   return new Promise((resolve, reject) => {
     const socket = createConnection(endpoint)
     let response = Buffer.alloc(0)
-    const fail = () => { socket.destroy(); reject(new Error('Gateway session is unavailable')) }
+    // Whether the request frame ever left this process. A registration file
+    // outlives the session that wrote it, so the common way a peer looks
+    // reachable and is not is a stale registration whose endpoint no longer
+    // exists; connecting to one fails with ENOENT. That is a definite failure
+    // and must not be reported the same way as a lost acknowledgement, where
+    // the peer did receive the request and only the reply went missing.
+    let connected = false
+    const fail = () => {
+      socket.destroy()
+      const error = new Error('Gateway session is unavailable') as Error & { peerConnected?: boolean }
+      error.peerConnected = connected
+      reject(error)
+    }
     socket.setTimeout(RESPONSE_TIMEOUT_MS, fail)
     socket.on('error', fail)
-    socket.on('connect', () => socket.write(frame))
+    socket.on('connect', () => { connected = true; socket.write(frame) })
     socket.on('data', chunk => {
       response = Buffer.concat([response, chunk])
       if (response.length > MAX_FRAME) return fail()
@@ -410,7 +422,22 @@ export class GatewaySessionTransport {
     try {
       receipt = await callGatewayPeer(target.peer.endpoint, { type: 'message', token: target.token, senderToken: this.token, message })
       if (receipt?.ok !== false && (receipt?.ok !== true || receipt.id !== message.id || !['held', 'queued', 'delivered', 'refused'].includes(receipt.state))) throw new Error('Invalid receipt')
-    } catch {
+    } catch (error) {
+      // Never connected: the peer is gone, and the request was not handed over.
+      // Saying so is what makes a dead peer cheap to discover - otherwise the
+      // caller is told to check a receipt for a session that cannot have one,
+      // and reads the failure as a transport bug rather than an exited peer.
+      if ((error as { peerConnected?: boolean }).peerConnected === false) {
+        await this.serial(async () => {
+          const history = this.history.map(entry => entry.direction === 'sent' && entry.message.id === message.id ? { ...entry, status: 'failed' as const, error: 'Peer is not reachable' } : entry)
+          await this.persist(this.records, this.policy, history)
+          this.history = history
+        }).catch(() => {})
+        return {
+          ok: false, state: 'failed', id: message.id,
+          reason: `Session ${toSessionId} is not reachable: its registration is on disk but nothing is listening. That session has exited or crashed without deregistering. Do not retry it; use /sessions list for peers that are live.`,
+        }
+      }
       return { ok: false, state: 'unknown', id: message.id, reason: 'Delivery acknowledgement unavailable. Check receipt before taking further action; do not send a new copy.' }
     }
     let historySaved = true
