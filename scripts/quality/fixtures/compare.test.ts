@@ -220,6 +220,62 @@ describe('gate fails closed', () => {
     }
   });
 
+  test('a baseline from a different pinned instrument is INCOMPLETE', () => {
+    const tree = createFixtureTree();
+    try {
+      // The pin moved, the code did not. This check exists because
+      // `toolchainDigest` was computed, stored on every run record and every
+      // baseline, and read by NO decision: an external resolver pinned in its own
+      // project (`.quality/tools`, outside the walk that produces
+      // `measurementDigest`) could be swapped for a newer one and every check the
+      // gate made would still agree, while the numbers on both sides came from
+      // different programs. A newer resolver can add or drop findings on an
+      // unchanged tree, so this must refuse rather than compare.
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline: baselineOf(tree.root, [finding()]),
+        result: result([finding()]),
+        candidateAtStart: candidate({ toolchainDigest: 'toolchain-2' }),
+        candidateAtFinish: candidate({ toolchainDigest: 'toolchain-2' }),
+        repoRoot: tree.root,
+      });
+      expect(gate.decision).toBe('INCOMPLETE');
+      expect(gate.incompleteReasons.join(' ')).toContain('pinned instrument');
+      // The reason must name the direction, not just the fact: "re-record" and
+      // "the code changed" are indistinguishable from a findings count alone.
+      expect(gate.incompleteReasons.join(' ')).toContain('quality migrate');
+      expect(gate.incompleteReasons.join(' ')).toContain('not a finding about the code');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('an instrument-less baseline is not blocked by the instrument check', () => {
+    const tree = createFixtureTree();
+    try {
+      // Baselines written before instrument tracking existed have no digest to
+      // compare. Same reasoning as the epoch-less case above: inventing a value
+      // would compare equal and silently skip, so absence reads as unknown and
+      // the migration report is what forces the deliberate re-record.
+      const baseline = baselineOf(tree.root, [finding()]);
+      delete (baseline as { toolchainDigest?: string }).toolchainDigest;
+
+      const gate = compare({
+        analyzer: 'source-integrity',
+        profile: 'research',
+        baseline,
+        result: result([finding()]),
+        candidateAtStart: candidate({ toolchainDigest: 'toolchain-2' }),
+        candidateAtFinish: candidate({ toolchainDigest: 'toolchain-2' }),
+        repoRoot: tree.root,
+      });
+      expect(gate.decision).toBe('PASS');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
   test('an epoch-less baseline is not blocked by the measurement check', () => {
     const tree = createFixtureTree();
     try {

@@ -17,23 +17,57 @@ const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.mjs', '.js', '.jsx', '.cjs'];
 export interface AliasConfig {
   baseUrl: string;
   paths: Record<string, string[]>;
+  /**
+   * True when tsconfig.json exists but could not be read as JSON.
+   *
+   * Distinguished from `paths: {}` because the two mean opposite things: an empty
+   * map is a claim that this repository declares no aliases, while `unreadable`
+   * is a statement that aliases are UNKNOWN. Collapsing them is what let a broken
+   * stripper look like a repository without aliases for as long as it did.
+   */
+  unreadable?: boolean;
 }
 
 export function loadAliasConfig(repoRoot: string): AliasConfig {
   const raw = readText(join(repoRoot, 'tsconfig.json'));
   if (raw === null) return { baseUrl: '.', paths: {} };
 
-  try {
-    const parsed = JSON.parse(stripJsonComments(raw)) as {
-      compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> };
-    };
-    return {
-      baseUrl: parsed.compilerOptions?.baseUrl ?? '.',
-      paths: parsed.compilerOptions?.paths ?? {},
-    };
-  } catch {
-    return { baseUrl: '.', paths: {} };
+  // Parse the file as it is written before reaching for the comment stripper.
+  //
+  // This order is load-bearing, and getting it backwards cost 222 dependency
+  // edges their analysis. `stripJsonComments` removes `/* ... */` with a regex,
+  // and a regex cannot tell a comment from a string literal. This repository's
+  // tsconfig is valid JSON containing `"src/*": ["./src/*"]`, and its `include`
+  // array contains `"src/**/*.ts"`. The `/*` opening the alias matched and the
+  // `*/` inside `**/` closed, so the stripper deleted ~100 characters of
+  // perfectly good configuration, `JSON.parse` threw, and the `catch` returned
+  // an EMPTY alias map.
+  //
+  // The consequence was not cosmetic. Every `src/...` specifier - 222 of them,
+  // 118 in `src/cli/print.ts` alone - then resolved as `external`, which the
+  // integrity analyzer reports as INT-007 at severity `info`, which is a PASS.
+  // A hundred-odd intra-repository edges were passing unexamined, in a baseline
+  // that said the repository had been measured.
+  //
+  // So: valid JSON is never handed to the stripper, and the stripper is only
+  // reached for the JSON5-style tsconfig that actually needs it.
+  const attempts = [raw, stripJsonComments(raw)];
+  for (const attempt of attempts) {
+    try {
+      const parsed = JSON.parse(attempt) as {
+        compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> };
+      };
+      return {
+        baseUrl: parsed.compilerOptions?.baseUrl ?? '.',
+        paths: parsed.compilerOptions?.paths ?? {},
+      };
+    } catch {
+      // Try the next form. A failure on the last form is reported below rather
+      // than swallowed, because an unreadable tsconfig means aliases are unknown
+      // - and treating "unknown" as "no aliases" is the bug this function had.
+    }
   }
+  return { baseUrl: '.', paths: {}, unreadable: true };
 }
 
 function stripJsonComments(input: string): string {

@@ -63,7 +63,23 @@ export type SourceCapability =
    * files ineligible by accident - the exact silent scope narrowing this role
    * model exists to prevent.
    */
-  | 'import-integrity';
+  | 'import-integrity'
+  /**
+   * Something must reach the file, its exports and its declared dependencies.
+   *
+   * The only capability that is a statement about a file's ABSENCE of callers
+   * rather than about its contents, which is why it cannot be granted to every
+   * role. Two roles must not have it:
+   *
+   *  - `declarations` (`globals.d.ts`): ambient declarations exist to be
+   *    referenced by name from anywhere, so by construction nothing imports
+   *    them. Granting this there would report the whole file as dead code.
+   *  - `quality-fixture`: those trees hold deliberately unreferenced constructs -
+   *    planted clones, unresolved specifiers - because that is what makes them
+   *    fixtures. A reachability walk would report the test data as dead, and the
+   *    analyzer's own findings would then be what makes its fixtures fail.
+   */
+  | 'unused-structure';
 
 export interface SourceRole {
   name: string;

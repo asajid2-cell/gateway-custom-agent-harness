@@ -56,6 +56,14 @@ const SKIP = new Set([
   '.quality',
   '.claude',
   '.agent',
+  // `.candidate-build` is a build artifact: a whole COPY of this repository,
+  // produced by the acceptance build and gitignored. Not skipping it meant every
+  // sandbox contained two repositories - measured here at 8,800 files and 139 MB
+  // of the 1,700-file working tree, copied once per sandbox - and the analyzers
+  // were then run in a tree that is not the candidate. That is the same defect the
+  // unused-structure analyzer guards against by excluding the path from its own
+  // walk, and it belongs at the copy, where it costs nothing to avoid.
+  '.candidate-build',
 ]);
 
 interface Sandbox {

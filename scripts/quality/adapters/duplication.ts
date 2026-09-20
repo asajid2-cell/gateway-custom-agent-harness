@@ -73,6 +73,13 @@ import type { Analyzer, AnalyzerContext } from '../lib/registry';
 import { ensureDir, isFile } from '../lib/fsutil';
 import { parseJsonReport, runTool } from '../lib/toolrun';
 import {
+  probeToolVersion,
+  resolveToolHome,
+  toolEntrypointExists,
+  TOOL_HOME,
+  type PinnedTool,
+} from '../lib/toolHome';
+import {
   familiesFromPairs,
   membersKey,
   type CloneFamily,
@@ -129,8 +136,10 @@ const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
 /**
  * The clone detector's version, pinned in the source.
  *
- * See the invocation in `runJscpd` for why an unpinned `bun x jscpd` would let
- * the detector change under an unchanged `toolchainDigest`.
+ * Kept here as well as in the tool home for the reason the architecture adapter
+ * records: the pin in `.quality/tools/package.json` is what the instrument
+ * actually resolves to, and this constant is what the adapter VERIFIES it
+ * resolved to. A single pin could only be checked against itself.
  */
 export const JSCPD_VERSION = '5.3.0';
 
@@ -353,7 +362,7 @@ function run(context: AnalyzerContext): AnalyzerResult {
     };
   }
 
-  const report = runJscpd(context, parsable, limits);
+  const report = runJscpd(context, parsable, limits, notes);
   if (!report.ok) {
     return {
       analyzer: DUPLICATION_ANALYZER,
@@ -561,11 +570,61 @@ function sizeOf(absolutePath: string): number {
   }
 }
 
+/**
+ * The clone detector as this engine installs it.
+ *
+ * `node_modules/jscpd/run-jscpd.js` rather than a `bun x` invocation, for the
+ * three measured defects recorded on `lib/toolHome.ts`. The one that bites here
+ * is the third: `bun x jscpd@5.3.0` pins jscpd's own version and nothing else, so
+ * the detector's tokenizer and its transitive graph came from whatever a package
+ * cache held. Two runs of the same command on two machines could therefore
+ * disagree about the same file, and `toolchainDigest` would be identical for both
+ * - which is the definition of an unreproducible ruler.
+ */
+export const JSCPD_TOOL: PinnedTool = {
+  package: 'jscpd',
+  entrypoint: 'node_modules/jscpd/run-jscpd.js',
+  version: JSCPD_VERSION,
+};
+
 function runJscpd(
   context: AnalyzerContext,
   files: string[],
-  limits: DuplicationLimits
+  limits: DuplicationLimits,
+  notes: string[]
 ): { ok: true; duplicates: JscpdDuplicate[] } | { ok: false; reason: string } {
+  const home = resolveToolHome(context.repoRoot, JSCPD_TOOL);
+  if (!toolEntrypointExists(home)) {
+    return {
+      ok: false,
+      reason:
+        `the pinned clone detector is absent at ${home.entrypoint}. It is not ` +
+        'installed from the repository dependency graph on purpose, so run ' +
+        '`bun install` inside ' +
+        `${TOOL_HOME} - and do NOT fall back to \`bun x\`, whose resolution is ` +
+        'not represented by any lockfile and therefore not comparable',
+    };
+  }
+
+  // A pin written in source is a claim. This makes it a fact: without it, a tool
+  // home left on an older install would be measured under the new pin's
+  // identity - a reproducible ruler that is merely a documented one.
+  const probe = probeToolVersion(context.repoRoot, home);
+  if (probe.observed !== JSCPD_TOOL.version) {
+    return {
+      ok: false,
+      reason:
+        `pinned jscpd ${JSCPD_TOOL.version} but the installed tool reports ` +
+        `${probe.observed === '' ? '(nothing)' : JSON.stringify(probe.observed)}` +
+        (probe.failure === null ? '' : ` - ${probe.failure}`),
+    };
+  }
+  // Returned to the caller rather than pushed onto `context.notes`: this adapter
+  // builds its OWN notes array, and `context.notes` is not the one that reaches
+  // the run record. Pushing there would have recorded the verification nowhere -
+  // which is the failure mode this whole change exists to close, one level up.
+  notes.push(`clone detector: jscpd@${probe.observed} (verified) at ${home.home}`);
+
   const outDir = join(context.cacheDir, 'jscpd');
   ensureDir(outDir);
   const reportPath = join(outDir, 'jscpd-report.json');
@@ -614,19 +673,12 @@ function runJscpd(
   if (existsSync(reportPath)) rmSync(reportPath, { force: true });
 
   const outcome = runTool({
-    command: 'bun',
-    // The version is PINNED, and it is pinned HERE, in the analyzer's own source,
-    // for a reason that is about the identity model rather than about hygiene.
-    // `toolchainDigest` covers `package.json` and the lockfiles, and this tool is
-    // in neither: it is fetched by `bun x` and resolved from whatever is cached,
-    // so the detector version could change under a digest that did not move - a
-    // measurement taken by a different ruler and reported as comparable. The
-    // adapter source IS covered, by `measurementDigest` (which hashes the whole
-    // `scripts/quality` tree), so a pin written here moves the digest and shows
-    // up in `migrate` as a measurement change. A floating `jscpd` would not.
-    //
-    // Version 5.3.0 is what every measurement recorded so far was taken with.
-    args: ['x', `jscpd@${JSCPD_VERSION}`, '-c', configPath],
+    command: process.execPath,
+    // Resolved through the tool home, so the detector and its whole transitive
+    // graph are what the lockfile records. The version is verified above rather
+    // than asserted by this argument: `jscpd@5.3.0` in a `bun x` argument was the
+    // old form and it pinned one package while leaving the graph floating.
+    args: [home.entrypoint, '-c', configPath],
     cwd: context.repoRoot,
     // 0 is the only success: jscpd does not use a non-zero code for "found
     // clones", so any non-zero exit is a failure to run, not a finding. Measured:

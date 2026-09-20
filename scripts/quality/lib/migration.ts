@@ -114,11 +114,18 @@ export function measureMigration(opts: MigrationOptions): MeasurementMigration {
   }
 
   const scopeChanged = scopeMoved(baseline, result);
+  // A baseline that predates the field cannot be compared on it. Reported as
+  // unchanged rather than as changed, because "we never recorded it" and "it is
+  // different" are different facts and only the second is a reason to re-record.
+  const instrumentChanged =
+    baseline.toolchainDigest !== undefined &&
+    baseline.toolchainDigest !== opts.candidate.toolchainDigest;
 
   return {
     analyzer: opts.analyzer,
     from: {
       measurementDigest: recordedEpoch,
+      toolchainDigest: baseline.toolchainDigest ?? null,
       policyDigest: baseline.policyDigest,
       recordedAt: baseline.createdAt,
       recordedFindings: Object.keys(baseline.findings).length,
@@ -126,6 +133,7 @@ export function measureMigration(opts: MigrationOptions): MeasurementMigration {
     },
     to: {
       measurementDigest: opts.candidate.measurementDigest,
+      toolchainDigest: opts.candidate.toolchainDigest,
       policyDigest: opts.candidate.policyDigest,
       // The same filtered quantity the baseline records, not the raw finding
       // count. Reporting `result.findings.length` here would put ~14,500
@@ -141,15 +149,31 @@ export function measureMigration(opts: MigrationOptions): MeasurementMigration {
     stableCount,
     scopeChanged,
     unknownEpoch,
-    // Ordered by what a reviewer must do about it. An unknown epoch cannot be
-    // compared at all; a moved scope makes every count incomparable; only then
-    // is the comparison itself worth reading.
-    verdict: unknownEpoch
-      ? 'unknown-epoch'
-      : scopeChanged
-        ? 'scope-moved'
-        : 'comparable',
+    instrumentChanged,
+    verdict: verdictOf({ unknownEpoch, scopeChanged, instrumentChanged }),
   };
+}
+
+/**
+ * Ordered by what a reviewer must do about it. An unknown epoch cannot be
+ * compared at all; a moved scope makes every count incomparable; a changed
+ * instrument means the numbers came from a different program; only then is the
+ * comparison itself worth reading.
+ *
+ * Written as an if-chain rather than a nested conditional so that the precedence
+ * is readable as the precedence. As a ternary the order lived in the shape of
+ * the expression, which is also why adding one more state turned it into a
+ * nesting-depth finding rather than a one-line edit.
+ */
+function verdictOf(state: {
+  unknownEpoch: boolean;
+  scopeChanged: boolean;
+  instrumentChanged: boolean;
+}): MeasurementMigration['verdict'] {
+  if (state.unknownEpoch) return 'unknown-epoch';
+  if (state.scopeChanged) return 'scope-moved';
+  if (state.instrumentChanged) return 'instrument-changed';
+  return 'comparable';
 }
 
 /**
@@ -195,6 +219,17 @@ export function renderMigration(migration: MeasurementMigration): string {
   );
   lines.push(
     `  measured under   : ${migration.to.measurementDigest.slice(0, 12)}`
+  );
+  // Named as its own line rather than folded into the two above, because a
+  // changed instrument and a changed measurement call for different actions and
+  // a reader who sees one digest line will assume both moved together.
+  lines.push(
+    `  instrument       : ${
+      migration.from.toolchainDigest === null
+        ? 'unknown (baseline predates instrument tracking)'
+        : migration.from.toolchainDigest.slice(0, 12)
+    } -> ${migration.to.toolchainDigest.slice(0, 12)}` +
+      (migration.instrumentChanged ? '   CHANGED' : '')
   );
   lines.push(
     `  recorded findings: ${migration.from.recordedFindings} -> measured ${migration.to.measuredFindings}`

@@ -107,33 +107,9 @@ export function compare(opts: CompareOptions): GateResult {
     incompleteReasons.push('analyzer scanned zero files');
   }
 
-  if (opts.baseline === null) {
-    incompleteReasons.push(
-      `no accepted baseline for analyzer "${opts.analyzer}"; nothing can be ` +
-        'authorized until one is proposed and reviewed'
-    );
-  } else if (opts.baseline.policyDigest !== opts.candidateAtStart.policyDigest) {
-    incompleteReasons.push(
-      'baseline was produced under a different policy digest; what counts as ' +
-        'tolerable has changed since it was accepted'
-    );
-  } else if (
-    // A different observation system means the baseline's numbers describe a
-    // different measurement, so comparing them would report every difference
-    // between two rulers as a difference in the code. Blocked here rather than
-    // guessed at; `quality migrate <analyzer>` produces the old-vs-new report
-    // a reviewer needs before re-recording.
-    opts.baseline.measurementDigest !== undefined &&
-    opts.baseline.measurementDigest !== opts.candidateAtStart.measurementDigest
-  ) {
-    incompleteReasons.push(
-      'baseline was recorded by a different measurement system (the analyzer or ' +
-        'engine implementation changed since it was accepted); the two sets of ' +
-        'numbers are not comparable. Run `quality migrate ' +
-        `${opts.analyzer}\` to see what the new system adds, removes and changes, ` +
-        'then re-record deliberately'
-    );
-  }
+  incompleteReasons.push(
+    ...epochReasons(opts.analyzer, opts.baseline, opts.candidateAtStart)
+  );
 
   if (incompleteReasons.length > 0) {
     return emptyResult(opts, incompleteReasons);
@@ -351,6 +327,82 @@ export function compare(opts: CompareOptions): GateResult {
     coverage: opts.result.coverage,
     completeness: completenessOf(opts.result),
   };
+}
+
+/**
+ * Whether the baseline and the candidate were measured under the same epoch.
+ *
+ * Three questions, checked in this order because the FIRST one that fails is the
+ * one a reviewer has to act on, and reporting all three at once would bury the
+ * earliest cause under two consequences of it:
+ *
+ *  1. Is there a baseline at all?
+ *  2. Was it recorded under the same POLICY? (what counts as tolerable)
+ *  3. Was it recorded by the same MEASUREMENT SYSTEM? (the analyzer's own code)
+ *  4. Was it recorded with the same INSTRUMENT? (the pinned external tool)
+ *
+ * 3 and 4 are separate because they are covered by separate digests and fail for
+ * separate reasons. `measurementDigest` hashes the analyzer's implementation
+ * under `scripts/quality`; the pinned external resolver lives in `.quality/tools`
+ * with its own lockfile, so a moved tool pin changes `toolchainDigest` and
+ * NOTHING else. Until the fourth check existed, `toolchainDigest` was computed
+ * and stored on every run and read by no decision - a moved pin re-scored the
+ * whole tree under a different resolver while every check the gate made still
+ * agreed, which is the exact silent-ruler-change the digest was built to prevent.
+ *
+ * Extracted from `compare` so the gate body states the decision rather than the
+ * six branches that establish whether a decision is even possible. The order is
+ * preserved exactly: this is a chain of `else if`s, so a baseline that fails the
+ * policy check reports the policy problem and not the two that follow from it.
+ */
+function epochReasons(
+  analyzer: string,
+  baseline: Baseline | null,
+  candidate: CandidateIdentity
+): string[] {
+  if (baseline === null) {
+    return [
+      `no accepted baseline for analyzer "${analyzer}"; nothing can be ` +
+        'authorized until one is proposed and reviewed',
+    ];
+  }
+  if (baseline.policyDigest !== candidate.policyDigest) {
+    return [
+      'baseline was produced under a different policy digest; what counts as ' +
+        'tolerable has changed since it was accepted',
+    ];
+  }
+  // A different observation system means the baseline's numbers describe a
+  // different measurement, so comparing them would report every difference
+  // between two rulers as a difference in the code. Blocked here rather than
+  // guessed at; `quality migrate <analyzer>` produces the old-vs-new report
+  // a reviewer needs before re-recording.
+  if (
+    baseline.measurementDigest !== undefined &&
+    baseline.measurementDigest !== candidate.measurementDigest
+  ) {
+    return [
+      'baseline was recorded by a different measurement system (the analyzer or ' +
+        'engine implementation changed since it was accepted); the two sets of ' +
+        'numbers are not comparable. Run `quality migrate ' +
+        `${analyzer}\` to see what the new system adds, removes and changes, ` +
+        'then re-record deliberately',
+    ];
+  }
+  if (
+    baseline.toolchainDigest !== undefined &&
+    baseline.toolchainDigest !== candidate.toolchainDigest
+  ) {
+    return [
+      'baseline was recorded with a different pinned instrument (an analyzer ' +
+        'toolchain input changed since it was accepted - a lockfile or a tool ' +
+        'pin). A newer resolver can add or drop findings on an unchanged tree, so ' +
+        'the two sets of numbers are not comparable and this is not a finding ' +
+        `about the code. Run \`quality migrate ${analyzer}\` to see the ` +
+        'old-vs-new report, then re-record deliberately',
+    ];
+  }
+  return [];
 }
 
 /**

@@ -10,6 +10,8 @@ import type {
 } from './types';
 import { readText, writeJson } from './fsutil';
 import { fileDigest } from './hash';
+import { attributeSubject, type Attribution } from './ownership';
+import type { SourceUniverse } from './sourceUniverse';
 
 export function baselinesDir(repoRoot: string): string {
   return join(repoRoot, '.quality', 'baselines');
@@ -61,6 +63,15 @@ export interface BaselineProposalOptions {
   acceptedBy: string;
   owner?: string | null;
   expiresAt?: string | null;
+  /**
+   * The universe that decides inherited ownership.
+   *
+   * Optional so that a caller which has no universe to hand (fixtures that test
+   * the proposal arithmetic alone) still works. When absent, ownership falls back
+   * to the explicit `owner` option and is marked `explicit` rather than silently
+   * claiming inheritance that never happened.
+   */
+  universe?: SourceUniverse;
 }
 
 export interface BaselineProposal {
@@ -104,12 +115,51 @@ export function proposeBaseline(
     (finding) => finding.status === 'pass' && !finding.debt
   );
 
-  const acceptance: Acceptance = {
-    reason: options.reason,
-    acceptedBy: options.acceptedBy,
-    acceptedAt: new Date().toISOString(),
-    owner: options.owner ?? null,
-    expiresAt: options.expiresAt ?? null,
+  // Ownership is derived PER FINDING from the subject's role, not stamped once
+  // for the whole baseline. A single `owner` on the proposal was how 8,001
+  // entries across three baselines came to have `owner: null`: it is one optional
+  // command-line flag, so it is absent unless someone remembers it, and the
+  // absence is per-baseline rather than per-finding with no way to see which
+  // entries could have been attributed and which could not.
+  //
+  // An explicit `owner` option still wins where it is given - a reviewer who
+  // names an accountable team for a specific acceptance has made a decision, and
+  // deriving over it would discard that - and it is recorded as `explicit` so the
+  // two provenances are distinguishable.
+  const attributionFor = (finding: Finding): Acceptance => {
+    let attribution: Attribution;
+    if (options.universe === undefined) {
+      attribution = {
+        owner: options.owner ?? null,
+        source: options.owner === undefined || options.owner === null ? 'unattributable' : 'explicit',
+        role: null,
+        reason:
+          options.owner === undefined || options.owner === null
+            ? 'no source universe was available to this proposal, so no owner ' +
+              'could be inherited and none was named explicitly'
+            : 'named explicitly by the caller, not inherited from a role',
+      };
+    } else if (options.owner !== undefined && options.owner !== null) {
+      attribution = {
+        owner: options.owner,
+        source: 'explicit',
+        role: options.universe.roleOf(finding.subject),
+        reason: 'named explicitly by the caller, not inherited from a role',
+      };
+    } else {
+      attribution = attributeSubject(options.universe, finding.subject);
+    }
+
+    return {
+      reason: options.reason,
+      acceptedBy: options.acceptedBy,
+      acceptedAt: new Date().toISOString(),
+      owner: attribution.owner,
+      ownerSource: attribution.source,
+      ownerRole: attribution.role,
+      ownerReason: attribution.reason,
+      expiresAt: options.expiresAt ?? null,
+    };
   };
 
   // Only tolerated and failing findings belong in a ratchet. Recording tens of
@@ -117,7 +167,11 @@ export function proposeBaseline(
   // ordinary file move into thousands of "new findings".
   const findings: Record<string, BaselineFinding> = {};
   for (const finding of [...debt, ...grandfathered]) {
-    findings[finding.id] = toBaselineFinding(repoRoot, finding, acceptance);
+    findings[finding.id] = toBaselineFinding(
+      repoRoot,
+      finding,
+      attributionFor(finding)
+    );
   }
 
   return {
@@ -129,6 +183,13 @@ export function proposeBaseline(
       // compares against it rather than assuming the old numbers still mean the
       // same thing; see lib/migration.ts.
       measurementDigest: candidate.measurementDigest,
+      // The instrument, one level out from the measurement. `measurementDigest`
+      // covers the analyzer's implementation, which lives in `scripts/quality`;
+      // it cannot cover the pinned external tool, which lives in its own project
+      // with its own lockfile. Without this field a moved tool pin would leave
+      // both digests unchanged and the gate would score the tree under a
+      // different resolver with no epoch change to show for it.
+      toolchainDigest: candidate.toolchainDigest,
       recordedEligible: result.coverage.eligible,
       createdAt: new Date().toISOString(),
       candidate,

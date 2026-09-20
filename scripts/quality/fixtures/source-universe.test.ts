@@ -17,9 +17,11 @@ import { describe, expect, test } from 'bun:test';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { createFixtureTree } from './tree';
-import { loadSourceUniverse } from '../lib/sourceUniverse';
+import { loadSourceUniverse, SOURCE_UNIVERSE_PATH } from '../lib/sourceUniverse';
 import { loadRuntimeRoots } from '../lib/runtimeRoots';
 import { globToRegExp } from '../lib/glob';
+import { policyDigest } from '../lib/identity';
+import { POLICY_INPUTS } from '../lib/hash';
 
 function manifest(tree: ReturnType<typeof createFixtureTree>, body: unknown): void {
   mkdirSync(join(tree.root, '.quality', 'policy'), { recursive: true });
@@ -359,5 +361,57 @@ describe('brace alternation in role globs', () => {
     const match = globToRegExp('scripts/a{b.ts');
     expect(match.test('scripts/a{b.ts')).toBe(true);
     expect(match.test('scripts/ab.ts')).toBe(false);
+  });
+});
+
+/**
+ * The scope manifest is a POLICY INPUT, and this is asserted rather than
+ * described.
+ *
+ * Its own rationale claimed "this file is hashed into policyDigest and
+ * invalidates accepted baselines". Neither was true. It was loaded only by
+ * `cli.ts` and resolved only as an ANALYZER_POLICY_INPUTS entry, and it appeared
+ * in no such list - so rewriting its role table left `policyDigest`
+ * byte-identical. Measured before the fix: changing a role's owner and its
+ * `checks` moved the digest by nothing at all.
+ *
+ * The consequences are worse here than for any other policy file, because this
+ * one decides ELIGIBILITY. Deleting `clones` from a role's `checks` removes an
+ * entire subsystem from the duplication analyzer's scope. Without the file in
+ * POLICY_INPUTS the run reports a smaller scope under an unchanged digest, every
+ * baseline keeps matching, and nothing in any report says that the amount of the
+ * repository being measured just changed.
+ */
+describe('the source-universe manifest is hashed as policy', () => {
+  test('a narrowed role scope moves policyDigest', () => {
+    const tree = createFixtureTree();
+    try {
+      manifest(tree, BASE_MANIFEST);
+      const before = policyDigest(tree.root, []);
+
+      // The exact edit a scope change looks like: one capability removed from one
+      // role. Nothing else about the repository is touched.
+      const narrowed = {
+        ...BASE_MANIFEST,
+        roles: BASE_MANIFEST.roles.map((role) =>
+          role.name === 'production-source'
+            ? { ...role, checks: ['lint', 'import-integrity'] }
+            : role
+        ),
+      };
+      manifest(tree, narrowed);
+
+      expect(policyDigest(tree.root, [])).not.toBe(before);
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('is listed in POLICY_INPUTS by name, so the rule is not incidental', () => {
+    // Membership is asserted separately from observed behaviour: a future edit
+    // that hashes the file through some other path would keep the test above
+    // green while leaving the declared list - the thing a reader consults -
+    // wrong.
+    expect(POLICY_INPUTS).toContain(SOURCE_UNIVERSE_PATH);
   });
 });

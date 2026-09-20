@@ -114,6 +114,8 @@ function oldBaseline(
     eligible?: number | null;
     /** Write the baseline as one predating epoch tracking: no field at all. */
     stripEpoch?: boolean;
+    /** Write the baseline as one predating instrument tracking. */
+    stripInstrument?: boolean;
   } = {}
 ): Baseline {
   const proposal = proposeBaseline(
@@ -123,6 +125,10 @@ function oldBaseline(
     candidate({ measurementDigest: opts.measurementDigest ?? 'measurement-1' }),
     ACCEPTANCE
   ).baseline;
+
+  if (opts.stripInstrument === true) {
+    delete (proposal as { toolchainDigest?: string }).toolchainDigest;
+  }
 
   if (opts.stripEpoch === true) {
     // The shape every baseline written before the field existed actually has.
@@ -223,6 +229,79 @@ describe('migration refuses to be a blank cheque', () => {
 
       expect(migration.verdict).toBe('comparable');
       expect(migrationIsReviewable(migration)).toBe(true);
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a changed instrument is not a measurement change, and is named as its own state', () => {
+    // The failure this pins: the pinned external resolver lives in its own
+    // project (`.quality/tools`) with its own lockfile, so a moved tool pin
+    // changes `toolchainDigest` and NOTHING else - not `measurementDigest`,
+    // which walks only `scripts/quality`, and not `policyDigest`. A newer
+    // resolver can add or drop findings on a byte-identical tree. Without a
+    // verdict for this, the report would print "comparable" and a reviewer would
+    // read a changed instrument as a changed codebase.
+    const tree = createFixtureTree();
+    try {
+      const migration = measureMigration({
+        analyzer: 'source-integrity',
+        baseline: oldBaseline(tree.root, [finding()]),
+        result: result([finding()]),
+        candidate: candidate({
+          measurementDigest: 'measurement-1',
+          toolchainDigest: 'toolchain-2',
+        }),
+      });
+
+      expect(migration.instrumentChanged).toBe(true);
+      expect(migration.scopeChanged).toBe(false);
+      expect(migration.unknownEpoch).toBe(false);
+      expect(migration.verdict).toBe('instrument-changed');
+      expect(migrationIsReviewable(migration)).toBe(false);
+      expect(renderMigration(migration)).toContain('CHANGED');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a baseline predating instrument tracking cannot claim the instrument changed', () => {
+    // "We never recorded it" and "it is different" are different facts, and only
+    // the second is a reason to refuse the comparison.
+    const tree = createFixtureTree();
+    try {
+      const migration = measureMigration({
+        analyzer: 'source-integrity',
+        baseline: oldBaseline(tree.root, [finding()], { stripInstrument: true }),
+        result: result([finding()]),
+        candidate: candidate({ toolchainDigest: 'toolchain-2' }),
+      });
+
+      expect(migration.from.toolchainDigest).toBeNull();
+      expect(migration.instrumentChanged).toBe(false);
+      expect(migration.verdict).toBe('comparable');
+      expect(renderMigration(migration)).toContain('predates instrument tracking');
+    } finally {
+      tree.cleanup();
+    }
+  });
+
+  test('a moved scope outranks a changed instrument', () => {
+    // Both are real, but they demand different next actions: re-scope versus
+    // re-record. The scope is reported because it makes every count
+    // incomparable before the instrument question is even meaningful.
+    const tree = createFixtureTree();
+    try {
+      const migration = measureMigration({
+        analyzer: 'source-integrity',
+        baseline: oldBaseline(tree.root, [finding()], { eligible: 10 }),
+        result: result([finding()], { coverage: coverage({ eligible: 12, scanned: 12 }) }),
+        candidate: candidate({ toolchainDigest: 'toolchain-2' }),
+      });
+
+      expect(migration.instrumentChanged).toBe(true);
+      expect(migration.scopeChanged).toBe(true);
+      expect(migration.verdict).toBe('scope-moved');
     } finally {
       tree.cleanup();
     }

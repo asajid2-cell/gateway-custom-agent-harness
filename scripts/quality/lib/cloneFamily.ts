@@ -46,6 +46,34 @@ import { normalizeAnchor } from './anchor';
  * ---------------------------------------------------------------------------
  *
  * ---------------------------------------------------------------------------
+ * KNOWN IMPRECISION: A PAIR WHOSE TWO REGIONS OVERLAP
+ *
+ * Measured on this repository, 89 of 2,748 duplication findings (3.2%) carry
+ * evidence whose two members are regions of ONE file that overlap - `theme.ts
+ * 5-87` against `6-88`, `readOnlyValidation.ts 559-619` against `589-649`,
+ * `unusedStructure.ts 462-471` against `463-472`. jscpd's token window slides
+ * past the true boundary of a repeated run, so the maximal match it reports
+ * extends beyond the block that actually repeats.
+ *
+ * This is deliberately NOT suppressed, and the reason is the failure mode of
+ * suppressing it. Those findings are not false positives: `readOnlyValidation.ts`
+ * really does hold a `sha1sum` flag table that duplicates its `sha256sum` table,
+ * and that is the only finding the file produces. Dropping a pair whose regions
+ * overlap would delete a true finding to fix its DESCRIPTION, and deleting a true
+ * finding is how debt disappears from the ratchet. Trimming the regions to their
+ * disjoint parts was rejected for the same reason one level down: the shape
+ * fingerprint is taken over the whole reported fragment, so a trimmed region
+ * describes a block whose digest no longer matches the family it is filed under.
+ *
+ * The identity is unaffected either way - `anchor` is the shape digest, and the
+ * regions live in `evidence` precisely because they are a description of where a
+ * family sits, not what it is. So the cost is bounded to a reviewer reading two
+ * region ranges that share lines, and the benefit is that a real duplication is
+ * still reported exactly once. What a reviewer should take from an overlapping
+ * pair is the file and the shape, not the two ranges.
+ * ---------------------------------------------------------------------------
+ *
+ * ---------------------------------------------------------------------------
  * COPY VERSUS MOVE
  *
  * A family whose members changed is not automatically new debt. A file rename or

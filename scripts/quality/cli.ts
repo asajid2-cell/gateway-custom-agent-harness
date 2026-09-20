@@ -31,6 +31,7 @@ import {
   writeBaseline,
   writeProposal,
 } from './lib/baseline';
+import { ownershipDrift, unattributedReasons } from './lib/ownership';
 import { compare } from './lib/compare';
 import { writeRun } from './lib/runStore';
 import {
@@ -332,6 +333,83 @@ async function commandGate(args: ParsedArgs): Promise<number> {
   return EXIT[gate.decision];
 }
 
+/**
+ * `baseline list` - what is currently tolerated, and by whom.
+ *
+ * Its own function because it is the one action that answers a question about
+ * the recorded state rather than about a candidate: it runs no analyzer, reads
+ * no tree, and shares nothing with `propose` or `accept-resolution` beyond the
+ * word "baseline". Leaving it inline made the command that DOES measure
+ * candidates harder to read for no benefit to either path.
+ */
+function listBaselinesCommand(repoRoot: string): number {
+  const baselines = listBaselines(repoRoot);
+  if (baselines.length === 0) {
+    process.stdout.write('no accepted baselines\n');
+    return EXIT.PASS;
+  }
+  // Loaded once, outside the loop: the universe is what ownership is inherited
+  // from, and both the unowned count and the drift check need it.
+  const universe = loadSourceUniverse(repoRoot);
+  let totalUnowned = 0;
+  for (const name of baselines) {
+    const baseline = readBaseline(repoRoot, name);
+    if (baseline === null) continue;
+    const entries = Object.values(baseline.findings);
+    const expiring = expiredWaivers(baseline, new Date()).length;
+    const owners = new Set(
+      entries.map((entry) => entry.acceptance.owner ?? '(unowned)')
+    );
+    const unowned = entries.filter((entry) => entry.acceptance.owner === null);
+    totalUnowned += unowned.length;
+    process.stdout.write(
+      `${name}: ${entries.length} recorded findings\n` +
+        `    schema        : v${baseline.schemaVersion}\n` +
+        `    oldest accept : ${oldestAcceptance(entries) ?? 'unknown'}\n` +
+        `    owners        : ${[...owners].sort().join(', ')}\n` +
+        `    unowned       : ${unowned.length}\n` +
+        `    expired waiver: ${expiring}\n`
+    );
+
+    // Reported per reason, not as a count. "3 unowned" is not actionable;
+    // "3 findings with no file subject" and "3 findings whose role declares no
+    // owner" call for completely different responses.
+    for (const [reason, count] of unattributedReasons(entries)) {
+      process.stdout.write(`      ${count} unowned: ${reason}\n`);
+    }
+
+    const drift = ownershipDrift(
+      universe,
+      Object.entries(baseline.findings).map(([id, entry]) => ({
+        id,
+        subject: entry.subject,
+        acceptance: entry.acceptance,
+      }))
+    );
+    if (drift.length > 0) {
+      const moves = new Map<string, number>();
+      for (const entry of drift) {
+        const key = `${entry.recordedRole ?? '(none)'} -> ${entry.currentRole ?? '(none)'}`;
+        moves.set(key, (moves.get(key) ?? 0) + 1);
+      }
+      process.stdout.write(
+        `    ownership drift: ${drift.length} inherited finding(s) changed hands\n`
+      );
+      for (const [move, count] of [...moves].sort()) {
+        process.stdout.write(`      ${count}  ${move}\n`);
+      }
+    }
+  }
+  if (totalUnowned > 0) {
+    process.stdout.write(
+      `\n  ${totalUnowned} accepted finding(s) across all baselines have no ` +
+        'answerable owner. Accepted debt owned by nobody cannot be paid down by ' +
+        'anyone in particular.\n'
+    );
+  }
+  return EXIT.PASS;
+}
+
 async function commandBaseline(args: ParsedArgs): Promise<number> {
   const action =
     args.options.get('action') ??
@@ -342,28 +420,7 @@ async function commandBaseline(args: ParsedArgs): Promise<number> {
         : 'list');
 
   if (action === 'list') {
-    const baselines = listBaselines(args.repoRoot);
-    if (baselines.length === 0) {
-      process.stdout.write('no accepted baselines\n');
-      return EXIT.PASS;
-    }
-    for (const name of baselines) {
-      const baseline = readBaseline(args.repoRoot, name);
-      if (baseline === null) continue;
-      const entries = Object.values(baseline.findings);
-      const expiring = expiredWaivers(baseline, new Date()).length;
-      const owners = new Set(
-        entries.map((entry) => entry.acceptance.owner ?? '(unowned)')
-      );
-      process.stdout.write(
-        `${name}: ${entries.length} recorded findings\n` +
-          `    schema        : v${baseline.schemaVersion}\n` +
-          `    oldest accept : ${oldestAcceptance(entries) ?? 'unknown'}\n` +
-          `    owners        : ${[...owners].sort().join(', ')}\n` +
-          `    expired waiver: ${expiring}\n`
-      );
-    }
-    return EXIT.PASS;
+    return listBaselinesCommand(args.repoRoot);
   }
 
   if (args.analyzer === null) {
@@ -469,6 +526,10 @@ async function commandBaseline(args: ParsedArgs): Promise<number> {
       acceptedBy: args.options.get('accepted-by') ?? 'unreviewed',
       owner: args.options.get('owner') ?? null,
       expiresAt: args.options.get('expires') ?? null,
+      // Every entry gets an owner derived from the role its subject belongs to,
+      // so no finding is recorded as owned by nobody while a role owns the file
+      // it is about. The universe is what makes that total.
+      universe: loadSourceUniverse(args.repoRoot),
     }
   );
 

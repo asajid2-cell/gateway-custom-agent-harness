@@ -26,14 +26,15 @@
  * execution that found nothing.
  */
 import { describe, expect, setDefaultTimeout, test } from 'bun:test';
-import { rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { rmSync, existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { runAnalyzer } from '../lib/registry';
 import { compare } from '../lib/compare';
 import { proposeBaseline } from '../lib/baseline';
 import { createFixtureTree } from './tree';
 import { loadSourceUniverse } from '../lib/sourceUniverse';
-import { duplicationAnalyzer } from '../adapters/duplication';
+import { JSCPD_TOOL, duplicationAnalyzer } from '../adapters/duplication';
+import { TOOL_HOME_ENV } from '../lib/toolHome';
 import {
   familiesFromPairs,
   familyFingerprint,
@@ -49,8 +50,46 @@ import type {
 } from '../lib/types';
 
 // Every case here either spawns the detector or reads real files; the detector
-// spawn is the slow part and `bun x` resolution makes it variable.
+// spawn is the slow part.
 setDefaultTimeout(300_000);
+
+/**
+ * The repository this fixture lives in - the only place with the tool home.
+ *
+ * The detector is no longer fetched by `bun x`, which resolved from anywhere and
+ * so worked from a temporary tree by accident. It is installed in one place with
+ * a lockfile, and a fixture tree cannot carry a copy of it. Pointing the fixtures
+ * at the real home is what exercises the real invocation path, and it is also the
+ * only way these cases can assert that the detector was VERIFIED rather than
+ * merely present.
+ */
+const REAL_ROOT = resolve(import.meta.dir, '..', '..', '..');
+const REAL_TOOL_HOME = join(REAL_ROOT, '.quality', 'tools');
+
+/** Run `fn` with the tool home pointed at `home`, restoring the previous value. */
+async function withToolHome<T>(home: string, fn: () => T | Promise<T>): Promise<T> {
+  const previous = process.env[TOOL_HOME_ENV];
+  process.env[TOOL_HOME_ENV] = home;
+  try {
+    return await fn();
+  } finally {
+    if (previous === undefined) delete process.env[TOOL_HOME_ENV];
+    else process.env[TOOL_HOME_ENV] = previous;
+  }
+}
+
+/**
+ * A missing tool home is a FAILURE, not a skip. A skipped fixture and a passing
+ * fixture are the same colour in every test report.
+ */
+function requireRealToolHome(): void {
+  if (!existsSync(join(REAL_TOOL_HOME, ...JSCPD_TOOL.entrypoint.split('/')))) {
+    throw new Error(
+      `the pinned tool home is missing at ${REAL_TOOL_HOME}; run \`bun install\` ` +
+        'inside it before running these fixtures'
+    );
+  }
+}
 
 const ACCEPTANCE = {
   reason: 'fixture',
@@ -185,7 +224,9 @@ function contextFor(root: string, files: string[]): AnalyzerContext {
 }
 
 async function analyze(root: string, files: string[]) {
-  return runAnalyzer(duplicationAnalyzer, contextFor(root, files));
+  return withToolHome(REAL_TOOL_HOME, () =>
+    runAnalyzer(duplicationAnalyzer, contextFor(root, files))
+  );
 }
 
 /** The single DUP-001 finding for a tree with exactly one clone family. */
@@ -760,9 +801,8 @@ describe('DUP-7..DUP-10: what must NOT be reported, and what must not be missed'
       );
       expect(eligible).not.toContain('scripts/quality/fixtures/planted-a.ts');
 
-      const result = await runAnalyzer(
-        duplicationAnalyzer,
-        contextFor(tree.root, eligible)
+      const result = await withToolHome(REAL_TOOL_HOME, () =>
+        runAnalyzer(duplicationAnalyzer, contextFor(tree.root, eligible))
       );
       // The production pair is reported; the fixture pair contributes nothing.
       const finding = onlyFinding(result.findings);
@@ -876,7 +916,14 @@ describe('DUP-7..DUP-10: what must NOT be reported, and what must not be missed'
         cacheDir: join(tree.abs('src/a.ts'), 'not-a-directory'),
       };
 
-      const result = await runAnalyzer(duplicationAnalyzer, broken);
+      // The tool home is pointed at the real one even though this case expects a
+      // throw. Without it the throw would come from the missing tool home instead
+      // of from the unwritable cache directory, and the case would pass while
+      // testing a completely different path - the failure mode these fixtures
+      // exist to prevent, one level up.
+      const result = await withToolHome(REAL_TOOL_HOME, () =>
+        runAnalyzer(duplicationAnalyzer, broken)
+      );
       expect(result.status).toBe('failed');
       expect(result.complete).toBe(false);
       expect(result.findings).toHaveLength(0);
@@ -913,6 +960,45 @@ describe('DUP-7..DUP-10: what must NOT be reported, and what must not be missed'
       // ...and the unchanged file cannot be dropped from scope, because a clone is
       // a relation between two regions and one of them is not in the change set.
       expect(finding.occurrences).toBe(2);
+    } finally {
+      tree.cleanup();
+    }
+  });
+});
+
+/**
+ * The detector is now installed in ONE place, so "the tool is missing" became a
+ * reachable state that did not exist when `bun x` fetched it from a cache on
+ * demand. This pins the response to it, because a missing instrument is exactly
+ * the kind of condition that gets handled by falling back to something
+ * convenient - and the convenient fallback here (`bun x jscpd`) is the
+ * unreproducible invocation this whole change removes.
+ */
+describe('a missing instrument is a failed run, never a clean one', () => {
+  test('DUP-11: an absent tool home fails the run and refuses to fall back', async () => {
+    requireRealToolHome();
+    const tree = createFixtureTree();
+    try {
+      tree.write('src/a.ts', BLOCK_A);
+      tree.write('src/b.ts', BLOCK_A);
+
+      const result = await withToolHome(
+        join(tree.root, 'no-such-tool-home'),
+        () => runAnalyzer(duplicationAnalyzer, contextFor(tree.root, ['src/a.ts', 'src/b.ts']))
+      );
+
+      expect(result.status).toBe('failed');
+      expect(result.complete).toBe(false);
+      // Zero findings, and the run says why. This is the distinction the whole
+      // engine is built around: no clones found is a claim about the code, and
+      // no detector run is the absence of one.
+      expect(result.findings).toHaveLength(0);
+      expect(result.coverage.scanned).toBe(0);
+      const message = String(result.errors[0]?.message ?? '');
+      expect(message).toContain('pinned clone detector is absent');
+      // The refusal must name the forbidden alternative, so a future reader does
+      // not "fix" this by restoring the invocation whose resolution is unhashed.
+      expect(message).toContain('do NOT fall back');
     } finally {
       tree.cleanup();
     }

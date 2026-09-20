@@ -1,0 +1,91 @@
+{
+  "version": 1,
+  "owner": "gateway-maintainers",
+  "rationale": "This file decides what the SHAPE of the dependency graph must be, as opposed to the three analyzers before it, which decide whether the code in each file is correct. A cycle, an inverted layer and a dependency that crosses an ownership boundary are not defects in any line of code - every line parses, resolves and passes lint - so nothing before this analyzer can see them. Every number quoted below was measured on this repository, not chosen, and the measurements are written down so a future reader can re-run them before changing a value rather than taking this prose on trust. This file is POLICY: it is hashed into policyDigest, so editing it invalidates accepted baselines instead of quietly re-scoring the tree under different rules.",
+
+  "ruler": {
+    "typeAware": false,
+    "rationale": "MEASURED, and it changes the answer more than any rule in this file. `typeAware: true` makes dependency-cruiser follow type-only imports, so an `import type` counts as an edge. Both rulers were run over the whole repository: runtime-only (this value) sees 2,234 nodes, 12,112 internal edges and SIX cyclic components - {604, 31, 3, 3, 3, 2}, 646 files. Type-aware sees 2,237 nodes, 14,142 internal edges, 1,875 type-only edges and TWO cyclic components - {1465, 3} - because type imports weld almost the whole program into a single 1,465-file component. Both are true statements about different graphs. The runtime graph is the one this rule is named for: ARCH-002 says a RUNTIME cycle, and a cycle that exists only through `import type` is erased when the bundle is built, so it cannot be a runtime cycle. Reporting the 1,465-file component as a cycle would be a confident, wrong report, which is worse than a missing one because it would also be a ratchet nobody can ever repay. Switching this value changes the finding set completely, which is exactly why it lives here and not in code."
+  },
+
+  "capabilities": ["import-integrity"],
+  "capabilitiesRationale": "The scope is borrowed from the capability that already means 'this file's import specifiers must be understood as a graph'. It grants exactly the executable universe - production-source, build-tooling, quality-tooling, harness-test, harness-tooling - and withholds it from `declarations` (a .d.ts has no runtime imports) and from `quality-fixture` (fixture trees contain deliberately broken specifiers). Measured: eligibleFor(['import-integrity']) is 2,188 files, and every one of them is under src/ or scripts/, which is what lets the walk be rooted at those two directories and reconciled file by file.",
+
+  "fidelity": {
+    "maxUnresolvedInternalFraction": 0.05,
+    "requireEveryEligibleFileCruised": true,
+    "rationale": "These are preconditions on trusting the graph at all, and they are the reason ARCH-005 is not a finding rule. The failure they exist to catch was MEASURED here, not imagined: the same tool run through `bun x` instead of through the pinned tool home could not see this repository's `typescript`, fell back to a non-TypeScript parser, and reported 287 modules with 300 of 331 edges unresolved - while exiting ZERO. A graph that is 90% missing edges cannot form cycles, so `no-circular` would have returned few or none and read as a clean architecture. `maxUnresolvedInternalFraction` is 0.05 against a measured 0.00107 on this repository (13 unresolved internal edges of 12,125), a fifty-fold margin: loose enough that a file mid-refactor does not block the run, tight enough that a degraded resolver cannot pass. The two failure modes are INCOMPLETE, never findings, and that is the point - a finding can be accepted into a baseline and forgotten; a precondition that fails cannot be accepted at all, so it can never turn into permanent invisible debt. ARCH-005 was proposed as an 'unresolved internal graph edge' rule and is deliberately NOT one: the source-integrity analyzer already reports every unresolved internal specifier as INT-004 (52 accepted entries, including `src/hooks/useReplBridge.tsx::../bridge/webhookSanitizer.js`, which is one of this analyzer's own 13), and a second rule id for one defect would make the same problem look like two. THE ONE LIMIT THIS CEILING CANNOT SEE, recorded here because the policy is hashed and therefore this sentence cannot drift away from the measurement it describes: dependency-cruiser reports a literal specifier that does not resolve (`couldNotResolve`), but for a COMPUTED specifier - `await import(name)`, `await import('./plugins/' + name + '.js')`, `await import(`./plugins/${name}.js`)` - it emits NO dependency record at all. MEASURED on the pinned 18.3.1 over a file containing all four shapes: exactly one dependency record was emitted, the literal-but-absent `./does-not-exist.js`, and none for the four computed ones. Those edges are ABSENT from the graph, not unresolved, so this fraction cannot count them and no threshold on it can be tightened until they are. The analyzer therefore counts them separately, from source text, and reports the count as an exclusion plus a note naming the files, so the size of the blind spot is a number in the run record rather than an assumption; a cycle that runs only through a computed specifier is invisible to ARCH-002 and is not claimed to have been ruled out."
+  },
+
+  "forbiddenEdges": [
+    {
+      "id": "types-are-the-bottom",
+      "name": "src/types must not import src/components",
+      "from": "src/types/**",
+      "to": "src/components/**",
+      "reason": "src/types declares the shapes that every layer shares. src/components is the top of the application UI stack, so a type importing a component makes the bottom depend on the top: the shared contract would then transitively require the whole React tree to exist before it can be described.",
+      "measuredEdgesWhenDeclared": 0
+    },
+    {
+      "id": "ink-primitives-stay-primitive",
+      "name": "src/ink must not import src/components",
+      "from": "src/ink/**",
+      "to": "src/components/**",
+      "reason": "src/ink is the terminal rendering primitive library; src/components is application UI written on top of it. The two edge counts are 65 (components -> ink) and 0 (ink -> components), which is the whole argument: the dependency has one direction and it is the one that keeps the renderer usable without the application.",
+      "measuredEdgesWhenDeclared": 0
+    },
+    {
+      "id": "native-bindings-are-standalone",
+      "name": "src/native-ts must not import src/components",
+      "from": "src/native-ts/**",
+      "to": "src/components/**",
+      "reason": "src/native-ts holds bindings that mirror a non-TypeScript implementation and must stay inspectable next to it. Depending on application UI would make the binding impossible to port or test on its own.",
+      "measuredEdgesWhenDeclared": 0
+    },
+    {
+      "id": "tooling-must-not-start-the-product",
+      "name": "scripts must not import src/entrypoints",
+      "from": "scripts/**",
+      "to": "src/entrypoints/**",
+      "reason": "src/entrypoints is the bundle root: importing it from a build or test script would execute the product as a side effect of measuring it. Measured 0 edges, and the mirror direction (src -> src/entrypoints, 17 edges) is a separate and unproven claim, so it is NOT declared here - see notDeclared.",
+      "measuredEdgesWhenDeclared": 0
+    }
+  ],
+
+  "roleImports": [
+    {
+      "id": "production-source-owns-its-own-leaves",
+      "from": "production-source",
+      "allowed": ["production-source", "declarations"],
+      "reason": "The shipped product may depend on itself and on its ambient declarations, and on nothing else. Measured over the whole graph: production-source has ZERO outgoing edges to any of build-tooling, quality-tooling, quality-fixture, harness-test and harness-tooling, so this boundary is already true and the rule exists to keep it true. The reverse directions are all present and all legitimate (build-tooling -> production-source 106, harness-test -> production-source 87, harness-tooling -> production-source 4), which is why the rule is one-directional: the product is a leaf with respect to who consumes it. This is the rule the repository's ownership model actually backs, because each of those other roles carries its own owner and proof in .quality/policy/source-universe.json."
+    }
+  ],
+
+  "notDeclared": [
+    {
+      "name": "src/** -> src/entrypoints/**",
+      "measuredEdges": 17,
+      "reason": "Tempting and refused. Importing the bundle root from a utility is the kind of thing that looks wrong at a glance, and 17 edges is small enough to look like a tidy ratchet. But the two examples examined are `src/utils/settings/types.ts -> src/entrypoints/sandboxTypes.ts` and `src/schemas/hooks.ts -> src/entrypoints/agentSdkTypes.ts` - a shared type living under the entrypoint directory, not a util executing the CLI. Declaring this would produce 17 findings whose remedy is moving a type, which is a refactor decision with an owner, not a measured architectural defect. It becomes declarable once the types move or once someone decides the boundary is real anyway."
+    },
+    {
+      "name": "src/utils/** -> src/components/**",
+      "measuredEdges": 17,
+      "reason": "The classic inverted layer, and the honest reading is that this repository does not have a clean utility layer: measured 754 edges components -> utils against 17 utils -> components. The 17 are real inversions, but declaring the rule would open the architecture baseline with 17 findings that predate this analyzer and that nobody has been asked to repay. That is not a reason to hide them - the number is recorded here, and the rule is one line away - but it is a reason not to invent day-one debt by my own taste."
+    },
+    {
+      "name": "src/constants/** -> outside constants",
+      "measuredEdges": 83,
+      "reason": "constants -> utils 26 and 57 further edges mean src/constants is not a leaf table of constants but a module with behaviour. Whether that is a defect depends on what the module is for, which this file cannot see."
+    },
+    {
+      "name": "src/** -> scripts/**",
+      "measuredEdges": 4,
+      "reason": "Four edges, and every one of them targets scripts/effort-capabilities.json - a data file, not build machinery. JSON is not in the source universe, so no role-based rule can see these edges either. Reporting them would be a false positive of exactly the kind that teaches people to ignore a ratchet."
+    },
+    {
+      "name": "quality-fixture -> quality-tooling",
+      "measuredEdges": 32,
+      "reason": "The one cross-role edge pair that is genuinely load-bearing in the other direction: fixtures exist to drive the engine, so they must import it. Recorded so that reading the role matrix does not mistake this for an oversight."
+    }
+  ]
+}

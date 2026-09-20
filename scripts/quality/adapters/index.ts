@@ -10,9 +10,19 @@ import { registerAnalyzer } from '../lib/registry';
 import { sourceIntegrityAnalyzer } from './sourceIntegrity';
 import { maintainabilityAnalyzer } from './maintainability';
 import { duplicationAnalyzer } from './duplication';
+import { unusedStructureAnalyzer } from './unusedStructure';
+import { architectureAnalyzer } from './architecture';
 
 registerAnalyzer(sourceIntegrityAnalyzer);
 registerAnalyzer(maintainabilityAnalyzer);
 registerAnalyzer(duplicationAnalyzer);
+registerAnalyzer(unusedStructureAnalyzer);
+registerAnalyzer(architectureAnalyzer);
 
-export { sourceIntegrityAnalyzer, maintainabilityAnalyzer, duplicationAnalyzer };
+export {
+  sourceIntegrityAnalyzer,
+  maintainabilityAnalyzer,
+  duplicationAnalyzer,
+  unusedStructureAnalyzer,
+  architectureAnalyzer,
+};

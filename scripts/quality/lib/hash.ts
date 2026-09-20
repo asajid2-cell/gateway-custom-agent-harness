@@ -55,6 +55,29 @@ export const POLICY_INPUTS = [
   // while the manifest had no reader, so a scope change was invisible to the
   // ratchet. Listed here so the manifest's claim about itself is enforced.
   '.quality/policy/runtime-roots.json',
+  // The source-universe manifest decides ELIGIBILITY: which roles grant which
+  // capability, and therefore which files each analyzer is allowed to see. It has
+  // the same defect class as `runtime-roots.json` above and a wider blast radius,
+  // because it is the manifest every analyzer's scope is derived from - and it was
+  // covered by no digest. Measured: rewriting this file's owner and role table
+  // left `policyDigest` byte-identical, because it is loaded only by `cli.ts` and
+  // resolved only as an ANALYZER_POLICY_INPUTS entry, which never contained it.
+  //
+  // Its own rationale claims the opposite ("this file is hashed into policyDigest
+  // and invalidates accepted baselines"). A scope manifest that can be narrowed
+  // while every baseline keeps matching is the ratchet bypass this file exists to
+  // close: removing a role from `checks` drops a whole subsystem from every
+  // measurement, and without this entry the run reports a smaller scope under an
+  // unchanged digest, so nothing reports that anything changed.
+  '.quality/policy/source-universe.json',
+  // `.gitignore` decides what `git ls-files --others --exclude-standard` reports,
+  // and the SOURCE UNIVERSE is built from exactly that: an ignored file is not in
+  // the universe at all, so it is not measured and not reportable. Ignoring a
+  // file is therefore a scope change made in a file no analyzer reads, and it was
+  // covered by no digest - a candidate could remove debt from every measurement by
+  // adding one line to `.gitignore`, and every baseline would still match. It is a
+  // policy input for that reason and not because it configures a tool.
+  '.gitignore',
 ];
 
 /**
@@ -69,4 +92,20 @@ export const TOOLCHAIN_INPUTS = [
   'yarn.lock',
   'pnpm-lock.yaml',
   'tsconfig.json',
+  // The architecture analyzer does not run its resolver out of the repository's
+  // own dependency graph: `bun x` was measured resolving a DIFFERENT typescript
+  // than the one pinned here, which silently degrades dependency-cruiser to a
+  // non-TS parser (287 modules and 300 of 331 edges unresolved in one file,
+  // against 2,176 modules and 60 unresolved through the pinned home). So the
+  // instrument is the tool home, and its pin is the two files below.
+  //
+  // They were covered by no digest, because `engineImplementationFiles` walks
+  // only `scripts/quality` and `computeCandidateIdentity` passes no extra files.
+  // That made the analyzer's own doc comment - "the lockfile plus package.json
+  // are hashed into toolchainDigest" - false, which is precisely the state a
+  // reproducible instrument must not be in: a pin could move and accepted
+  // baselines would keep matching, re-scoring the same tree under a different
+  // ruler with no epoch change. Listed here so the claim is enforced.
+  '.quality/tools/package.json',
+  '.quality/tools/bun.lock',
 ];

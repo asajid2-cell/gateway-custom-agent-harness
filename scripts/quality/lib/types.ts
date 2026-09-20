@@ -314,6 +314,25 @@ export interface Acceptance {
   acceptedAt: string;
   /** Ownership for routing and for staleness reports. */
   owner: string | null;
+  /**
+   * How `owner` was arrived at. `inherited` means it was derived from the
+   * source-universe role of the finding's subject rather than typed in, so it
+   * follows the file instead of drifting away from it.
+   */
+  ownerSource?: 'inherited' | 'explicit' | 'unattributable';
+  /**
+   * The source-universe role whose owner was inherited - the SCOPE of this
+   * tolerance. A role reassignment moves this field, which is how a finding that
+   * has quietly changed hands becomes visible without anyone re-reading 8,000
+   * entries.
+   */
+  ownerRole?: string | null;
+  /**
+   * Why the owner is what it is, or why there is none. Never empty: an
+   * unowned entry with no reason is indistinguishable from one nobody looked at,
+   * and those are the entries that become permanent invisible debt.
+   */
+  ownerReason?: string;
   /** ISO timestamp after which a waiver stops being accepted. */
   expiresAt: string | null;
 }
@@ -383,6 +402,26 @@ export interface Baseline {
    */
   measurementDigest?: string;
   /**
+   * The instrument this baseline was recorded with.
+   *
+   * Recorded for the same reason as `measurementDigest`, one level further out.
+   * That field covers the analyzer's own implementation; it does not cover the
+   * external tool the analyzer shells out to, because that tool lives in its own
+   * project with its own lockfile (`.quality/tools`), outside the tree the
+   * implementation walk visits. So a moved pin would leave `measurementDigest`
+   * unchanged while the instrument that produced the numbers was a different
+   * program - the exact "different ruler, same measurement" hole this field is
+   * the outer half of.
+   *
+   * The ratchet reads this. An accepted baseline cannot be silently re-scored by
+   * a newer resolver; the run is refused with a direction, not merely a count,
+   * because "the tree changed" and "the measuring instrument changed" are
+   * indistinguishable from a findings count alone. Optional for the same reason
+   * as `measurementDigest`: a baseline written before this existed reads as
+   * "instrument unknown", which is honest and is reported.
+   */
+  toolchainDigest?: string;
+  /**
    * How many entities the analyzer was obliged to consider when this baseline
    * was recorded.
    *
@@ -414,6 +453,8 @@ export interface MeasurementMigration {
   from: {
     /** Absent when the baseline predates epoch tracking. */
     measurementDigest: string | null;
+    /** Absent when the baseline predates instrument tracking. */
+    toolchainDigest: string | null;
     policyDigest: string;
     recordedAt: string;
     recordedFindings: number;
@@ -421,6 +462,7 @@ export interface MeasurementMigration {
   };
   to: {
     measurementDigest: string;
+    toolchainDigest: string;
     policyDigest: string;
     measuredFindings: number;
     measuredEligible: number | null;
@@ -459,7 +501,17 @@ export interface MeasurementMigration {
    * numbers cannot be lined up at all and the reviewer is being asked to
    * accept something that was not compared.
    */
-  verdict: 'comparable' | 'scope-moved' | 'unknown-epoch';
+  /**
+   * Whether the two measurements were taken with the same instrument - the
+   * analyzer implementation AND the pinned external tool it shells out to.
+   *
+   * Distinct from `scopeChanged`: a scope change means the same instrument looked
+   * at more or less of the tree, while this means the instrument itself is a
+   * different program. The remedy differs - re-scope versus re-record - so they
+   * are reported as two conditions rather than one "something moved".
+   */
+  instrumentChanged: boolean;
+  verdict: 'comparable' | 'scope-moved' | 'instrument-changed' | 'unknown-epoch';
 }
 
 export interface MovedFinding {

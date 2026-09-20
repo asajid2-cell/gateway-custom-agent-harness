@@ -1,0 +1,13 @@
+{
+  "name": "gateway-quality-tools",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "External measurement tools the quality engine executes, installed as a self-contained project so their resolved dependency graph is recorded in a lockfile instead of being re-derived from whatever a package cache happens to hold. Pins are EXACT and deliberate: package.json and bun.lock here are hashed into toolchainDigest, so changing a pin invalidates accepted baselines rather than silently re-scoring the tree under a different instrument.",
+  "dependencies": {
+    "dependency-cruiser": "18.3.1",
+    "typescript": "5.9.3",
+    "jscpd": "5.3.0",
+    "knip": "5.88.1"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "owner": "gateway-maintainers",
+  "profile": "production",
+  "profileRationale": "MEASURED, not chosen by taste. Both profiles were run over this repository. full: 2188 eligible files, 538 findings. production: 2133 eligible (55 test/fixture files removed from the project set AND from the entry set, counted in the run record as an exclusion), 538 findings, and a diff of ZERO - the two profiles name exactly the same debt, finding for finding. So the narrower ruler is the honest one here: it answers the question the product actually cares about, 'does the shipped tree need this file', at no cost in coverage of the debt, whereas full would let a test file hold production code alive forever when nothing else needs it. The numbers are recorded so a future reader can re-run both before changing the value rather than taking this sentence on trust. Switching it changes policyDigest, so the switch invalidates accepted baselines instead of quietly re-scoring the tree under the other ruler.",
+  "rationale": "ENTRY DECLARATIONS for unused-structure. This file answers exactly one question: which repository files are EXECUTED by something outside the import graph, and so must not be reported as dead. Knip's answer to 'is this file used' is 'is it reachable by an import from an entry', and for this repository that question has a large false-positive class: a supervisor spawned by a PowerShell launcher, a live acceptance probe a human runs by hand, a test file collected by bun test, an ESLint config loaded by name, a napi implementation reached through a tsconfig path alias. Declaring them here is a POLICY act with an owner and a proof, which is why it is a file rather than a heuristic in the adapter. It is NOT a suppression list: a file declared here is a file something runs, and a file NOT declared here that nothing imports is reported. Adding an entry therefore makes a finding disappear, so each addition must name what executes the file - 'it is probably used' is not a proof. This file is hashed into policyDigest.",
+  "entries": [
+    {
+      "path": "scripts/quality/policy/maintainability.config.mjs",
+      "kind": "loaded-by-name",
+      "owner": "gateway-maintainers",
+      "proof": "Passed to ESLint via --config by adapters/maintainability.ts, which resolves it as scripts/quality/policy/maintainability.config.mjs. A config named by string is never imported, so no import-graph analysis can see it."
+    }
+  ],
+  "exclude": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/.candidate-build/**"
+  ],
+  "excludedIssueTypes": {
+    "unresolved": "Owned by source-integrity (INT-004/INT-005 resolve specifiers inside the repository and classify the failure; knip reports the same edges as a flat unresolved list). Two analyzers reporting one edge would make the ratchet require the defect to be fixed twice and would double-count the debt. Counted here so the exclusion is visible rather than silent.",
+    "catalog": "Workspace catalog entries. This repository declares no catalogs, so the class is empty and measuring it would be a rule that can never fire.",
+    "duplicates": "A module exporting the same name twice. That is an export-consistency defect, not unused structure, and it has no home in this catalog; counted rather than dropped.",
+    "binaries": "Binaries named in an npm script that no dependency provides. Measured on this repository the class reported exactly one item, `powershell`, which the operating system supplies - so the class answers 'is this an npm dependency?' with a question about the host environment, and the honest reading of its findings is neither defect nor clean. A rule the ratchet cannot defend at this confidence is not a rule. It is still REQUESTED, so its count appears in every run record as an exclusion; a class that is neither reported nor counted is the silent hole, and this is not one. If this repository ever invokes a tool it genuinely must declare, that is a manifest defect another rule should own."
+  },
+  "notMeasuredIssueTypes": {
+    "nsExports": "Exports reached only through a namespace import (import * as ns). Knip separates this class from `exports` because the symbol is used through an object it cannot always follow, so its members are false-positive-prone by construction.",
+    "nsTypes": "As nsExports, for type-only namespace imports.",
+    "classMembers": "Unused exported class members. Knip separates it from enumMembers and reports it against a parent symbol; false-positive-prone for the same reason as nsExports.",
+    "whyNotRequested": "MEASURED, not assumed: requesting these three classes made knip exhaust a 4 GB heap on this repository and terminate without a report. Because they are not requested they produce no count, so - unlike the four classes in excludedIssueTypes - they cannot appear in the coverage exclusions. The correct reading of their absence is 'not measured', never 'measured and zero', and that distinction is stated here rather than left to a reader's assumption.",
+    "howToClose": "Raise the heap or narrow the project set and request them again; until then this remains an open measurement gap, recorded as such."
+  },
+  "measuredContract": {
+    "tool": "knip",
+    "version": "5.88.1",
+    "exitCodes": "0 = measurement completed, no issues. 1 = measurement completed, issues found. 2 = the run did not happen (unusable config, unreadable project).",
+    "whyDocumented": "1 is the COMMON case and is a successful measurement. Reading it as a failure would discard every non-clean run; reading 2 as 'issues found' would invent a clean tree out of a run that never started.",
+    "coverageEvidence": "knip's JSON output lists only files that CARRY an issue, so it cannot prove which files were examined. The resolved project set is read from the --debug stream section '[.] Finding project paths', and the run is FAILED - never clean - when that section is absent or empty while files were authorized."
+  }
+}
