@@ -74,6 +74,66 @@ for (const columns of [40, 100]) test(`carousel pointer and wheel select full se
   } finally { t.close() }
 })
 
+test('the bar offers only leaves that can still take the terminal', async () => {
+  const live = fixtures(2).views
+  const ended = { ...live[0]!, member: { ...live[0]!.member, number: 8, name: 'Ended eight', sessionId: 'leaf-ended' }, process: { getState: () => 'closed' } } as LeafView
+  const failed = { ...live[0]!, member: { ...live[0]!.member, number: 9, name: 'Failed nine', sessionId: 'leaf-failed' }, process: { getState: () => 'failed' } } as LeafView
+  let selected: string | undefined
+  const t = await terminal(<LeafCarousel views={[...live, ended, failed]} activeId={undefined} onSelect={id => { selected = id }} />)
+  try {
+    const screen = textOf(t.ink.rootNode)
+    // Entering one of these muted this session and left a black screen, so the
+    // gesture that did it must not exist: they stay in the /leaf menu, which is
+    // where they can be reopened, and leave the bar.
+    assert.doesNotMatch(screen, /Ended eight/, 'a leaf whose process ended is not an entry point')
+    assert.doesNotMatch(screen, /Failed nine/, 'a leaf that failed to start is not an entry point')
+    assert.match(screen, /All 3/, 'the session and its two live leaves remain')
+    await t.click('2 Chat 2')
+    assert.equal(selected, 'leaf-1', 'the live leaves are still selectable')
+  } finally { t.close() }
+})
+
+test('the terminal goes only to a leaf that can take it, and comes back when it cannot', async () => {
+  const instances = (await import('../src/ink/instances.ts')).default
+  const { focusLeafTerminal } = await import('../src/utils/leafTerminalHost.ts')
+  const stdoutDescriptor = Object.getOwnPropertyDescriptor(process, 'stdout')!
+  const stdinDescriptor = Object.getOwnPropertyDescriptor(process, 'stdin')!
+  const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24, isTTY: true })
+  stdout.resume()
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, isRaw: false, setRawMode(mode: boolean) { this.isRaw = mode; return this } })
+  let entered = 0, exited = 0
+  // The real terminal's Ink instance is what hands off and takes back the screen.
+  instances.set(stdout as any, { enterAlternateScreen() { entered++ }, exitAlternateScreen() { exited++ } } as any)
+  Object.defineProperty(process, 'stdin', { configurable: true, value: stdin })
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  const sessionWrite = process.stdout.write
+  const focused: boolean[] = []
+  const leaf = (state: string) => ({ getState: () => state, focus: (active: boolean) => { focused.push(active) } })
+  try {
+    assert.equal(focusLeafTerminal(leaf('closed') as any), false, 'an ended leaf is refused')
+    assert.equal(process.stdout.write, sessionWrite, 'a refused handoff never mutes this session')
+    assert.equal(entered, 0, 'a refused handoff never takes this session off the screen')
+
+    assert.equal(focusLeafTerminal(leaf('idle') as any), true, 'a live leaf takes the terminal')
+    assert.notEqual(process.stdout.write, sessionWrite, 'the leaf owns the output while it is on screen')
+    assert.equal(focusLeafTerminal(undefined), true, 'going back is always allowed')
+    assert.equal(process.stdout.write, sessionWrite, 'this session prints again')
+    assert.deepEqual(focused, [true, false], 'the leaf is focused, then released')
+
+    // The leaf ended between accepting the switch and taking the terminal. The
+    // handoff is undone rather than left half-done: muted output and an active
+    // alternate screen with nothing drawing in it is the black terminal.
+    const dying = { getState: () => 'idle', focus: () => { throw new Error('Leaf process ended') } }
+    assert.equal(focusLeafTerminal(dying as any), false, 'a failed handoff is reported as a refusal')
+    assert.equal(process.stdout.write, sessionWrite, 'this session takes its writers back')
+    assert.equal(entered, exited, 'this session is not left inside the alternate screen')
+  } finally {
+    Object.defineProperty(process, 'stdin', stdinDescriptor)
+    Object.defineProperty(process, 'stdout', stdoutDescriptor)
+    instances.delete(stdout as any)
+  }
+})
+
 test('press-and-hold opens all sessions without selecting on release', async () => {
   const { views } = fixtures(15)
   let selected: string | undefined

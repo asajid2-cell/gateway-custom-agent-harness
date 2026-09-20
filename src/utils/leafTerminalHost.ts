@@ -1,5 +1,5 @@
 import instances from '../ink/instances.js'
-import type { LeafProcess } from './leafProcess.js'
+import { isLeafProcessAlive, type LeafProcess } from './leafProcess.js'
 
 let current: LeafProcess | undefined
 let epoch = 0
@@ -16,9 +16,31 @@ const resize = () => {
   try { current.terminal({ type: 'leaf-resize', ...dimensions() }) } catch { /* Exit notification restores the root. */ }
 }
 
-/** Only this session family hands off the terminal; no user process is suspended or restarted. */
-export function focusLeafTerminal(next?: LeafProcess): void {
-  if (next === current) return
+/** Undo the handoff: this session's own writers, keyboard and screen come back. */
+function restoreSessionTerminal(): void {
+  if (!restoreOutput) return
+  process.stdin.off('data', input)
+  process.stdout.off('resize', resize)
+  restoreOutput()
+  restoreOutput = undefined
+  writeTerminal = undefined
+  rootInk?.exitAlternateScreen()
+  rootInk = undefined
+}
+
+/**
+ * Hand the terminal to a leaf, or leave it with this session.
+ *
+ * Returns whether the leaf took the terminal. Only this session family hands
+ * off the terminal; no user process is suspended or restarted.
+ */
+export function focusLeafTerminal(next?: LeafProcess): boolean {
+  if (next === current) return true
+  // A leaf whose process has ended cannot take the terminal, and asking anyway
+  // used to mute this session for it before the attempt: the screen went black
+  // with no way back. Refusing before the handoff is what makes an entry for a
+  // closed leaf harmless.
+  if (next && !isLeafProcessAlive(next.getState())) return false
   const previous = current
   const size = dimensions()
   if (previous) {
@@ -26,7 +48,7 @@ export function focusLeafTerminal(next?: LeafProcess): void {
   }
   if (next && !current) {
     rootInk = instances.get(process.stdout)
-    if (!rootInk) return
+    if (!rootInk) return false
     rootInk.enterAlternateScreen()
     const stdoutWrite = process.stdout.write
     const stderrWrite = process.stderr.write
@@ -45,20 +67,26 @@ export function focusLeafTerminal(next?: LeafProcess): void {
     process.stdout.on('resize', resize)
   }
   current = next
-  epoch++
-  if (next) {
-    process.stdin.setRawMode?.(true)
-    writeTerminal?.('\x1b[0m\x1b[?25l\x1b[2J\x1b[H')
-    next.focus(true, epoch, size.columns, size.rows)
-  } else if (restoreOutput) {
-    process.stdin.off('data', input)
-    process.stdout.off('resize', resize)
-    restoreOutput()
-    restoreOutput = undefined
-    writeTerminal = undefined
-    rootInk?.exitAlternateScreen()
-    rootInk = undefined
+  const frameEpoch = ++epoch
+  if (!next) {
+    restoreSessionTerminal()
+    return true
   }
+  process.stdin.setRawMode?.(true)
+  writeTerminal?.('\x1b[0m\x1b[?25l\x1b[2J\x1b[H')
+  try {
+    next.focus(true, frameEpoch, size.columns, size.rows)
+  } catch {
+    // The leaf ended between accepting the switch and taking the terminal.
+    // Without undoing the handoff this session stays muted inside the alternate
+    // screen, which is the black terminal the switch was supposed to avoid.
+    current = previous
+    epoch++
+    if (previous) { try { previous.focus(true, epoch, size.columns, size.rows) } catch { /* The previous leaf ended too. */ } }
+    else restoreSessionTerminal()
+    return false
+  }
+  return true
 }
 
 export function renderLeafTerminal(child: LeafProcess, frameEpoch: number, data: string): void {

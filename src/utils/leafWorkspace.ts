@@ -32,9 +32,12 @@ export function selectLeaf(sessionId?: string): void {
   const root = getSessionId()
   const view = sessionId ? views.get(sessionId) : undefined
   if (sessionId && (!view || view.rootSessionId !== root)) throw new Error('Unknown leaf')
+  // Taking the terminal is the precondition for being selected, not a side
+  // effect of it: a leaf that cannot take it stays unselected, so nothing points
+  // at a session that is not on screen.
+  if (!focusLeafTerminal(view?.process)) return
   if (sessionId) selected.set(root, sessionId)
   else selected.delete(root)
-  focusLeafTerminal(view?.process)
   publish()
 }
 let contextReturn: ((id: string, text: string) => Promise<string>) | undefined
@@ -470,6 +473,12 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
       const id = current?.member.sessionId ?? member.sessionId
       if (selected.get(rootSessionId) === id && getSessionId() === rootSessionId) selectLeaf()
       void (ownerReleases.get(id)?.() ?? releaseOwner()).catch(() => {})
+      // The view is what the session bar offers to enter, so a view kept past
+      // its process left an entry into a leaf that was gone. The draft is not
+      // written here: a deliberate close saves it before closing, and a leaf on
+      // its way out reports its composer as empty, so saving it here replaced a
+      // stored draft with that empty value.
+      if (current) views.delete(current.member.sessionId)
       publish()
     },
     onEvent: () => {},
@@ -495,7 +504,16 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     if (member.model) await child.setModel(member.model)
     if (member.effort) await child.setEffort(member.effort)
   }
-  catch (error) { await child.close(); await releaseOwner(); ownerReleases.delete(member.sessionId); publish(); throw error }
+  catch (error) {
+    await child.close()
+    await releaseOwner()
+    ownerReleases.delete(member.sessionId)
+    // A leaf that never reached its input loop owns no process, so its view
+    // must not stay behind as an entry into a session that cannot be opened.
+    views.delete(member.sessionId)
+    publish()
+    throw error
+  }
   publish()
   return view
 }

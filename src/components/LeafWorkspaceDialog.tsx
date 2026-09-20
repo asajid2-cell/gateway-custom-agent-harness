@@ -5,6 +5,7 @@ import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
 import { LEAF_EFFORT_LEVELS, getLeafRootName, getLeafViews, listLeafMembers, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
+import { isLeafProcessAlive } from '../utils/leafProcess.js'
 import { isGatewayMode } from '../utils/model/providers.js'
 
 export function LeafSessionBar(): React.ReactNode {
@@ -267,7 +268,11 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
   const [page, setPage] = useState(0)
   const hold = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const held = useRef(false)
-  const items = [{ id: undefined, label: getLeafRootName(), state: '' }, ...views.map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
+  // Only leaves that can still take the terminal are offered. A leaf whose
+  // process has ended is not an entry point - entering one muted this session
+  // and left a black screen - and it stays in the menu, where it can be
+  // reopened, rather than in the bar, where a click is the only gesture.
+  const items = [{ id: undefined, label: getLeafRootName(), state: '' }, ...views.filter(view => isLeafProcessAlive(view.process.getState())).map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
   const active = Math.max(0, items.findIndex(item => item.id === activeId))
   const capacity = Math.max(1, Math.floor((columns - 14) / 20))
   const first = Math.max(0, Math.min(active - Math.floor(capacity / 2), items.length - capacity))

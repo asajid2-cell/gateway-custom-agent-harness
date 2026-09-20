@@ -7,6 +7,16 @@ import type { LeafTerminalMessage, LeafSnapshot } from './leafTerminal.js'
 export type LeafPermission = { id: string; tool: string; input: Record<string, unknown> }
 export type LeafProcessState = 'starting' | 'idle' | 'running' | 'awaiting-approval' | 'closed' | 'failed'
 
+/**
+ * Whether a leaf in this state still owns a process.
+ *
+ * `closed` and `failed` are the two states a leaf does not come back from, so
+ * neither the terminal nor a turn can be handed to it.
+ */
+export function isLeafProcessAlive(state: LeafProcessState): boolean {
+  return state !== 'closed' && state !== 'failed'
+}
+
 /** A leaf owns its CLI process and permission requests; no parent queue or bootstrap state is shared. */
 export class LeafProcess {
   private child: ChildProcessWithoutNullStreams | undefined

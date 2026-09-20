@@ -159,6 +159,50 @@ test('a sibling leaf send records the asking leaf as the sender, not the root', 
   }
 })
 
+test('closing a leaf takes its entry out of the bar and keeps the text typed into it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-close-entry-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { getLeafViews, registerLeafViewForTesting } = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const familyPath = join(directory, 'leaf-families', `${root}.json`)
+    const transcriptPath = join(directory, 'lifecycle.jsonl')
+    await writeFile(transcriptPath, '')
+    const member = await addLeafMember(familyPath, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Lifecycle', transcriptPath, forkMessageId: randomUUID() })
+    const leaf = new LeafProcess({ executable: process.execPath, args: [], cwd: getCwd(), env: {}, onEvent: () => {}, onState: () => {}, interactive: true }) as unknown as {
+      child: unknown; setState: (state: string) => void; control: () => Promise<void>
+    }
+    leaf.child = { connected: true, send: (_message: unknown, callback?: (error?: Error) => void) => { callback?.() } }
+    leaf.setState('idle')
+    // The draft sync the close path asks for, answered here so the real close
+    // path runs with no CLI behind it.
+    leaf.control = () => Promise.resolve()
+    const unregister = registerLeafViewForTesting({ rootSessionId: root, member, process: leaf as never, draft: 'SAVED_DRAFT' })
+    try {
+      assert.deepEqual(getLeafViews().map(view => view.member.sessionId), [member.sessionId], 'an open leaf is an entry point')
+      await changeLeaf(member.sessionId, { status: 'closed' })
+      // The reported failure: the closed leaf stayed clickable in the bottom bar,
+      // and entering it muted this session inside an alternate screen that
+      // nothing was drawing in. The bar offers what `getLeafViews` returns, so a
+      // closed leaf must not be in it.
+      assert.deepEqual(getLeafViews(), [], 'a closed leaf is not an entry point')
+      const stored = (await readLeafFamily(familyPath, root)).members[0]!
+      assert.equal(stored.status, 'closed', 'the close is recorded')
+      assert.equal(stored.draft, 'SAVED_DRAFT', 'closing must not lose the text typed into the leaf')
+    } finally { unregister() }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('an answer a leaf reports mid-turn reaches the asker without the turn ending', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-early-answer-'))
   const saved = process.env.CLAUDE_CONFIG_DIR
