@@ -59,6 +59,20 @@ test('bottom bar identifies Gateway providers without inventing quota data', () 
     formatBottomBarUsage('gateway-gpt-luna', null, 200_000),
     /Codex · model gateway-gpt-luna · usage unavailable · context unavailable$/,
   )
+  // With a status line on the same row the model is already printed once, so
+  // the readout must not print it again.
+  assert.match(
+    formatBottomBarUsage('gateway-gpt-luna', null, 200_000, undefined, null, {
+      includeModel: false,
+    }),
+    /^Codex · usage unavailable · context unavailable$/,
+  )
+  assert.doesNotMatch(
+    formatBottomBarUsage('gateway-gpt-luna', null, 200_000, undefined, null, {
+      includeModel: false,
+    }),
+    /gateway-gpt-luna/,
+  )
   assert.match(
     formatBottomBarUsage(
       'gateway-gpt-luna',

@@ -76,10 +76,18 @@ export function formatBottomBarUsage(
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
   codexQuota?: CodexQuotaDisplay | null,
+  options?: { includeModel?: boolean },
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
   const weeklyRemaining = getWeeklyRemainingPercent(weekly)
-  const parts = [getGatewayProviderLabel(model), `model ${model}`]
+  const parts = [getGatewayProviderLabel(model)]
+
+  // A custom status line already prints the model, so repeating it here would
+  // be the second copy of it on the same row. Callers that have no status line
+  // pass includeModel - there this readout is the only place the model shows.
+  if (options?.includeModel !== false) {
+    parts.push(`model ${model}`)
+  }
 
   if (codexQuota && getGatewayProviderLabel(model) === 'Codex') {
     parts.push(`Codex remaining ${codexQuota.remainingPercent}%`)

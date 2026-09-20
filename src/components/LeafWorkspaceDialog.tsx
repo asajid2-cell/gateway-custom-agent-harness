@@ -10,8 +10,15 @@ import { isGatewayMode } from '../utils/model/providers.js'
 
 export function LeafSessionBar(): React.ReactNode {
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
+  const { columns } = useTerminalSize()
   if (!isGatewayMode()) return null
-  return <Box flexDirection="column" paddingX={2} flexShrink={0}><LeafCarousel views={getLeafViews()} activeId={selectedLeafId()} onSelect={selectLeaf} /></Box>
+  // A dim rule, because the carousel is a band of its own rather than a fourth
+  // footer row. Without it the leaf labels sat flush under the usage readout
+  // and the footer pills and read as one run-on block of text.
+  return <Box flexDirection="column" paddingX={2} flexShrink={0}>
+    <Text dimColor>{'─'.repeat(Math.max(0, columns - 4))}</Text>
+    <LeafCarousel views={getLeafViews()} activeId={selectedLeafId()} onSelect={selectLeaf} />
+  </Box>
 }
 
 /** Effort choices offered by the wizard; `inherit` keeps the parent's effort. */
@@ -298,12 +305,12 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
     <Box gap={1} height={1} onWheel={event => { event.stopImmediatePropagation(); cycle(event.deltaY) }}
       onMouseDown={() => { stopHold(); held.current = false; hold.current = setTimeout(() => { held.current = true; expand() }, 450) }}
       onMouseUp={stopHold} onMouseLeave={stopHold}>
-      <Box flexShrink={0} onClick={() => { if (!held.current) cycle(-1) }}><Text>‹</Text></Box>
+      <Box flexShrink={0} onClick={() => { if (!held.current) cycle(-1) }}><Text dimColor>‹</Text></Box>
       {items.slice(first, first + capacity).map(item => <Box key={item.id ?? 'original'} width={Math.min(20, Math.max(8, columns - 14))} flexShrink={0} onClick={() => { if (!held.current) choose(item.id) }}>
         <Text inverse={item.id === activeId} wrap="truncate">{item.label}{item.state === 'running' ? ' · working' : item.state === 'awaiting-approval' ? ' · approval' : item.state === 'failed' ? ' · failed' : ''}</Text>
       </Box>)}
-      <Box flexShrink={0} onClick={() => { if (!held.current) cycle(1) }}><Text>›</Text></Box>
-      <Box flexShrink={0} onClick={() => { if (!held.current) { if (expanded) collapse(); else expand() } }}><Text>All {items.length}</Text></Box>
+      <Box flexShrink={0} onClick={() => { if (!held.current) cycle(1) }}><Text dimColor>›</Text></Box>
+      <Box flexShrink={0} onClick={() => { if (!held.current) { if (expanded) collapse(); else expand() } }}><Text dimColor>All {items.length}</Text></Box>
     </Box>
   </Box>
 }
