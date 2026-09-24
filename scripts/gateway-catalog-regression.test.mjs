@@ -30,6 +30,14 @@ test('shared catalog exports the exact visible Gateway picker metadata', () => {
     catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-luna'),
     {
       value: 'gateway-gpt-luna',
+      label: 'GPT-5.6-Luna',
+      description: 'Gateway - GPT-5.6 Luna',
+    },
+  )
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-6-luna'),
+    {
+      value: 'gateway-gpt-6-luna',
       label: 'GPT-6-Luna',
       description: 'Gateway - GPT-6 Luna',
     },
@@ -38,6 +46,14 @@ test('shared catalog exports the exact visible Gateway picker metadata', () => {
     catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-sol'),
     {
       value: 'gateway-gpt-sol',
+      label: 'GPT-5.6-Sol',
+      description: 'Gateway - GPT-5.6 Sol',
+    },
+  )
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-6-sol'),
+    {
+      value: 'gateway-gpt-6-sol',
       label: 'GPT-6-Sol',
       description: 'Gateway - GPT-6 Sol',
     },
@@ -63,19 +79,22 @@ test('catalog aliases resolve only to visible Gateway routes', () => {
     'gpt-6-astra',
     'claude-gpt-astra',
   ])
-  // The Gateway name is versionless and means the current generation, so the
-  // 5.6 ids stay listed beside the 6 ids they were superseded by. A session
-  // still holding the old spelling resolves to the Gateway name and runs the
-  // current model, and a direct caller keeps its own pinned 5.6 route.
+  // Both generations are served at once, so a versioned id folds only onto the
+  // route that runs the same upstream. The versionless Gateway names and the
+  // legacy `claude-` spelling stay pinned to the generation they always meant.
   assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-luna'], [
-    'gpt-6-luna',
     'gpt-5.6-luna',
     'claude-gpt-luna',
   ])
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-6-luna'], ['gpt-6-luna'])
   assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-sol'], [
-    'gpt-6-sol',
     'gpt-5.6-sol',
     'claude-gpt-sol',
+  ])
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-6-sol'], ['gpt-6-sol'])
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-terra'], [
+    'gpt-5.6-terra',
+    'claude-gpt-terra',
   ])
   const flattened = aliases.flatMap(([, values]) => values)
   assert.equal(
@@ -90,12 +109,15 @@ test('catalog aliases resolve only to visible Gateway routes', () => {
   }
 })
 
-test('the GPT-6 routes name the GPT-6 upstreams and offer only accepted levels', () => {
+test('each GPT route names its own generation upstream and offers only accepted levels', () => {
   const data = modelsResponse().data
   const upstreamByGatewayId = {
     'gateway-gpt-astra': 'gpt-6-astra',
-    'gateway-gpt-luna': 'gpt-6-luna',
-    'gateway-gpt-sol': 'gpt-6-sol',
+    'gateway-gpt-luna': 'gpt-5.6-luna',
+    'gateway-gpt-6-luna': 'gpt-6-luna',
+    'gateway-gpt-sol': 'gpt-5.6-sol',
+    'gateway-gpt-6-sol': 'gpt-6-sol',
+    'gateway-gpt-terra': 'gpt-5.6-terra',
   }
   for (const [id, upstream] of Object.entries(upstreamByGatewayId)) {
     const entry = data.find(model => model.id === id)
@@ -109,6 +131,29 @@ test('the GPT-6 routes name the GPT-6 upstreams and offer only accepted levels',
   for (const id of Object.keys(upstreamByGatewayId)) {
     const entry = data.find(model => model.id === id)
     assert.equal(entry.effort_levels.includes('ultra'), false, `${id} must not offer ultra`)
+  }
+})
+
+test('no alias folds a route onto a different generation', () => {
+  const data = modelsResponse().data
+  const generation = id => {
+    const match = id.toLowerCase().match(/gpt-(\d+(?:\.\d+)?)-/)
+    return match ? match[1] : null
+  }
+  for (const [canonical, aliases] of Object.entries(catalog.gatewayModelAliases)) {
+    const entry = data.find(model => model.id === canonical)
+    if (!entry) continue
+    const routeGeneration = generation(entry.display_name)
+    if (routeGeneration === null) continue
+    for (const alias of aliases) {
+      const aliasGeneration = generation(alias)
+      if (aliasGeneration === null) continue
+      assert.equal(
+        aliasGeneration,
+        routeGeneration,
+        `${alias} names GPT-${aliasGeneration} but folds onto ${canonical} (${entry.display_name})`,
+      )
+    }
   }
 })
 

@@ -105,6 +105,9 @@ test('gateway aliases mirror the provider capability contract', () => {
 
 test('compiled client fallback resolves provider-qualified gateway effort levels', () => {
   assert.deepEqual(getGatewayNativeEffortLevels('gateway-gpt-luna'), catalog.gpt56)
+  assert.deepEqual(getGatewayNativeEffortLevels('gateway-gpt-6-luna'), catalog.gpt56)
+  assert.deepEqual(getGatewayNativeEffortLevels('gateway-gpt-sol'), catalog.gpt56)
+  assert.deepEqual(getGatewayNativeEffortLevels('gateway-gpt-6-sol'), catalog.gpt56)
   assert.deepEqual(
     getGatewayNativeEffortLevels('gateway-gpt-astra'),
     ASTRA_EFFORT_LEVELS,

@@ -14,7 +14,7 @@ const accountManager = path.join(
 )
 const nativeAccount = process.env.PARITY_CODEX_ACCOUNT || 'freedock'
 const nativeModel = process.env.PARITY_NATIVE_MODEL || 'gpt-6-luna'
-const gatewayModel = process.env.PARITY_GATEWAY_MODEL || 'gateway-gpt-luna'
+const gatewayModel = process.env.PARITY_GATEWAY_MODEL || 'gateway-gpt-6-luna'
 const effort = process.env.PARITY_EFFORT || 'low'
 const timeoutMs = Number(process.env.PARITY_TIMEOUT_MS || 120_000)
 const artifactPath = process.env.PARITY_ARTIFACT ||

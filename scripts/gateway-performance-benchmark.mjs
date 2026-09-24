@@ -54,15 +54,16 @@ const liveModels = (process.env.PERF_MODELS || nativeModel)
 
 // A benchmark row compares the native model against the Gateway name that
 // serves it, so the pairing has to be exact - a wrong name fails the row
-// instead of measuring it. The 5.6 upstreams stay routable, so they keep their
-// pairs; anything else falls back to stripping the generation from the name.
+// instead of measuring it. Both generations are served at once, so each native
+// id pairs only with the Gateway route that names the same upstream. There is
+// no `gpt-5.6-astra`: the provider 400s that spelling.
 const GATEWAY_MODEL_FOR_NATIVE = {
-  'gpt-6-luna': 'gateway-gpt-luna',
+  'gpt-6-luna': 'gateway-gpt-6-luna',
   'gpt-5.6-luna': 'gateway-gpt-luna',
-  'gpt-6-sol': 'gateway-gpt-sol',
+  'gpt-6-sol': 'gateway-gpt-6-sol',
   'gpt-5.6-sol': 'gateway-gpt-sol',
   'gpt-6-astra': 'gateway-gpt-astra',
-  'gpt-5.6-astra': 'gateway-gpt-astra',
+  'gpt-5.6-terra': 'gateway-gpt-terra',
 }
 
 function accountHomeFor(name) {

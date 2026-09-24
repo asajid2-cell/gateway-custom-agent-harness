@@ -34,6 +34,30 @@ export function isCanonicalGatewayModelId(model: string): boolean {
   return model.toLowerCase().startsWith('gateway-')
 }
 
+const GATEWAY_MODEL_CONTEXT_WINDOWS = new Map(
+  Object.entries(
+    catalog.gatewayModelMetadata as Record<
+      string,
+      { contextWindow?: unknown } | undefined
+    >,
+  )
+    .filter(([, meta]) => typeof meta?.contextWindow === 'number')
+    .map(([canonical, meta]) => [
+      canonical.toLowerCase(),
+      meta!.contextWindow as number,
+    ]),
+)
+
+/**
+ * The accounting context window for a Gateway route, resolved through the alias
+ * fold so every spelling of one route reports the same value. Returns null for
+ * anything the catalog does not describe, leaving the caller to fall back.
+ */
+export function getGatewayModelContextWindow(model: string): number | null {
+  const canonical = normalizeGatewayModelId(model)
+  return GATEWAY_MODEL_CONTEXT_WINDOWS.get(canonical.toLowerCase()) ?? null
+}
+
 const GATEWAY_MODEL_DISPLAY_NAMES = new Map(
   (catalog.gatewayModelOptions as Array<{ value?: unknown; label?: unknown }>)
     .filter(

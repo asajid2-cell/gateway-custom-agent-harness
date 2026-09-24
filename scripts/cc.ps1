@@ -796,7 +796,7 @@ $env:CLAUDE_CODE_GATEWAY_PROVENANCE = @{
   cwd_actual = $LaunchDirectory
   launch_nonce = $env:TANDEM_BRANCH_PROVIDER_LAUNCH_NONCE
 } | ConvertTo-Json -Compress
-$env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'
+$env:MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-6-sol'
 $env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'
 # The fast model backs every auxiliary call - WebFetch's summariser, awaySummary,
 # session titles, session search, agent hooks - so a lane that stalls degrades

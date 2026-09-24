@@ -589,19 +589,36 @@ test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsEffort('claude-ultracode'), true)
 })
 
-test('GPT-6 aliases use the supported client accounting window', () => {
-  // The provider maximum is larger than the window the client accounts for, so
-  // each route is reached by its Gateway name, its provider-native id, and its
-  // legacy name and all three report the same number.
-  assert.equal(getContextWindowForModel('gateway-gpt-astra'), 272_000)
-  assert.equal(getContextWindowForModel('gpt-6-astra'), 272_000)
-  assert.equal(getContextWindowForModel('claude-gpt-astra'), 272_000)
-  assert.equal(getContextWindowForModel('gateway-gpt-luna'), 272_000)
-  assert.equal(getContextWindowForModel('gpt-6-luna'), 272_000)
-  assert.equal(getContextWindowForModel('claude-gpt-luna'), 272_000)
-  assert.equal(getContextWindowForModel('gateway-gpt-sol'), 272_000)
-  assert.equal(getContextWindowForModel('gpt-6-sol'), 272_000)
-  assert.equal(getContextWindowForModel('claude-gpt-sol'), 272_000)
+test('every GPT route spelling reports the same client accounting window', () => {
+  // The provider maximum (872k) is larger than the window the client accounts
+  // for, so each route is reached by its Gateway name, its provider-native id,
+  // and its legacy name and all of them report the same number. Both
+  // generations are served at once, so the 5.6 route must not borrow the 6
+  // route's window just because the two names look alike.
+  for (const spelling of [
+    'gateway-gpt-astra',
+    'gpt-6-astra',
+    'claude-gpt-astra',
+    'gateway-gpt-luna',
+    'gpt-5.6-luna',
+    'claude-gpt-luna',
+    'gateway-gpt-6-luna',
+    'gpt-6-luna',
+    'gateway-gpt-sol',
+    'gpt-5.6-sol',
+    'claude-gpt-sol',
+    'gateway-gpt-6-sol',
+    'gpt-6-sol',
+    'gateway-gpt-terra',
+    'gpt-5.6-terra',
+    'claude-gpt-terra',
+  ]) {
+    assert.equal(
+      getContextWindowForModel(spelling),
+      272_000,
+      `${spelling} must report the route's accounting window`,
+    )
+  }
 })
 
 test('gateway preserves native effort levels on GPT aliases', () => {

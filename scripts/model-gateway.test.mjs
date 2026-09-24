@@ -1074,6 +1074,34 @@ test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to max'
   })
 })
 
+test('HTTP boundary sends each GPT route to the upstream its name promises', async () => {
+  const expected = {
+    'gateway-gpt-6-luna': 'gpt-6-luna',
+    'gateway-gpt-luna': 'gpt-5.6-luna',
+    'gateway-gpt-6-sol': 'gpt-6-sol',
+    'gateway-gpt-sol': 'gpt-5.6-sol',
+    'gateway-gpt-terra': 'gpt-5.6-terra',
+    'gateway-gpt-astra': 'gpt-6-astra',
+  }
+  await withGatewayAndFakeCodexState({
+    handlerFactory: astraCodexHandler,
+    run: async ({ gateway, state }) => {
+      for (const id of Object.keys(expected)) {
+        const result = await postGateway(gateway.port, {
+          model: id,
+          stream: true,
+          messages: [{ role: 'user', content: `synthetic ${id} request` }],
+        })
+        assert.equal(result.status, 200, `${id} must be routable`)
+      }
+      assert.deepEqual(
+        state.requests.map(body => body.model),
+        Object.values(expected),
+      )
+    },
+  })
+})
+
 test('HTTP boundary reports a successful completion with phase timing', async () => {
   const result = await assertGatewayBoundedResult({
     handler: healthyCodexHandler,

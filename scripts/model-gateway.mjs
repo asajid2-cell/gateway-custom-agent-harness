@@ -144,10 +144,9 @@ const DEFAULT_MODELS = {
   'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
   'gpt-6-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
-  // The GPT-6 generation of the Luna and Sol line, added beside the 5.6
-  // upstreams above. Those stay routable for anything pinned to them, and the
-  // Gateway names further down are what Luna and Sol now mean - the same way
-  // the versionless `gateway-gpt-astra` has always meant the current Astra.
+  // The GPT-6 generation of the Luna and Sol line. Both generations are served
+  // by the provider at once, so each one keeps its own visible route below
+  // rather than one id floating onto whichever generation is current.
   'gpt-6-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
   'gpt-6-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'deepseek-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
@@ -216,8 +215,10 @@ const DEFAULT_MODELS = {
       },
     ]),
   ),
-  'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
-  'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
+  'gateway-gpt-6-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
+  'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
+  'gateway-gpt-6-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
+  'gateway-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
   'gateway-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS },
   'gateway-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS },
   'gateway-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'] },
@@ -258,8 +259,8 @@ const DEFAULT_MODELS = {
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
-  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
-  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
+  'claude-gpt-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'claude-gpt-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
   'claude-gpt-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
   'claude-ds-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'], hidden: true },

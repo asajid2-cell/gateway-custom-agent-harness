@@ -32,7 +32,7 @@ test('launcher forwards the full Gateway model catalog with economical role defa
   assert.match(script, /\$Effort = Resolve-DefaultGatewayEffort -Value \$Model/)
   assert.match(script, /-not \[string\]::IsNullOrWhiteSpace\(\$Effort\) -and/)
   assert.doesNotMatch(script, /else \{ 'medium' \}/)
-  assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-sol'/)
+  assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-6-sol'/)
   assert.match(script, /MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'/)
   // Both roles must land on a lane that answers: the Codex lanes measured
   // 1/10 and 0/10 under 10 concurrent auxiliary calls, the ds lanes 10/10.
