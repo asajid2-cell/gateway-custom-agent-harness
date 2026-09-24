@@ -55,17 +55,24 @@ test('session resume command keeps the directory and session ID copyable', () =>
 test('bottom bar identifies Gateway providers without inventing quota data', () => {
   assert.equal(getGatewayProviderLabel('gateway-gpt-luna'), 'Codex')
   assert.equal(getGatewayProviderLabel('gateway-opencode-mimo-v2.5-free'), 'OpenCode')
+  // The readout leads with the model, not with the provider label: the label
+  // named the provider a second time on a row that already says it.
   assert.match(
     formatBottomBarUsage('gateway-gpt-luna', null, 200_000),
-    /Codex · model gateway-gpt-luna · usage unavailable · context unavailable$/,
+    /^model gateway-gpt-luna · usage unavailable · context unavailable$/,
+  )
+  assert.doesNotMatch(
+    formatBottomBarUsage('gateway-gpt-luna', null, 200_000),
+    /^Codex ·/,
   )
   // With a status line on the same row the model is already printed once, so
-  // the readout must not print it again.
+  // the readout must not print it again - nor the provider label that stood in
+  // for it.
   assert.match(
     formatBottomBarUsage('gateway-gpt-luna', null, 200_000, undefined, null, {
       includeModel: false,
     }),
-    /^Codex · usage unavailable · context unavailable$/,
+    /^usage unavailable · context unavailable$/,
   )
   assert.doesNotMatch(
     formatBottomBarUsage('gateway-gpt-luna', null, 200_000, undefined, null, {

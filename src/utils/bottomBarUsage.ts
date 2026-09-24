@@ -80,8 +80,13 @@ export function formatBottomBarUsage(
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
   const weeklyRemaining = getWeeklyRemainingPercent(weekly)
-  const parts = [getGatewayProviderLabel(model)]
+  const parts: string[] = []
 
+  // The provider used to lead this readout as its own part ("OpenCode"), which
+  // named the provider a second time: the model id carries it already, and a
+  // custom status line prints the model next door on the same row. The model is
+  // the fact worth the columns, so the bare label is the part that goes.
+  //
   // A custom status line already prints the model, so repeating it here would
   // be the second copy of it on the same row. Callers that have no status line
   // pass includeModel - there this readout is the only place the model shows.
