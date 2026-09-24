@@ -8,7 +8,7 @@ import { nodeCache } from '../src/ink/node-cache.ts'
 import { LeafCarousel } from '../src/components/LeafWorkspaceDialog.tsx'
 import { SessionEditControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
 import { AppStateProvider } from '../src/state/AppState.tsx'
-import type { LeafView } from '../src/utils/leafWorkspace.ts'
+import { requestLeafMenu, subscribeLeafMenuRequest, type LeafView } from '../src/utils/leafWorkspace.ts'
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 80))
 async function waitForScreen(predicate: () => boolean): Promise<void> {
@@ -72,6 +72,31 @@ for (const columns of [40, 100]) test(`carousel pointer and wheel select full se
     await t.click(getLeafRootName())
     assert.equal(selected, undefined)
   } finally { t.close() }
+})
+
+test('the session bar reaches the leaf menu by click, with nothing typed', async () => {
+  const { views } = fixtures(3)
+  let opened = 0
+  const unsubscribe = subscribeLeafMenuRequest(() => { opened++ })
+  try {
+    // No onManage prop: the default is the real request channel, so this is the
+    // gesture the user actually clicks rather than a test double standing in
+    // for it. The carousel is in the layout, below the prompt, so it cannot
+    // render the menu itself - it asks for it and the prompt overlay opens it.
+    const t = await terminal(<LeafCarousel views={views} activeId={undefined} onSelect={() => {}} />)
+    try {
+      assert.equal(opened, 0, 'nothing opens the menu on its own')
+      await t.click('All 4')
+      await t.click('Manage leaves')
+      assert.equal(opened, 1, 'Manage leaves asks for the leaf menu')
+      // The list folds away behind the menu instead of leaving two rosters up.
+      assert.doesNotMatch(textOf(t.ink.rootNode), /All sessions/)
+    } finally { t.close() }
+  } finally { unsubscribe() }
+  // Unsubscribing is what the host does on unmount; a listener that outlived
+  // it would reopen a menu in a session that is no longer on screen.
+  requestLeafMenu()
+  assert.equal(opened, 1, 'a removed listener is not called')
 })
 
 test('the bar offers only leaves that can still take the terminal', async () => {

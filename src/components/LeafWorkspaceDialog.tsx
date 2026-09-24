@@ -3,21 +3,19 @@ import { Box, Text, useInput } from '../ink.js'
 import { Select } from './CustomSelect/select.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, getLeafRootName, getLeafViews, listLeafMembers, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafRootName, leafParentIsOpen, leafParentMember, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
 import { isGatewayMode } from '../utils/model/providers.js'
 
 export function LeafSessionBar(): React.ReactNode {
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
-  const { columns } = useTerminalSize()
   if (!isGatewayMode()) return null
-  // A dim rule, because the carousel is a band of its own rather than a fourth
-  // footer row. Without it the leaf labels sat flush under the usage readout
-  // and the footer pills and read as one run-on block of text.
-  return <Box flexDirection="column" paddingX={2} flexShrink={0}>
-    <Text dimColor>{'─'.repeat(Math.max(0, columns - 4))}</Text>
-    <LeafCarousel views={getLeafViews()} activeId={selectedLeafId()} onSelect={selectLeaf} />
+  // A row of the footer section, not a band of its own. The dim rule that used
+  // to sit above the labels cost a row and made them read as a separate block;
+  // inside the footer they line up with the rows above them instead.
+  return <Box paddingX={2} flexShrink={0} width="100%">
+    <LeafCarousel views={getLeafCarouselViews()} activeId={selectedLeafId()} onSelect={selectLeaf} />
   </Box>
 }
 
@@ -37,6 +35,15 @@ function modelLabel(value: string): string {
   return value
 }
 
+/**
+ * How a session is named in a result. The parent has no leaf number, so calling
+ * it "Leaf #0" would misname the one session that is not a leaf.
+ */
+function describeSession(member?: { number: number; name: string }): string {
+  if (!member) return 'That session'
+  return member.number === 0 ? `The parent session ${member.name}` : `Leaf #${member.number} ${member.name}`
+}
+
 /** Enter on a choice row advances to its next value and wraps. */
 function nextIn(values: readonly string[], current: string): string {
   const index = values.indexOf(current)
@@ -54,6 +61,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   useRegisterOverlay('leaf-menu', true)
   const [screen, setScreen] = useState<'home' | 'list' | 'create'>('home')
   const [members, setMembers] = useState<LeafMember[] | undefined>(undefined)
+  const [parent, setParent] = useState<LeafMember | undefined>(undefined)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -61,7 +69,11 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // Refresh the family roster whenever the workspace publishes a change.
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
   const reload = () => { void listLeafMembers().then(setMembers).catch(() => setMembers([])) }
-  useEffect(reload, [screen])
+  // The parent session is a member of its own family but not a row in the family
+  // file, so it is asked for separately. From the parent itself there is none:
+  // the session on screen is not a target.
+  const reloadParent = () => { void leafParentMember().then(setParent).catch(() => setParent(undefined)) }
+  useEffect(() => { reload(); reloadParent() }, [screen])
 
   const run = async (label: string, action: () => Promise<string | void>) => {
     if (busy) return
@@ -94,7 +106,21 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
 
   if (screen === 'list') {
     const open = members?.filter(member => member.status !== 'archived') ?? []
+    const parentOpen = Boolean(parent) && leafParentIsOpen()
     const options = [
+      // The parent is the family's permanent session: it can be opened, closed
+      // and reopened from here, but never archived or renamed - there would be
+      // nothing left to name the family.
+      ...(parent ? [{
+        value: `open:${parent.sessionId}`,
+        label: `Open the parent session ${parent.name}`,
+        description: parentOpen ? 'The conversation this family was forked from; it is open now' : 'The conversation this family was forked from',
+      }] : []),
+      ...(parent && parentOpen ? [{
+        value: `close:${parent.sessionId}`,
+        label: `Close the parent session ${parent.name}`,
+        description: 'Stop it here; it stays this family\'s permanent session and reopens from this menu',
+      }] : []),
       ...open.map(member => ({
         value: `open:${member.sessionId}`,
         label: `Open  #${member.number} ${member.name}`,
@@ -110,16 +136,17 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         label: `Archive #${member.number} ${member.name}`,
         description: 'Detach it from this family and hide it from this menu; the transcript is kept',
       })),
-      ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
+      ...(open.length === 0 && !parent ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
     ]
     return <Box flexDirection="column">
       <Text bold>Leaves in this family</Text>
       <Text dimColor>Opening a leaf is the only thing that starts its process. Closed leaves stay closed until you open them again.</Text>
+      {parent && <Text dimColor>This family also has a parent session: the conversation everything here was forked from. It is always resumable and is never archived.</Text>}
       <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
         if (value === 'back' || value === 'empty') { setScreen('home'); return }
         const id = value.slice(value.indexOf(':') + 1)
-        const member = members?.find(item => item.sessionId === id)
+        const member = members?.find(item => item.sessionId === id) ?? (parent?.sessionId === id ? parent : undefined)
         const action = value.slice(0, value.indexOf(':'))
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
@@ -127,8 +154,8 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           await workspace.changeLeaf(id, { status: action === 'archive' ? 'archived' : 'closed' })
           selectLeaf(undefined)
           return action === 'archive'
-            ? `Leaf #${member?.number} ${member?.name} archived. It is detached from this family and no longer appears here; its transcript and session are untouched.`
-            : `Leaf #${member?.number} ${member?.name} closed. Its transcript is retained; open it again any time.`
+            ? `${describeSession(member)} archived. It is detached from this family and no longer appears here; its transcript and session are untouched.`
+            : `${describeSession(member)} closed. Its transcript is retained; open it again any time.`
         })
       }} />
       {busy && <Text dimColor>Working…</Text>}
@@ -187,7 +214,7 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
   const creating = useRef(false)
 
   const sources = [
-    { value: 'root', label: rootName, description: selectedId ? 'The original conversation' : 'The current conversation' },
+    { value: 'root', label: rootName, description: 'The conversation this family was forked from' },
     ...(members ?? []).filter(member => member.status !== 'archived').map(member => ({
       value: member.sessionId,
       label: `#${member.number} ${member.name}`,
@@ -267,8 +294,11 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
   </Box>
 }
 
-export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
+export function LeafCarousel({ views, activeId, onSelect, onExpand, onManage }: {
   views: LeafView[]; activeId?: string; onSelect: (id?: string) => void; onExpand?: (expanded: boolean) => void
+  /** Opens the leaf menu. Defaults to asking the prompt overlay for it, since
+   *  the carousel sits in the layout rather than inside the prompt. */
+  onManage?: () => void
 }): React.ReactNode {
   const { columns, rows } = useTerminalSize()
   const [expanded, setExpanded] = useState(false)
@@ -279,7 +309,7 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
   // process has ended is not an entry point - entering one muted this session
   // and left a black screen - and it stays in the menu, where it can be
   // reopened, rather than in the bar, where a click is the only gesture.
-  const items = [{ id: undefined, label: getLeafRootName(), state: '' }, ...views.filter(view => isLeafProcessAlive(view.process.getState())).map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
+  const items = [{ id: undefined, label: getLeafHostName(), state: '' }, ...views.filter(view => isLeafProcessAlive(view.process.getState())).map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
   const active = Math.max(0, items.findIndex(item => item.id === activeId))
   const capacity = Math.max(1, Math.floor((columns - 14) / 20))
   const first = Math.max(0, Math.min(active - Math.floor(capacity / 2), items.length - capacity))
@@ -299,6 +329,9 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand }: {
         <Box onClick={() => setPage(value => Math.max(0, value - 1))}><Text>Previous</Text></Box>
         <Text>{page + 1}/{Math.ceil(items.length / pageSize)}</Text>
         <Box onClick={() => setPage(value => Math.min(Math.ceil(items.length / pageSize) - 1, value + 1))}><Text>Next</Text></Box>
+        {/* Creating, opening, closing and archiving all live in the leaf menu;
+            this is the one gesture that reaches it without typing /leaf. */}
+        <Box onClick={() => { collapse(); (onManage ?? requestLeafMenu)() }}><Text>Manage leaves</Text></Box>
         <Box onClick={collapse}><Text>Close list</Text></Box>
       </Box>
     </Box>}

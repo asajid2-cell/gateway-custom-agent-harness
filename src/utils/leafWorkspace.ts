@@ -1,17 +1,19 @@
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { access, readFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { getSessionId } from '../bootstrap/state.js'
+import { getSessionId, getSessionResumeDirectory } from '../bootstrap/state.js'
 import { asSessionId } from '../types/ids.js'
 import { getCwd } from './cwd.js'
 import { checkHasTrustDialogAccepted } from './config.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { createFork } from '../commands/branch/branch.js'
-import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscriptPathForSession, saveSessionName } from './sessionStorage.js'
+import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscriptPath, getTranscriptPathForSession, saveSessionName } from './sessionStorage.js'
 import { addLeafMember, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
-import { LeafProcess } from './leafProcess.js'
+import { LeafProcess, isLeafProcessAlive } from './leafProcess.js'
+import { LeafTakenError } from './leafChannel.js'
+import { leafColorEnv } from './leafColor.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
 import { getLeafSnapshot, isInteractiveLeaf, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
@@ -26,18 +28,38 @@ const listeners = new Set<() => void>()
 const selected = new Map<string, string>()
 const launches = new Map<string, Promise<OwnedLeafView>>()
 export function selectedLeafId(): string | undefined { return isInteractiveLeaf() ? getSessionId() : selected.get(getSessionId()) }
-export function getLeafRootName(): string { return getLeafSnapshot()?.rootName || getCurrentSessionTitle(getSessionId()) || 'Original' }
+export function getLeafRootName(): string {
+  const snapshot = getLeafSnapshot()
+  if (snapshot) return snapshot.rootName
+  if (familyRootSync() === getSessionId()) return getCurrentSessionTitle(getSessionId()) || 'Original'
+  return resolvedRoot?.pointer?.rootName || 'Original'
+}
+
+/**
+ * The label for the session on screen, which is the carousel's first entry.
+ *
+ * Usually that is the family root, but a member hosting the family after its
+ * parent was closed is its own first entry - labelling it with the root's name
+ * would offer a switch to the session you are already in.
+ */
+export function getLeafHostName(): string {
+  const snapshot = getLeafSnapshot()
+  if (snapshot) return snapshot.rootName
+  if (familyRootSync() === getSessionId()) return getLeafRootName()
+  return getCurrentSessionTitle(getSessionId()) || 'This session'
+}
+
 export function selectLeaf(sessionId?: string): void {
   if (isInteractiveLeaf()) { void requestLeafWorkspace('select', [sessionId]).catch(() => {}); return }
-  const root = getSessionId()
+  const self = getSessionId()
   const view = sessionId ? views.get(sessionId) : undefined
-  if (sessionId && (!view || view.rootSessionId !== root)) throw new Error('Unknown leaf')
+  if (sessionId && (!view || view.rootSessionId !== familyRootSync())) throw new Error('Unknown leaf')
   // Taking the terminal is the precondition for being selected, not a side
   // effect of it: a leaf that cannot take it stays unselected, so nothing points
   // at a session that is not on screen.
   if (!focusLeafTerminal(view?.process)) return
-  if (sessionId) selected.set(root, sessionId)
-  else selected.delete(root)
+  if (sessionId) selected.set(self, sessionId)
+  else selected.delete(self)
   publish()
 }
 let contextReturn: ((id: string, text: string) => Promise<string>) | undefined
@@ -149,9 +171,10 @@ function publish(): void {
   revision++
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
-  const snapshot = { rootSessionId: getSessionId(), rootName: getLeafRootName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const root = familyRootSync()
+  const snapshot = { rootSessionId: root, rootName: getLeafRootName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
-    if (view.rootSessionId === getSessionId() && !['closed', 'failed'].includes(view.process.getState())) {
+    if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
     }
   }
@@ -159,24 +182,198 @@ function publish(): void {
 subscribeLeafSnapshot(() => { revision++; for (const listener of listeners) listener() })
 export function subscribeLeafWorkspace(listener: () => void): () => void { listeners.add(listener); return () => { listeners.delete(listener) } }
 export function leafWorkspaceRevision(): number { return revision }
+
+/**
+ * The session bar lives in the layout, below the prompt, so it cannot reach the
+ * leaf menu by rendering it: the menu is a prompt overlay that has to float
+ * above the clipped bottom slot. It asks for the menu by name instead, and
+ * whichever component already owns that overlay slot opens it. Kept separate
+ * from the workspace listeners so a menu request never re-renders every leaf
+ * consumer.
+ */
+const menuListeners = new Set<() => void>()
+export function requestLeafMenu(): void { for (const listener of menuListeners) listener() }
+export function subscribeLeafMenuRequest(listener: () => void): () => void { menuListeners.add(listener); return () => { menuListeners.delete(listener) } }
 export function getLeafViews(): LeafView[] {
   if (isInteractiveLeaf()) return (getLeafSnapshot()?.members ?? []).map(({ member, state }) => ({
     rootSessionId: getLeafSnapshot()!.rootSessionId, member, draft: member.draft ?? '',
     process: { getState: () => state, checkpoint: (name?: string) => requestLeafWorkspace('checkpoint', [member.sessionId, name]), setModel: (model: string) => requestLeafWorkspace('model', [member.sessionId, model]), setEffort: (effort: string) => requestLeafWorkspace('effort', [member.sessionId, effort]) },
   }))
-  return [...views.values()].filter(view => view.rootSessionId === getSessionId())
+  const root = familyRootSync()
+  // The parent session can be hosted as a child of one of its own leaves, but it
+  // is the family's root rather than one of its leaves: it is the carousel's
+  // first entry, not an entry in the list of leaves.
+  return [...views.values()].filter(view => view.rootSessionId === root && view.member.number > 0)
 }
+
+/**
+ * The sessions the carousel can switch to: the leaves, plus the parent when a
+ * member is hosting it. Kept apart from `getLeafViews`, which is also the roster
+ * published to children - a leaf has no parent row to offer.
+ */
+export function getLeafCarouselViews(): LeafView[] {
+  const parent = views.get(familyRootSync())
+  return parent ? [parent, ...getLeafViews()] : getLeafViews()
+}
+
+/**
+ * A member's pointer back to the family it belongs to.
+ *
+ * The family file is named after the root's session id, and until now the only
+ * way to learn that id was to be started by the session that owns it. That made
+ * membership depend on the parent being up: a leaf resumed on its own was an
+ * orphan with an empty family, and closing the parent closed the family. Each
+ * member now carries its own pointer, written by the root's process (the only
+ * one that knows its transcript path and directory), so any member can find the
+ * family and reopen the rest of it - including the parent.
+ */
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string }
+let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
+
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
+function familyIndexDir(): string { return join(getClaudeConfigHomeDir(), 'leaf-families', 'index') }
+function familyPointerPath(sessionId: string): string { return join(familyIndexDir(), `${sessionId}.json`) }
+
+async function readLeafFamilyPointer(sessionId: string): Promise<LeafFamilyPointer | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(familyPointerPath(sessionId), 'utf8')) as LeafFamilyPointer
+    return parsed && typeof parsed.rootSessionId === 'string' ? parsed : undefined
+  } catch { return undefined }
+}
+
+/** Written like the family file itself: temp file, then a rename that Windows may refuse while a reader holds the target. */
+async function writeLeafFamilyPointer(sessionId: string, pointer: LeafFamilyPointer): Promise<void> {
+  await mkdir(familyIndexDir(), { recursive: true, mode: 0o700 })
+  const target = familyPointerPath(sessionId)
+  const temporary = `${target}.${randomUUID()}.tmp`
+  await writeFile(temporary, JSON.stringify(pointer), { mode: 0o600 })
+  for (let attempt = 0; ; attempt++) {
+    try { await rename(temporary, target); return }
+    catch (error) {
+      if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '') || attempt >= 5) {
+        await unlink(temporary).catch(() => {})
+        throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)))
+    }
+  }
+}
+
+/** What a member needs to find the family, and to open its parent again. */
+function rootPointerInfo(root: string): LeafFamilyPointer {
+  if (root === getSessionId()) return {
+    rootSessionId: root,
+    rootName: getCurrentSessionTitle(getSessionId()) || 'Original',
+    rootTranscriptPath: getTranscriptPath(),
+    rootCwd: getSessionResumeDirectory(),
+  }
+  const pointer = resolvedRoot?.pointer
+  return { rootSessionId: root, rootName: pointer?.rootName, rootTranscriptPath: pointer?.rootTranscriptPath, rootCwd: pointer?.rootCwd }
+}
+
+/**
+ * Record which family each member belongs to, so membership outlives the parent
+ * process that created it. Failures are swallowed: a pointer that cannot be
+ * written costs a member its standalone discovery, never the family it is
+ * already in.
+ */
+function indexLeafMembers(root: string, members: readonly LeafMember[]): Promise<void> {
+  const pointer = rootPointerInfo(root)
+  return Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, pointer).catch(() => {}))).then(() => {})
+}
+
+/**
+ * The session that owns this family's file and children.
+ *
+ * At the root this is the session itself. For a member - a leaf resumed on its
+ * own, or one hosting the family after its parent was closed - it is the root
+ * its pointer names, so every member reads the same family and can reopen the
+ * rest of it. A pointer whose family file is gone is ignored rather than
+ * resurrected into a family of one.
+ */
+export async function familyRootSessionId(): Promise<string> {
+  const self = getSessionId()
+  if (resolvedRoot?.forSession === self) return resolvedRoot.sessionId
+  // A member learns the family from the session watching it while one is
+  // watching. With nobody attached there is no snapshot to read, and a member
+  // must still know where it belongs - so the pointer it wrote on its own way in
+  // is the fallback, for a member exactly as for a leaf someone resumed by hand.
+  const watching = isInteractiveLeaf() ? getLeafSnapshot()?.rootSessionId : undefined
+  if (watching) {
+    resolvedRoot = { forSession: self, sessionId: watching }
+    return watching
+  }
+  const pointer = await readLeafFamilyPointer(self)
+  if (pointer && pointer.rootSessionId !== self) {
+    try {
+      await access(familyPath(pointer.rootSessionId))
+      resolvedRoot = { forSession: self, sessionId: pointer.rootSessionId, pointer }
+      return pointer.rootSessionId
+    } catch { /* The family is gone; this session stands alone. */ }
+  }
+  resolvedRoot = { forSession: self, sessionId: self }
+  return self
+}
+
+/** The same root, for render paths that cannot await. Populated by the restore. */
+export function familyRootSync(): string {
+  const self = getSessionId()
+  if (resolvedRoot?.forSession === self) return resolvedRoot.sessionId
+  return getLeafSnapshot()?.rootSessionId ?? self
+}
+
+/** Test seam: drop the cached resolution so a pointer written afterwards is read. */
+export function forgetLeafFamilyRoot(): void { resolvedRoot = undefined }
+
+/**
+ * The family's parent session as a member row, when this session is not it.
+ *
+ * The parent is a member of its own family in every sense that matters - it can
+ * be listed, opened, closed and messaged - but it has no entry in the family
+ * file, which is keyed by its id: recording it as a member of itself would be a
+ * cycle. It is synthesized here from the pointer its own process wrote.
+ */
+export async function leafParentMember(): Promise<LeafMember | undefined> {
+  const root = await familyRootSessionId()
+  if (root === getSessionId()) return undefined
+  const pointer = resolvedRoot?.pointer
+  return {
+    sessionId: root,
+    parentSessionId: root,
+    number: 0,
+    name: pointer?.rootName || 'Original',
+    transcriptPath: pointer?.rootTranscriptPath ?? getTranscriptPathForSession(root),
+    forkMessageId: null,
+    createdAt: new Date(0).toISOString(),
+    status: 'open',
+    ...(pointer?.rootCwd ? { cwd: pointer.rootCwd } : {}),
+  }
+}
+
+/** Whether the parent session is currently hosted here, so the menu can offer to close it. */
+export function leafParentIsOpen(): boolean {
+  const view = views.get(familyRootSync())
+  return Boolean(view && isLeafProcessAlive(view.process.getState()))
+}
+
+/** How a member is named in a result or an error, where number 0 is the parent. */
+function memberLabel(member: LeafMember): string {
+  return member.number === 0 ? `the parent session ${member.name}` : `Leaf #${member.number} ${member.name}`
+}
 
 async function currentFamily(): Promise<LeafFamily> {
-  const root = getSessionId()
+  const root = await familyRootSessionId()
   return readLeafFamily(familyPath(root), root)
 }
 
-/** Members of the current family, from the parent's file or a leaf's snapshot. */
+/** Members of the current family, from the family file or a leaf's snapshot. */
 export async function listLeafMembers(): Promise<LeafMember[]> {
   if (isInteractiveLeaf()) return (getLeafSnapshot()?.members ?? []).map(entry => entry.member)
-  return (await currentFamily()).members
+  const self = getSessionId()
+  // A member reading its family is looking for the others: itself is the session
+  // already on screen, and offering it as a target would start a second copy of
+  // the conversation you are in.
+  return (await currentFamily()).members.filter(member => member.sessionId !== self)
 }
 
 /**
@@ -185,6 +382,10 @@ export async function listLeafMembers(): Promise<LeafMember[]> {
  * agent turn to locate a leaf.
  */
 export async function resolveLeafRef(reference: string): Promise<LeafMember | undefined> {
+  // `original`/`root`/`parent` name the conversation the family was forked from.
+  // At the root that is the session asking, which is not a target; from inside a
+  // member it is the parent session, which is.
+  if (rootReference(reference)) return leafParentMember()
   return resolveLeafMember(await listLeafMembers(), reference)
 }
 
@@ -213,7 +414,7 @@ export function leafFamilyReference(reference: string): boolean {
 
 /** The root's session ID as seen from inside the family. */
 export function getLeafRootSessionId(): string {
-  return getLeafSnapshot()?.rootSessionId ?? getSessionId()
+  return getLeafSnapshot()?.rootSessionId ?? familyRootSync()
 }
 
 /**
@@ -251,11 +452,12 @@ export const LEAF_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', '
 async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
   const member = await resolveLeafRef(reference)
   if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  const root = familyRootSync()
   let view = views.get(member.sessionId)
-  if (view && view.rootSessionId !== getSessionId()) view = undefined
-  if (!view || ['closed', 'failed'].includes(view.process.getState())) {
-    if (member.status !== 'open') throw new Error(`Leaf #${member.number} ${member.name} is ${member.status}`)
-    view = await launch(member, getSessionId())
+  if (view && view.rootSessionId !== root) view = undefined
+  if (!view || !isLeafProcessAlive(view.process.getState())) {
+    if (member.status !== 'open') throw new Error(`${memberLabel(member)} is ${member.status}`)
+    view = await launch(member, root)
   }
   return { member, view }
 }
@@ -352,8 +554,8 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
   if (!delivered) {
     forgetExpectedReply(view.member.sessionId, message)
     throw new Error(busy
-      ? `Message to leaf #${member.number} ${member.name} was not run; the leaf ended before its turn finished`
-      : `Leaf #${member.number} ${member.name} did not take the message; it was not run`)
+      ? `Message to ${memberLabel(member)} was not run; it ended before its turn finished`
+      : `${memberLabel(member)} did not take the message; it was not run`)
   }
   return busy
     // Refusing here dropped the message and left the sender to guess when to
@@ -361,8 +563,8 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
     // it and runs it at the next step boundary, so only a leaf sitting on a
     // permission dialog actually waits; the reply is reported separately, as
     // soon as the answer exists rather than when the turn ends.
-    ? `Queued for leaf #${member.number} ${member.name} (${member.sessionId}); ${state === 'awaiting-approval' ? 'it is waiting for permission, so it holds the message until the dialog is answered' : 'it is mid-turn, so it takes the message at its next step boundary - expect the reply before the turn ends'}.`
-    : `Delivered to leaf #${member.number} ${member.name} (${member.sessionId}).`
+    ? `Queued for ${memberLabel(member)} (${member.sessionId}); ${state === 'awaiting-approval' ? 'it is waiting for permission, so it holds the message until the dialog is answered' : 'it is mid-turn, so it takes the message at its next step boundary - expect the reply before the turn ends'}.`
+    : `Delivered to ${memberLabel(member)} (${member.sessionId}).`
 }
 
 export async function interruptLeaf(reference: string): Promise<string> {
@@ -373,7 +575,7 @@ export async function interruptLeaf(reference: string): Promise<string> {
   }
   const { member, view } = await requireLeafView(reference)
   await view.process.interrupt()
-  return `Interrupted leaf #${member.number} ${member.name}.`
+  return `Interrupted ${memberLabel(member)}.`
 }
 
 export async function checkpointLeaf(reference: string, name?: string): Promise<string> {
@@ -384,7 +586,7 @@ export async function checkpointLeaf(reference: string, name?: string): Promise<
   }
   const { member, view } = await requireLeafView(reference)
   await view.process.checkpoint(name)
-  return `Checkpointed leaf #${member.number} ${member.name}.`
+  return `Checkpointed ${memberLabel(member)}.`
 }
 
 export async function configureLeaf(reference: string, patch: { model?: string; effort?: string }): Promise<string> {
@@ -400,7 +602,12 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
   if (patch.model !== undefined) await view.process.setModel(patch.model)
   if (patch.effort !== undefined) await view.process.setEffort(patch.effort)
   await saveLeafSettings(member.sessionId, patch.model !== undefined ? { model: patch.model } : { effort: patch.effort as LeafMember['effort'] })
-  return `Leaf #${member.number} ${member.name} ${patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`} updated and saved for restart.`
+  const applied = patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`
+  // The parent has no family entry to store settings in, so nothing survives a
+  // restart of it - say so rather than promising a restart it cannot honour.
+  return member.number === 0
+    ? `${memberLabel(member)} ${applied} updated for this run.`
+    : `${memberLabel(member)} ${applied} updated and saved for restart.`
 }
 
 /**
@@ -425,6 +632,17 @@ export async function returnLeafContext(reference: string, text: string): Promis
   return contextReturn(member.sessionId, text)
 }
 
+/**
+ * How a member names itself to its own model. The parent is not "Leaf 0": it is
+ * the conversation the family came from, and telling it otherwise would have it
+ * believe it was one of its own leaves.
+ */
+function leafSelfLabel(member: LeafMember, rootSessionId: string): string {
+  return member.number === 0
+    ? `The original session ${member.name} (family root ${rootSessionId})`
+    : `Leaf ${member.number}: ${member.name} (of session ${rootSessionId})`
+}
+
 function launch(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
   const pending = launches.get(member.sessionId)
   if (pending) return pending
@@ -436,14 +654,20 @@ function launch(member: LeafMember, rootSessionId: string): Promise<OwnedLeafVie
 async function launchOnce(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
   const existing = views.get(member.sessionId)
   if (existing && !['closed', 'failed'].includes(existing.process.getState())) return existing
-  const release = await lock(`${member.transcriptPath}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 })
-  let releasePromise: Promise<void> | undefined
-  const releaseOwner = () => releasePromise ??= release()
-  ownerReleases.set(member.sessionId, releaseOwner)
-  let hasTranscript = member.forkMessageId !== null
+  let release: () => Promise<void>
+  try { release = await lock(`${member.transcriptPath}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 }) }
+  // A collision means a second member is being started for one transcript right
+  // now, which is the one thing that must not happen. It is only that: a member
+  // that is already up holds nothing here, so opening a running leaf is an
+  // attach, not a refusal.
+  catch { throw new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`) }
+  // The parent session always has a transcript - it is the conversation the
+  // family was forked from - so it is always resumed. Starting it under
+  // `--session-id` would shadow the real conversation with an empty one.
+  let hasTranscript = member.number === 0 || member.forkMessageId !== null
   if (!hasTranscript) {
     try { hasTranscript = (await readFile(member.transcriptPath, 'utf8')).split('\n').filter(line => line.trim()).some(line => { const entry = JSON.parse(line); return entry.type === 'user' || entry.type === 'assistant' }) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await releaseOwner(); ownerReleases.delete(member.sessionId); throw error } }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await release(); throw error } }
   }
   const processArgs = [process.argv[1]!, ...(hasTranscript ? ['--resume', member.sessionId] : ['--session-id', member.sessionId])]
   if (member.model) processArgs.push('--model', member.model)
@@ -458,10 +682,19 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     // so this label is not an advertisement: it names the leaf to itself.
     // Without it a leaf would derive its intent from the parent transcript it
     // was forked from and believe it was that session.
-    GATEWAY_LEAF_LABEL: `Leaf ${member.number}: ${member.name} (of session ${rootSessionId})`,
+    GATEWAY_LEAF_LABEL: leafSelfLabel(member, rootSessionId),
     GATEWAY_LEAF_DRAFT: existing?.draft ?? member.draft ?? '',
     GATEWAY_LEAF_COLUMNS: String(process.stdout.columns || 80), GATEWAY_LEAF_ROWS: String(process.stdout.rows || 24),
+    // The leaf's own stdout is a pipe, so chalk would resolve to "no colour"
+    // there and the leaf would render black and white. Its bytes are drawn by
+    // THIS terminal, so hand down the depth that is actually going to render.
+    ...leafColorEnv(),
   }, interactive: true,
+    // The member's own address, which is how any session reaches it - including
+    // one that outlives this process, and this one after it has been closed and
+    // reopened. It is not a parent handle: nothing here is held open for the
+    // member, and the member is not held open by anything here.
+    sessionId: member.sessionId,
     onQueued: () => publish(),
     onState: () => {
       const current = [...views.values()].find(view => view.process === child)
@@ -471,8 +704,12 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     onExit: () => {
       const current = [...views.values()].find(view => view.process === child)
       const id = current?.member.sessionId ?? member.sessionId
-      if (selected.get(rootSessionId) === id && getSessionId() === rootSessionId) selectLeaf()
-      void (ownerReleases.get(id)?.() ?? releaseOwner()).catch(() => {})
+      if (selected.get(getSessionId()) === id) selectLeaf()
+      // A member that was handed a new identity took a fresh claim on the
+      // transcript it moved to, and that one is still held here. The claim taken
+      // to start a member was released the moment it reached its endpoint, so
+      // there is nothing else to give back.
+      void ownerReleases.get(id)?.().catch(() => {})
       // The view is what the session bar offers to enter, so a view kept past
       // its process left an entry into a leaf that was gone. The draft is not
       // written here: a deliberate close saves it before closing, and a leaf on
@@ -506,13 +743,21 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
   }
   catch (error) {
     await child.close()
-    await releaseOwner()
-    ownerReleases.delete(member.sessionId)
     // A leaf that never reached its input loop owns no process, so its view
     // must not stay behind as an entry into a session that cannot be opened.
     views.delete(member.sessionId)
     publish()
+    // Naming the member is the whole value of this error: "that session is
+    // already open" leaves a person to guess which one they asked for.
+    if (error instanceof LeafTakenError) throw new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`)
     throw error
+  }
+  finally {
+    // The claim covers the start, not the member's life. Once it is listening
+    // it refuses a second session on its own, and a file that outlives the
+    // session that took it would go stale and start reading as "nobody is
+    // holding this" while the member is still running under it.
+    await release().catch(() => {})
   }
   publish()
   return view
@@ -615,7 +860,7 @@ async function reportLeafReply(item: { source: string; root: string; message: st
     await contextNotify(item.source, text)
     return
   }
-  if (item.root !== getSessionId()) return
+  if (item.root !== familyRootSync()) return
   // A sibling reads this as a turn in its own REPL, so it goes back through the
   // same send path - which labels it, since the reply is a peer message too.
   await sendLeafMessage(item.source, text)
@@ -630,7 +875,7 @@ function handleLeafRequest(child: LeafProcess, sourceId: string, root: string, m
 async function executeLeafRequest(child: LeafProcess, sourceId: string, root: string, message: Extract<LeafTerminalMessage, { type: 'leaf-request' }>): Promise<void> {
   try {
     const source = [...views.values()].find(view => view.process === child)
-    if (getSessionId() !== root || !source || source.rootSessionId !== root) throw new Error('Leaf family changed')
+    if (familyRootSync() !== root || !source || source.rootSessionId !== root) throw new Error('Leaf family changed')
     sourceId = source.member.sessionId
     const [id, value, third, fourth] = message.args as any[]
     let result: unknown
@@ -735,16 +980,21 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
     const member = await requestLeafWorkspace<LeafMember>('create', [name, parentSessionId ?? getSessionId(), worktree, options])
     return getLeafViews().find(view => view.member.sessionId === member.sessionId)!
   }
-  const root = getSessionId()
+  const self = getSessionId()
+  const root = await familyRootSessionId()
   const resolvedParentId = resolveLeafSource(parentSessionId, root, selectedLeafId())
-  const fromRoot = resolvedParentId === root
-  const parent = fromRoot ? undefined : getLeafViews().find(view => view.member.sessionId === resolvedParentId)
+  // At the root, "the root" is this session and its live conversation is the
+  // fork source. From a member, the root is a session on disk - or one hosted
+  // here - so its transcript is what gets forked, never this conversation.
+  const fromSelf = resolvedParentId === root && root === self
+  const hosted = views.get(resolvedParentId)
+  const parent = !fromSelf && hosted && hosted.rootSessionId === root ? hosted : undefined
   // A source that is not an open leaf is still forkable: any session whose
   // transcript exists on disk can seed a leaf. Refusing it here is what made
   // "fork this session into a leaf" unreliable for anything but a live leaf.
   let source: { sessionId: string; transcriptPath: string } | undefined
-  if (!fromRoot && !parent) {
-    const transcriptPath = getTranscriptPathForSession(resolvedParentId)
+  if (!fromSelf && !parent) {
+    const transcriptPath = resolvedParentId === root ? (await leafParentMember())?.transcriptPath ?? getTranscriptPathForSession(resolvedParentId) : getTranscriptPathForSession(resolvedParentId)
     try { await access(transcriptPath) }
     catch { throw new Error(`No session or open leaf matches ${resolvedParentId}`) }
     source = { sessionId: resolvedParentId, transcriptPath }
@@ -764,17 +1014,37 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   if (parent && !options.fresh) await parent.process.checkpoint()
   const freshId = randomUUID()
   const fork = options.fresh ? undefined : await createFork(undefined, parent ? { sessionId: parent.member.sessionId, transcriptPath: parent.member.transcriptPath } : source)
-  if (getSessionId() !== root) throw new Error('Session changed before leaf creation')
+  if (getSessionId() !== self) throw new Error('Session changed before leaf creation')
   const member = await addLeafMember(familyPath(root), root, {
     sessionId: fork?.sessionId ?? freshId, parentSessionId: parent?.member.sessionId ?? root,
-    name: name || (options.fresh ? 'New conversation' : parent?.member.name || getCurrentSessionTitle(root) || 'Conversation'),
+    name: name || (options.fresh ? 'New conversation' : parent?.member.name || getLeafRootName()),
     transcriptPath: fork?.forkPath ?? join(getProjectDir(cwd), `${freshId}.jsonl`), forkMessageId: fork?.serializedMessages.at(-1)?.uuid ?? null,
     cwd, model: options.model ?? parent?.member.model, effort: options.effort ?? parent?.member.effort,
   })
   saveSessionName(asSessionId(member.sessionId), `Leaf ${member.number}: ${member.name}`, member.transcriptPath)
+  // The new member gets its pointer now, so it can find this family if it is
+  // ever resumed on its own.
+  void indexLeafMembers(root, [member])
   const view = await launch(member, root)
-  if (getSessionId() === root) selectLeaf(member.sessionId)
+  if (familyRootSync() === root) selectLeaf(member.sessionId)
   return view
+}
+
+let hostRelease: (() => Promise<void>) | undefined
+/**
+ * Hold this session's own transcript for the process that is on screen.
+ *
+ * A member of a family can now be opened from any other member, which means a
+ * session that is already live in one window could be started again in another.
+ * Two writers on one transcript interleave into it and neither of them is the
+ * conversation, so a top-level session claims its own transcript and `launch`
+ * collides with that claim. Best-effort: resuming the same session twice is a
+ * person's choice, not corruption this can prevent.
+ */
+async function claimHostOwnership(): Promise<void> {
+  if (hostRelease) return
+  try { hostRelease = await lock(`${getTranscriptPath()}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 }) }
+  catch { /* Another window already owns this session; it still works. */ }
 }
 
 /**
@@ -787,8 +1057,13 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
  */
 export async function restoreLeafWorkspace(): Promise<void> {
   if (isInteractiveLeaf()) return
-  const root = getSessionId()
-  await readLeafFamily(familyPath(root), root)
+  const root = await familyRootSessionId()
+  const family = await readLeafFamily(familyPath(root), root)
+  // Only the root knows its own transcript path and directory, so only the root
+  // writes the pointers its members will read. A member re-indexes with what it
+  // read: nothing new, unless the roster grew while it was hosting.
+  await indexLeafMembers(root, family.members)
+  await claimHostOwnership()
   publish()
 }
 
@@ -805,12 +1080,14 @@ export async function openLeaf(reference: string): Promise<string> {
   // whose process died gets a fresh one. Launching here as well would double it.
   await changeLeaf(member.sessionId, { status: 'open' })
   selectLeaf(member.sessionId)
-  return `Leaf #${member.number} ${member.name} opened.`
+  return `${memberLabel(member)} opened.`
 }
 
 export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {
   if (isInteractiveLeaf()) return requestLeafWorkspace('change', [sessionId, patch])
-  const root = getSessionId()
+  const root = await familyRootSessionId()
+  if (sessionId === root) return changeParent(patch)
+  const self = getSessionId()
   const view = views.get(sessionId)
   if (view && view.rootSessionId !== root) throw new Error('Leaf belongs to another family')
   if (patch.status === 'promoted' && view && view.process.getState() !== 'idle') throw new Error('Wait for the leaf turn before promoting')
@@ -841,9 +1118,42 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   if (view) view.member = member
   if (patch.status && patch.status !== 'open') {
     views.delete(sessionId)
-    if (selected.get(root) === sessionId) selected.delete(root)
+    if (selected.get(self) === sessionId) selected.delete(self)
   }
   if (patch.status === 'open') await launch(member, root)
+  publish()
+}
+
+/**
+ * Close or reopen the family's parent session from inside one of its members.
+ *
+ * The parent has no family entry to update - it *is* the family - so closing it
+ * stops the process hosting the family here, and reopening it starts the same
+ * session again from the transcript its pointer names. It cannot be archived or
+ * promoted, and it cannot be renamed from here: it is the permanent member, and
+ * it is what names the family.
+ */
+async function changeParent(patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {
+  const self = getSessionId()
+  const root = familyRootSync()
+  if (self === root) throw new Error('This is the parent session; it ends when you leave it')
+  if (patch.name) throw new Error('The parent session keeps its own name')
+  if (patch.status && patch.status !== 'open' && patch.status !== 'closed') throw new Error("The parent session cannot be archived or promoted; it is this family's permanent session")
+  const view = views.get(root)
+  if (patch.status !== 'open') {
+    if (!view) return
+    await saveLeafDraft(view)
+    await view.process.close()
+    await ownerReleases.get(root)?.()
+    ownerReleases.delete(root)
+    views.delete(root)
+    if (selected.get(self) === root) selected.delete(self)
+    publish()
+    return
+  }
+  const member = await leafParentMember()
+  if (!member) throw new Error('This session is the parent')
+  if (!view || !isLeafProcessAlive(view.process.getState())) await launch(member, root)
   publish()
 }
 
@@ -852,7 +1162,7 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
   const { recursivelySanitizeUnicode } = await import('./sanitization.js')
   const normalized = recursivelySanitizeUnicode(tag).trim()
   if (!normalized || normalized.length > 200) throw new Error('Tag must contain 1–200 characters')
-  const root = getSessionId()
+  const root = await familyRootSessionId()
   const family = await readLeafFamily(familyPath(root), root)
   const member = family.members.find(item => item.sessionId === sessionId)
   if (!member) throw new Error('Unknown leaf')
@@ -888,7 +1198,7 @@ export async function setLeafGoal(sessionId: string, args: string): Promise<stri
   const { readPersistSessionRecord, writePersistSessionRecord } = await import('./sessionStorage.js')
   const parsed = parsePersistArgs(args)
   if (parsed.kind === 'error') throw new Error(parsed.message)
-  const root = getSessionId()
+  const root = await familyRootSessionId()
   const family = await readLeafFamily(familyPath(root), root)
   const member = family.members.find(item => item.sessionId === sessionId)
   if (!member) throw new Error('Unknown leaf')
@@ -925,8 +1235,11 @@ export async function setLeafGoal(sessionId: string, args: string): Promise<stri
 
 export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<LeafMember>, 'model' | 'effort'>): Promise<void> {
   if (isInteractiveLeaf()) return requestLeafWorkspace('settings', [sessionId, patch])
-  const view = getLeafViews().find(item => item.member.sessionId === sessionId)
+  const view = views.get(sessionId)
   if (!view) throw new Error('Unknown leaf')
+  // The parent keeps its own settings: there is no family entry to record them
+  // in, and its own session is where they belong.
+  if (view.member.number === 0) return
   view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, sessionId, patch)
   publish()
 }
@@ -934,9 +1247,24 @@ export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<Le
 export async function saveLeafDraft(view: LeafView): Promise<void> {
   const owned = views.get(view.member.sessionId)
   if (owned && !['closed', 'failed'].includes(owned.process.getState())) await owned.process.syncDraft()
+  // A hosted parent has no family entry to store a draft in.
+  if (view.member.number === 0) return
   view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, view.member.sessionId, { draft: view.draft })
 }
 
-registerCleanup(async () => { await Promise.all([...views.values()].map(async view => {
-  try { await saveLeafDraft(view) } finally { await view.process.close() }
-})) })
+registerCleanup(async () => {
+  // This session leaving is not the family leaving. A member is its own
+  // process, so it is detached and keeps running - which is what lets a person
+  // close the session they are in and carry on in a leaf, and what stops the
+  // session that happened to start a leaf being its reason to exist. Closing a
+  // leaf for good is `changeLeaf`, and only a person does that.
+  await Promise.all([...views.values()].map(async view => {
+    try { await saveLeafDraft(view) } catch { /* The member may already be gone. */ }
+    view.process.detach()
+  }))
+  // Release the claims this session took, so what it was holding can be picked
+  // up straight away instead of waiting for the lock to go stale.
+  for (const release of [...ownerReleases.values()]) await release().catch(() => {})
+  ownerReleases.clear()
+  await hostRelease?.().catch(() => {})
+})

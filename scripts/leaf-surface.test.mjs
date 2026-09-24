@@ -442,6 +442,82 @@ test('the leaf menu names choices by goal and keeps the arg grammar as passthrou
   assert.doesNotMatch(command, /LeafCreateMenu/)
 })
 
+test('the bottom nav reaches the leaf menu, and the prompt overlay is what shows it', async () => {
+  // The carousel lives in the layout, below the prompt, so it cannot render the
+  // menu where it sits - the menu is an overlay that has to escape the bottom
+  // slot's clip. It asks for the menu by name and the prompt opens it.
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /onManage \?\? requestLeafMenu/)
+  assert.match(dialog, /Manage leaves/)
+
+  const prompt = await readFile(new URL('../src/components/PromptInput/PromptInput.tsx', import.meta.url), 'utf8')
+  assert.match(prompt, /subscribeLeafMenuRequest\(\(\) => setShowLeafMenu\(true\)\)/)
+  assert.match(prompt, /const leafMenuDialog = showLeafMenu \? <LeafMenu onDone/)
+  // Composed into the same portal as the other prompt dialogs, so it floats
+  // above the prompt instead of being cropped to a row by the bottom slot.
+  assert.match(prompt, /const promptOverlayDialog = gatewaySessionsDialog \?\? leafMenuDialog \?\? sessionMetadataDialog \?\? autoModeOptInDialog/)
+  // Escape inside the menu must not reach the double-press message selector.
+  assert.match(prompt, /showGatewaySessions \|\| showLeafMenu \|\| isLocalJSXCommandActive/)
+  assert.match(prompt, /if \(showLeafMenu && !isFullscreenEnvEnabled\(\)\) return leafMenuDialog/)
+})
+
+test('the family outlives its parent: any member can find and reopen the rest', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // A member's own pointer is what makes membership survive the parent process:
+  // the family file is keyed by the root's id, which only the root can know.
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string }'))
+  assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
+  assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
+  assert.match(workspace, /export function familyRootSync\(\): string/)
+  assert.match(workspace, /export function forgetLeafFamilyRoot\(\): void/)
+  // The root's own process is the only writer, because only it knows where its
+  // transcript lives and which directory to resume it in.
+  assert.match(workspace, /async function writeLeafFamilyPointer\(sessionId: string, pointer: LeafFamilyPointer\)/)
+  assert.match(workspace, /await indexLeafMembers\(root, family\.members\)/)
+  assert.match(workspace, /function rootPointerInfo\(root: string\): LeafFamilyPointer/)
+
+  // The parent is a synthesized row, never an entry in the file keyed by its id.
+  assert.match(workspace, /export async function leafParentMember\(\): Promise<LeafMember \| undefined>/)
+  assert.match(workspace, /if \(root === getSessionId\(\)\) return undefined/)
+  assert.match(workspace, /number: 0,/)
+  assert.match(workspace, /if \(rootReference\(reference\)\) return leafParentMember\(\)/)
+  // It is always resumed: starting it under `--session-id` would shadow the real
+  // conversation with an empty one.
+  assert.match(workspace, /let hasTranscript = member\.number === 0 \|\| member\.forkMessageId !== null/)
+  assert.match(workspace, /function leafSelfLabel\(member: LeafMember, rootSessionId: string\): string/)
+
+  // The permanent member closes and reopens, and is never detached.
+  assert.match(workspace, /async function changeParent\(patch: Pick<Partial<LeafMember>, 'name' \| 'status'>\): Promise<void>/)
+  assert.match(workspace, /cannot be archived or promoted/)
+  assert.match(workspace, /The parent session keeps its own name/)
+  assert.match(workspace, /if \(sessionId === root\) return changeParent\(patch\)/)
+  // Reopening it from a member must not put two writers on one transcript.
+  assert.match(workspace, /await claimHostOwnership\(\)/)
+  assert.match(workspace, /is already open in another window; close it there before opening it here/)
+  // The bar can switch to a hosted parent; the roster published to the leaves
+  // must not list it, or every leaf would read the conversation it came from as
+  // a sibling.
+  assert.match(workspace, /export function getLeafCarouselViews\(\): LeafView\[\]/)
+  assert.match(workspace, /view\.rootSessionId === root && view\.member\.number > 0/)
+  assert.match(workspace, /export function getLeafHostName\(\): string/)
+  assert.match(workspace, /return \(await currentFamily\(\)\)\.members\.filter\(member => member\.sessionId !== self\)/)
+})
+
+test('the leaf menu offers the parent session, and never as an archive', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /leafParentMember\(\)\.then\(setParent\)/)
+  assert.match(dialog, /leafParentIsOpen\(\)/)
+  assert.match(dialog, /Open the parent session \$\{parent\.name\}/)
+  assert.match(dialog, /Close the parent session \$\{parent\.name\}/)
+  // The family is named after the parent, so there is no archive row for it and
+  // none can be reached by a value built from its id.
+  assert.doesNotMatch(dialog, /archive:\$\{parent/)
+  assert.match(dialog, /describeSession/)
+  // The bar's first entry is the session on screen, which is not always the root.
+  assert.match(dialog, /label: getLeafHostName\(\)/)
+  assert.match(dialog, /views=\{getLeafCarouselViews\(\)\}/)
+})
+
 test('archive detaches a leaf without deleting anything', async () => {
   const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
   // Archiving is detach, not delete: it must reach for the archived status and

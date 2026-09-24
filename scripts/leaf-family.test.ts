@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
@@ -9,6 +9,24 @@ import { createFork } from '../src/commands/branch/branch.ts'
 import { createLeaf, changeLeaf, fileLeaf } from '../src/utils/leafWorkspace.ts'
 import { LeafProcess } from '../src/utils/leafProcess.ts'
 import { getCwd } from '../src/utils/cwd.ts'
+
+/**
+ * What this file is about decides the environment it runs in.
+ *
+ * Every case here builds a leaf and drives it from the outside: the subject is
+ * the session side of a leaf family, not the leaf side. Launched by a leaf -
+ * which is what happens when a leaf session runs the suite - the inherited
+ * identity changes what those same calls mean, because a leaf has no workspace
+ * to ask and answers "Leaf workspace disconnected" instead. Nine cases failed
+ * for that reason and no other. Pin it so the file says the same thing wherever
+ * it is launched, and put it back so the process is unchanged for what runs next.
+ */
+const ambientLeafIdentity = process.env.GATEWAY_INTERACTIVE_LEAF
+delete process.env.GATEWAY_INTERACTIVE_LEAF
+after(() => {
+  if (ambientLeafIdentity === undefined) delete process.env.GATEWAY_INTERACTIVE_LEAF
+  else process.env.GATEWAY_INTERACTIVE_LEAF = ambientLeafIdentity
+})
 
 type QueuedProcess = LeafProcess & { child: unknown; state: string; controls: Map<string, { resolve: () => void; reject: (error: Error) => void }> }
 
@@ -614,4 +632,95 @@ test('five concurrent allocations preserve ancestry and never recycle numbers af
     await assert.rejects(readLeafFamily(path, randomUUID()), /identity/)
     await assert.rejects(addLeafMember(path, root, { ...first, parentSessionId: randomUUID(), sessionId: randomUUID() }), /Unknown leaf parent/)
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('a member resumed on its own finds its family, its siblings, and its parent', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-member-discovery-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
+    const { asSessionId } = await import('../src/types/ids.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const { getTranscriptPath } = await import('../src/utils/sessionStorage.ts')
+    const root = getSessionId()
+    const rootTranscript = getTranscriptPath()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Sibling', transcriptPath: join(directory, 'sibling.jsonl'), forkMessageId: randomUUID() })
+    const member = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Member', transcriptPath: join(directory, 'member.jsonl'), forkMessageId: randomUUID() })
+
+    // Nothing in the family file names the family; only the root's own process
+    // knows its transcript path and directory, so it writes the pointer every
+    // member reads on the way back in.
+    await workspace.restoreLeafWorkspace()
+    const pointer = JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${member.sessionId}.json`), 'utf8'))
+    assert.equal(pointer.rootSessionId, root, 'a member must be able to name the family it belongs to')
+    assert.equal(pointer.rootTranscriptPath, rootTranscript, 'and to find the parent transcript it will be resumed from')
+
+    // At the root there is no parent row: the parent is the session asking.
+    assert.equal(await workspace.leafParentMember(), undefined)
+    assert.equal(await workspace.resolveLeafRef('parent'), undefined)
+    assert.deepEqual((await workspace.listLeafMembers()).map(item => item.name), ['Sibling', 'Member'])
+    await assert.rejects(workspace.changeLeaf(root, { status: 'closed' }), /ends when you leave it/)
+
+    // Now be that member: a leaf resumed on its own, with no parent above it.
+    const projectDir = getSessionProjectDir()
+    const resumeDirectory = getSessionResumeDirectory()
+    switchSession(asSessionId(member.sessionId), null, directory)
+    workspace.forgetLeafFamilyRoot()
+    try {
+      assert.equal(await workspace.familyRootSessionId(), root, 'the member resolves the family it was forked from')
+      assert.deepEqual((await workspace.listLeafMembers()).map(item => item.name), ['Sibling'], 'it sees its siblings, not itself')
+      const parent = await workspace.leafParentMember()
+      assert.equal(parent?.sessionId, root)
+      assert.equal(parent?.number, 0, 'the parent is a member row, but not one of the numbered leaves')
+      assert.equal(parent?.transcriptPath, rootTranscript, 'the parent row carries the transcript to resume')
+      assert.equal((await workspace.resolveLeafRef('parent'))?.sessionId, root, 'the parent is addressable by name')
+      assert.equal((await workspace.resolveLeafRef('1'))?.name, 'Sibling', 'and a sibling by number')
+      assert.match(await workspace.familyRoster(), new RegExp(`^root .* \\[parent\\] ${root}$`, 'm'))
+      // The parent is the permanent member: it closes and reopens, but it is
+      // never archived, promoted, or renamed out from under the family.
+      await assert.rejects(workspace.changeLeaf(root, { status: 'archived' }), /cannot be archived or promoted/)
+      await assert.rejects(workspace.changeLeaf(root, { status: 'promoted' }), /cannot be archived or promoted/)
+      await assert.rejects(workspace.changeLeaf(root, { name: 'Mine now' }), /keeps its own name/)
+      await workspace.changeLeaf(root, { status: 'closed' })
+    } finally {
+      switchSession(asSessionId(root), projectDir, resumeDirectory)
+      workspace.forgetLeafFamilyRoot()
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a hosted parent is the session on screen, never one of its own leaves', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-hosted-parent-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const { leaf } = parkedLeaf()
+    const root = getSessionId()
+    const parent = {
+      sessionId: root, parentSessionId: root, number: 0, name: 'Parent',
+      transcriptPath: join(directory, 'root.jsonl'), forkMessageId: null,
+      createdAt: new Date(0).toISOString(), status: 'open',
+    }
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: parent as never, process: leaf as never, draft: '' })
+    try {
+      // The family file is keyed by the parent's id, so the parent cannot also be
+      // a member of it - and a roster that listed it would have every leaf
+      // believe the conversation it was forked from was a sibling.
+      assert.deepEqual(workspace.getLeafViews(), [], 'the parent is not a leaf of its own family')
+      assert.deepEqual(workspace.getLeafCarouselViews().map(view => view.member.number), [0], 'but it is a session the bar can switch to')
+      assert.equal(workspace.leafParentIsOpen(), true, 'a hosted parent can be closed from the menu')
+    } finally { unregister() }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
 })

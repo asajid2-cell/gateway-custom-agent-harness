@@ -157,7 +157,12 @@ test('a leaf never registers on the shared bus', async () => {
   assert.match(hook, /return deriveSessionPurpose\(messages, name\)/)
 
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  assert.match(workspace, /GATEWAY_LEAF_LABEL: `Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{rootSessionId\}\)`/)
+  assert.match(workspace, /GATEWAY_LEAF_LABEL: leafSelfLabel\(member, rootSessionId\)/)
+  assert.match(workspace, /function leafSelfLabel\(member: LeafMember, rootSessionId: string\): string/)
+  assert.match(workspace, /`Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{rootSessionId\}\)`/)
+  // The parent session is hosted as a member now, and naming it "Leaf 0" would
+  // have it derive its intent from being one of its own leaves.
+  assert.match(workspace, /`The original session \$\{member\.name\} \(family root \$\{rootSessionId\}\)`/)
   // The launch comment must not claim bus registration: that is how the guard
   // above gets reverted by the next reader who trusts the prose.
   assert.doesNotMatch(workspace, /A leaf registers on the same peer bus as any session/)

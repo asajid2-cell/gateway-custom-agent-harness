@@ -35,6 +35,25 @@ processes = []
 blocked_turns = {name: threading.Event() for name in ('LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK')}
 started_turns = set()
 finished_turns = set()
+# Where a view-tag keystroke landed, in arrival order. See Terminal.typed_in.
+arrivals = []
+
+def session_of(body):
+    """The session a request belongs to, as the app itself stamps it.
+
+    Every model request carries metadata.user_id, a JSON string holding the
+    session id of the REPL that sent it (services/api/claude.ts). That is the
+    ground truth for "which session is this", and it is available for a leaf
+    exactly as for the root - the leaf is a session, not a special case.
+    """
+    identity = (body.get('metadata') or {}).get('user_id')
+    if not isinstance(identity, str): return None
+    try: return json.loads(identity).get('session_id')
+    except ValueError: return None
+
+# A view tag is a unique marker a probe types into whatever session is on
+# screen, to learn who received it.
+VIEW_TAG_RE = re.compile(r'VIEW_TAG_[0-9a-f]{8}')
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
@@ -42,8 +61,15 @@ class Handler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
+        view = VIEW_TAG_RE.search(latest)
         marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
+        if view:
+            # Recorded here and deliberately kept out of `requests`: a view tag
+            # is an instrument reading, not one of the turns the probes count
+            # and inspect. Its reply is tagged too, so it can never be mistaken
+            # for the plain FIXTURE_REPLY_BACKGROUND turn a tool result gets.
+            arrivals.append(dict(tag=view.group(0), session=session_of(body)))
         if marker in blocked_turns:
             started_turns.add(marker)
             if not blocked_turns[marker].wait(75): return
@@ -53,7 +79,7 @@ class Handler(BaseHTTPRequestHandler):
         frames = [
             dict(type='message_start', message=dict(id='msg_' + uuid.uuid4().hex, type='message', role='assistant', model='claude-sonnet-4-6', content=[], stop_reason=None, stop_sequence=None, usage=dict(input_tokens=100, output_tokens=0))),
             dict(type='content_block_start', index=0, content_block=dict(type='text', text='')),
-            dict(type='content_block_delta', index=0, delta=dict(type='text_delta', text='FIXTURE_REPLY_' + marker)),
+            dict(type='content_block_delta', index=0, delta=dict(type='text_delta', text='FIXTURE_REPLY_' + (view.group(0) if view else marker))),
             dict(type='content_block_stop', index=0),
             dict(type='message_delta', delta=dict(stop_reason='end_turn', stop_sequence=None), usage=dict(output_tokens=20)),
             dict(type='message_stop'),
@@ -140,6 +166,7 @@ class Terminal:
         if permission_mode: cli_args += ['--permission-mode', permission_mode]
         self.proc = PtyProcess.spawn(subprocess.list2cmdline(cli_args), cwd=str(root), env=env, dimensions=(args.rows, args.columns))
         self.owned = {self.proc.pid: psutil.Process(self.proc.pid)}
+        self.births = {self.proc.pid: self.owned[self.proc.pid].create_time()}
         processes.append(self)
         self.screen.reply = self.proc.write
         def drain():
@@ -151,8 +178,29 @@ class Terminal:
         for process in list(self.owned.values()):
             try:
                 if process.is_running():
-                    for child in process.children(recursive=True): self.owned[child.pid] = child
+                    for child in process.children(recursive=True):
+                        self.owned[child.pid] = child
+                        try: self.births[child.pid] = child.create_time()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied): pass
             except psutil.NoSuchProcess: pass
+    def running_owned(self):
+        """The captured processes that are still the ones that were captured.
+
+        A pid captured earlier can be gone, and Windows then hands its number to
+        whatever starts next: a closed leaf frees one, so the check at the end of
+        a run can find that number owned by a Session 0 service nothing can open,
+        and psutil raises `AccessDenied` instead of reporting it gone - or, worse,
+        a cleanup pass terminates a stranger. Same pid and same creation time is
+        the same process; anything else is not one of ours, and no assertion here
+        is about it.
+        """
+        live = []
+        for pid, born_at in self.births.items():
+            process = self.owned[pid]
+            try:
+                if process.is_running() and process.create_time() == born_at: live.append(process)
+            except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+        return live
     def pump(self):
         while True:
             try:
@@ -160,14 +208,17 @@ class Terminal:
                 self.output = (self.output + chunk)[-262144:]
                 self.stream.feed(chunk)
             except queue.Empty: return
+    def dump(self):
+        """Leave what was on screen behind, for whoever reads the failure."""
+        (root / 'screen.txt').write_text('\n'.join(self.screen.display), encoding='utf-8')
+        (root / 'terminal-output.txt').write_text(self.output, encoding='utf-8')
     def wait(self, predicate, label, timeout=30):
         end = time.monotonic() + timeout
         while time.monotonic() < end:
             self.pump()
             if predicate(): return
             time.sleep(.03)
-        (root / 'screen.txt').write_text('\n'.join(self.screen.display), encoding='utf-8')
-        (root / 'terminal-output.txt').write_text(self.output, encoding='utf-8')
+        self.dump()
         raise AssertionError(label + ' (screen saved locally)')
     def pause(self, seconds=.2):
         end = time.monotonic() + seconds
@@ -177,6 +228,57 @@ class Terminal:
     def submit(self, text):
         self.capture_owned()
         self.proc.write('\x1b[200~' + text + '\x1b[201~'); self.pause(.5); self.proc.write('\r')
+    def typed_in(self, tag, wait=10):
+        """Type a unique marker once and see which session took it.
+
+        Returns the session id the marker became a request for, or None if it
+        reached nobody inside the window.
+        """
+        before = len(arrivals)
+        self.proc.write('\x15'); self.pause(.3)
+        self.submit(tag)
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            self.pump()
+            landed = [row for row in arrivals[before:] if row['tag'] == tag]
+            if landed: return landed[0]['session']
+            time.sleep(.03)
+        return None
+    def assert_view(self, session_id, what='focused session', timeout=30):
+        """The session on screen is `session_id`, witnessed by routing.
+
+        This is how the harness learns which session is on screen. It used to
+        read the focused session id off the footer, but the footer stopped
+        printing the id (it prints the resume command), so that reading was a
+        stale copy of an old layout: it would say "not on screen" about any
+        session at all, since the string it looked for is nowhere in the UI
+        any more. A keystroke that becomes a request stamped with its
+        session's id is the same fact read from the app instead of from a
+        painted label, and no label can satisfy it.
+
+        It is asked more than once because a leaf is a process with a whole
+        CLI to evaluate, and until it is up its keystrokes are still handled
+        by whatever is on screen. That first answer is honest - it really did
+        go somewhere else - so the marker is sent again rather than accepted.
+        """
+        deadline = time.monotonic() + timeout
+        landed = None
+        attempts = 0
+        while time.monotonic() < deadline:
+            attempts += 1
+            tag = 'VIEW_TAG_' + uuid.uuid4().hex[:8]
+            landed = self.typed_in(tag)
+            if landed == session_id:
+                # The marker's own reply, which is what makes the session idle
+                # again for whatever the probe types next.
+                self.wait(lambda: 'FIXTURE_REPLY_' + tag in self.text(),
+                          'view-tag turn finished', 45)
+                return
+            time.sleep(1)
+        self.dump()
+        raise AssertionError(
+            what + ' is not ' + session_id[:8] + ': after ' + str(attempts) +
+            ' markers the keystroke landed in ' + (str(landed)[:8] if landed else 'no session'))
     def point(self, label):
         self.pause(.6)
         def matches():
@@ -216,26 +318,63 @@ class Terminal:
         except PermissionError:
             return getattr(self, 'last_family', {'members': []})
         return self.last_family
-    def original(self):
+    def original(self, draft=None):
         self.click('All ' + str(sum(member['status'] == 'open' for member in self.family()['members']) + 1))
         self.click('Original')
-        self.wait(lambda: self.id[:8] in self.text(), 'original prompt restored')
+        self.witness(self.id, 'the original session', draft)
         self.pause(.5)
-    def leaf(self, index, permission=False):
+    def leaf(self, index, permission=False, draft=None):
         self.click('All ' + str(sum(member['status'] == 'open' for member in self.family()['members']) + 1))
         member = self.family()['members'][index]
         self.click(str(member['number']) + ' ' + member['name'] + ' [')
-        self.wait(lambda: ('Do you want to create approved-leaf.txt?' in self.text()) if permission else member['sessionId'][:8] in self.text(), 'selected leaf UI')
+        if permission:
+            # The pending permission dialog is itself proof of which session is
+            # on screen, and is the thing the probe goes on to answer.
+            self.wait(lambda: 'Do you want to create approved-leaf.txt?' in self.text(), 'selected leaf UI')
+        else:
+            self.witness(member['sessionId'], 'the selected leaf', draft)
+    def witness(self, session_id, what, draft=None):
+        """Say which session is on screen, without damaging what is on it.
+
+        Normally that is routing: type a marker, see whose request it became.
+        But a session can be holding unsent text, and typing into it proves
+        focus by destroying the very thing the next assertion is about - the
+        draft exists on exactly one session's screen, so it is its own witness
+        and the marker would only be a second, contradictory one.
+        """
+        if draft is not None:
+            self.wait(lambda: draft in self.text(), what + ', still holding its draft')
+        else:
+            self.assert_view(session_id, what)
     def resize(self, columns, rows):
         self.screen.resize(lines=rows, columns=columns)
         self.proc.setwinsize(rows, columns)
         self.pause(.8)
-    def exit(self):
+    def exit(self, family_survives=None):
+        """Leave the session, and check what that did to the family.
+
+        A member is its own process, so the session watching it leaving is a
+        detach and the family keeps running - closing the session you are in is
+        what used to take the whole family down with it. Where this terminal has
+        a member open, surviving is the expected outcome and dying is the
+        failure; a terminal with no leaves still has to exit cleanly.
+        """
         self.submit('/exit')
         self.wait(lambda: not self.proc.isalive(), 'graceful root exit')
-        _, alive = psutil.wait_procs(list(self.owned.values()), timeout=10)
-        assert not alive, 'Graceful exit left owned processes: ' + str([p.pid for p in alive])
-        self.wait(lambda: not list((root / 'gateway-writers').glob('*.lock')), 'all fixture writer locks released')
+        _, alive = psutil.wait_procs(self.running_owned(), timeout=10)
+        if family_survives is None:
+            family_survives = any(member['status'] == 'open' for member in self.family()['members'])
+        if family_survives:
+            assert alive, 'Graceful exit closed the family instead of detaching it'
+        else:
+            assert not alive, 'Graceful exit left owned processes: ' + str([p.pid for p in alive])
+        # Whoever is still running is still writing, so only the session that
+        # left gives its claim back. Waiting for every writer lock here would
+        # mean waiting for the family, which is the thing that must not happen.
+        self.wait(lambda: not (root / 'gateway-writers' / (self.id + '.lock')).exists(),
+                  'the leaving session released its writer lock')
+        if not family_survives:
+            self.wait(lambda: not list((root / 'gateway-writers').glob('*.lock')), 'all fixture writer locks released')
         self.wait(lambda: not list((root / 'projects').rglob('*.leaf-owner.lock')), 'all leaf owner locks released')
 
 def probe_full_tui():
@@ -244,7 +383,8 @@ def probe_full_tui():
     t.submit('/leaf new FullSession')
     t.wait(lambda: len(t.family()['members']) == 1 and 'All 2' in t.text(), 'leaf created', 75)
     leaf_id = t.family()['members'][0]['sessionId']
-    t.wait(lambda: leaf_id[:8] in t.text() and 'session:' in t.text(), 'leaf must show its own normal session footer', 75)
+    t.wait(lambda: 'session:' in t.text(), 'leaf must show its own normal session footer', 75)
+    t.assert_view(leaf_id, 'the new leaf', 75)
     t.click('✎ Rename')
     t.wait(lambda: 'Session metadata' in t.text(), 'leaf must open normal session metadata dialog')
     t.proc.write('\x1b'); t.pause()
@@ -264,9 +404,9 @@ def probe_full_tui():
     t.wait(lambda: 'LEAF_UNSENT' in t.text(), 'leaf draft visible before Tab', 10)
     t.proc.write('\t'); t.pause()
     t.wait(lambda: 'LEAF_UNSENT' in t.text(), 'Tab switched away or lost draft', 3)
-    t.original()
-    t.wait(lambda: 'ROOT_UNSENT' in t.text() and 'LEAF_UNSENT' not in t.text(), 'Root draft was not retained independently')
-    t.leaf(0)
+    t.original('ROOT_UNSENT')
+    t.wait(lambda: 'LEAF_UNSENT' not in t.text(), 'the leaf draft leaked into the root')
+    t.leaf(0, draft='LEAF_UNSENT')
     t.wait(lambda: 'LEAF_UNSENT' in t.text(), 'Leaf draft lost on switch', 10)
     t.proc.write('\x15'); t.pause()
     t.submit('LEAF_BLOCKED_TASK')
@@ -298,7 +438,11 @@ def probe_full_tui():
     assert (root / 'approved-leaf.txt').read_text() == 'APPROVED_LEAF_ONLY'
     t.wait(lambda: 'FIXTURE_REPLY_BACKGROUND' in t.text(), 'tool result turn completes')
     t.resize(60, 28)
-    t.wait(lambda: 'All 2' in t.text() and 'session:' in t.text(), 'selected full UI resizes')
+    # At this width the footer's `session:` clause is truncated away (cwd takes
+    # the row), so what a narrow layout still owes the user is the row it does
+    # render and a prompt that still takes what is typed at it.
+    t.wait(lambda: 'All 2' in t.text() and 'cwd:' in t.text(), 'selected full UI resizes')
+    t.assert_view(leaf_id, 'the selected leaf at 60 columns')
     t.resize(args.columns, args.rows)
     t.original()
     t.exit()
@@ -319,7 +463,8 @@ def probe_selection():
     t.submit('ROOT_CONTEXT_CAFE_世界')
     t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root reply')
     t.submit('/leaf fork original ForkOne')
-    t.wait(lambda: len(t.family()['members']) == 1 and t.family()['members'][0]['sessionId'][:8] in t.text(), 'fork created', 75)
+    t.wait(lambda: len(t.family()['members']) == 1, 'fork created', 75)
+    t.assert_view(t.family()['members'][0]['sessionId'], 'the fork', 75)
     t.original()
     t.wait(lambda: 'session:' in t.text(), 'original restored')
 
@@ -475,13 +620,14 @@ def probe_lifecycle():
     t.submit('/leaf new Lifecycle')
     t.wait(lambda: len(t.family()['members']) == 1, 'fresh leaf recorded', 75)
     leaf_id = t.family()['members'][0]['sessionId']
-    t.wait(lambda: leaf_id[:8] in t.text(), 'full leaf active', 75)
+    t.assert_view(leaf_id, 'the new leaf', 75)
     t.submit('FRESH_ONLY_TASK')
     t.wait(lambda: 'FIXTURE_REPLY_FRESH_ONLY_TASK' in t.text(), 'leaf turn')
     t.submit('/leaf fork original RootCopy')
-    t.wait(lambda: len(t.family()['members']) == 2 and t.family()['members'][1]['sessionId'][:8] in t.text(), 'root fork from leaf', 75)
+    t.wait(lambda: len(t.family()['members']) == 2, 'root fork from leaf', 75)
     fork = t.family()['members'][1]
     assert fork['parentSessionId'] == t.id, 'Explicit original fork used the leaf as source'
+    t.assert_view(fork['sessionId'], 'the root fork', 75)
     t.submit('FORK_ONLY_TASK')
     t.wait(lambda: 'FIXTURE_REPLY_FORK_ONLY_TASK' in t.text(), 'root fork turn')
     assert 'ROOT_CONTEXT_CAFE_' in json.dumps(requests[-1]) and 'FRESH_ONLY_TASK' not in json.dumps(requests[-1]), 'Original fork context incorrect'
@@ -490,12 +636,12 @@ def probe_lifecycle():
     root_logs = list((root / 'projects').rglob(t.id + '.jsonl'))
     assert len(root_logs) == 1 and 'SELECTED_CONTEXT_NOTE' in root_logs[0].read_text(encoding='utf-8'), 'Return did not persist in original'
     t.submit('/clear')
-    t.wait(lambda: len(t.family()['members']) == 3 and t.family()['members'][1]['status'] == 'closed' and t.family()['members'][2]['sessionId'][:8] in t.text(), 'clear updates leaf identity')
+    t.wait(lambda: len(t.family()['members']) == 3 and t.family()['members'][1]['status'] == 'closed', 'clear updates leaf identity')
     assert t.family()['members'][1]['status'] == 'closed', 'Clear left old identity live'
     cleared = t.family()['members'][2]
+    t.assert_view(cleared['sessionId'], 'the cleared session')
     t.original()
     t.leaf(2)
-    t.wait(lambda: cleared['sessionId'][:8] in t.text(), 'cleared session selectable')
     t.original()
     t.submit('/leaf close ' + cleared['sessionId'])
     t.wait(lambda: t.family()['members'][2]['status'] == 'closed', 'cleared session closes')
@@ -516,8 +662,8 @@ def probe_lifecycle():
     assert t.family()['members'][0]['draft'] == 'SAVED_DRAFT', 'Close lost draft'
     t.submit('/leaf reopen ' + leaf_id)
     t.wait(lambda: t.family()['members'][0]['status'] == 'open' and 'All 3' in t.text(), 'leaf reopened', 75)
-    t.leaf(0)
-    t.wait(lambda: 'SAVED_DRAFT' in t.text() and 'FRESH_ONLY_TASK' in t.text(), 'Reopen lost draft or transcript')
+    t.leaf(0, draft='SAVED_DRAFT')
+    t.wait(lambda: 'FRESH_ONLY_TASK' in t.text(), 'Reopen lost draft or transcript')
     t.proc.write('\x15'); t.pause()
     t.submit('FRESH_ONLY_TASK_MODEL')
     t.wait(lambda: requests[-1].get('model') == 'claude-haiku-4-5' and 'FIXTURE_REPLY_FRESH_ONLY_TASK' in t.text(), 'reopened model applied')
@@ -547,9 +693,10 @@ def probe_lifecycle():
     worktree = root / 'isolated-worktree'
     subprocess.run(['git', '-C', str(root), 'worktree', 'add', '-b', 'fixture-worktree', str(worktree)], check=True, capture_output=True, timeout=15)
     t.submit('/leaf worktree ' + json.dumps(dict(path=str(worktree), name='WorktreeLeaf')))
-    t.wait(lambda: len(t.family()['members']) == 4 and t.family()['members'][3]['sessionId'][:8] in t.text(), 'worktree leaf opens', 75)
+    t.wait(lambda: len(t.family()['members']) == 4, 'worktree leaf opens', 75)
     worktree_member = t.family()['members'][3]
     assert Path(worktree_member['cwd']).resolve() == worktree.resolve(), 'Leaf cwd not isolated'
+    t.assert_view(worktree_member['sessionId'], 'the worktree leaf', 75)
     t.submit('FORK_ONLY_TASK_WORKTREE')
     t.wait(lambda: 'FIXTURE_REPLY_FORK_ONLY_TASK' in t.text(), 'worktree fork answers')
     assert 'ROOT_CONTEXT_CAFE_' in json.dumps(requests[-1]), 'Worktree fork lost source context'
@@ -561,9 +708,11 @@ def probe_lifecycle():
     t.leaf(3)
     t.wait(lambda: 'FORK_ONLY_TASK_WORKTREE' in t.text(), 'worktree history retained')
     t.submit('/branch NativeBranch')
-    t.wait(lambda: len(t.family()['members']) == 5 and t.family()['members'][3]['status'] == 'closed' and t.family()['members'][4]['sessionId'][:8] in t.text(), 'native branch updates family identity', 75)
+    t.wait(lambda: len(t.family()['members']) == 5 and t.family()['members'][3]['status'] == 'closed', 'native branch updates family identity', 75)
+    t.assert_view(t.family()['members'][4]['sessionId'], 'the native branch', 75)
     t.submit('/resume ' + worktree_member['sessionId'])
-    t.wait(lambda: t.family()['members'][3]['status'] == 'open' and t.family()['members'][4]['status'] == 'closed' and worktree_member['sessionId'][:8] in t.text(), 'native resume restores family identity', 75)
+    t.wait(lambda: t.family()['members'][3]['status'] == 'open' and t.family()['members'][4]['status'] == 'closed', 'native resume restores family identity', 75)
+    t.assert_view(worktree_member['sessionId'], 'the resumed session', 75)
     t.original()
     t.exit()
     print(json.dumps(dict(lifecycle=True, rootFork=True, modelRestart=True, savedDraft=True, goal=True, filing=True, promotion=True, ownedProcessCleanup=True)), flush=True)
@@ -578,7 +727,8 @@ try:
     t.submit('ROOT_CONTEXT_CAFE_世界')
     t.wait(lambda: len(requests) >= 1 and 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root response')
     t.submit('/leaf fork original ForkOne')
-    t.wait(lambda: len(t.family()['members']) == 1 and t.family()['members'][0]['sessionId'][:8] in t.text(), 'fork created', 75)
+    t.wait(lambda: len(t.family()['members']) == 1, 'fork created', 75)
+    t.assert_view(t.family()['members'][0]['sessionId'], 'the fork', 75)
     t.submit('FORK_ONLY_TASK')
     t.wait(lambda: len(requests) >= 2 and 'FIXTURE_REPLY_FORK_ONLY_TASK' in t.text(), 'fork response')
     assert 'ROOT_CONTEXT_CAFE_' in json.dumps(requests[-1]), 'Fork context missing'
@@ -589,18 +739,23 @@ try:
     t.original()
     t.wait(lambda: 'session:' in t.text(), 'original restored')
     t.submit('/leaf new FreshOne')
-    t.wait(lambda: len(t.family()['members']) == 2 and t.family()['members'][1]['sessionId'][:8] in t.text(), 'fresh leaf created', 75)
+    t.wait(lambda: len(t.family()['members']) == 2, 'fresh leaf created', 75)
+    fresh = t.family()['members'][1]
+    t.assert_view(fresh['sessionId'], 'the fresh leaf', 75)
     t.submit('FRESH_ONLY_TASK')
     t.wait(lambda: len(requests) >= 3 and 'FIXTURE_REPLY_FRESH_ONLY_TASK' in t.text(), 'fresh response')
     assert 'ROOT_CONTEXT_CAFE_' not in json.dumps(requests[-1]), 'Fresh leaf inherited context'
-    t.wait(lambda: t.family()['members'][1]['sessionId'][:8] in t.text(), 'fresh turn idle before wheel')
+    # A marker that is answered proves the leaf is back at its input loop,
+    # which is the idle claim, and that it - not the root - is on screen.
+    t.assert_view(fresh['sessionId'], 'the fresh leaf, idle before the wheel')
     t.pause(.5)
     t.wheel('2 FreshOne', False)
-    t.wait(lambda: t.family()['members'][0]['sessionId'][:8] in t.text(), 'wheel switched leaf')
+    t.assert_view(t.family()['members'][0]['sessionId'], 'the wheel target')
     t.click('All 3', hold=True)
     t.wait(lambda: 'All sessions' in t.text(), 'hold expanded picker')
     t.click('2 FreshOne [idle]')
-    t.wait(lambda: t.family()['members'][1]['sessionId'][:8] in t.text() and 'All sessions' not in t.text(), 'picker switched leaf')
+    t.assert_view(fresh['sessionId'], 'the picker target')
+    assert 'All sessions' not in t.text(), 'the picker stayed open after a selection'
     t.original()
     t.click('✎ Rename')
     t.wait(lambda: 'Session metadata' in t.text(), 'pencil opens root rename')
@@ -617,19 +772,21 @@ try:
     resumed.wait(lambda: 'Create a leaf' in resumed.text(), 'creation menu inside leaf')
     resumed.proc.write('MenuFork'); resumed.pause()
     resumed.click('Copy context')
-    resumed.wait(lambda: len(resumed.family()['members']) == 3 and resumed.family()['members'][-1]['sessionId'][:8] in resumed.text(), 'menu context fork', 75)
+    resumed.wait(lambda: len(resumed.family()['members']) == 3, 'menu context fork', 75)
     assert resumed.family()['members'][-1]['parentSessionId'] == resumed.family()['members'][0]['sessionId'], 'Menu fork ancestry'
+    resumed.assert_view(resumed.family()['members'][-1]['sessionId'], 'the menu context fork', 75)
     resumed.submit('/leaf')
     resumed.wait(lambda: 'Create a leaf' in resumed.text(), 'new-chat menu inside leaf')
     resumed.proc.write('MenuFresh\r')
-    resumed.wait(lambda: len(resumed.family()['members']) == 4 and resumed.family()['members'][-1]['sessionId'][:8] in resumed.text(), 'menu fresh chat', 75)
+    resumed.wait(lambda: len(resumed.family()['members']) == 4, 'menu fresh chat', 75)
+    resumed.assert_view(resumed.family()['members'][-1]['sessionId'], 'the menu fresh chat', 75)
     assert resumed.family()['members'][-1]['forkMessageId'] is None, 'Menu new copied context'
     print(json.dumps(dict(fullscreen=args.fullscreen, columns=args.columns, rows=args.rows, forkContext=True, freshIsolation=True, clickSwitch=True, wheelSwitch=True, holdPicker=True, rootRename=True, leafRename=True, restoredHistory=True, creationMenu=True, modelRequests=len(requests))), flush=True)
 finally:
     for gate in blocked_turns.values(): gate.set()
     for terminal in processes:
         terminal.capture_owned()
-        owned = list(terminal.owned.values())
+        owned = terminal.running_owned()
         for child in reversed(owned):
             try:
                 if child.is_running(): child.terminate()
