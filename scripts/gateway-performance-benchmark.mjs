@@ -36,7 +36,7 @@ async function selectedCodexAccount() {
 }
 
 const account = await selectedCodexAccount()
-const nativeModel = process.env.PERF_NATIVE_MODEL || 'gpt-5.6-luna'
+const nativeModel = process.env.PERF_NATIVE_MODEL || 'gpt-6-luna'
 const gatewayModel = process.env.PERF_GATEWAY_MODEL || 'gateway-gpt-luna'
 const efforts = (process.env.PERF_EFFORTS || 'low')
   .split(',')
@@ -51,6 +51,19 @@ const liveModels = (process.env.PERF_MODELS || nativeModel)
   .split(',')
   .map(value => value.trim())
   .filter(Boolean)
+
+// A benchmark row compares the native model against the Gateway name that
+// serves it, so the pairing has to be exact - a wrong name fails the row
+// instead of measuring it. The 5.6 upstreams stay routable, so they keep their
+// pairs; anything else falls back to stripping the generation from the name.
+const GATEWAY_MODEL_FOR_NATIVE = {
+  'gpt-6-luna': 'gateway-gpt-luna',
+  'gpt-5.6-luna': 'gateway-gpt-luna',
+  'gpt-6-sol': 'gateway-gpt-sol',
+  'gpt-5.6-sol': 'gateway-gpt-sol',
+  'gpt-6-astra': 'gateway-gpt-astra',
+  'gpt-5.6-astra': 'gateway-gpt-astra',
+}
 
 function accountHomeFor(name) {
   return name === 'default'
@@ -495,13 +508,13 @@ async function runLoopbackBenchmark() {
       ).length
 
       const warmBody = anthropicProbeBody(stream, 'low')
-      const warmRequest = anthropicToCodex(warmBody, 'gpt-5.6-luna', 'normal')
+      const warmRequest = anthropicToCodex(warmBody, 'gpt-6-luna', 'normal')
       await measureHttp(fake.url, warmRequest)
       await measureHttp(gatewayUrl, warmBody)
 
       for (let i = 0; i < repetitions; i += 1) {
         const body = anthropicProbeBody(stream, 'low')
-        const request = anthropicToCodex(body, 'gpt-5.6-luna', 'normal')
+        const request = anthropicToCodex(body, 'gpt-6-luna', 'normal')
         direct.push(await measureHttp(fake.url, request))
         gatewayClient.push(await measureHttp(gatewayUrl, body))
 
@@ -934,11 +947,9 @@ async function runLiveBenchmark() {
   const reports = []
   try {
     for (const model of liveModels) {
-      const gatewayModelForNative = model === 'gpt-5.6-luna'
-        ? 'gateway-gpt-luna'
-        : model === 'gpt-5.6-sol'
-          ? 'gateway-gpt-sol'
-          : `gateway-${model.replace(/^gpt-5\\.6-/, '')}`
+      const gatewayModelForNative =
+        GATEWAY_MODEL_FOR_NATIVE[model] ??
+        `gateway-${model.replace(/^gpt-(?:5\.6|6)-/, '')}`
       for (const effort of efforts) {
         debug(`case start model=${model} effort=${effort}`)
         const nativeBefore = performance.now()

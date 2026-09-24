@@ -13,7 +13,7 @@ const accountManager = path.join(
   'codex-account-manager.ps1',
 )
 const nativeAccount = process.env.PARITY_CODEX_ACCOUNT || 'freedock'
-const nativeModel = process.env.PARITY_NATIVE_MODEL || 'gpt-5.6-luna'
+const nativeModel = process.env.PARITY_NATIVE_MODEL || 'gpt-6-luna'
 const gatewayModel = process.env.PARITY_GATEWAY_MODEL || 'gateway-gpt-luna'
 const effort = process.env.PARITY_EFFORT || 'low'
 const timeoutMs = Number(process.env.PARITY_TIMEOUT_MS || 120_000)

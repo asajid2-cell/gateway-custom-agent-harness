@@ -20,7 +20,7 @@ const codexBinary =
   )
 const account = process.env.WARM_CODEX_ACCOUNT || 'freedock'
 const accountHome = path.join(os.homedir(), '.codex-accounts', account)
-const nativeModel = process.env.WARM_NATIVE_MODEL || 'gpt-5.6-sol'
+const nativeModel = process.env.WARM_NATIVE_MODEL || 'gpt-6-sol'
 const gatewayModel = process.env.WARM_GATEWAY_MODEL || 'gateway-gpt-sol'
 const effort = process.env.WARM_EFFORT || 'low'
 const toolMode = process.env.MODEL_GATEWAY_CODEX_TOOL_MODE || 'compact'

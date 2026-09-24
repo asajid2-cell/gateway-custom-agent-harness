@@ -8,7 +8,7 @@ const args = process.argv.slice(2)
 const portIndex = args.indexOf('--port')
 const port = Number(portIndex >= 0 ? args[portIndex + 1] : process.env.LUNA_BRIDGE_PORT || 4011)
 const host = '127.0.0.1'
-const model = process.env.LUNA_MODEL || 'gpt-5.6-luna'
+const model = process.env.LUNA_MODEL || 'gpt-6-luna'
 const reasoningEffort = process.env.LUNA_REASONING_EFFORT || 'max'
 const codexEndpoint =
   process.env.CODEX_RESPONSES_URL || 'https://chatgpt.com/backend-api/codex/responses'
