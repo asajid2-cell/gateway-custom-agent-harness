@@ -3801,6 +3801,143 @@ test('OpenCode request headers default to JSON and opt into SSE explicitly', () 
   assert.equal(openCodeGoHeaders('responses', 'synthetic-key', true).accept, 'text/event-stream')
 })
 
+test('Chat Completions echoes the provider reasoning back on assistant turns', () => {
+  // DeepSeek's thinking mode rejects a follow-up turn whose assistant messages
+  // omit the reasoning the model produced, so dropping every `thinking` block
+  // broke the stream mid-conversation. The reasoning must come back verbatim.
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'first' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'let me weigh ' },
+          { type: 'thinking', thinking: 'the options' },
+          { type: 'text', text: 'Answer.' },
+        ],
+      },
+      { role: 'user', content: 'again' },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  const assistant = request.messages.find(message => message.role === 'assistant')
+  assert.equal(assistant.reasoning_content, 'let me weigh the options')
+  assert.deepEqual(assistant.content, [{ type: 'text', text: 'Answer.' }])
+  // Reasoning is not content: it must not leak into the visible text blocks.
+  assert.doesNotMatch(JSON.stringify(assistant.content), /weigh the options/)
+})
+
+test('Chat Completions carries reasoning alongside a tool call', () => {
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'inspect' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'I should read the file' },
+          { type: 'tool_use', id: 'call-1', name: 'read', input: { path: 'x' } },
+        ],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: 'done' }] },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  const assistant = request.messages.find(message => message.role === 'assistant')
+  assert.equal(assistant.reasoning_content, 'I should read the file')
+  assert.equal(assistant.tool_calls[0].id, 'call-1')
+})
+
+test('Chat Completions never invents reasoning on turns that carry none', () => {
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'plain question' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'plain answer' }] },
+      // Opaque by construction: redacted reasoning carries no text to echo.
+      { role: 'assistant', content: [{ type: 'redacted_thinking', data: 'opaque' }] },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  for (const message of request.messages) {
+    assert.equal(
+      Object.hasOwn(message, 'reasoning_content'),
+      false,
+      `${message.role} must not carry an invented reasoning_content`,
+    )
+  }
+  // The redacted-only turn had nothing sendable, so it is not emitted at all.
+  assert.deepEqual(request.messages.map(message => message.role), ['system', 'user', 'assistant'])
+})
+
+test('Chat Completions sends an empty reasoning_content on a tool call whose thinking was cleared', () => {
+  // Measured against the live provider: an assistant message carrying
+  // tool_calls is rejected with "The reasoning_content in the thinking mode
+  // must be passed back to the API" when that key is absent or null, and
+  // accepted when it is an empty string. The harness drops the thinking block
+  // (clear_thinking_20251015, which non-ant users get too, and the >1h-idle
+  // latch that keeps only the last thinking turn), so the adapter has to send
+  // the field even with nothing to echo.
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'inspect' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'call-1', name: 'read', input: { path: 'x' } }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: 'done' }] },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  const assistant = request.messages.find(message => message.role === 'assistant')
+  assert.equal(Object.hasOwn(assistant, 'reasoning_content'), true)
+  assert.equal(assistant.reasoning_content, '')
+  assert.equal(assistant.tool_calls[0].id, 'call-1')
+})
+
+test('Chat Completions owes reasoning on every tool call, not just the latest', () => {
+  // The requirement is per-turn and cumulative: with two tool-call rounds in
+  // history, stripping either one's reasoning fails the whole request.
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'inspect' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'first pass' },
+          { type: 'tool_use', id: 'call-1', name: 'read', input: { path: 'x' } },
+        ],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: 'done' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'call-2', name: 'read', input: { path: 'y' } }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-2', content: 'done' }] },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  const assistants = request.messages.filter(message => message.role === 'assistant')
+  assert.deepEqual(
+    assistants.map(message => message.reasoning_content),
+    ['first pass', ''],
+  )
+})
+
+test('Chat Completions does not add the reasoning marker to non-tool-call turns', () => {
+  // The obligation is scoped to tool calls. A plain text turn keeps its
+  // existing shape so the request stays byte-identical to what the provider
+  // already accepts.
+  const request = anthropicToOpenCodeChat({
+    messages: [
+      { role: 'user', content: 'plain question' },
+      { role: 'assistant', content: [{ type: 'text', text: 'plain answer' }] },
+      { role: 'user', content: 'again' },
+    ],
+  }, 'deepseek-v4.1-flash')
+
+  const assistant = request.messages.find(message => message.role === 'assistant')
+  assert.equal(Object.hasOwn(assistant, 'reasoning_content'), false)
+})
+
 test('keeps OpenCode tool results adjacent to the assistant tool call', () => {
   const request = anthropicToOpenCodeChat({
     messages: [
@@ -3820,6 +3957,9 @@ test('keeps OpenCode tool results adjacent to the assistant tool call', () => {
   assert.deepEqual(request.messages[2], {
     role: 'assistant',
     content: null,
+    // A tool-call turn owes the provider a reasoning_content string; see the
+    // cleared-thinking test above.
+    reasoning_content: '',
     tool_calls: [{
       id: 'call-1',
       type: 'function',

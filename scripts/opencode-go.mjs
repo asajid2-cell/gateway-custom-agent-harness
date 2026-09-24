@@ -317,6 +317,43 @@ function chatContent(blocks) {
   return result
 }
 
+/**
+ * The provider's own reasoning text for one assistant turn, as it must be
+ * echoed back.
+ *
+ * DeepSeek's thinking mode is not a request knob — it is a round-trip
+ * obligation. The upstream rejects a follow-up turn whose assistant messages
+ * omit the `reasoning_content` the model produced (`The reasoning_content in
+ * the thinking mode must be passed back to the API`), which is what happened
+ * here: the adapter dropped every `thinking` block, so the model's own
+ * reasoning never made it back and the stream died mid-conversation. Only
+ * `thinking` carries text the provider accepts; `redacted_thinking` is opaque
+ * by construction and is still dropped.
+ */
+function reasoningText(blocks) {
+  return blocks
+    .filter(block => block?.type === 'thinking' && typeof block.thinking === 'string')
+    .map(block => block.thinking)
+    .join('')
+}
+
+/**
+ * Reasoning is owed on every tool-call turn, not just the one that carried
+ * text.
+ *
+ * Measured against the live provider: an assistant message with `tool_calls`
+ * whose `reasoning_content` is absent or `null` is rejected with the 400 above,
+ * while an empty string is accepted. The requirement is per-turn and
+ * cumulative — with two tool-call rounds in history, stripping either one's
+ * reasoning fails the whole request — so a turn whose thinking the harness has
+ * already dropped (`clear_thinking_20251015`, which non-ant users get too, or
+ * the >1h-idle latch that keeps only the last thinking turn) still has to send
+ * the field.
+ */
+function owesReasoning(role, toolCalls) {
+  return role === 'assistant' && toolCalls.length > 0
+}
+
 function appendChatMessage(messages, message) {
   const role = message?.role === 'assistant' ? 'assistant' : 'user'
   const sanitizedContent = role === 'assistant'
@@ -369,6 +406,16 @@ function appendChatMessage(messages, message) {
   const converted = content.length || toolCalls.length
     ? { role, content: content.length ? chatContent(content) : null }
     : null
+  // Only an assistant turn can carry reasoning, and only alongside the content
+  // it belongs to. Attaching it to a user message (or to a turn with nothing
+  // else in it) would invent a message the provider never sent. A tool-call
+  // turn with no thinking left to echo still sends the field, empty: the
+  // provider requires its presence there.
+  const reasoning = role === 'assistant' ? reasoningText(blocks) : ''
+  if (converted && reasoning) converted.reasoning_content = reasoning
+  else if (converted && owesReasoning(role, toolCalls)) {
+    converted.reasoning_content = ''
+  }
   // Images that came out of tool results. They follow the tool messages they
   // belong to, so the model reads them as the output of the call it just made,
   // and stay ahead of any ordinary user text on the same turn.
