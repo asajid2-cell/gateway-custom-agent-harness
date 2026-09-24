@@ -303,6 +303,11 @@ export async function readCodexQuota(): Promise<CodexQuota | null> {
     shell: process.platform === 'win32',
     env: { ...process.env, CODEX_HOME: getCodexHome() },
     stdio: ['pipe', 'pipe', 'ignore'],
+    // On Windows this is a shell hop into `codex.cmd`, so it is the one
+    // console in the whole Codex subtree: hide it here and every tool
+    // app-server starts below it - the bundled ripgrep included - inherits
+    // that hidden console instead of asking Windows for one of its own.
+    windowsHide: true,
   })
 
   return await new Promise(resolve => {
