@@ -8,10 +8,37 @@
     "max"
   ],
   "gatewayModelMetadata": {
+    "gateway-gpt-sol": {
+      "defaultReasoning": "medium",
+      "nativeEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
+      "contextWindow": 272000,
+      "maximumContext": 1050000,
+      "effectiveContextPercentage": 95,
+      "modalities": ["text", "image"],
+      "apiSupported": true,
+      "tier": "fast",
+      "execution": "unified",
+      "webSearch": true,
+      "imageDetail": "original",
+      "defaultVerbosity": "low"
+    },
+    "gateway-gpt-luna": {
+      "defaultReasoning": "medium",
+      "nativeEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
+      "contextWindow": 272000,
+      "maximumContext": 1050000,
+      "effectiveContextPercentage": 95,
+      "modalities": ["text", "image"],
+      "apiSupported": true,
+      "tier": "fast",
+      "execution": "unified",
+      "webSearch": true,
+      "imageDetail": "original",
+      "defaultVerbosity": "low"
+    },
     "gateway-gpt-astra": {
       "defaultReasoning": "low",
-      "nativeEffortLevels": ["low", "medium", "high", "xhigh", "max", "ultra"],
-      "ultraDescription": "Maximum reasoning with automatic task delegation.",
+      "nativeEffortLevels": ["low", "medium", "high", "xhigh", "max"],
       "contextWindow": 272000,
       "maximumContext": 872000,
       "effectiveContextPercentage": 95,
@@ -79,7 +106,7 @@
     "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
-    "gateway-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gateway-gpt-astra": ["low", "medium", "high", "xhigh", "max"],
     "gateway-ds-flash": ["low", "high", "max"],
     "gateway-ds-pro": ["low", "high", "max"],
     "gateway-ds-4.1-flash": ["low", "high", "max"],
@@ -126,7 +153,7 @@
     "claude-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-sol": ["none", "low", "medium", "high", "xhigh", "max"],
     "claude-gpt-terra": ["none", "low", "medium", "high", "xhigh", "max"],
-    "claude-gpt-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "claude-gpt-astra": ["low", "medium", "high", "xhigh", "max"],
     "claude-ds-flash": ["low", "high", "max"],
     "claude-ds-pro": ["low", "high", "max"],
     "claude-ds-4.1-flash": ["low", "high", "max"],
@@ -162,13 +189,13 @@
   "gatewayModelOptions": [
     {
       "value": "gateway-gpt-luna",
-      "label": "GPT 5.6 Luna",
-      "description": "Gateway - GPT 5.6 Luna"
+      "label": "GPT-6-Luna",
+      "description": "Gateway - GPT-6 Luna"
     },
     {
       "value": "gateway-gpt-sol",
-      "label": "GPT 5.6 Sol",
-      "description": "Gateway - GPT 5.6 Sol"
+      "label": "GPT-6-Sol",
+      "description": "Gateway - GPT-6 Sol"
     },
     {
       "value": "gateway-gpt-astra",
@@ -404,8 +431,8 @@
       "commandcode-ling-3.0-flash-sante-free",
       "commandcode/inclusionai/ling-3.0-flash-sante:free"
     ],
-    "gateway-gpt-luna": ["gpt-5.6-luna", "claude-gpt-luna"],
-    "gateway-gpt-sol": ["gpt-5.6-sol", "claude-gpt-sol"],
+    "gateway-gpt-luna": ["gpt-6-luna", "gpt-5.6-luna", "claude-gpt-luna"],
+    "gateway-gpt-sol": ["gpt-6-sol", "gpt-5.6-sol", "claude-gpt-sol"],
     "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
     "gateway-gpt-astra": ["gpt-6-astra", "claude-gpt-astra"],
     "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],

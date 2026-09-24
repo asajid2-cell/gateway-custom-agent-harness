@@ -1054,7 +1054,7 @@ test('HTTP boundary cancels the upstream when the consumer disconnects after out
   })
 })
 
-test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to ultra', async () => {
+test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to max', async () => {
   await withGatewayAndFakeCodexState({
     handlerFactory: astraCodexHandler,
     run: async ({ gateway, state }) => {
@@ -1068,7 +1068,7 @@ test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to ultr
       assert.equal(result.status, 200)
       assert.equal(state.requests.length, 1)
       assert.equal(state.requests[0].model, 'gpt-6-astra')
-      assert.equal(state.requests[0].reasoning.effort, 'ultra')
+      assert.equal(state.requests[0].reasoning.effort, 'max')
       assert.equal(JSON.stringify(state.requests[0]).includes('ultracode'), false)
     },
   })
@@ -3397,7 +3397,7 @@ test('gateway exposes canonical routes with Astra metadata and provider-qualifie
   const astra = response.data.find(item => item.id === 'gateway-gpt-astra')
   assert.ok(astra)
   assert.equal(astra.display_name, 'gpt-6-astra')
-  assert.deepEqual(astra.effort_levels, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.deepEqual(astra.effort_levels, ['low', 'medium', 'high', 'xhigh', 'max'])
   for (const model of [
     'gateway-opencode-mimo-v2.5',
     'gateway-opencode-hy3',

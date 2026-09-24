@@ -47,8 +47,17 @@ test('gateway display labels preserve Gateway identities and normalize provider 
     `../src/utils/model/gatewayModelIds.ts?display=${Date.now()}-${Math.random()}`,
   )
   assert.equal(getGatewayModelDisplayName('gateway-gpt-terra'), 'GPT 5.6 Terra')
-  assert.equal(getGatewayModelDisplayName('gateway-gpt-sol'), 'GPT 5.6 Sol')
-  assert.equal(getGatewayModelDisplayName('gateway-gpt-luna'), 'GPT 5.6 Luna')
+  // The Gateway name is versionless and its aliases are the ids that resolve
+  // onto it, so every spelling of one route reads as the one model it runs -
+  // including the 5.6 spelling, which the Gateway name now answers with GPT-6.
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-sol'), 'GPT-6-Sol')
+  assert.equal(getGatewayModelDisplayName('gpt-6-sol'), 'GPT-6-Sol')
+  assert.equal(getGatewayModelDisplayName('gpt-5.6-sol'), 'GPT-6-Sol')
+  assert.equal(getGatewayModelDisplayName('claude-gpt-sol'), 'GPT-6-Sol')
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-luna'), 'GPT-6-Luna')
+  assert.equal(getGatewayModelDisplayName('gpt-6-luna'), 'GPT-6-Luna')
+  assert.equal(getGatewayModelDisplayName('gpt-5.6-luna'), 'GPT-6-Luna')
+  assert.equal(getGatewayModelDisplayName('claude-gpt-luna'), 'GPT-6-Luna')
   assert.equal(getGatewayModelDisplayName('gateway-gpt-astra'), 'GPT-6-Astra')
   assert.equal(getGatewayModelDisplayName('gpt-6-astra'), 'GPT-6-Astra')
   assert.equal(getGatewayModelDisplayName('claude-gpt-astra'), 'GPT-6-Astra')

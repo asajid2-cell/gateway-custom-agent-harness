@@ -51,8 +51,13 @@ test('a backend is resolved from the catalog, not from the model name', () => {
   )
   assert.equal(resolveModelBackend('gateway-amd-qwen3.8-27b'), 'amd-radeon')
 
-  // Provider-native and legacy spellings reach the same backend.
+  // Provider-native and legacy spellings reach the same backend. The 5.6 ids
+  // stay routable beside the GPT-6 ones they were superseded by, so both
+  // generations are attributed rather than only the current one.
   assert.equal(resolveModelBackend('gpt-5.6-luna'), 'codex')
+  assert.equal(resolveModelBackend('gpt-6-luna'), 'codex')
+  assert.equal(resolveModelBackend('gpt-6-sol'), 'codex')
+  assert.equal(resolveModelBackend('gpt-6-astra'), 'codex')
   assert.equal(resolveModelBackend('claude-gpt-sol'), 'codex')
   assert.equal(resolveModelBackend('deepseek-v4-flash'), 'deepseek')
   assert.equal(resolveModelBackend('opencode-go/hy3'), 'opencode-go')

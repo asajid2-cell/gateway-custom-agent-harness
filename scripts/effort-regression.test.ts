@@ -589,24 +589,38 @@ test('gateway reasoning capabilities are truthful', () => {
   assert.equal(modelSupportsEffort('claude-ultracode'), true)
 })
 
-test('Astra aliases use the supported client accounting window', () => {
+test('GPT-6 aliases use the supported client accounting window', () => {
+  // The provider maximum is larger than the window the client accounts for, so
+  // each route is reached by its Gateway name, its provider-native id, and its
+  // legacy name and all three report the same number.
   assert.equal(getContextWindowForModel('gateway-gpt-astra'), 272_000)
   assert.equal(getContextWindowForModel('gpt-6-astra'), 272_000)
   assert.equal(getContextWindowForModel('claude-gpt-astra'), 272_000)
+  assert.equal(getContextWindowForModel('gateway-gpt-luna'), 272_000)
+  assert.equal(getContextWindowForModel('gpt-6-luna'), 272_000)
+  assert.equal(getContextWindowForModel('claude-gpt-luna'), 272_000)
+  assert.equal(getContextWindowForModel('gateway-gpt-sol'), 272_000)
+  assert.equal(getContextWindowForModel('gpt-6-sol'), 272_000)
+  assert.equal(getContextWindowForModel('claude-gpt-sol'), 272_000)
 })
 
 test('gateway preserves native effort levels on GPT aliases', () => {
   assert.equal(resolveAppliedEffort('claude-gpt-luna', 'max'), 'max')
   assert.equal(resolveAppliedEffort('claude-gpt-sol', 'max'), 'max')
   assert.equal(resolveAppliedEffort('claude-gpt-terra', 'max'), 'max')
-  assert.equal(resolveAppliedEffort('claude-gpt-astra', 'ultra'), 'ultra')
+  assert.equal(resolveAppliedEffort('claude-gpt-astra', 'max'), 'max')
   assert.equal(resolveAppliedEffort('claude-gpt-luna', 'ultracode'), 'ultracode')
   assert.equal(resolveProviderEffort('claude-gpt-sol', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('claude-gpt-terra', 'ultracode'), 'max')
-  assert.equal(resolveProviderEffort('claude-gpt-astra', 'ultracode'), 'ultra')
+  assert.equal(resolveProviderEffort('claude-gpt-astra', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('claude-gpt-luna', 'ultracode'), 'max')
-  assert.equal(resolveProviderEffort('claude-gpt-astra', 'ultra'), 'ultra')
+  assert.equal(resolveProviderEffort('claude-gpt-astra', 'ultra'), undefined)
   assert.equal(resolveProviderEffort('claude-gpt-luna', 'ultra'), undefined)
+  // The provider-native GPT-6 ids reach the same ladder as the Gateway aliases
+  // they normalize onto, so the native id a launcher passes is not a blind spot.
+  assert.equal(resolveProviderEffort('gpt-6-luna', 'ultracode'), 'max')
+  assert.equal(resolveProviderEffort('gpt-6-sol', 'ultracode'), 'max')
+  assert.equal(resolveProviderEffort('gpt-6-astra', 'ultracode'), 'max')
 })
 
 test('DeepSeek exposes only its real effort levels', () => {
@@ -644,7 +658,7 @@ test('DeepSeek exposes only its real effort levels', () => {
   assert.equal(resolveAppliedEffort('gateway-opencode-mimo-v2.5', 'ultracode'), 'ultracode')
   assert.equal(resolveProviderEffort('gateway-opencode-glm-5.3-flash', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('gateway-opencode-mimo-v2.5', 'ultracode'), 'max')
-  assert.equal(resolveProviderEffort('gateway-gpt-astra', 'ultracode'), 'ultra')
+  assert.equal(resolveProviderEffort('gateway-gpt-astra', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('claude-ultracode', 'ultracode'), 'high')
 
   assert.equal(resolveAppliedEffort('gateway-gpt-luna', 'medium'), 'medium')

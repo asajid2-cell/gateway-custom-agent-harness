@@ -26,6 +26,22 @@ test('shared catalog exports the exact visible Gateway picker metadata', () => {
       description: 'Our most capable model for complex, demanding work.',
     },
   )
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-luna'),
+    {
+      value: 'gateway-gpt-luna',
+      label: 'GPT-6-Luna',
+      description: 'Gateway - GPT-6 Luna',
+    },
+  )
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-sol'),
+    {
+      value: 'gateway-gpt-sol',
+      label: 'GPT-6-Sol',
+      description: 'Gateway - GPT-6 Sol',
+    },
+  )
 })
 
 test('every visible Gateway route is represented by the shared catalog', () => {
@@ -47,6 +63,20 @@ test('catalog aliases resolve only to visible Gateway routes', () => {
     'gpt-6-astra',
     'claude-gpt-astra',
   ])
+  // The Gateway name is versionless and means the current generation, so the
+  // 5.6 ids stay listed beside the 6 ids they were superseded by. A session
+  // still holding the old spelling resolves to the Gateway name and runs the
+  // current model, and a direct caller keeps its own pinned 5.6 route.
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-luna'], [
+    'gpt-6-luna',
+    'gpt-5.6-luna',
+    'claude-gpt-luna',
+  ])
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-sol'], [
+    'gpt-6-sol',
+    'gpt-5.6-sol',
+    'claude-gpt-sol',
+  ])
   const flattened = aliases.flatMap(([, values]) => values)
   assert.equal(
     new Set(flattened.map(alias => alias.toLowerCase())).size,
@@ -57,6 +87,28 @@ test('catalog aliases resolve only to visible Gateway routes', () => {
     for (const alias of values) {
       assert.equal(GATEWAY_MODEL_ALIAS_MAP[alias.toLowerCase()], canonical)
     }
+  }
+})
+
+test('the GPT-6 routes name the GPT-6 upstreams and offer only accepted levels', () => {
+  const data = modelsResponse().data
+  const upstreamByGatewayId = {
+    'gateway-gpt-astra': 'gpt-6-astra',
+    'gateway-gpt-luna': 'gpt-6-luna',
+    'gateway-gpt-sol': 'gpt-6-sol',
+  }
+  for (const [id, upstream] of Object.entries(upstreamByGatewayId)) {
+    const entry = data.find(model => model.id === id)
+    assert.ok(entry, `${id} must be discoverable`)
+    assert.equal(entry.owned_by, 'codex')
+    assert.equal(entry.display_name, upstream)
+  }
+  // The provider enumerates none/minimal/low/medium/high/xhigh/max for the
+  // whole generation and rejects `ultra` by name, so no GPT-6 route may offer
+  // it - a level the endpoint 400s is a failed turn, not a capability.
+  for (const id of Object.keys(upstreamByGatewayId)) {
+    const entry = data.find(model => model.id === id)
+    assert.equal(entry.effort_levels.includes('ultra'), false, `${id} must not offer ultra`)
   }
 })
 

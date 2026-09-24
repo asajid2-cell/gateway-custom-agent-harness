@@ -20,17 +20,25 @@ test('5.6 model switching preserves the full native ladder', () => {
   assert.deepEqual(lunaLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(solLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(terraLevels, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
-  assert.deepEqual(astraLevels, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.deepEqual(astraLevels, ['low', 'medium', 'high', 'xhigh', 'max'])
   assert.equal(solLevels.includes('ultra'), false)
   assert.equal(terraLevels.includes('ultra'), false)
   assert.equal(lunaLevels.includes('ultra'), false)
+  assert.equal(astraLevels.includes('ultra'), false)
   assert.equal(
     resolveGatewayEffortAfterModelSwitch(terraLevels, 'max', 'max', 'max', true),
     'max',
   )
   assert.equal(
+    resolveGatewayEffortAfterModelSwitch(astraLevels, 'max', 'max', 'max', true),
+    'max',
+  )
+  // Astra used to carry `ultra` and the endpoint rejects it by name, so a
+  // session still holding that value drops it rather than running at a level
+  // the user cannot see.
+  assert.equal(
     resolveGatewayEffortAfterModelSwitch(astraLevels, 'ultra', 'ultra', 'ultra', true),
-    'ultra',
+    undefined,
   )
 })
 

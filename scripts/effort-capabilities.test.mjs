@@ -31,10 +31,11 @@ test('shared effort catalog preserves model-specific GPT ladders', () => {
   assert.deepEqual(GPT_TERRA_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-terra'])
   assert.deepEqual(GPT_SOL_EFFORT_LEVELS, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(GPT_TERRA_EFFORT_LEVELS, ['none', 'low', 'medium', 'high', 'xhigh', 'max'])
-  assert.deepEqual(ASTRA_EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+  assert.deepEqual(ASTRA_EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max'])
   assert.deepEqual(ASTRA_EFFORT_LEVELS, catalog.gatewayAliases['gateway-gpt-astra'])
   assert.equal(GPT_SOL_EFFORT_LEVELS.includes('ultra'), false)
   assert.equal(GPT_TERRA_EFFORT_LEVELS.includes('ultra'), false)
+  assert.equal(ASTRA_EFFORT_LEVELS.includes('ultra'), false)
 })
 
 test('every OpenCode Go route has explicit capability metadata', () => {
