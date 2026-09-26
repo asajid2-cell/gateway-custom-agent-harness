@@ -138,7 +138,12 @@ function writeAnthropicStream(res, model) {
   res.end()
 }
 
-test('compiled auth status is Gateway-native under poisoned Anthropic state', async () => {
+// Every test here spawns the compiled CLI, which costs a process start on a
+// machine that runs a whole fleet of sessions. The default per-test budget is
+// 5s, so a loaded box reported these as product failures while the same run
+// passed with a longer budget. Declare one that covers the spawn, as the
+// long-running tests below already do.
+test('compiled auth status is Gateway-native under poisoned Anthropic state', { timeout: 60_000 }, async () => {
   const result = await runProcess(
     bun,
     [cli, 'auth', 'status', '--json'],
@@ -157,7 +162,7 @@ test('compiled auth status is Gateway-native under poisoned Anthropic state', as
   })
 })
 
-test('compiled Gateway blocks Anthropic login and logout commands', async () => {
+test('compiled Gateway blocks Anthropic login and logout commands', { timeout: 60_000 }, async () => {
   const env = poisonedGatewayEnv()
   const login = await runProcess(bun, [cli, 'auth', 'login'], env)
   assert.equal(login.timedOut, false, login.stderr)
@@ -176,7 +181,7 @@ test('compiled Gateway blocks Anthropic login and logout commands', async () => 
   )
 })
 
-test('compiled Gateway fails closed when its base URL is missing', async () => {
+test('compiled Gateway fails closed when its base URL is missing', { timeout: 60_000 }, async () => {
   const result = await runProcess(
     bun,
     [
