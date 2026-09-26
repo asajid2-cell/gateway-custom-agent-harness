@@ -12,17 +12,17 @@ import type { SetAppState } from './messageQueueManager.js'
  * request is owed and allows the stop otherwise, which keeps the cost to the
  * turns that actually carry peer traffic instead of every turn end.
  *
- * The hook claims the requests still sitting in the command queue. That queue
- * is the only way an idle session can be woken, so a request that is still in
- * it when a turn ends is one the queue path has not run: the session was busy
- * and this turn boundary is the earliest it could have been answered. Once the
- * hook has injected a request it takes it out of the queue, so a request that
- * has LEFT the queue was consumed as a turn's input and is left alone rather
- * than asked a second time.
+ * The hook claims the requests still sitting in the command queue. The queue is
+ * drained mid-turn, so a request that is still in it when a turn ends is one
+ * that arrived after the last tool iteration: the drain had no further boundary
+ * to run at, and this turn boundary is the earliest it could be answered. Once
+ * the hook has injected a request it takes it out of the queue, so a request
+ * that has LEFT the queue was consumed as a turn's input and is left alone
+ * rather than asked a second time.
  *
- * The queue path is therefore still live and still necessary. A session
- * sitting idle has no turn to end, so no Stop hook can fire for it, and that
- * is exactly the case the queue exists to cover.
+ * The queue path is therefore still live and still necessary. A session sitting
+ * idle has no turn to end, so no Stop hook can fire for it, and that is exactly
+ * the case the queue exists to cover.
  */
 
 /** Long enough to cover an inbox acknowledgement write, which the callback awaits. */

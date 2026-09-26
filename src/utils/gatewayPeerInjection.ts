@@ -6,11 +6,12 @@ import { getCommandQueue, removeByFilter } from './messageQueueManager.js'
  * Peer requests sitting in the command queue, keyed by message ID.
  *
  * The queue is what makes "has this been delivered yet" decidable without
- * keeping a second ledger. A peer request reaches a session two ways: the queue
- * wakes an idle session, and this hook injects at a turn boundary. The queue is
- * the one place both can see, so a request still in it at a turn boundary is a
- * request the queue path has not run - the session was busy - and the turn
- * boundary is therefore where it belongs.
+ * keeping a second ledger. A peer request reaches a session three ways: the
+ * queue wakes an idle session, the mid-turn drain takes it between tool calls,
+ * and this hook injects at a turn boundary. The queue is the one place all
+ * three can see, so a request still in it at a turn boundary is one neither
+ * queue path has run - the turn had no further tool iteration to drain at - and
+ * the turn boundary is therefore where it belongs.
  *
  * Read as bus traffic, not as "any command from another session": the leaf wire
  * stamps its own turns on the same origin, and a leaf's handed-over turn has no
@@ -25,14 +26,24 @@ export function queuedGatewayPeerIds(): ReadonlySet<string> {
 }
 
 /**
- * Delivery of peer text into a turn as hook feedback rather than as a prompt.
+ * Delivery of a peer request the mid-turn drain could not reach.
  *
- * A peer message used to be enqueued as a prompt, which makes it
- * indistinguishable from something the user typed: it renders as a user prompt
- * and reads as if the operator asked for it. It is neither. A peer request is
- * closer to a hook event - something that arrived and wants a decision - so the
- * Stop hook injects it, and the turn boundary becomes the natural place to
- * answer.
+ * The command queue is the primary path: a peer message is enqueued like any
+ * other prompt and drained between tool calls, so it is seen right after the
+ * tool call in flight instead of at the end of the turn. That is the live
+ * channel, and it renders with peer framing because the body opens with the
+ * peer header.
+ *
+ * This hook covers the gap: a turn that has no further tool iteration never
+ * reaches that drain again, so a message arriving late in such a turn would sit
+ * in the queue until the session went idle. A Stop hook fires at exactly that
+ * boundary, and because a hook has no way to speak from a callback that allows
+ * the stop, it blocks - the injected text is its `errorMessage` - and the
+ * continuation turn becomes the answer.
+ *
+ * The two therefore partition the space rather than race: whatever the drain
+ * consumed is gone from the queue, and the hook claims only what is still
+ * there.
  *
  * Two-phase acknowledgement, and why it is required:
  *
