@@ -11,7 +11,11 @@ async function readCompiledBundle() {
 function assertCompiledStoreContract(bundle) {
   assert.match(bundle, /class SandboxViolationStore/)
   assert.match(bundle, /getTotalCount\(\)/)
-  assert.match(bundle, /subscribe\(listener\)/)
+  // The parameter is named `listener` in the source, but the bundler suffixes
+  // it whenever that name is taken in the enclosing scope, so the compiled
+  // form is `listener2`. The contract is the one-argument `subscribe`, not the
+  // local's name — asserting the bare name made this fail for every build.
+  assert.match(bundle, /subscribe\(listener\w*\)/)
   assert.match(bundle, /maxSize = 100/)
   assert.match(bundle, /typeof store\.subscribe !== ['\"]function['\"]/)
   assert.match(bundle, /typeof store\.getTotalCount !== ['\"]function['\"]/)
