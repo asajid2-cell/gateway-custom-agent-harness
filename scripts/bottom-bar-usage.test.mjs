@@ -52,6 +52,35 @@ test('session resume command keeps the directory and session ID copyable', () =>
   )
 })
 
+test('session resume command can target the session by name instead of its ID', () => {
+  assert.equal(
+    formatSessionResumeCommand(
+      'Z:\\Work Repo\\gateway',
+      '0bffad12-00fb-420d-95b3-09e5a3390a63',
+      'Release triage',
+    ),
+    "cd 'Z:\\Work Repo\\gateway'; & cc --resume 'Release triage'",
+  )
+  // A name is free text, so the same quoting has to escape an apostrophe in it.
+  assert.equal(
+    formatSessionResumeCommand(
+      "C:\\Ahmed's Work",
+      '12345678-1234-1234-1234-123456789abc',
+      "Ahmed's session",
+    ),
+    "cd 'C:\\Ahmed''s Work'; & cc --resume 'Ahmed''s session'",
+  )
+  // An unnamed session has no second target, so the ID is what it resumes by.
+  assert.equal(
+    formatSessionResumeCommand(
+      'Z:\\Work Repo\\gateway',
+      '0bffad12-00fb-420d-95b3-09e5a3390a63',
+      null,
+    ),
+    "cd 'Z:\\Work Repo\\gateway'; & cc --resume 0bffad12-00fb-420d-95b3-09e5a3390a63",
+  )
+})
+
 test('bottom bar identifies Gateway providers without inventing quota data', () => {
   assert.equal(getGatewayProviderLabel('gateway-gpt-luna'), 'Codex')
   assert.equal(getGatewayProviderLabel('gateway-opencode-mimo-v2.5-free'), 'OpenCode')

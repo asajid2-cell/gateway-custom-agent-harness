@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { getSessionId } from '../bootstrap/state.js'
-import { getCwd } from '../utils/cwd.js'
+import { getSessionId, getSessionResumeDirectory } from '../bootstrap/state.js'
 import { GatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
 import { gatewayMessageIds } from '../utils/gatewaySessionDelivery.js'
 import { registerGatewayPeerStopHook, type PeerStopHookHandle } from '../utils/gatewayPeerStopHook.js'
@@ -54,7 +53,12 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
     // traffic keeps its own channel and does not depend on this bus; the label
     // is what stops a forked leaf from being mistaken for the session it copied.
     if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1') return
-    const runtime = new GatewaySessionRuntime(sessionId, getCwd(), name)
+    // The registration advertises where this conversation is resumed from, not
+    // the live cwd: the cwd moves with the worktree you are working in, so a
+    // listing that read it could name a directory this session cannot be
+    // resumed from. This effect re-runs on every session switch, so a resume
+    // picks up the directory that switch just set.
+    const runtime = new GatewaySessionRuntime(sessionId, getSessionResumeDirectory(), name)
     let disposed = false
     const started = closing.current.then(async () => {
       if (disposed) return

@@ -141,6 +141,20 @@ test('every session records an intent on registration', async () => {
   assert.match(transport, /if \(typeof raw\?\.peer\?\.purpose === 'string'\) this\.peer\.purpose = raw\.peer\.purpose\.slice\(0, 1000\)/)
 })
 
+test('a registration advertises the directory the conversation resumes from', async () => {
+  const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
+  // The live cwd moves with the worktree you are working in, so a registration
+  // reading it advertised a directory the session cannot be resumed from. The
+  // resume directory is the one `cc --resume` needs, so it is the one a
+  // listing shows - and this effect re-runs on every session switch, so a
+  // resume picks up the directory that switch just set.
+  assert.match(hook, /new GatewaySessionRuntime\(sessionId, getSessionResumeDirectory\(\), name\)/)
+  assert.doesNotMatch(hook, /getCwd\(\)/)
+
+  const headless = await readFile(new URL('../src/cli/print.ts', import.meta.url), 'utf8')
+  assert.match(headless, /new GatewaySessionRuntime\(getSessionId\(\), getSessionResumeDirectory\(\), 'Gateway headless session'\)/)
+})
+
 test('a leaf registers on the shared bus as a leaf, not as the session it forked', async () => {
   const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
   // A leaf is a session: registering is what lets another family's leaf find it

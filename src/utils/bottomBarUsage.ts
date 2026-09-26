@@ -63,11 +63,18 @@ export function getGatewayProviderLabel(model: string): string {
   return 'Gateway'
 }
 
+// A session can be resumed by id or by name: `cc --resume <name>` resolves the
+// same transcript by exact custom title, so a name replaces the id as the
+// target. It is quoted because a name is free text - spaces and apostrophes are
+// both legal in one - and absent when the session has no name, which leaves the
+// id form.
 export function formatSessionResumeCommand(
   directory: string,
   sessionId: string,
+  name?: string | null,
 ): string {
-  return `cd ${quotePowerShellLiteral(directory)}; & cc --resume ${sessionId}`
+  const target = name ? quotePowerShellLiteral(name) : sessionId
+  return `cd ${quotePowerShellLiteral(directory)}; & cc --resume ${target}`
 }
 
 export function formatBottomBarUsage(

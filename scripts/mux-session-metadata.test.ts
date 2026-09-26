@@ -18,6 +18,7 @@ import { Box, Button, Text, useInput } from '../src/ink.ts'
 import instances from '../src/ink/instances.ts'
 import { isFullscreenEnvEnabled } from '../src/utils/fullscreen.ts'
 import { formatSessionResumeCommand } from '../src/utils/bottomBarUsage.ts'
+import { SessionResumeControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
 
 function MetadataPortal({ onDone }: { onDone: () => void }) {
   const dialog = React.useMemo(() => React.createElement(SessionMetadataDialog, { onDone }), [onDone])
@@ -130,6 +131,99 @@ test(`actual footer ${control} responds to terminal mouse input`, async () => {
   } finally { app.unmount() }
 })
 }
+
+test('the resume row names the resume directory, never the live cwd', async () => {
+  const footer = await readFile(new URL('../src/components/PromptInput/PromptInputFooter.tsx', import.meta.url), 'utf8')
+  // The live cwd moves with the worktree you are working in, so a row reading
+  // it could name a directory this session cannot be resumed from. Both the
+  // bare path and the command the control renders come from the resume
+  // directory, which is why the two cannot disagree.
+  assert.match(footer, /<SessionResumeControl directory=\{sessionResumeDirectory\}/)
+  assert.match(footer, /cd: \{sessionResumeDirectory\}/)
+  assert.doesNotMatch(footer, /getCwd\(\)/)
+})
+
+/** Mount the footer's resume control on its own, at the cell a click lands on. */
+async function mountSessionResume(name: string | undefined) {
+  const stdout = Object.assign(new PassThrough(), { columns: 100, rows: 24, isTTY: true })
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} })
+  let output = ''
+  stdout.on('data', chunk => { output += chunk.toString() })
+  const element = React.createElement(SessionResumeControl, {
+    directory: 'Z:\\work', sessionId: '00000000-0000-4000-8000-000000000001', name, isBounded: true,
+  })
+  function InputHost() {
+    useInput(() => {})
+    return element
+  }
+  const app = await render(React.createElement(InputHost), { stdout: stdout as unknown as NodeJS.WriteStream, stderr: stdout as unknown as NodeJS.WriteStream,
+    stdin: stdin as unknown as NodeJS.ReadStream, patchConsole: false, exitOnCtrlC: false })
+  const instance = instances.get(stdout as unknown as NodeJS.WriteStream)!
+  instance.setAltScreenActive(true, true)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  return {
+    // The renderer writes changed cells and cursor moves, so the assertions are
+    // made against the characters that reached the terminal with the escapes
+    // taken back out.
+    rendered: () => output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''),
+    clear: () => { output = '' },
+    // A press and a release on the same cell is the click.
+    click: async () => {
+      stdin.write('\x1b[<0;1;1M')
+      stdin.write('\x1b[<0;1;1m')
+      await new Promise(resolve => setTimeout(resolve, 100))
+    },
+    // A press that drags is a selection, which is what keeps the command
+    // copyable, so the release lands on a cell the press did not start on.
+    drag: async () => {
+      stdin.write('\x1b[<0;1;1M')
+      stdin.write('\x1b[<32;6;1M')
+      stdin.write('\x1b[<0;6;1m')
+      await new Promise(resolve => setTimeout(resolve, 100))
+    },
+    keys: async (keys: string) => {
+      stdin.write(keys)
+      await new Promise(resolve => setTimeout(resolve, 100))
+    },
+    unmount: () => app.unmount(),
+  }
+}
+
+test('a click toggles the resume command between the session ID and the session name', async () => {
+  const control = await mountSessionResume('Release triage')
+  try {
+    assert.match(control.rendered(), /--resume 00000000-0000-4000-8000-000000000001/)
+    // The command stays selectable: dragging across it selects the text rather
+    // than toggling the target, so only a click moves the row to the name.
+    await control.drag()
+    assert.match(control.rendered(), /--resume 00000000-0000-4000-8000-000000000001/)
+    assert.doesNotMatch(control.rendered(), /Release triage/)
+    control.clear()
+    await control.click()
+    assert.match(control.rendered(), /Release triage/)
+    control.clear()
+    await control.click()
+    assert.match(control.rendered(), /00000000-0000-4000-8000-000000000001/)
+    // Click-only, like the controls beside it: the click must not leave a focus
+    // target that Space or Tab re-activates, which would toggle the row back
+    // without a pointer.
+    control.clear()
+    await control.keys(' \t')
+    assert.doesNotMatch(control.rendered(), /Release triage/)
+  } finally { control.unmount() }
+})
+
+test('an unnamed session keeps the ID form and has nothing to toggle to', async () => {
+  const control = await mountSessionResume(undefined)
+  try {
+    assert.match(control.rendered(), /--resume 00000000-0000-4000-8000-000000000001/)
+    control.clear()
+    await control.click()
+    // A name that does not exist cannot be a resume target, so the click must
+    // never produce a quoted one.
+    assert.doesNotMatch(control.rendered(), /--resume '/)
+  } finally { control.unmount() }
+})
 
 test('native rename appends both resume metadata records to the captured transcript', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'session-rename-'))
