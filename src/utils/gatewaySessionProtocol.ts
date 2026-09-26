@@ -319,15 +319,23 @@ export function appendSessionTopic(existing: readonly string[] | undefined, topi
  * field that answers "which is doing which"; the id is present but last, since
  * it is the addressing detail rather than the description.
  *
+ * The pid rides with the id because a process list is where an unattributed
+ * session is actually noticed. The command line only carries the session it was
+ * resumed from, so without this the only way to find out what a stray bun
+ * process was is to guess from its start time, and the registry cannot be joined
+ * to the process list at all. Optional so callers holding a record-shaped value
+ * without one still render.
+ *
  * Exported for testing.
  */
-export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'>): string {
+export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'> & { pid?: number }): string {
   const purpose = peer.purpose.trim() || peer.name.trim() || 'no stated intent'
   // The opening purpose is a historical anchor, not a description of current
   // work. Surfacing the recent request topics beside it is what lets a peer be
   // found by what it is doing now rather than by what it started as.
   const recent = (peer.topics ?? []).map(topic => topic.replace(/\s+/g, ' ').trim()).filter(Boolean)
   const suffix = recent.length ? `\n    recent: ${recent.join(' | ')}` : ''
-  return `[${peer.status}] ${purpose}\n    name: ${peer.name}\n    id: ${peer.sessionId}\n    cwd: ${peer.cwd}${suffix}`
+  const pid = typeof peer.pid === 'number' ? ` (pid ${peer.pid})` : ''
+  return `[${peer.status}] ${purpose}\n    name: ${peer.name}\n    id: ${peer.sessionId}${pid}\n    cwd: ${peer.cwd}${suffix}`
 }
 

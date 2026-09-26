@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { mkdtemp, rm, mkdir, rename, readFile, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { mkdtemp, rm, mkdir, rename, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -327,6 +328,58 @@ test('independent peers authenticate, discover, hold, release, acknowledge and p
   } finally {
     await a.close()
     await b.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a listing lets go of registrations that are provably dead, and only those', { timeout: 30000 }, async () => {
+  // A registration file outlives the process that wrote it. Filtering the answer
+  // was never enough: the file stayed, so anything reading the directory - a
+  // person, a process scanner, a diagnosis of a pile-up - was still told about a
+  // session that had exited. Deleting is the risky half, so this pins every
+  // direction: an abandoned one goes; one behind a live pid stays, because a busy
+  // peer can miss a ping; and one that died a moment ago stays, because a session
+  // being restarted reads its own registration back for the intent it declared.
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-stale-'))
+  const directory = join(root, 'private')
+  const seed = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Seed', cwd: root })
+  const abandonedId = randomUUID()
+  const crashedId = randomUUID()
+  const aliveId = randomUUID()
+  const write = async (sessionId: string, pid: number) => {
+    const runtimeId = randomUUID()
+    const path = join(directory, `${sessionId}.json`)
+    await writeFile(path, JSON.stringify({
+      peer: {
+        protocol: 1, sessionId, runtimeId, name: 'Fabricated', cwd: root, purpose: '',
+        pid, startedAt: new Date().toISOString(), status: 'idle',
+        endpoint: `\\\\.\\pipe\\gateway-${runtimeId}`,
+      },
+      token: 'a'.repeat(64),
+    }))
+    return path
+  }
+  try {
+    // Creates the directory with its private ACL, which the listing validates.
+    await seed.start()
+    await seed.close()
+    const exited = spawnSync(process.execPath, ['-e', ''])
+    assert.ok(exited.pid && exited.pid > 0)
+    const abandoned = await write(abandonedId, exited.pid!)
+    const crashed = await write(crashedId, exited.pid!)
+    await write(aliveId, process.pid)
+    const twoHoursAgo = new Date(Date.now() - 7_200_000)
+    await utimes(abandoned, twoHoursAgo, twoHoursAgo)
+
+    assert.deepEqual(await listGatewayPeers(directory), [], 'no endpoint here is listening')
+    await assert.rejects(readFile(abandoned), { code: 'ENOENT' })
+    // Its process is gone, but a restart is still plausible, so it keeps the
+    // intent it declared until the window closes.
+    assert.ok((await readFile(crashed, 'utf8')).includes(`"pid":${exited.pid}`))
+    // Its pid answers a probe, so a silent endpoint is not proof of anything.
+    assert.ok((await readFile(join(directory, `${aliveId}.json`), 'utf8')).includes(`"pid":${process.pid}`))
+  } finally {
+    await seed.close()
     await rm(root, { recursive: true, force: true })
   }
 })

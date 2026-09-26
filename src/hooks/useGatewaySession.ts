@@ -9,6 +9,13 @@ import { appendSessionTopic, deriveSessionPurpose, deriveSessionTopic } from '..
 import type { Message } from '../types/message.js'
 import { logForDebugging } from '../utils/debug.js'
 import { registerCleanup } from '../utils/cleanupRegistry.js'
+import { leafLabel as leafLaunchLabel } from '../utils/leafTerminal.js'
+
+/** The leaf's own name for itself, or nothing when this session is not a leaf. */
+function leafLabel(): string | undefined {
+  const label = leafLaunchLabel()?.replace(/\s+/g, ' ').trim()
+  return label || undefined
+}
 
 /**
  * A leaf announces itself on the shared bus instead of looking like a stray
@@ -16,28 +23,37 @@ import { registerCleanup } from '../utils/cleanupRegistry.js'
  * transcript: a forked leaf carries its parent's history, so deriving from
  * messages would advertise the parent's opening prompt and make the leaf
  * indistinguishable from the session it was forked from.
+ *
+ * The label is the advertised name as well as the intent, because it is what a
+ * session listing another family's leaf has to go on: `Leaf 2: api (of session
+ * …)` says which leaf it is and which conversation it belongs to, in one string
+ * that cannot collide with the parent's title.
  */
+function sessionPeerName(name: string): string {
+  return (leafLabel() ?? name).slice(0, 200)
+}
+
 function sessionPurposeSeed(messages: Message[] | undefined, name: string): string {
-  const label = process.env.GATEWAY_LEAF_LABEL
-  if (label) return label.replace(/\s+/g, ' ').trim().slice(0, 1000)
-  return deriveSessionPurpose(messages, name)
+  return leafLabel()?.slice(0, 1000) ?? deriveSessionPurpose(messages, name)
 }
 
 export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiting', sessionMessages: Message[] | undefined): void {
   const sessionId = getSessionId()
-  const latest = useRef({ name, status })
-  latest.current = { name, status }
+  const peerName = sessionPeerName(name)
+  const latest = useRef({ name: peerName, status })
+  latest.current = { name: peerName, status }
   const runtimeRef = useRef<GatewaySessionRuntime | undefined>(undefined)
   const stopHookRef = useRef<PeerStopHookHandle | undefined>(undefined)
   const closing = useRef<Promise<void>>(Promise.resolve())
   // Stable across renders, so registering the hook cannot re-run the effect.
   const setAppState = useSetAppState()
   useEffect(() => {
-    // Interactive leaves belong to a leaf family, not the global session bus.
-    // Registering them here made a leaf visible beside unrelated sessions
-    // (including other products) and let model-directed peer traffic escape its
-    // family. Parent/leaf communication uses the leaf IPC channel instead.
-    if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1' || process.env.GATEWAY_INTERACTIVE_LEAF === '1') return
+    // A leaf is a live session like any other: it registers so a session outside
+    // its family - another family's leaf included - can find it and message it
+    // by ID or by the label it advertises here, and so it can answer. Family
+    // traffic keeps its own channel and does not depend on this bus; the label
+    // is what stops a forked leaf from being mistaken for the session it copied.
+    if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1') return
     const runtime = new GatewaySessionRuntime(sessionId, getCwd(), name)
     let disposed = false
     const started = closing.current.then(async () => {
@@ -77,8 +93,8 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
     }
   }, [sessionId])
   useEffect(() => {
-    void runtimeRef.current?.transport.update({ name, status: status === 'busy' ? 'running' : status === 'waiting' ? 'awaiting-approval' : 'idle' }).catch(() => { logForDebugging('Gateway session status update failed.') })
-  }, [name, status])
+    void runtimeRef.current?.transport.update({ name: peerName, status: status === 'busy' ? 'running' : status === 'waiting' ? 'awaiting-approval' : 'idle' }).catch(() => { logForDebugging('Gateway session status update failed.') })
+  }, [peerName, status])
   // Refresh the advertised topics as the session takes new work. Purpose is
   // frozen at the opening prompt by design, so without this a session that
   // moves on (a stack question becoming a 2D-platformer discussion) stayed

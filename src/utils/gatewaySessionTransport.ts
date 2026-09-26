@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Server } from 'node:net'
 import { join } from 'node:path'
+import { isProcessRunning } from './genericProcessUtils.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
@@ -161,13 +162,70 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
   try { await validatePrivateDirectory(directory) } catch { return [] }
   const peers: GatewayPeer[] = []
   for (const entry of candidates) {
+    const sessionId = entry.slice(0, -5)
+    // Kept outside the try so the sweep can run after a failure. A peer that is
+    // gone usually fails the ping by rejecting rather than by answering
+    // something unrecognisable - the endpoint does not exist any more - so a
+    // sweep that only ran on a mismatch would never run at all. An unreadable
+    // registration leaves this unset, and nothing is deleted on a guess.
+    let peer: GatewayPeer | undefined
+    let answered = false
     try {
-      const { peer, token } = await readRegistrationUnchecked(directory, entry.slice(0, -5))
-      const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token }) as { runtimeId?: string }
-      if (response.runtimeId === peer.runtimeId) peers.push(peer)
+      const registration = await readRegistrationUnchecked(directory, sessionId)
+      peer = registration.peer
+      const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token: registration.token }) as { runtimeId?: string }
+      answered = response.runtimeId === peer.runtimeId
+      if (answered) peers.push(peer)
     } catch { /* Stale or inaccessible registrations are not live sessions. */ }
+    if (peer && !answered) await unlinkIfDead(directory, sessionId, peer.pid)
   }
   return peers
+}
+
+/**
+ * How long a dead registration is kept before a listing lets it go.
+ *
+ * Not zero, because a registration is not only a liveness advertisement: a
+ * session that restarts reads it back to keep the intent it had already declared
+ * and the topics it had already been working on, which is what stops a resumed
+ * session reappearing as an unnamed stranger. A session that crashed and is about
+ * to be resumed is dead for exactly that moment, so deleting on the first dead
+ * listing would quietly throw that intent away. An hour is far longer than any
+ * crash-restart and short enough that an abandoned fleet empties within the day.
+ */
+const DEAD_REGISTRATION_GRACE_MS = 3_600_000
+
+/**
+ * Delete a registration that is provably dead and no longer needed, rather than
+ * only filtering it out of the answer.
+ *
+ * A filtered listing was correct and still left the problem behind: the file
+ * stayed on disk advertising a name, a cwd and a pid for a session that had
+ * exited, so anything reading the directory directly - a person, a process
+ * scanner, a diagnosis of a pile-up - kept being told about sessions that no
+ * longer existed. The listing is the only routine that reads every registration,
+ * so it is also the only place that can let them go.
+ *
+ * Two independent signals are required before deleting. The endpoint must have
+ * failed to answer AND the recorded pid must be gone: a busy peer can miss a
+ * ping, and a recycled pid reads as alive, while deleting a live session's
+ * registration would make it unreachable until it happened to write one again.
+ * Being wrong in the other direction only leaves a stale file, which is what
+ * happens today anyway.
+ */
+async function unlinkIfDead(directory: string, sessionId: string, pid: number): Promise<void> {
+  if (isProcessRunning(pid)) return
+  const path = join(directory, `${sessionId}.json`)
+  try {
+    if (Date.now() - (await stat(path)).mtimeMs < DEAD_REGISTRATION_GRACE_MS) return
+  } catch { return }
+  // A live process may have written a fresh registration since the read above;
+  // only remove the one that was actually proven dead.
+  try {
+    const current = await readRegistrationUnchecked(directory, sessionId)
+    if (current.peer.pid !== pid) return
+  } catch { return }
+  await unlink(path).catch(() => {})
 }
 
 export class GatewaySessionTransport {

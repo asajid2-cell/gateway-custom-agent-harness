@@ -109,10 +109,45 @@ test('a session ID that is not live is refused, not routed onward', async () => 
   }
 })
 
+test('a peer send is not refused for carrying model or effort', async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  // No runtime is registered in this process, so the peer route fails - but it
+  // fails for its own reason. The defect was that the local-subagent override
+  // check ran first and answered a gateway: address with "only supported when
+  // resuming a local subagent", which a sender can only read as "retry with the
+  // same fields", so the identical message went out again and again.
+  const context = { getAppState: () => getDefaultAppState() }
+  for (const overrides of [{ model: 'gateway-gpt-luna' }, { effort: 'none' as const }, { model: '', effort: 'medium' as const }]) {
+    const result = await SendMessageTool.call(
+      { to: 'gateway:a-session-that-is-not-live', message: 'Continue the task', summary: 'Continue', ...overrides },
+      context,
+      async () => ({ behavior: 'deny' }),
+    )
+    assert.equal(result.data.success, false)
+    assert.doesNotMatch(result.data.message, /only supported when resuming a local subagent/)
+    assert.match(result.data.message, /Gateway peer bus|No live session named/)
+  }
+  // The local rule still holds where it applies: a teammate name is this
+  // process's own routing, so an override on a name that is not a local
+  // subagent is refused exactly as before.
+  const local = await SendMessageTool.call(
+    { to: 'a-teammate-that-does-not-exist', message: 'Continue', summary: 'Continue', model: 'gateway-gpt-luna' },
+    context,
+    async () => ({ behavior: 'deny' }),
+  )
+  assert.equal(local.data.success, false)
+  assert.match(local.data.message, /only supported when resuming a local subagent/)
+})
+
 test('SendMessage routes the gateway scheme through the peer transport, not the mailbox', async () => {
   const tool = await readFile(new URL('../src/tools/SendMessageTool/SendMessageTool.ts', import.meta.url), 'utf8')
   assert.match(tool, /addr\.scheme === 'gateway'/)
   assert.match(tool, /sendViaGatewayPeer/)
+  // The override guard must be scoped to the local scheme. Unscoped, it refused
+  // the send before the address was parsed, so no peer message that carried
+  // model or effort ever reached this route.
+  assert.match(tool, /parseAddress\(input\.to\)\.scheme === 'other' &&/)
   // The route must not sit behind a feature gate: feature() is stubbed to false
   // at build time, which is how the only cross-process path disappears from the
   // shipped bundle.

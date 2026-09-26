@@ -14,6 +14,95 @@ import { clearBundledSkills, getBundledSkills } from '../src/skills/bundledSkill
 import { getSessionId } from '../src/bootstrap/state.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
 
+/**
+ * A leaf's family channel points inward: it addresses its own siblings and its
+ * parent and has no way to name another family's leaf. The bus is what makes a
+ * leaf reachable as a session - findable by its label, messageable by ID - and
+ * it is deliberately one to one: a send lands in the target's inbox alone, so a
+ * leaf's family is never copied by addressing one of its members.
+ */
+test('two leaves of two families find each other on the bus and exchange messages', { timeout: 60000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), 'leaf-peer-bus-'))
+  const saved = {
+    home: process.env.CLAUDE_CONFIG_DIR,
+    leaf: process.env.GATEWAY_INTERACTIVE_LEAF,
+    label: process.env.GATEWAY_LEAF_LABEL,
+    gateway: process.env.CLAUDE_CODE_USE_GATEWAY,
+  }
+  process.env.CLAUDE_CONFIG_DIR = home
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.GATEWAY_INTERACTIVE_LEAF = '1'
+  const leafLabelA = `Leaf 2: api (of session ${randomUUID()})`
+  const leafLabelB = `Leaf 1: parser (of session ${randomUUID()})`
+  const leafLabelSibling = `Leaf 3: sibling (of session ${leafLabelA.slice(leafLabelA.indexOf('session ') + 8)})`
+  // The session the test process is: a leaf of family A, registered under the
+  // label it advertises, which is what the hook passes in.
+  const leafA = getSessionId()
+  const leafB = randomUUID()
+  const leafC = randomUUID()
+  const runtimeA = new GatewaySessionRuntime(leafA, home, leafLabelA)
+  const runtimeB = new GatewaySessionRuntime(leafB, home, leafLabelB)
+  const runtimeC = new GatewaySessionRuntime(leafC, home, leafLabelSibling)
+  process.env.GATEWAY_LEAF_LABEL = leafLabelA
+  try {
+    await runtimeA.start(new Set())
+    await runtimeB.start(new Set())
+    await runtimeC.start(new Set())
+    const { resolveGatewayPeer, sendViaGatewayPeer } = await import('../src/utils/gatewayPeerSend.ts')
+    // Find each other: the other family's leaf is listed by the label it
+    // advertises, and that label resolves to exactly one session.
+    const listed = await runtimeA.list()
+    assert.ok(listed.some(peer => peer.sessionId === leafB && peer.name === leafLabelB), JSON.stringify(listed))
+    assert.deepEqual(await resolveGatewayPeer(leafLabelB), { sessionId: leafB, label: `${leafLabelB} (${leafB})` })
+    // Talk to each other: the send from a leaf goes through the same route every
+    // session uses, and it arrives with the marking that keeps peer text from
+    // reading as something the person typed.
+    const sent = await sendViaGatewayPeer(leafB, 'HANDOFF_ACROSS_FAMILIES', 'cross-family handoff')
+    assert.equal(sent.ok, true, sent.message)
+    const arrived = runtimeB.transport.inbox().find(record => record.message.id === sent.messageId)
+    assert.equal(arrived?.message.text, 'HANDOFF_ACROSS_FAMILIES')
+    assert.equal(arrived?.message.fromSessionId, leafA)
+    assert.equal(arrived?.state, 'queued')
+    const queued = removeByFilter(command => command.uuid === sent.messageId)
+    assert.equal(queued.length, 1)
+    assert.equal(queued[0]!.skipSlashCommands, true)
+    assert.equal(queued[0]!.isMeta, true)
+    assert.deepEqual(queued[0]!.origin, { kind: 'gateway-peer' })
+    // One recipient, not the family: the sibling leaf of the sender's own family
+    // - and the sender itself - received nothing.
+    assert.equal(runtimeC.transport.inbox().length, 0)
+    assert.equal(runtimeA.transport.inbox().length, 0)
+    // The reply comes back the same way, from the leaf that was asked.
+    const replied = await runtimeB.transport.send(leafA, 'HANDOFF_ACCEPTED', 'handoff accepted', sent.messageId) as { id: string }
+    const answer = runtimeA.transport.inbox().find(record => record.message.id === replied.id)
+    assert.equal(answer?.message.replyTo, sent.messageId)
+    assert.equal(answer?.message.text, 'HANDOFF_ACCEPTED')
+    // Discovery inside a leaf is the skill, not just the runtime call.
+    clearBundledSkills()
+    registerGatewayPeersSkill()
+    const skill = getBundledSkills().find(entry => entry.name === 'gateway-peers')!
+    assert.ok(skill?.type === 'prompt')
+    const result = await skill.getPromptForCommand('list', {} as ToolUseContext)
+    assert.match(result[0]?.type === 'text' ? result[0].text : '', new RegExp(leafLabelB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    clearBundledSkills()
+  } finally {
+    await runtimeA.close()
+    await runtimeB.close()
+    await runtimeC.close()
+    const { runCleanupFunctions } = await import('../src/utils/cleanupRegistry.ts')
+    await runCleanupFunctions()
+    if (saved.home === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved.home
+    if (saved.leaf === undefined) delete process.env.GATEWAY_INTERACTIVE_LEAF
+    else process.env.GATEWAY_INTERACTIVE_LEAF = saved.leaf
+    if (saved.label === undefined) delete process.env.GATEWAY_LEAF_LABEL
+    else process.env.GATEWAY_LEAF_LABEL = saved.label
+    if (saved.gateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = saved.gateway
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('closed runtime rejects restart even after an earlier successful start', async () => {
   const runtime = new GatewaySessionRuntime(randomUUID(), tmpdir(), 'Closed runtime')
   runtime.transport.start = async () => {}
