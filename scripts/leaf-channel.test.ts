@@ -270,11 +270,17 @@ test('a leaf is one by environment, not by having a parent', async () => {
   const cli = await readFile(new URL('../src/entrypoints/cli.tsx', import.meta.url), 'utf8')
   // The gate is the environment and nothing else: it used to also require an
   // IPC channel, which made being a leaf the same thing as being somebody's
-  // child.
-  assert.match(cli, /if \(process\.env\.GATEWAY_INTERACTIVE_LEAF === '1'\) \{\r?\n    const \{ installLeafTerminal \}/)
+  // child. Read once, then consumed, because the environment a leaf runs in is
+  // the one its children inherit.
+  assert.match(cli, /const \{ consumeLeafLaunchEnv, installLeafTerminal, isInteractiveLeaf \} = await import\('\.\.\/utils\/leafTerminal\.js'\)/)
+  assert.match(cli, /const leaf = isInteractiveLeaf\(\)/)
+  assert.match(cli, /if \(leaf\) \{\r?\n    consumeLeafLaunchEnv\(\)/)
   assert.doesNotMatch(cli, /GATEWAY_INTERACTIVE_LEAF === '1' && typeof process\.send/)
+  // A protocol flag is not a session and must not take over the terminal the
+  // leaf is drawing into: a leaf's own peer-send hook reaches this file.
+  assert.ok(cli.indexOf("args[0] === '--gateway-peer-send'") < cli.indexOf('installLeafTerminal()'))
   const main = await readFile(new URL('../src/main.tsx', import.meta.url), 'utf8')
-  assert.match(main, /const leafTranscript = process\.env\.GATEWAY_INTERACTIVE_LEAF === '1' && process\.env\.GATEWAY_LEAF_SESSION === sessionId/)
+  assert.match(main, /const leafResumePath = isInteractiveLeaf\(\) && leafSessionId\(\) === sessionId/)
   assert.doesNotMatch(main, /typeof process\.send === 'function' && process\.env\.GATEWAY_LEAF_SESSION/)
 
   const terminal = await readFile(new URL('../src/utils/leafTerminal.ts', import.meta.url), 'utf8')
@@ -285,4 +291,48 @@ test('a leaf is one by environment, not by having a parent', async () => {
   assert.match(terminal, /registerCleanup\(async \(\) => \{ sendLeafTerminal\(\{ type: 'leaf-exit', code: 0 \}\) \}\)/)
   assert.doesNotMatch(terminal, /process\.once\('disconnect'/)
   assert.doesNotMatch(terminal, /gracefulShutdown\(0\)/)
+})
+
+test('the leaf keeps its identity and its children inherit none of it', { timeout: 60_000 }, async () => {
+  // Run in a child, because consuming the launch identity is once per process
+  // by design and the test runner is not that process.
+  //
+  // What this pins is the cost of inheriting it: a leaf's tools run in the
+  // leaf's environment, so a marker left in it made every command that happened
+  // to be this CLI install the leaf's terminal for itself - no stdout of its
+  // own, exit 0, and on a platform whose channel is a socket file, the leaf's
+  // address taken from the leaf. Reported as "leaf peer sends do nothing and
+  // the CLI prints nothing inside a leaf", and measured as four identity tests
+  // failing when the suite ran from a leaf.
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const root = fileURLToPath(new URL('..', import.meta.url))
+  const probe = `
+    process.env.GATEWAY_INTERACTIVE_LEAF = '1'
+    process.env.GATEWAY_LEAF_SESSION = '11111111-1111-4111-8111-111111111111'
+    process.env.GATEWAY_LEAF_LABEL = 'Leaf 2: api (of session 11111111-1111-4111-8111-111111111111)'
+    const { execFile } = await import('node:child_process')
+    const leaf = await import(${JSON.stringify(new URL('../src/utils/leafTerminal.ts', import.meta.url).href)})
+    leaf.consumeLeafLaunchEnv()
+    const child = await new Promise(resolve => {
+      execFile(process.execPath, ['--version'], { env: process.env }, (error, stdout) => resolve(error ? 'ERR ' + error.message : stdout.trim()))
+    })
+    console.log(JSON.stringify({
+      stillLeaf: leaf.isInteractiveLeaf(),
+      session: leaf.leafSessionId(),
+      label: leaf.leafLabel(),
+      inherited: Object.keys(process.env).filter(key => key.startsWith('GATEWAY_LEAF_') || key === 'GATEWAY_INTERACTIVE_LEAF'),
+      child,
+    }))
+  `
+  const result = await promisify(execFile)(process.execPath, ['-e', probe], { cwd: root, timeout: 30_000 })
+  const observed = JSON.parse(result.stdout.trim().split('\n').at(-1)!)
+  // The leaf is still the leaf to itself...
+  assert.equal(observed.stillLeaf, true)
+  assert.equal(observed.session, '11111111-1111-4111-8111-111111111111')
+  assert.equal(observed.label, 'Leaf 2: api (of session 11111111-1111-4111-8111-111111111111)')
+  // ...and nothing it starts is told otherwise. `GATEWAY_LEAF_TRUSTED` and the
+  // viewport stay: every reader of those is gated on the identity itself.
+  assert.deepEqual(observed.inherited, [])
+  assert.match(observed.child, /^\d+\.\d+\.\d+/)
 })

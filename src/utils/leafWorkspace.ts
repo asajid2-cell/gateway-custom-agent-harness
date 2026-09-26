@@ -368,7 +368,16 @@ async function currentFamily(): Promise<LeafFamily> {
 
 /** Members of the current family, from the family file or a leaf's snapshot. */
 export async function listLeafMembers(): Promise<LeafMember[]> {
-  if (isInteractiveLeaf()) return (getLeafSnapshot()?.members ?? []).map(entry => entry.member)
+  // A leaf's snapshot is the LIVE roster: the session hosting the family only
+  // publishes members it holds a process for. A closed leaf - and an archived
+  // one, which has no process at all - is missing from it, which is exactly the
+  // set the archive screen exists to offer, so the leaf asks the host to read
+  // the family file instead. The snapshot stays the fallback: an orphaned leaf
+  // whose host is gone still knows the siblings it was last told about.
+  if (isInteractiveLeaf()) {
+    try { return await requestLeafWorkspace<LeafMember[]>('members') }
+    catch { return (getLeafSnapshot()?.members ?? []).map(entry => entry.member) }
+  }
   const self = getSessionId()
   // A member reading its family is looking for the others: itself is the session
   // already on screen, and offering it as a target would start a second copy of
@@ -678,8 +687,8 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     // The leaf inherits this session's trust decision; it cannot answer a
     // dialog before it mounts, so an unanswered trust prompt would wedge start.
     GATEWAY_LEAF_TRUSTED: checkHasTrustDialogAccepted() ? '1' : '0',
-    // A leaf does not register on the shared peer bus (see useGatewaySession),
-    // so this label is not an advertisement: it names the leaf to itself.
+    // What a leaf advertises and names itself by: it is the leaf's identity to
+    // itself and, on the shared peer bus, to any other session that lists it.
     // Without it a leaf would derive its intent from the parent transcript it
     // was forked from and believe it was that session.
     GATEWAY_LEAF_LABEL: leafSelfLabel(member, rootSessionId),
@@ -908,7 +917,10 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       }
       case 'select': selectLeaf(id); break
       case 'create': {
-        const view = await createLeaf(id, value, third, fourth)
+        // `sourceId` is the leaf that asked. It matters to the fork: a leaf
+        // forking itself is mid-turn by construction, and a mid-turn leaf
+        // cannot be checkpointed.
+        const view = await createLeaf(id, value, third, { ...(fourth ?? {}), requestedBy: sourceId })
         result = view.member
         break
       }
@@ -918,6 +930,13 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
         break
       case 'restore': await restoreLeafWorkspace(); break
       case 'open': result = await openLeaf(String(id)); break
+      case 'open-once': result = await openLeafOnce(String(id)); break
+      // Read here rather than through `listLeafMembers`, which inside a leaf
+      // asks the host - and the host is this process, or the session that hosts
+      // this one. Answering with the file stops the question going back up the
+      // chain. The roster is complete: a leaf looks for itself in it, because
+      // forking itself is the one thing it does to itself.
+      case 'members': result = (await currentFamily()).members; break
       case 'change': await changeLeaf(id, value); break
       case 'file': await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
@@ -957,8 +976,13 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       default: throw new Error('Unknown workspace action')
     }
     child.terminal({ type: 'leaf-response', id: message.id, ok: true, value: result })
-  } catch {
-    try { child.terminal({ type: 'leaf-response', id: message.id, ok: false }) } catch { /* Closing the originating session needs no reply. */ }
+  } catch (error) {
+    // A refusal the requester cannot read is a refusal it cannot act on: a bad
+    // reference, a busy target and an unavailable parent all arrived as the same
+    // silent `ok: false`, so the leaf could only report that something failed.
+    // The reason travels back with the refusal, single-lined and bounded.
+    const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
+    try { child.terminal({ type: 'leaf-response', id: message.id, ok: false, value: reason || undefined }) } catch { /* Closing the originating session needs no reply. */ }
   }
 }
 
@@ -975,10 +999,27 @@ export function resolveLeafSource(explicit: string | undefined, root: string, se
   return selected ?? root
 }
 
-export async function createLeaf(name?: string, parentSessionId?: string, worktree?: string, options: { fresh?: boolean; model?: string; effort?: LeafMember['effort'] } = {}): Promise<LeafView> {
+export async function createLeaf(name?: string, parentSessionId?: string, worktree?: string, options: { fresh?: boolean; model?: string; effort?: LeafMember['effort']; requestedBy?: string } = {}): Promise<LeafView> {
   if (isInteractiveLeaf()) {
+    // A fork copies this leaf's transcript FILE, and the fork is made by the
+    // session hosting the family, which cannot flush another process's storage
+    // queue. Land this process's own writes first, or a leaf forks itself from a
+    // transcript that is missing the turns it just wrote.
+    await flushSessionStorage()
     const member = await requestLeafWorkspace<LeafMember>('create', [name, parentSessionId ?? getSessionId(), worktree, options])
-    return getLeafViews().find(view => view.member.sessionId === member.sessionId)!
+    // The new leaf runs in the session that made it, not here: this process
+    // hosts no child of its own, so there is no view to find. Its row is built
+    // from the reply instead, which is everything the asking menu reads - the
+    // leaf's number and name land in the sentence it reports back.
+    return {
+      rootSessionId: familyRootSync(), member, draft: member.draft ?? '',
+      process: {
+        getState: () => getLeafSnapshot()?.members.find(entry => entry.member.sessionId === member.sessionId)?.state ?? 'idle',
+        checkpoint: (label?: string) => requestLeafWorkspace('checkpoint', [member.sessionId, label]),
+        setModel: (model: string) => requestLeafWorkspace('model', [member.sessionId, model]),
+        setEffort: (effort: string) => requestLeafWorkspace('effort', [member.sessionId, effort]),
+      },
+    }
   }
   const self = getSessionId()
   const root = await familyRootSessionId()
@@ -1011,7 +1052,14 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
     cwd = targetRoot.stdout.trim()
   }
   await flushSessionStorage()
-  if (parent && !options.fresh) await parent.process.checkpoint()
+  // A leaf forking itself cannot be checkpointed: its own turn is the one making
+  // the request, and a member refuses a checkpoint of a running turn, so asking
+  // for one turned "fork this leaf" into an opaque failure. Its transcript was
+  // written at its last turn boundary, and a conversation copied as it stood
+  // there is all that a mid-turn fork can honestly copy. Asking anything else
+  // to checkpoint still goes through: a busy source is a refusal, not a bug.
+  const selfFork = parent?.member.sessionId === options.requestedBy
+  if (parent && !options.fresh && !selfFork) await parent.process.checkpoint()
   const freshId = randomUUID()
   const fork = options.fresh ? undefined : await createFork(undefined, parent ? { sessionId: parent.member.sessionId, transcriptPath: parent.member.transcriptPath } : source)
   if (getSessionId() !== self) throw new Error('Session changed before leaf creation')
@@ -1081,6 +1129,39 @@ export async function openLeaf(reference: string): Promise<string> {
   await changeLeaf(member.sessionId, { status: 'open' })
   selectLeaf(member.sessionId)
   return `${memberLabel(member)} opened.`
+}
+
+/**
+ * Start an archived leaf WITHOUT taking it out of the archive.
+ *
+ * Filing a leaf away is meant to shorten the family list, not to put it out of
+ * reach: a person who needs to look something up in an old leaf should not have
+ * to unfile it first. Nothing here writes a status, so the leaf files itself
+ * back the moment its process exits - and reviving stays a deliberate choice
+ * rather than a side effect of having opened something once.
+ */
+export async function openLeafOnce(reference: string): Promise<string> {
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('open-once', [member.sessionId])
+  const root = familyRootSync()
+  await launch(member, root)
+  if (familyRootSync() === root) selectLeaf(member.sessionId)
+  return `${memberLabel(member)} opened. It stays in the archive; close it and it is filed away again.`
+}
+
+/**
+ * Put an archived leaf back in the ordinary list without starting it.
+ *
+ * Reviving is filing, not opening: the leaf returns to the family list and stays
+ * closed until someone opens it, which makes "I archived that by mistake" one
+ * step to undo instead of a relaunch.
+ */
+export async function reviveLeaf(reference: string): Promise<string> {
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  await changeLeaf(member.sessionId, { status: 'closed' })
+  return `${memberLabel(member)} is back in the leaf list. It stays closed until you open it.`
 }
 
 export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {

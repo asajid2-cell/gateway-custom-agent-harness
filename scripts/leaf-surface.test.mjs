@@ -85,12 +85,17 @@ test('forks work for any session with a transcript, not only an open leaf', asyn
 
 test('leaves skip setup modals that would wedge startup, inheriting trust instead', async () => {
   const source = await readFile(new URL('../src/interactiveHelpers.tsx', import.meta.url), 'utf8')
-  assert.match(source, /const isLeaf = process\.env\.GATEWAY_INTERACTIVE_LEAF === '1'/)
+  assert.match(source, /const isLeaf = isInteractiveLeaf\(\)/)
   // Onboarding is a per-user dialog with no keyboard available in a leaf.
   assert.match(source, /if \(!isLeaf && \(!config\.theme \|\| !config\.hasCompletedOnboarding\)/)
   // Trust is inherited from the parent, never bypassed: the dialog is only
   // skipped when the parent recorded that this workspace was already accepted.
-  assert.match(source, /const inheritsTrust = isLeaf && process\.env\.GATEWAY_LEAF_TRUSTED === '1'/)
+  // Both answers come from the launch snapshot rather than the environment,
+  // because a leaf takes its launch environment back out of the process
+  // (consumeLeafLaunchEnv) before setup screens run - reading process.env here
+  // answered "not a leaf, not trusted", which is the dialog this skips.
+  assert.match(source, /const inheritsTrust = isLeaf && leafTrusted\(\)/)
+  assert.match(source, /import \{ isInteractiveLeaf, leafTrusted \} from '\.\/utils\/leafTerminal\.js'/)
   assert.match(source, /if \(!checkHasTrustDialogAccepted\(\) && !inheritsTrust\) \{/)
   assert.match(source, /allErrors\.length === 0 && !isLeaf/)
   assert.match(source, /if \(!isLeaf && await shouldShowClaudeMdExternalIncludesWarning\(\)\)/)
@@ -381,11 +386,107 @@ test('opening is the only thing that starts a leaf process', async () => {
   assert.match(restore, /await readLeafFamily\(familyPath\(root\), root\)/)
   assert.match(restore, /publish\(\)/)
 
-  const open = workspace.slice(workspace.indexOf('export async function openLeaf'), workspace.indexOf('export async function changeLeaf'))
+  const open = workspace.slice(workspace.indexOf('export async function openLeaf'), workspace.indexOf('export async function openLeafOnce'))
   assert.match(open, /await changeLeaf\(member\.sessionId, \{ status: 'open' \}\)/)
   // changeLeaf launches on status 'open'; a second launch here would double it.
   assert.doesNotMatch(open, /await launch\(/)
   assert.match(open, /selectLeaf\(member\.sessionId\)/)
+})
+
+test('an archived leaf can be read, revived, and run without unfiling it', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  // The archive screen is reachable from both menus a person looks in: the home
+  // menu, and the family list where a missing leaf sends them.
+  assert.match(dialog, /if \(screen === 'archives'\)/)
+  assert.equal(dialog.match(/\{ value: 'archives', label: 'Archived leaves'/g)?.length, 2)
+  // Three verbs, and each one is offered for an archived member by id.
+  assert.match(dialog, /value: `revive:\$\{member\.sessionId\}`/)
+  assert.match(dialog, /value: `open-once:\$\{member\.sessionId\}`/)
+  assert.match(dialog, /value: `view:\$\{member\.sessionId\}`/)
+  // Viewing reads the saved transcript and starts nothing.
+  assert.match(dialog, /const \{ loadTranscriptFromFile \} = await import\('\.\.\/utils\/sessionStorage\.js'\)/)
+  assert.match(dialog, /<SessionPreview/)
+  assert.doesNotMatch(dialog, /\bunlink\b|\brmSync\b|\brm\(/)
+
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // Open once launches and selects, and writes no status at all: that is what
+  // leaves the leaf archived, and what files it back when its process exits.
+  const once = workspace.slice(workspace.indexOf('export async function openLeafOnce'), workspace.indexOf('export async function reviveLeaf'))
+  assert.match(once, /await launch\(member, root\)/)
+  assert.match(once, /selectLeaf\(member\.sessionId\)/)
+  assert.doesNotMatch(once, /changeLeaf|updateLeafMember/)
+  // Reviving is the opposite trade: back on the list, still closed, never started.
+  const revive = workspace.slice(workspace.indexOf('export async function reviveLeaf'), workspace.indexOf('export async function changeLeaf'))
+  assert.match(revive, /await changeLeaf\(member\.sessionId, \{ status: 'closed' \}\)/)
+  assert.doesNotMatch(revive, /launch\(/)
+  // Both work from a leaf, which reaches the family through the session hosting it.
+  assert.match(once, /requestLeafWorkspace<string>\('open-once'/)
+  assert.match(workspace, /case 'open-once': result = await openLeafOnce\(String\(id\)\); break/)
+})
+
+test('a leaf can fork itself, which it cannot checkpoint while it asks', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const create = workspace.slice(workspace.indexOf('export async function createLeaf'), workspace.indexOf('let hostRelease'))
+  // A mid-turn member refuses a checkpoint of its own turn, so a self-fork asked
+  // for one and came back as an opaque failure. Only the asking leaf is skipped:
+  // any other busy source is still a legible refusal.
+  assert.match(create, /const selfFork = parent\?\.member\.sessionId === options\.requestedBy/)
+  assert.match(create, /if \(parent && !options\.fresh && !selfFork\) await parent\.process\.checkpoint\(\)/)
+  // The host knows which leaf asked from the request itself, not from a guess.
+  assert.match(workspace, /requestedBy: sourceId/)
+  // A fork copies a transcript FILE, and the host cannot flush another process's
+  // queue, so the asking leaf lands its own writes before it asks.
+  const relay = create.slice(create.indexOf('if (isInteractiveLeaf())'), create.indexOf('const self = getSessionId()'))
+  const flushed = relay.indexOf('await flushSessionStorage()')
+  assert.ok(flushed >= 0, 'the relay has to flush its own storage first')
+  assert.ok(flushed < relay.indexOf("requestLeafWorkspace<LeafMember>('create'"), 'the flush precedes the request')
+  // The leaf hosts no children, so the row for the leaf it just made is built
+  // from the reply. Looking it up in the roster instead handed the menu an
+  // undefined view, and the create reported a failure for a leaf that existed.
+  assert.match(relay, /return \{\s*rootSessionId: familyRootSync\(\), member, draft: member\.draft \?\? ''/)
+  assert.doesNotMatch(relay, /return getLeafViews\(\)\.find/)
+})
+
+test('a leaf menu shows filed-away leaves, which its own snapshot cannot', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const list = workspace.slice(workspace.indexOf('export async function listLeafMembers'), workspace.indexOf('export async function resolveLeafRef'))
+  // The snapshot a leaf holds is the live roster: it carries no process-less
+  // member, so an archived leaf is missing from it. The family file is the
+  // roster; the snapshot is only the fallback when the host is gone.
+  assert.match(list, /requestLeafWorkspace<LeafMember\[\]>\('members'\)/)
+  assert.match(list, /catch \{ return \(getLeafSnapshot\(\)\?\.members \?\? \[\]\)\.map\(entry => entry\.member\) \}/)
+  // The host answers from the family file directly, never by relaying: a leaf
+  // hosting its own family would otherwise send the question back to the
+  // session it hosts, and the two would volley it until both timed out.
+  assert.match(workspace, /case 'members': result = \(await currentFamily\(\)\)\.members; break/)
+  // The roster is complete, asker included: a leaf forks itself from its own
+  // menu, so it has to find itself in the list the wizard offers.
+  assert.doesNotMatch(workspace, /case 'members': result = \(await currentFamily\(\)\)\.members\.filter/)
+})
+
+test('a leaf menu acts on the family, never on the session holding it', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  // The roster a leaf reads is the family file, and a leaf is in it. Rows for
+  // the session on screen would close or archive the process drawing the menu,
+  // so that one is dropped from the rows - the same rule the host applies to
+  // itself when it lists its own family.
+  assert.match(dialog, /const self = selectedLeafId\(\)/)
+  assert.match(dialog, /member\.status !== 'archived' && member\.sessionId !== self/)
+  // A missing row is confusing on its own, so which session is on screen is
+  // said out loud instead.
+  assert.ok(dialog.includes('These rows act on the rest of the family'), 'the self row is named, not just dropped')
+})
+
+test('a refusal a leaf cannot read is a refusal it cannot act on', async () => {
+  // The session that owns the family sends the reason...
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  assert.match(workspace, /const reason = error instanceof Error \? error\.message\.replace\(/)
+  assert.match(workspace, /\.trim\(\)\.slice\(0, 300\)/)
+  assert.match(workspace, /ok: false, value: reason \|\| undefined/)
+  // ...and the asking leaf reports it, keeping the old line for a bare refusal.
+  const terminal = await readFile(new URL('../src/utils/leafTerminal.ts', import.meta.url), 'utf8')
+  assert.match(terminal, /`Leaf workspace action failed: \$\{message\.value\.trim\(\)\.slice\(0, 300\)\}`/)
+  assert.match(terminal, /'Leaf workspace action failed; saved sessions are retained'/)
 })
 
 test('the fork source rule picks the leaf on screen, and only says root when told to', () => {
@@ -527,7 +628,7 @@ test('archive detaches a leaf without deleting anything', async () => {
   // Detach must not become delete: no file removal anywhere in the menu.
   assert.doesNotMatch(dialog, /\bunlink\b|\brmSync\b|\brm\(/)
   // An archived leaf leaves the menu, which is what "detached" means here.
-  assert.match(dialog, /members\?\.filter\(member => member\.status !== 'archived'\)/)
+  assert.match(dialog, /members\?\.filter\(member => member\.status !== 'archived' && member\.sessionId !== self\)/)
   assert.match(dialog, /\(members \?\? \[\]\)\.filter\(member => member\.status !== 'archived'\)/)
 
   // The engine path already releases the process and the owner claim, keeps the

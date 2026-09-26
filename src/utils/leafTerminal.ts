@@ -59,9 +59,31 @@ let wakeInput: (() => void) | undefined
 // a failure: a leaf whose session closed keeps running with nobody attached and
 // is picked up again by whoever opens it next.
 let client: LeafChannel | undefined
+// When the last attached session went away, or when this process started if
+// nobody has ever attached. Undefined while a session is attached, so the pair
+// with `client` is always consistent.
+let clientDetachedAt: number | undefined
+const processStartedAt = Date.now()
 // The last state this leaf published, so a session that arrives later learns
 // what it is doing without waiting for the next turn boundary to change it.
 let lastState: LeafProcessState | undefined
+
+/**
+ * Whether a session is watching this leaf.
+ *
+ * Being detached is the ordinary "paused, waiting to be picked up" state, and
+ * that is precisely why it cannot be the whole signal for closing a leaf: a
+ * leaf between owners must survive long enough for the next one to attach.
+ */
+export function isLeafClientAttached(): boolean {
+  return client !== undefined
+}
+
+/** How long this leaf has had nobody attached; 0 while someone is. */
+export function leafIdleMs(): number {
+  if (client !== undefined) return 0
+  return Date.now() - (clientDetachedAt ?? processStartedAt)
+}
 
 /**
  * Bring the leaf's REPL back to life without typing anything into it.
@@ -79,6 +101,22 @@ export function wakeLeafInput(): void {
 }
 
 /**
+ * What this process was launched as, kept once the environment it arrived in
+ * has been cleaned up. Undefined until consumeLeafLaunchEnv() runs.
+ */
+type LeafLaunch = {
+  interactive: boolean
+  sessionId: string | undefined
+  label: string | undefined
+  trusted: boolean
+  transcript: string | undefined
+  columns: number
+  rows: number
+  colorDepth: number
+}
+let launch: LeafLaunch | undefined
+
+/**
  * Whether this process is a leaf.
  *
  * This is the environment's answer alone. It used to also require
@@ -86,8 +124,53 @@ export function wakeLeafInput(): void {
  * child - a leaf could not exist without a parent process holding the other end
  * of its IPC pipe. The transport is a socket now, so identity and transport are
  * independent: this says what the session *is*, not who launched it.
+ *
+ * Being a leaf is a fact about the process the family started, and the answer is
+ * only about this process: a child of a leaf is not a leaf, which is why the
+ * launch environment is taken back out of it (consumeLeafLaunchEnv) the moment
+ * the leaf owns it. Inherited, it made every child a leaf - a nested CLI
+ * replaced its own stdout with the leaf's channel, so it printed nothing at all
+ * and reported success, and on a platform where the channel is a socket file it
+ * unlinked and rebound the leaf's own address out from under the leaf.
  */
-export function isInteractiveLeaf(): boolean { return process.env.GATEWAY_INTERACTIVE_LEAF === '1' }
+export function isInteractiveLeaf(): boolean { return launch ? launch.interactive : process.env.GATEWAY_INTERACTIVE_LEAF === '1' }
+export function leafSessionId(): string | undefined { return launch ? launch.sessionId : process.env.GATEWAY_LEAF_SESSION }
+export function leafLabel(): string | undefined { return launch ? launch.label : process.env.GATEWAY_LEAF_LABEL }
+export function leafTrusted(): boolean { return launch ? launch.trusted : process.env.GATEWAY_LEAF_TRUSTED === '1' }
+export function leafTranscript(): string | undefined { return launch ? launch.transcript : process.env.GATEWAY_LEAF_TRANSCRIPT }
+export function leafViewport(): { columns: number; rows: number; colorDepth: number } {
+  const reading = launch ?? { columns: Number(process.env.GATEWAY_LEAF_COLUMNS) || 80, rows: Number(process.env.GATEWAY_LEAF_ROWS) || 24, colorDepth: Math.min(Number(process.env.GATEWAY_LEAF_COLOR_DEPTH) || 0, 3) }
+  return { columns: reading.columns, rows: reading.rows, colorDepth: reading.colorDepth }
+}
+/**
+ * Take the launch environment out of this process, so nothing it starts can
+ * inherit it. The leaf keeps every answer; its children get none.
+ *
+ * Read once and kept, because the environment is the one thing a leaf hands to
+ * every command it runs: these arrive on the launch and describe the process the
+ * family started, not the tools it then goes on to run. FORCE_COLOR is the one
+ * exception - it is not about being a leaf, and a child that draws to this
+ * terminal wants it as much as the leaf does.
+ */
+export function consumeLeafLaunchEnv(): void {
+  if (launch) return
+  launch = {
+    interactive: process.env.GATEWAY_INTERACTIVE_LEAF === '1',
+    sessionId: process.env.GATEWAY_LEAF_SESSION,
+    label: process.env.GATEWAY_LEAF_LABEL,
+    trusted: process.env.GATEWAY_LEAF_TRUSTED === '1',
+    transcript: process.env.GATEWAY_LEAF_TRANSCRIPT,
+    ...leafViewport(),
+  }
+  delete process.env.GATEWAY_INTERACTIVE_LEAF
+  delete process.env.GATEWAY_LEAF_SESSION
+  delete process.env.GATEWAY_LEAF_LABEL
+  delete process.env.GATEWAY_LEAF_TRUSTED
+  delete process.env.GATEWAY_LEAF_TRANSCRIPT
+  delete process.env.GATEWAY_LEAF_COLUMNS
+  delete process.env.GATEWAY_LEAF_ROWS
+  delete process.env.GATEWAY_LEAF_COLOR_DEPTH
+}
 export function getLeafSnapshot(): LeafSnapshot | undefined { return snapshot }
 export function subscribeLeafSnapshot(listener: () => void): () => void { snapshotListeners.add(listener); return () => { snapshotListeners.delete(listener) } }
 export function consumeLeafInitialDraft(): string { const value = initialDraft; initialDraft = ''; return value }
@@ -132,7 +215,7 @@ export async function installLeafTerminal(): Promise<void> {
   // time this runs, so what actually colours a leaf is the FORCE_COLOR the owner
   // puts in its environment at launch. This binds for an unbundled leaf — the
   // tests, and a leaf started from source.
-  const colorDepth = Math.min(Number(process.env.GATEWAY_LEAF_COLOR_DEPTH) || 0, 3)
+  const { columns: startColumns, rows: startRows, colorDepth } = leafViewport()
   if (colorDepth > 0 && !('FORCE_COLOR' in process.env) && !process.env.NO_COLOR) {
     process.env.FORCE_COLOR = String(colorDepth)
   }
@@ -151,8 +234,8 @@ export async function installLeafTerminal(): Promise<void> {
     },
   }), {
     isTTY: true, fd: 1,
-    columns: Number(process.env.GATEWAY_LEAF_COLUMNS) || 80,
-    rows: Number(process.env.GATEWAY_LEAF_ROWS) || 24,
+    columns: startColumns,
+    rows: startRows,
     getColorDepth: () => colorDepth || 1, hasColors: () => colorDepth > 0,
     getWindowSize() { return [this.columns, this.rows] },
   })
@@ -211,7 +294,14 @@ export async function installLeafTerminal(): Promise<void> {
       clearTimeout(pending.timer)
       requests.delete(message.id)
       if (message.ok) pending.resolve(message.value)
-      else pending.reject(new Error('Leaf workspace action failed; saved sessions are retained'))
+      // One opaque string covered four unrelated causes - an unavailable
+      // parent, a busy target, a bad reference - so a refusal could not be told
+      // apart from a broken workspace. The session that owns the family reports
+      // what actually failed; the generic line is only the fallback for a
+      // refusal that carried no reason.
+      else pending.reject(new Error(typeof message.value === 'string' && message.value.trim()
+        ? `Leaf workspace action failed: ${message.value.trim().slice(0, 300)}`
+        : 'Leaf workspace action failed; saved sessions are retained'))
       return
     }
     if (message.type === 'leaf-control') {
@@ -223,20 +313,21 @@ export async function installLeafTerminal(): Promise<void> {
   // pipe it has to keep alive, which is what lets the leaf outlive whoever
   // started it: the launcher exiting closes a socket, and a closed socket is
   // only "nobody is watching", not a shutdown.
-  const sessionId = process.env.GATEWAY_LEAF_SESSION ?? ''
+  const sessionId = leafSessionId() ?? ''
   if (sessionId) {
     // Say goodbye while there is still a socket to say it on, so the session
     // watching this leaf can tell a deliberate exit from a kill.
     registerCleanup(async () => { sendLeafTerminal({ type: 'leaf-exit', code: 0 }) })
     serveLeafChannel({
       sessionId,
-      identify: () => ({ sessionId, pid: process.pid, label: process.env.GATEWAY_LEAF_LABEL, state: lastState }),
+      identify: () => ({ sessionId, pid: process.pid, label: leafLabel(), state: lastState }),
       onMessage: message => handle(message as LeafTerminalMessage),
-      onAttach: attached => { client = attached },
+      onAttach: attached => { client = attached; clientDetachedAt = undefined },
       // A detaching session takes its worker messages with it: they were asked
       // for by a conversation that is no longer there to receive the answer.
       onDetach: () => {
         client = undefined
+        clientDetachedAt = Date.now()
         active = false
         instances.get(process.stdout)?.pause()
         for (const pending of requests.values()) { clearTimeout(pending.timer); pending.reject(new Error('Leaf workspace disconnected')) }

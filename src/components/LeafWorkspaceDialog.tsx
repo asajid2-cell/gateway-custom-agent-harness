@@ -1,10 +1,12 @@
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Box, Text, useInput } from '../ink.js'
 import { Select } from './CustomSelect/select.js'
+import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafRootName, leafParentIsOpen, leafParentMember, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafRootName, getLeafViews, leafParentIsOpen, leafParentMember, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
+import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
 import { isGatewayMode } from '../utils/model/providers.js'
 
@@ -44,6 +46,16 @@ function describeSession(member?: { number: number; name: string }): string {
   return member.number === 0 ? `The parent session ${member.name}` : `Leaf #${member.number} ${member.name}`
 }
 
+/**
+ * How the archive entry reads, so both menus that offer it say the same thing.
+ * The count is the point of the row: archiving hides leaves from the ordinary
+ * list, and this is the only place that says how many went.
+ */
+function describeArchives(members: LeafMember[] | undefined, hint: string): string {
+  const count = (members ?? []).filter(member => member.status === 'archived').length
+  return count ? `${count} filed away · ${hint}` : 'Nothing is archived yet'
+}
+
 /** Enter on a choice row advances to its next value and wraps. */
 function nextIn(values: readonly string[], current: string): string {
   const index = values.indexOf(current)
@@ -59,8 +71,11 @@ function nextIn(values: readonly string[], current: string): string {
  */
 export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) => void; model?: string; effort?: string }): React.ReactNode {
   useRegisterOverlay('leaf-menu', true)
-  const [screen, setScreen] = useState<'home' | 'list' | 'create'>('home')
+  const [screen, setScreen] = useState<'home' | 'list' | 'create' | 'archives' | 'view'>('home')
   const [members, setMembers] = useState<LeafMember[] | undefined>(undefined)
+  // The transcript an archive row asked to read, with the member it belongs to:
+  // the viewer is read-only, and Enter in it resumes that member once.
+  const [viewing, setViewing] = useState<{ member: LeafMember; log: LogOption } | undefined>(undefined)
   const [parent, setParent] = useState<LeafMember | undefined>(undefined)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -92,6 +107,24 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     }
   }
 
+  // Reading a filed-away leaf starts nothing: its transcript is a file on disk,
+  // so this works the same whether or not anything is running.
+  const viewTranscript = async (member: LeafMember) => {
+    setBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const { loadTranscriptFromFile } = await import('../utils/sessionStorage.js')
+      setViewing({ member, log: await loadTranscriptFromFile(member.transcriptPath) })
+      setScreen('view')
+    } catch (failure) {
+      const reason = failure instanceof Error ? failure.message.replace(/\s+/g, ' ').trim() : ''
+      setError(reason || 'That leaf transcript could not be read.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (screen === 'create') {
     return <LeafCreateWizard
       members={members}
@@ -105,7 +138,13 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   }
 
   if (screen === 'list') {
-    const open = members?.filter(member => member.status !== 'archived') ?? []
+    // Inside a leaf the roster includes the session asking, because the roster
+    // is the family file and a leaf has an entry in it. That one row is not
+    // offered: closing or archiving it stops the process holding this menu. It
+    // is named instead, which is also how a leaf finds itself.
+    const self = selectedLeafId()
+    const mine = members?.find(member => member.sessionId === self)
+    const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
     const parentOpen = Boolean(parent) && leafParentIsOpen()
     const options = [
       // The parent is the family's permanent session: it can be opened, closed
@@ -137,14 +176,17 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         description: 'Detach it from this family and hide it from this menu; the transcript is kept',
       })),
       ...(open.length === 0 && !parent ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
+      { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
     ]
     return <Box flexDirection="column">
       <Text bold>Leaves in this family</Text>
       <Text dimColor>Opening a leaf is the only thing that starts its process. Closed leaves stay closed until you open them again.</Text>
+      {mine && <Text dimColor>These rows act on the rest of the family: {describeSession(mine)} is the session you are in.</Text>}
       {parent && <Text dimColor>This family also has a parent session: the conversation everything here was forked from. It is always resumable and is never archived.</Text>}
       <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
         if (value === 'back' || value === 'empty') { setScreen('home'); return }
+        if (value === 'archives') { setScreen('archives'); return }
         const id = value.slice(value.indexOf(':') + 1)
         const member = members?.find(item => item.sessionId === id) ?? (parent?.sessionId === id ? parent : undefined)
         const action = value.slice(0, value.indexOf(':'))
@@ -164,11 +206,85 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     </Box>
   }
 
+  // Archived leaves are out of the ordinary list, which is what archiving
+  // means, so they need a screen of their own to come back from. Nothing here
+  // deletes anything: the three verbs are file, read and run-if-you-must.
+  if (screen === 'archives') {
+    const archived = members?.filter(member => member.status === 'archived') ?? []
+    const running = new Set(getLeafViews().map(view => view.member.sessionId))
+    const options = [
+      ...archived.map(member => ({
+        value: `revive:${member.sessionId}`,
+        label: `Revive #${member.number} ${member.name}`,
+        description: 'Put it back in the leaf list; it stays closed until you open it',
+      })),
+      ...archived.map(member => ({
+        value: `open-once:${member.sessionId}`,
+        label: `Open once #${member.number} ${member.name}`,
+        description: 'Run it now, then file it away again when you close it',
+      })),
+      ...archived.map(member => ({
+        value: `view:${member.sessionId}`,
+        label: `View #${member.number} ${member.name}`,
+        description: 'Read the saved conversation; nothing is started',
+      })),
+      ...archived.filter(member => running.has(member.sessionId)).map(member => ({
+        value: `close:${member.sessionId}`,
+        label: `Close #${member.number} ${member.name}`,
+        description: 'Stop the process it is running now; it stays archived',
+      })),
+      ...(archived.length === 0 ? [{ value: 'empty', label: 'Nothing is archived', description: 'Leaves you archive are filed here' }] : []),
+      { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
+    ]
+    return <Box flexDirection="column">
+      <Text bold>Archived leaves</Text>
+      <Text dimColor>Archiving files a leaf away without deleting anything: its transcript, its session and its place in this family are kept.</Text>
+      <Text dimColor>Opening one from here runs it as it is and leaves it archived; reviving moves it back to the leaf list.</Text>
+      <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
+        if (value === 'back' || value === 'empty') { setScreen('home'); return }
+        const id = value.slice(value.indexOf(':') + 1)
+        const action = value.slice(0, value.indexOf(':'))
+        const member = archived.find(item => item.sessionId === id)
+        if (action === 'view' && member) { void viewTranscript(member); return }
+        void run('', async () => {
+          const workspace = await import('../utils/leafWorkspace.js')
+          if (action === 'revive') return workspace.reviveLeaf(id)
+          if (action === 'open-once') return workspace.openLeafOnce(id)
+          await workspace.changeLeaf(id, { status: 'archived' })
+          selectLeaf(undefined)
+          return `${describeSession(member)} closed. It stays archived.`
+        })
+      }} />
+      {busy && <Text dimColor>Working…</Text>}
+      {notice && <Text>{notice}</Text>}
+      {error && <Text color="error">{error}</Text>}
+    </Box>
+  }
+
+  // The read-only viewer. Enter is the one gesture it inherits from resume, so
+  // Enter means the same thing here as it does there: run it once, archived.
+  if (screen === 'view' && viewing) {
+    const member = viewing.member
+    return <SessionPreview
+      log={viewing.log}
+      onExit={() => { setViewing(undefined); setScreen('archives') }}
+      onSelect={() => {
+        setViewing(undefined)
+        setScreen('archives')
+        void run('', async () => {
+          const workspace = await import('../utils/leafWorkspace.js')
+          return workspace.openLeafOnce(member.sessionId)
+        })
+      }}
+    />
+  }
+
   const selected = selectedLeafId()
   const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafRootName()
   const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
     { value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' },
     { value: 'list', label: 'Leaves in this family', description: members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
+    { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'leaves you archive are filed here') },
     { value: 'exit', label: 'Cancel', description: 'Leave the leaf workspace' },
   ]
   return <Box flexDirection="column">
@@ -178,6 +294,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     <Select options={options} visibleOptionCount={6} onCancel={() => onDone()} onChange={(value: string) => {
       if (value === 'exit') { onDone(); return }
       if (value === 'list') { setScreen('list'); return }
+      if (value === 'archives') { setScreen('archives'); return }
       setError('')
       setNotice('')
       setScreen('create')
@@ -230,7 +347,10 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
     setError('')
     try {
       const { createLeaf, setLeafGoal } = await import('../utils/leafWorkspace.js')
-      const parent = source === 'root' ? undefined : source
+      // "Root" is named rather than left empty: an empty source means "the
+      // session on screen", which is not the same conversation once a leaf is
+      // selected - the row said root and forked the leaf.
+      const parent = source
       const view = await createLeaf(
         name.trim() || undefined,
         parent,

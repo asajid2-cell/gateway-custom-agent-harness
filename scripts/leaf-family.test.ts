@@ -547,6 +547,41 @@ test('archiving detaches a leaf but leaves its transcript on disk', async () => 
   }
 })
 
+test('reviving an archived leaf files it back in without starting it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-revive-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { getClaudeConfigHomeDir } = await import('../src/utils/envUtils.ts')
+    const { reviveLeaf, listLeafMembers, getLeafViews } = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const familyPath = join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`)
+    const member = await addLeafMember(familyPath, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Revive me', transcriptPath: join(directory, 'revive.jsonl'), forkMessageId: randomUUID() })
+    await changeLeaf(member.sessionId, { status: 'archived' })
+    assert.equal((await listLeafMembers()).filter(item => item.status !== 'archived').length, 0)
+    assert.equal(getLeafViews().some(view => view.member.sessionId === member.sessionId), false)
+
+    // Reviving by number, which is how a person names a leaf: an archived member
+    // is still a member, so every reference the family accepts still resolves.
+    const notice = await reviveLeaf(String(member.number))
+
+    assert.equal((await listLeafMembers()).find(item => item.sessionId === member.sessionId)?.status, 'closed')
+    // Back on the list and still shut: reviving is filing, not opening, so
+    // nothing can have started.
+    assert.equal(getLeafViews().some(view => view.member.sessionId === member.sessionId), false)
+    assert.match(notice, /back in the leaf list/)
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('worktree leaf rejects the current working tree before creating a fork', async () => {
   const { getCwdState, setCwdState } = await import('../src/bootstrap/state.ts')
   const { resolve } = await import('node:path')
