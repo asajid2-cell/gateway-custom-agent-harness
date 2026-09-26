@@ -86,11 +86,13 @@ test('Gateway does not opt external users into fullscreen', () => {
 for (const control of ['goal', 'pencil']) {
 test(`actual footer ${control} responds to terminal mouse input`, async () => {
   const source = await readFile(new URL('../src/components/PromptInput/PromptInputFooter.tsx', import.meta.url), 'utf8')
-  const start = source.indexOf(control === 'goal' ? '<Button onAction={() => onOpenSessionMetadata?.()}' : 'export function SessionEditControl')
-  const end = control === 'goal' ? source.indexOf('</Button>', start) + '</Button>'.length : source.indexOf('\ntype BridgeStatusProps', start)
+  const start = source.indexOf(control === 'goal' ? '<Box flexShrink={0} onClick={() => onOpenSessionMetadata?.()}' : 'export function SessionEditControl')
+  const end = control === 'goal' ? source.indexOf('</Box>', start) + '</Box>'.length : source.indexOf('\ntype BridgeStatusProps', start)
   assert.ok(start >= 0 && end > start)
+  // The goal control owns its hover state now, so the sliced element has to run
+  // inside a component that holds it rather than as a bare element.
   const snippet = control === 'goal'
-    ? `const element = ${source.slice(start, end)};`
+    ? `function GoalControl() {\nconst [persistHovered, setPersistHovered] = React.useState(false);\nreturn ${source.slice(start, end)};\n}\nconst element = React.createElement(GoalControl);`
     : `${source.slice(start, end).replace('export function', 'function')}\nconst element = React.createElement(SessionEditControl, { onOpen: onOpenSessionMetadata });`
   const code = new Bun.Transpiler({ loader: 'tsx', tsconfig: { compilerOptions: { jsx: 'react' } } }).transformSync(snippet)
   const stdout = Object.assign(new PassThrough(), { columns: 100, rows: 24, isTTY: true })
@@ -117,14 +119,14 @@ test(`actual footer ${control} responds to terminal mouse input`, async () => {
     stdin.write('\x1b[<0;1;1m')
     await new Promise(resolve => setTimeout(resolve, 100))
     assert.equal(opened, true)
-    if (control === 'pencil') {
-      opened = false
-      stdin.write(' ')
-      stdin.write('\t')
-      stdin.write(' ')
-      await new Promise(resolve => setTimeout(resolve, 100))
-      assert.equal(opened, false, 'typing Space or tabbing must not activate the pencil')
-    }
+    // Both controls are click-only: a click must not leave a focus target that
+    // Space or Tab re-activates once the dialog it opened has closed.
+    opened = false
+    stdin.write(' ')
+    stdin.write('\t')
+    stdin.write(' ')
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(opened, false, `typing Space or tabbing must not activate the ${control}`)
   } finally { app.unmount() }
 })
 }
