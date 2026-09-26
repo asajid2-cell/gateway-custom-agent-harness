@@ -3,6 +3,7 @@ import { getSessionId } from '../bootstrap/state.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { getGatewaySessionRuntime } from './gatewaySessionRuntime.js'
 import { listGatewayPeers } from './gatewaySessionTransport.js'
+import type { PeerMessageKind } from './gatewaySessionProtocol.js'
 
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -75,6 +76,7 @@ export async function sendViaGatewayPeer(
   text: string,
   summary: string,
   replyTo?: string,
+  kind?: PeerMessageKind,
 ): Promise<GatewayPeerSendResult> {
   const runtime = getGatewaySessionRuntime(getSessionId())
   if (!runtime) {
@@ -88,7 +90,7 @@ export async function sendViaGatewayPeer(
   if ('error' in resolved) return { ok: false, message: resolved.error }
   let receipt: any
   try {
-    receipt = await runtime.transport.send(resolved.sessionId, text, summary, replyTo)
+    receipt = await runtime.transport.send(resolved.sessionId, text, summary, replyTo, kind)
   } catch (error) {
     const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
     return { ok: false, message: `Delivery to ${resolved.label} failed: ${reason || 'transport error'}` }
@@ -101,10 +103,15 @@ export async function sendViaGatewayPeer(
       state: receipt.state,
     }
   }
+  // Report the kind back, because it changes what the receipt means: a
+  // directive is a task the peer is expected to carry out, and reading it as
+  // delivered-not-done is what sent senders looking for a second way to hand
+  // the work over.
+  const delivered = kind === 'directive' ? 'Delivered a directive to' : 'Delivered an inquiry to'
   return {
     ok: true,
     messageId: receipt?.id,
     state: receipt?.state,
-    message: `Delivered to ${resolved.label} (${receipt?.state ?? 'unknown'}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.`,
+    message: `${delivered} ${resolved.label} (${receipt?.state ?? 'unknown'}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.`,
   }
 }

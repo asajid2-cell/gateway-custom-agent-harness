@@ -140,6 +140,52 @@ test('a peer send is not refused for carrying model or effort', async () => {
   assert.match(local.data.message, /only supported when resuming a local subagent/)
 })
 
+test('a reply sent through SendMessage carries the id it answers, so the request retires', { timeout: 60000 }, async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  const { GatewaySessionRuntime } = await import('../src/utils/gatewaySessionRuntime.ts')
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  // The tool hard-coded replyTo to undefined, so a session answering a peer
+  // through SendMessage produced a reply the sender could not correlate: the
+  // request stayed in outstandingReplies() and was raised again at the next turn
+  // boundary. That is a reply that reads as never arriving, which is how the
+  // "reply just failed" report looks from the sender's side.
+  const home = await mkdtemp(join(tmpdir(), 'gateway-peer-reply-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = home
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  const receiver = new GatewaySessionRuntime(randomUUID(), home, 'Requester')
+  // The sender must itself be on the bus: the route refuses a session that is
+  // not registered rather than writing a mailbox nobody reads, which is why a
+  // real reply has a live runtime behind it.
+  const sender = new GatewaySessionRuntime(getSessionId(), home, 'Responder')
+  try {
+    await sender.start(new Set())
+    await receiver.start(new Set())
+    await receiver.setPolicy('accept')
+    const requestId = randomUUID()
+    const result = await SendMessageTool.call(
+      { to: `gateway:${receiver.transport.peer.sessionId}`, message: 'The parser review is done.', summary: 'Review done', replyTo: requestId },
+      { getAppState: () => getDefaultAppState() },
+      async () => ({ behavior: 'deny' }),
+    )
+    assert.equal(result.data.success, true, result.data.message)
+    const arrived = receiver.transport.inbox().find(record => record.message.text === 'The parser review is done.')
+    assert.equal(arrived?.message.replyTo, requestId)
+  } finally {
+    await sender.close()
+    await receiver.close()
+    const { runCleanupFunctions } = await import('../src/utils/cleanupRegistry.ts')
+    await runCleanupFunctions()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('SendMessage routes the gateway scheme through the peer transport, not the mailbox', async () => {
   const tool = await readFile(new URL('../src/tools/SendMessageTool/SendMessageTool.ts', import.meta.url), 'utf8')
   assert.match(tool, /addr\.scheme === 'gateway'/)
@@ -158,4 +204,36 @@ test('SendMessage routes the gateway scheme through the peer transport, not the 
   // The addressing rule the model needs, unconditional rather than in the
   // feature-gated UDS section.
   assert.doesNotMatch(prompt, /const gatewayRow = feature\(/)
+  // The kind decides whether the receiver does the work or answers a question,
+  // so it has to reach the transport rather than being a schema field the tool
+  // accepts and drops.
+  assert.match(tool, /kind: z\.enum\(PEER_MESSAGE_KINDS\)/)
+  assert.match(tool, /input\.kind,/)
+  // A reply has to be able to name the message it answers through this tool too,
+  // not only through the skill.
+  assert.match(tool, /replyTo: z\.string\(\)\.optional\(\)/)
+  assert.match(tool, /input\.replyTo,/)
+  assert.match(prompt, /hands it work to carry out/)
+  assert.match(prompt, /asks a question or shares information and asks only for an answer/)
+  // The loop the user hit was not one message but the same message sent again:
+  // a session recruited a second session to carry an instruction to a third,
+  // and both nudged the target until the nudges were the traffic. The rule that
+  // stops it is about addressing and repetition, and it has to be in the prompt
+  // the model reads rather than only in the transport that reports the refusal.
+  assert.match(prompt, /Send to the sessions your user named, and only those/)
+  assert.match(prompt, /is a locator, not an addressee/)
+  assert.match(prompt, /do not send to the session you found it through at all/)
+  assert.match(prompt, /Do not hand the same task to two sessions/)
+  assert.match(prompt, /do not recruit one session to carry an instruction to another/)
+  assert.match(prompt, /say so to your user rather than routing it through a third party/)
+  assert.match(prompt, /the identical message sent again is refused the same way/)
+  // The rule has to be in the skill as well as the tool. The sends that produced
+  // the user-visible incident came from the skill, not SendMessage - the tool was
+  // refusing them for carrying model and effort - so a rule that lives only in
+  // the tool's prompt did not reach the path that was actually used.
+  const skill = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
+  assert.match(skill, /is a locator, not an addressee/)
+  assert.match(skill, /never to the session you found it through, not even to pass a note about its own leaf/)
+  assert.match(skill, /do not recruit one session to carry an instruction to another/)
+  assert.match(skill, /replyTo\?,kind\?/)
 })

@@ -8,9 +8,9 @@ import { isProcessRunning } from './genericProcessUtils.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
-  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema,
+  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage,
   type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
-  type GatewayInboundPolicy,
+  type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
 
 const execFileAsync = promisify(execFile)
@@ -399,7 +399,7 @@ export class GatewaySessionTransport {
       return { ok: true, id: request.id, state: record?.state ?? 'unknown', meaning: 'delivered means transcript-persisted, not task completion' }
     }
     if (request.type !== 'message') throw new Error('Unsupported request')
-    const message = gatewayPeerMessageSchema.parse(request.message)
+    const message = parsePeerMessage(request.message)
     if (message.toSessionId !== this.peer.sessionId || message.fromSessionId === this.peer.sessionId) throw new Error('Invalid recipient')
     const sender = authenticatedSender ?? await readRegistration(this.options.directory, message.fromSessionId)
     if (sender.peer.runtimeId !== message.fromRuntimeId || request.senderToken !== sender.token) throw new Error('Invalid sender')
@@ -463,11 +463,11 @@ export class GatewaySessionTransport {
       }))
   }
 
-  async send(toSessionId: string, text: string, summary: string, replyTo?: string): Promise<unknown> {
+  async send(toSessionId: string, text: string, summary: string, replyTo?: string, kind?: PeerMessageKind): Promise<unknown> {
     const target = await readRegistration(this.options.directory, toSessionId)
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
-      toSessionId, text, summary, replyTo, createdAt: new Date().toISOString(),
+      toSessionId, text, summary, replyTo, ...(kind ? { kind } : {}), createdAt: new Date().toISOString(),
     })
     // Persist the identity before sending: a lost acknowledgement must not
     // turn a retry into a new task with a different message ID.

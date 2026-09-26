@@ -57,12 +57,21 @@ test('two leaves of two families find each other on the bus and exchange message
     // Talk to each other: the send from a leaf goes through the same route every
     // session uses, and it arrives with the marking that keeps peer text from
     // reading as something the person typed.
-    const sent = await sendViaGatewayPeer(leafB, 'HANDOFF_ACROSS_FAMILIES', 'cross-family handoff')
+    const sent = await sendViaGatewayPeer(leafB, 'HANDOFF_ACROSS_FAMILIES', 'cross-family handoff', undefined, 'directive')
     assert.equal(sent.ok, true, sent.message)
     const arrived = runtimeB.transport.inbox().find(record => record.message.id === sent.messageId)
     assert.equal(arrived?.message.text, 'HANDOFF_ACROSS_FAMILIES')
     assert.equal(arrived?.message.fromSessionId, leafA)
     assert.equal(arrived?.state, 'queued')
+    // The kind survives the whole route, and it is what decides whether the
+    // receiver does the work or answers a question. A directive must arrive
+    // reading as a directive, not as a message the receiver has to interpret.
+    assert.equal(arrived?.message.kind, 'directive')
+    assert.match(sent.message, /Delivered a directive to/)
+    const { formatGatewayPeerMessage } = await import('../src/utils/gatewaySessionProtocol.ts')
+    const asRead = formatGatewayPeerMessage(arrived!)
+    assert.match(asRead, /Kind: directive/)
+    assert.match(asRead, /Do the work, then report the outcome/)
     const queued = removeByFilter(command => command.uuid === sent.messageId)
     assert.equal(queued.length, 1)
     assert.equal(queued[0]!.skipSlashCommands, true)
@@ -84,6 +93,21 @@ test('two leaves of two families find each other on the bus and exchange message
     assert.ok(skill?.type === 'prompt')
     const result = await skill.getPromptForCommand('list', {} as ToolUseContext)
     assert.match(result[0]?.type === 'text' ? result[0].text : '', new RegExp(leafLabelB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    // The skill is how a session actually sends, so the kind has to be settable
+    // there too - and a kind that is not one of the two has to be refused rather
+    // than silently coerced to the default, because a directive quietly sent as
+    // an inquiry is the delay the kinds exist to remove.
+    await skill.getPromptForCommand(
+      `send {"toSessionId":"${leafB}","text":"DIRECTIVE_FROM_SKILL","summary":"directed handoff","kind":"directive"}`,
+      {} as ToolUseContext,
+    )
+    assert.equal(runtimeB.transport.inbox().find(record => record.message.text === 'DIRECTIVE_FROM_SKILL')?.message.kind, 'directive')
+    const bounced = await skill.getPromptForCommand(
+      `send {"toSessionId":"${leafB}","text":"NOT_SENT","summary":"bad kind","kind":"order"}`,
+      {} as ToolUseContext,
+    )
+    assert.match(bounced[0]?.type === 'text' ? bounced[0].text : '', /kind must be one of/)
+    assert.equal(runtimeB.transport.inbox().some(record => record.message.text === 'NOT_SENT'), false)
     clearBundledSkills()
   } finally {
     await runtimeA.close()

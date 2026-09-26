@@ -271,6 +271,23 @@ test('independent peers authenticate, discover, hold, release, acknowledge and p
     assert.equal((await callGatewayPeer(b.peer.endpoint, request) as any).state, 'held')
     assert.equal(b.inbox().length, 1)
     assert.equal((await callGatewayPeer(b.peer.endpoint, { ...request, message: { ...originalMessage, text: 'Altered replay' } }) as any).ok, false)
+    // The kind rides the envelope and survives the wire, which is what lets the
+    // receiver tell work it is expected to do from a question it only has to
+    // answer.
+    const directive = { ...originalMessage, id: randomUUID(), kind: 'directive' }
+    assert.equal((await callGatewayPeer(b.peer.endpoint, { ...request, message: directive }) as any).state, 'held')
+    assert.equal(b.inbox().find(record => record.message.id === directive.id)?.message.kind, 'directive')
+    // A field this build has never heard of must not refuse the message. A
+    // fleet is restarted session by session, so a newer sender and an older
+    // receiver coexisting is the normal state during a rollout, and refusing
+    // the whole message turns a forward-compatible field into a delivery
+    // failure the sender reads as the bus being flaky. The unknown key is
+    // dropped and every field this build knows is still validated.
+    const fromAFutureBuild = { ...originalMessage, id: randomUUID(), kind: 'inquiry', aFieldFromAFutureBuild: 'ignored' }
+    assert.equal((await callGatewayPeer(b.peer.endpoint, { ...request, message: fromAFutureBuild }) as any).state, 'held')
+    const arrived = b.inbox().find(record => record.message.id === fromAFutureBuild.id)?.message as any
+    assert.equal(arrived?.kind, 'inquiry')
+    assert.equal(arrived?.aFieldFromAFutureBuild, undefined)
     const inboxPath = join(directory, `${b.peer.sessionId}.inbox`)
     const savedPath = `${inboxPath}.saved`
     await rename(inboxPath, savedPath)
