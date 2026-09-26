@@ -91,7 +91,7 @@ try {
     assert.ok(init.tools.includes('mcp__gate__wait_for_release'))
   }
   const bStart=b.events.length, aStart=a.events.length
-  a.process.send(`Use Skill gateway-peers list to discover the other session, then send exactly one question to the other session. The other session ID is ${b.id}; use that exact toSessionId, not your own session ID. Ask which file it would own in a hypothetical split: you own a.txt and it owns b.txt. Ask it to reply through gateway-peers with replyTo and B_OWNS_B. Do not write files. Do not send follow-up acknowledgements or peer messages after the successful send; finish with the local final marker LOCAL_SEND_DONE.`)
+  a.process.send(`Use Skill gateway-peers list to discover the other session, then send exactly one question to the other session. The other session ID is ${b.id}; use that exact toSessionId, not your own session ID. Ask which file it would own in a hypothetical split: you own a.txt and it owns b.txt. Ask it to reply through gateway-peers with replyTo and B_OWNS_B. Set no replyTo on your own send - it is a new request, not a reply to one. Do not write files. Do not send follow-up acknowledgements or peer messages after the successful send; finish with the local final marker LOCAL_SEND_DONE.`)
   await wait(async()=> (await inbox(a)).records.some((r:any)=>r.message.text.includes('B_OWNS_B')&&r.message.replyTo),'model_reply')
   await wait(()=>a.events.slice(aStart).some(e=>e.type==='result')&&b.events.slice(bStart).some(e=>e.type==='result'),'coordination_complete')
   assert.ok(a.events.slice(aStart).some(e=>e.type==='assistant'&&e.message?.content?.some((block:any)=>block.type==='tool_use'&&block.name==='Skill'&&block.input?.skill==='gateway-peers'&&block.input.args==='list')))
@@ -104,7 +104,12 @@ try {
   }
   assert.ok(firstResultText(a, aStart).includes('LOCAL_SEND_DONE'))
   assert.ok(firstResultText(b, bStart).includes('LOCAL_SEND_DONE'))
-  const peerSends = (chat: Chat, start: number) => chat.events.slice(start).filter(e=>e.type==='assistant').flatMap(e=>e.message?.content??[]).filter((block:any)=>block.type==='tool_use'&&block.name==='Skill'&&block.input?.skill==='gateway-peers'&&block.input.args?.startsWith('send'))
+  // An outbound peer message is either form the skill offers: `send` with an
+  // explicit target, or `reply`, which the skill prefers because it infers the
+  // peer and the correlation id from the message being answered. Counting only
+  // `send` read a correlated `reply` as no message at all, which failed the
+  // step on a legitimate choice rather than on a missing message.
+  const peerSends = (chat: Chat, start: number) => chat.events.slice(start).filter(e=>e.type==='assistant').flatMap(e=>e.message?.content??[]).filter((block:any)=>block.type==='tool_use'&&block.name==='Skill'&&block.input?.skill==='gateway-peers'&&/^(?:send|reply)\b/.test(block.input.args??''))
   assert.equal(peerSends(a, aStart).length,1)
   assert.equal(peerSends(b, bStart).length,1)
   assert.ok(firstSuccessfulResult(a, aStart))
@@ -134,9 +139,8 @@ try {
   assert.equal(results(b).at(-1)?.subtype,'success')
   assert.equal(results(b).at(-1)?.is_error,false)
   assert.equal((await inbox(b)).records.find((r:any)=>r.message.id===idle.id)?.state,'delivered')
-  assert.equal(b.events.slice(idleStart).filter(e=>e.type==='assistant').flatMap(e=>e.message?.content??[]).filter((block:any)=>block.type==='tool_use'&&block.name==='Skill'&&block.input?.skill==='gateway-peers'&&block.input.args?.startsWith('send')).length,0)
-  assert.ok((await inbox(a)).history?.some((r:any)=>r.direction==='sent'))
   assert.equal(peerSends(b, idleStart).length,0)
+  assert.ok((await inbox(a)).history?.some((r:any)=>r.direction==='sent'))
   console.log('REAL_IDLE_WAKE_AND_HISTORY=PASS')
   const rounds = Number(process.env.GATEWAY_EVERYDAY_ROUNDS ?? 8)
   const measurements: number[] = []
@@ -151,7 +155,7 @@ try {
     const file = join(directory, `data-${round}.json`)
     await writeFile(file, JSON.stringify({ label: 'café 世界', values }))
     const beforeA = a.events.length, beforeB = b.events.length, started = performance.now()
-    a.process.send(`Delegate this one question to peer ${b.id} through gateway-peers send: Read ${JSON.stringify(file)} and compute the sum of its values array. Reply to you via gateway-peers with replyTo set to that incoming request ID, including ${marker} and SUM=<computed number>. You must not read the file or calculate it yourself. Send exactly once, then finish locally. No acknowledgement replies.`)
+    a.process.send(`Delegate this one question to peer ${b.id} through gateway-peers send: ask it to read ${JSON.stringify(file)} and compute the sum of its values array, and to reply to you through gateway-peers with replyTo set to the request id, including ${marker} and SUM=<computed number>. Set no replyTo on your own send - it is a new request, not a reply to one. You must not read the file or calculate it yourself. Send exactly once, then finish locally. No acknowledgement replies.`)
     await wait(async () => (await inbox(b)).records.some((record: any) => record.message.text.includes(marker)), 'everyday_request')
     const request = (await inbox(b)).records.find((record: any) => record.message.text.includes(marker))
     await wait(async () => (await inbox(a)).records.some((record: any) => record.message.replyTo === request.message.id && record.message.text.includes(marker)), 'everyday_correlated_reply')
