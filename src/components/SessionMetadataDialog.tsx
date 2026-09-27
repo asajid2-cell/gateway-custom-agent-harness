@@ -186,7 +186,10 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
                 if (action === 'clear') return true
                 if (goal.status === 'completed') return false
                 if (action === 'pause') return goal.status === 'active'
-                if (action === 'resume') return goal.status === 'paused' || goal.status === 'blocked'
+                // A stalled goal is retained with its heartbeat stopped, so
+                // resume is the control that brings it back - the same as a
+                // paused or blocked goal.
+                if (action === 'resume') return goal.status === 'paused' || goal.status === 'blocked' || goal.status === 'stalled'
                 return true
               }).map(action => (
                 <Button key={action} tabIndex={-1} onAction={() => {

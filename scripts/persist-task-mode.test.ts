@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import type { AppState } from '../src/state/AppState.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
 import { getSessionId } from '../src/bootstrap/state.ts'
+import { createAssistantMessage } from '../src/utils/messages.ts'
 import {
   decidePersistStop,
   drainPersistWrites,
@@ -131,6 +132,103 @@ test('task mode continues after budget exhaustion while bounded exhausts and kee
 
   const keep = makeState({ taskMode: 'keep', keep: true, nudgesRemaining: 0 })
   assert.equal(decidePersistStop(keep, [], undefined, context).kind, 'nudge')
+})
+
+function toolWork(id: string) {
+  return createAssistantMessage({
+    content: [{ type: 'tool_use' as const, id, name: 'Read', input: { file_path: 'src/index.ts' } }],
+  })
+}
+
+test('a continuation heartbeat disarms after repeated tool-free stops', () => {
+  const context = { chainId: 'stall-chain', depth: 1, stopHookActive: true }
+  const state = makeState({ taskMode: 'task', nudgesRemaining: 0 })
+  // The field flood verbatim: the same sentence and no tool call, heartbeat
+  // after heartbeat, so nothing about the conversation changes between them.
+  const stalled = [createAssistantMessage({ content: 'Complete. Standing by for your input.' })]
+
+  // Bounded mode disarms on its budget. A continuation heartbeat is armed
+  // forever, so this is the only ceiling that ends the loop.
+  assert.deepEqual(
+    [0, 1, 2].map(() => decidePersistStop(state, stalled, undefined, context).kind),
+    ['nudge', 'nudge', 'nudge'],
+  )
+  assert.equal(state.nudgesSent, 3)
+  assert.deepEqual(decidePersistStop(state, stalled, undefined, context), {
+    kind: 'allow',
+    reason: 'no-progress',
+  })
+  // Retained rather than cleared, and the disarmed status holds on the next
+  // heartbeat too, so a stale hook cannot restart the loop.
+  assert.equal(state.status, 'stalled')
+  assert.equal(state.task, 'finish the connected workflow')
+  assert.deepEqual(decidePersistStop(state, stalled, undefined, context), {
+    kind: 'allow',
+    reason: 'no-progress',
+  })
+})
+
+test('one tool call between heartbeats clears the stall count', () => {
+  const context = { chainId: 'stall-reset', depth: 1, stopHookActive: true }
+  const state = makeState({ taskMode: 'task', nudgesRemaining: 0 })
+  const idle = [createAssistantMessage({ content: 'Standing by.' })]
+  // The first heartbeat only sets the mark; each later one that finds the same
+  // mark is what counts as a no-progress heartbeat.
+  decidePersistStop(state, idle, undefined, context)
+  assert.equal(state.stalledHeartbeats, 0)
+  decidePersistStop(state, idle, undefined, context)
+  decidePersistStop(state, idle, undefined, context)
+  assert.equal(state.stalledHeartbeats, 2)
+
+  // A heartbeat that produced real tool work moved the goal, so the count
+  // starts over and the heartbeat stays armed.
+  const worked = [...idle, toolWork('toolu_stall_reset')]
+  assert.equal(decidePersistStop(state, worked, undefined, context).kind, 'nudge')
+  assert.equal(state.stalledHeartbeats, 0)
+
+  // Counting resumes from the new mark rather than from the old one.
+  decidePersistStop(state, worked, undefined, context)
+  assert.equal(state.stalledHeartbeats, 1)
+})
+
+test('a stalled heartbeat retires the hook and keeps the goal', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-task-stall-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const chain = { chainId: 'stall-runtime', depth: 1, stopHookActive: true }
+  const context = { setAppState: harness.setAppState, transcriptPath: path, queryTracking: chain } as unknown as ToolUseContext
+  const currentHook = () => {
+    const hook = harness.getHooks()[0]?.hook
+    assert.ok(hook?.type === 'function')
+    return hook
+  }
+  try {
+    await harness.command.getPromptForCommand('task --nudges 1 finish the stalled delivery', context)
+    // One turn of real work, then the loop: the same tool-free answer repeated.
+    const worked = [toolWork('toolu_stall_runtime')]
+    assert.equal(await currentHook().callback(worked, undefined, chain), false)
+    await settlePersistDelivery(getSessionId(), chain.chainId, true)
+
+    const idle = [...worked, createAssistantMessage({ content: 'Complete. Standing by for your input.' })]
+    assert.equal(await currentHook().callback(idle, undefined, chain), false)
+    await settlePersistDelivery(getSessionId(), chain.chainId, true)
+    assert.equal(await currentHook().callback(idle, undefined, chain), false)
+    await settlePersistDelivery(getSessionId(), chain.chainId, true)
+    assert.equal(await currentHook().callback(idle, undefined, chain), true)
+
+    // The loop is over because the hook is gone, not because a message was
+    // merely withheld, and the goal survives for /persist resume.
+    assert.equal(harness.getHooks().length, 0)
+    await drainPersistWrites()
+    const record = await readPersistSessionRecord(path)
+    assert.equal(record?.status, 'stalled')
+    assert.equal(record?.task, 'finish the stalled delivery')
+    assert.match(getPersistGoalContext() ?? '', /Do not automatically pursue it/)
+  } finally {
+    await harness.command.getPromptForCommand('clear', context)
+  }
 })
 
 test('task mode rejects speculative blockers but accepts a hard blocker', async t => {

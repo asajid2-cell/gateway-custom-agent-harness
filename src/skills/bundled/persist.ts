@@ -9,6 +9,7 @@ import {
 import type { SetAppState } from '../../utils/messageQueueManager.js'
 import {
   getUserMessageText,
+  isToolUseRequestMessage,
 } from '../../utils/messages.js'
 import { plural } from '../../utils/stringUtils.js'
 import {
@@ -31,6 +32,14 @@ export type { PersistSessionRecord, PersistSessionStatus }
 
 const DEFAULT_NUDGES = 1
 const MAX_NUDGES = 3
+// A heartbeat that produces no tool work is not pushing anything forward, and
+// continuation modes never disarm on the nudge budget, so a session that answers
+// every heartbeat with the same sentence arms another one forever. Measured in
+// the field as 1,239 heartbeats against one session, each a full round trip for
+// no work, filling the transcript. One stop without tools can be honest - the
+// model reasoned and yielded - so the heartbeat is allowed a short run before
+// the loop is called what it is.
+const MAX_STALLED_HEARTBEATS = 3
 const MAX_TASK_CONTEXT_LENGTH = 2000
 const MAX_USER_CONTEXT_LENGTH = 1000
 const TASK_BLOCKER_REVIEW_GUIDANCE = 'In task mode, hypotheses, reversible tests, and diagnosis uncertainty are not blockers: use persist-review checkpoint or continue and keep working. A blocked review must be JSON {kind:\'blocked\', blocker:\'user-input\'|\'authorization\'|\'safety\'|\'external-dependency\'|\'provider-failure\', canProceedWithoutUser:false, next:string, evidence:string} proving a hard stop condition.'
@@ -91,6 +100,11 @@ export type PersistState = {
   status?: PersistSessionStatus
   reviewEvidence?: string
   delivery?: DeliveryCheckpoint
+  // In-process progress tracking for the heartbeat, never persisted:
+  // recordFromState copies explicit fields only, so these stay out of the
+  // sidecar and a resumed session re-measures progress from scratch.
+  workMark?: string
+  stalledHeartbeats?: number
 }
 
 type PersistRuntime = {
@@ -123,7 +137,7 @@ export function getCurrentPersistRecord(): PersistSessionRecord | undefined {
 export function getPersistGoalContext(): string | undefined {
   const record = getCurrentPersistRecord()
   if (!record || record.status === 'completed' || record.status === 'cleared') return undefined
-  if (record.status === 'paused' || record.status === 'blocked') return `Stored goal (${record.status}): ${escapeXml(record.task)}. Do not automatically pursue it. Wait for /persist resume; the current conversation takes precedence.`
+  if (record.status === 'paused' || record.status === 'blocked' || record.status === 'stalled') return `Stored goal (${record.status}): ${escapeXml(record.task)}. Do not automatically pursue it. Wait for /persist resume; the current conversation takes precedence.`
   const taskMode = record.taskMode
   const continuation = taskMode === 'task'
     ? `Task mode uses the in-process Stop-hook heartbeat and does not stop at the nudge budget. Keep doing useful work until the goal-wide doneWhen condition has concrete completion evidence. ${TASK_BLOCKER_REVIEW_GUIDANCE}`
@@ -300,6 +314,7 @@ export type PersistStopDecision =
         | 'completed'
         | 'cleared'
         | 'cancelled'
+        | 'no-progress'
     }
   | { kind: 'nudge'; message: string; nudgesRemaining: number }
 
@@ -310,6 +325,31 @@ function tail(value: string, maxLength: number): string {
 function getLastUserText(messages: Message[]): string {
   const message = messages.findLast(item => item.type === 'user' && !item.isMeta)
   return message ? (getUserMessageText(message)?.trim() ?? '') : ''
+}
+
+/**
+ * How much tool work the conversation contains. The heartbeat exists to drive
+ * tool work, so a heartbeat that leaves this number unchanged did not move the
+ * goal. Comparing counts rather than inspecting the tail keeps it cheap and
+ * treats a shorter array (a fresh chain) as progress rather than a stall.
+ */
+function countWork(messages: Message[]): number {
+  let count = 0
+  for (const message of messages) {
+    if (isToolUseRequestMessage(message)) count += 1
+  }
+  return count
+}
+
+/**
+ * Everything a heartbeat can point to as progress: tool work in the
+ * conversation, and the review state the goal has recorded. Reviewing counts
+ * because a session may legitimately advance a checkpoint without a tool call
+ * in the same turn, and treating that as a stall would disarm a goal that is
+ * being worked. A heartbeat that adds none of it moved nothing.
+ */
+function progressSignature(state: PersistState, messages: Message[]): string {
+  return `${countWork(messages)}|${state.reviewEvidence ?? ''}|${state.delivery ? JSON.stringify(state.delivery) : ''}`
 }
 
 function parseNudges(value: string | undefined): number | undefined {
@@ -428,6 +468,10 @@ export function decidePersistStop(
   if (status === 'exhausted') {
     return { kind: 'allow', reason: 'budget-exhausted' }
   }
+  // The heartbeat already gave up on this goal. Reaching here means the hook
+  // survived a disarm it should not have - the status arm below is what stops
+  // the loop, and this keeps the two ends consistent.
+  if (status === 'stalled') return { kind: 'allow', reason: 'no-progress' }
 
   if (!context?.chainId) return { kind: 'allow', reason: 'inactive' }
 
@@ -446,6 +490,24 @@ export function decidePersistStop(
   if (state.nudgesRemaining === 0 && taskMode === 'bounded') {
     state.status = 'exhausted'
     return { kind: 'allow', reason: 'budget-exhausted' }
+  }
+
+  // Continuation modes have no budget ceiling, so the only thing standing
+  // between a session that answers every heartbeat with prose and an unbounded
+  // loop is a progress check. A heartbeat that finds no more progress than the
+  // last one did is not driving anything; after a short run of those the loop
+  // is what it is and the goal goes back to waiting for the user.
+  if (isContinuationMode(state)) {
+    const workMark = progressSignature(state, messages)
+    state.stalledHeartbeats =
+      state.workMark !== undefined && workMark === state.workMark
+        ? (state.stalledHeartbeats ?? 0) + 1
+        : 0
+    state.workMark = workMark
+    if (state.stalledHeartbeats >= MAX_STALLED_HEARTBEATS) {
+      state.status = 'stalled'
+      return { kind: 'allow', reason: 'no-progress' }
+    }
   }
 
   if (state.nudgesRemaining > 0) state.nudgesRemaining -= 1
@@ -489,6 +551,9 @@ function statusText(record: PersistSessionRecord | undefined): string {
   const taskMode = record.taskMode
   const task = record.task
   if (status === 'paused' || status === 'blocked') return `Persist goal ${status} (${taskMode}, task retained): ${task}`
+  if (status === 'stalled') {
+    return `Persist goal stalled (${taskMode}, task retained): ${task}\nAutomatic heartbeats stopped after ${MAX_STALLED_HEARTBEATS} that produced no work. Use /persist resume when you want the heartbeat re-armed.`
+  }
   if (status === 'completed') return `Completed persist task (${taskMode}): ${task}`
   if (status === 'cleared') return `Cleared persist task (${taskMode}): ${task}`
   if (status === 'exhausted') {
@@ -590,6 +655,7 @@ async function installPersistRuntime(
       const currentRecord = recordFromState(nextState)
       if (
         decision.reason === 'budget-exhausted' ||
+        decision.reason === 'no-progress' ||
         decision.reason === 'completed' ||
         decision.reason === 'cleared'
       ) {
