@@ -316,7 +316,7 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
@@ -619,6 +619,37 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   assert.match(workspace, /return \[\.\.\.views\.values\(\)\]\.filter\(view => view\.rootSessionId === root\)/)
   assert.match(workspace, /export function getLeafHostName\(\): string/)
   assert.match(workspace, /return \(await currentFamily\(\)\)\.members\.filter\(member => member\.sessionId !== self\)/)
+})
+
+test('every member is an entry point, and the doctrine says so', async () => {
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+  // The tool used to describe the family as forks of one session and treat the
+  // root as fixed. Neither is true now: the family id is historical, the parent
+  // is a designation that can move, and any member opens on its own.
+  assert.doesNotMatch(prompt, /forked from this one/)
+  assert.match(prompt, /cc --resume <session id>/)
+  assert.match(prompt, /reparent: make another member the family's parent/)
+  assert.match(prompt, /The family id is the session the family was created from/)
+  assert.match(prompt, /\\`original\\` names the member the family was created from/)
+  assert.match(prompt, /\\`parent\\` and \\`root\\` name the member designated as its parent/)
+  assert.match(prompt, /DESCRIPTION = 'See, talk to, and drive the leaf sessions in this family\.'/)
+
+  // The menu hands out the command that opens each member from anywhere. It is
+  // a read, not management, so a window that was displaced still offers it.
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /label: `Enter #\$\{member\.number\} \$\{member\.name\} from a terminal`/)
+  assert.match(dialog, /description: `cc --resume \$\{member\.sessionId\}`/)
+  assert.match(dialog, /if \(action === 'resume'\) \{ setNotice\(`To enter \$\{describeSession\(member\)\} from another terminal, run: cc --resume \$\{id\}`\); return \}/)
+  // Asking for the address starts nothing: running it elsewhere is the person's
+  // to do, and a session that opened on its own has no terminal to give.
+  const resumeBranch = dialog.slice(dialog.indexOf("if (action === 'resume')"), dialog.indexOf('void run(', dialog.indexOf("if (action === 'resume')")))
+  assert.doesNotMatch(resumeBranch, /openLeaf|openLeafOnce|createLeaf|changeLeaf/)
+
+  // The peer skill carries the same model: a member is addressable by its own
+  // session id, and the parent is a designation rather than an address.
+  const peers = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
+  assert.match(peers, /which member is the parent is a designation that can move/)
+  assert.match(peers, /never assume the session a family was created from is the one that owns the rest/)
 })
 
 test('the leaf menu treats the parent as an ordinary member', async () => {

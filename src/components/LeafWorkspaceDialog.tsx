@@ -171,6 +171,14 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           description: 'The family takes this member’s name; the member that is the parent now becomes a leaf',
         })),
       ]),
+      // Every member is an entry point, so every member gets the command that
+      // opens it from anywhere. It is a read, not management: a window that was
+      // displaced still hands out the address of the family it no longer runs.
+      ...open.map(member => ({
+        value: `resume:${member.sessionId}`,
+        label: `Enter #${member.number} ${member.name} from a terminal`,
+        description: `cc --resume ${member.sessionId}`,
+      })),
       ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
@@ -187,6 +195,9 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         const action = value.slice(0, value.indexOf(':'))
         // A roster row in a window that was displaced is a label, not a verb.
         if (action === 'member') { setNotice(`${describeSession(member)} is managed in the window the family moved to.`); return }
+        // Nothing is started here: the command is the answer, and running it in
+        // another terminal is the person's to do.
+        if (action === 'resume') { setNotice(`To enter ${describeSession(member)} from another terminal, run: cc --resume ${id}`); return }
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
