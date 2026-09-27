@@ -33,7 +33,7 @@ import { registerBundledSkill } from '../bundledSkills.js'
  * tree. It is machine-specific on purpose and is overridden by
  * GATEWAY_REPORT_DIR or --out.
  */
-const DEFAULT_REPORT_DIR =
+export const DEFAULT_REPORT_DIR =
   'Z:\\328\\CMPUT328-A2\\codexworks\\301\\archaeology-artifacts\\reports'
 
 /** A seed is pasted into a persist goal, which is re-injected into every turn's
