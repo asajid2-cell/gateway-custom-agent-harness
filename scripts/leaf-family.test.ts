@@ -49,6 +49,55 @@ function parkedLeaf(): { leaf: QueuedProcess; sent: { subtype: string; prompt?: 
   return { leaf, sent }
 }
 
+test('a leaf closes the parent it belongs to, and no session closes itself', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-close-parent-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const {
+      getLeafViews, registerLeafViewForTesting, dispatchLeafRequestForTesting, forgetLeafFamilyRoot,
+    } = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    forgetLeafFamilyRoot()
+    const familyPath = join(directory, 'leaf-families', `${root}.json`)
+    const { leaf } = parkedLeaf()
+    const member = await addLeafMember(familyPath, root, {
+      sessionId: randomUUID(), parentSessionId: root, name: 'Child',
+      transcriptPath: join(directory, 'child.jsonl'), forkMessageId: randomUUID(),
+    })
+    const unregister = registerLeafViewForTesting({ rootSessionId: root, member, process: leaf as never, draft: '' })
+    const status = async (sessionId: string) => (await readLeafFamily(familyPath, root)).members.find(item => item.sessionId === sessionId)?.status
+    try {
+      // The reported failure: from a leaf, `Close #8 Original` was refused with
+      // "That is the session you are in". The refusal belongs to the session that
+      // ASKED, and a leaf asks through the session hosting its family - which is
+      // usually the very parent it is asking to close, so the leaf was told it
+      // was the parent. This is the real dispatch path a leaf's request takes.
+      await dispatchLeafRequestForTesting(member.sessionId, root, 'change', [root, { status: 'closed' }])
+      assert.equal(await status(root), 'closed', 'a leaf must be able to close the parent it belongs to')
+      assert.deepEqual(getLeafViews().map(view => view.member.sessionId), [member.sessionId], 'closing the parent must not close the leaf that asked')
+
+      // The half that stays: a leaf cannot close itself. The host holds a view
+      // for the asker, so "is there a process to close" cannot tell a leaf
+      // closing itself from a leaf closing a sibling - the asker can.
+      await dispatchLeafRequestForTesting(member.sessionId, root, 'change', [member.sessionId, { status: 'closed' }])
+      assert.equal(await status(member.sessionId), 'open', 'a leaf cannot close itself')
+      assert.deepEqual(getLeafViews().map(view => view.member.sessionId), [member.sessionId], 'a refused close leaves the leaf running')
+
+      // And the parent still closes its own leaves, which is what "either
+      // direction" means: the same rule, read from the other side.
+      await changeLeaf(member.sessionId, { status: 'closed' })
+      assert.equal(await status(member.sessionId), 'closed', 'the parent must still be able to close a leaf')
+      assert.deepEqual(getLeafViews(), [], 'a closed leaf is no longer an entry point')
+    } finally { unregister() }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('a message to a running leaf is handed over mid-turn, not held until it ends', async () => {
   const { leaf, sent } = parkedLeaf()
   leaf.setState('running')

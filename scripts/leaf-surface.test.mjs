@@ -609,9 +609,13 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   assert.match(workspace, /function leafSelfLabel\(member: LeafMember, rootSessionId: string\): string/)
 
   // The creator is closed, reopened and renamed like any member; only the
-  // session doing the asking is refused.
+  // session doing the asking is refused - and asking means the leaf behind a
+  // request, not the session that executes it, or a leaf could never close the
+  // parent hosting its family.
   assert.doesNotMatch(workspace, /changeParent/)
   assert.match(workspace, /That is the session you are in; it ends when you leave it/)
+  assert.match(workspace, /if \(sessionId === \(requestedBy \?\? self\)\)/)
+  assert.match(workspace, /case 'change': await changeLeaf\(id, value, sourceId\)/)
   // Reopening it from a member must not put two writers on one transcript.
   assert.match(workspace, /await claimHostOwnership\(\)/)
   assert.match(workspace, /is already open in another window; close it there before opening it here/)

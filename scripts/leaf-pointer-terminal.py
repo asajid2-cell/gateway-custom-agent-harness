@@ -27,6 +27,7 @@ parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--probe-selection', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
+parser.add_argument('--probe-close-parent', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -1088,6 +1089,47 @@ def probe_parentage():
     s.exit()
     print(json.dumps(dict(parentage=True, directResume=True, leafOpensLeaves=True, leafReopensLeaves=True, reparent=True, familyTakesNewParentName=True, oldParentBecomesLeaf=True, displacedRefusesManagement=True, displacedKeepsTerminals=True)), flush=True)
 
+def probe_close_parent():
+    """A leaf closes the parent it belongs to, and no session closes itself.
+
+    The window that created the family is showing the leaf by the time the close
+    is asked for, so the keystroke is handled by the leaf's own process and the
+    request reaches the session hosting the family stamped with the leaf's id.
+    The refusal that used to greet it was decided by the process executing the
+    request - the host, which here is the very member the leaf asked for - so a
+    leaf was told it was the session it was trying to close. The rule is about
+    the session that asks: the leaf is refused for itself and for nothing else.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'alpha created', 75)
+    alpha = t.leaves()[0]
+    # The leaf is on screen in the window that made it, so what is typed here is
+    # handled by the leaf's process, which forwards management to its host.
+    t.assert_view(alpha['sessionId'], 'the new leaf on screen', 75)
+    parent = next(member for member in t.family()['members'] if member['sessionId'] == t.id)
+
+    # Asking to close itself is refused: that is the conversation the person is
+    # typing into, and it ends when they leave it.
+    t.submit('/leaf close ' + alpha['sessionId'])
+    t.wait(lambda: 'it ends when you leave it' in t.text(), 'a leaf refuses to close itself', 30)
+    assert next(member for member in t.family()['members'] if member['sessionId'] == alpha['sessionId'])['status'] == 'open', 'the refused close changed the leaf anyway'
+
+    # The parent is an ordinary member, and the leaf closes it.
+    t.menu()
+    t.pick('Leaves in this family')
+    close_parent = 'Close #%s %s' % (parent['number'], parent['name'])
+    t.wait(lambda: close_parent in t.text(), 'the leaf menu offers the parent for closing', 30)
+    t.pick(close_parent)
+    t.wait(lambda: next(member for member in t.family()['members'] if member['sessionId'] == t.id)['status'] == 'closed',
+           'a leaf closes the parent it belongs to', 45)
+    # The window the person is looking through is still running: the close is the
+    # member's, not the session that carries it out.
+    assert t.proc.isalive(), 'the window ended when a leaf closed its parent'
+    t.proc.terminate(force=True)
+    print(json.dumps(dict(leafClosesParent=True, selfCloseRefused=True, hostSurvivesClose=True)), flush=True)
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -1196,8 +1238,8 @@ def probe_queue():
 
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
-    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage or args.probe_queue:
-        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_queue if args.probe_queue else probe_parentage if args.probe_parentage else probe_parity)()
+    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage or args.probe_queue or args.probe_close_parent:
+        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_queue if args.probe_queue else probe_close_parent if args.probe_close_parent else probe_parentage if args.probe_parentage else probe_parity)()
         raise SystemExit(0)
     t = Terminal()
     t.wait(lambda: 'All 1' in t.text(), 'initial carousel', 60)

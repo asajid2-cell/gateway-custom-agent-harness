@@ -1253,7 +1253,12 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       // chain. The roster is complete: a leaf looks for itself in it, because
       // forking itself is the one thing it does to itself.
       case 'members': result = (await currentFamily()).members; break
-      case 'change': await changeLeaf(id, value); break
+      // `sourceId` is the leaf that asked. The refusal is about the session that
+      // asked, not about this one: a leaf closing the parent is closing a member
+      // the leaf is not, which is allowed, while a leaf asking to close itself is
+      // not - and the host holds a view for the asker, so the view alone cannot
+      // tell those two cases apart.
+      case 'change': await changeLeaf(id, value, sourceId); break
       case 'reparent': result = await reparentLeaf(String(id)); break
       case 'file': await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
@@ -1506,7 +1511,7 @@ export async function reviveLeaf(reference: string): Promise<string> {
   return `${memberLabel(member)} is back in the leaf list. It stays closed until you open it.`
 }
 
-export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {
+export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>, requestedBy?: string): Promise<void> {
   if (isInteractiveLeaf()) return requestLeafWorkspace('change', [sessionId, patch])
   const root = await familyRootSessionId()
   await requireFamilyHost(root)
@@ -1515,11 +1520,14 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   await refreshDesignatedParent()
   const self = getSessionId()
   const view = views.get(sessionId)
-  // The session on screen has no process here to close and no row to rewrite: it
-  // is the conversation you are in, and it ends when you leave it. A member can
-  // close, reopen and rename the creator like any other, because the creator is
-  // an ordinary member - this only refuses the session doing the asking.
-  if (sessionId === self && !view) throw new Error('That is the session you are in; it ends when you leave it')
+  // Only the session that ASKED is refused, and only for itself: it is the
+  // conversation being typed into and it ends when the person leaves it. Every
+  // other member is ordinary, so a leaf may close the parent it belongs to and
+  // the parent may close any of its leaves. `requestedBy` is the leaf behind a
+  // request, because a leaf asks through the session hosting its family - and
+  // that session is usually the very parent the leaf is trying to close, so
+  // comparing the target with this process refused every one of them.
+  if (sessionId === (requestedBy ?? self)) throw new Error('That is the session you are in; it ends when you leave it')
   if (view && view.rootSessionId !== root) throw new Error('Leaf belongs to another family')
   if (patch.status === 'promoted' && view && view.process.getState() !== 'idle') throw new Error('Wait for the leaf turn before promoting')
   if (patch.name && view && !['closed', 'failed'].includes(view.process.getState()) && (!patch.status || patch.status === 'open')) {
