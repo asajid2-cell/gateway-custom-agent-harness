@@ -5,6 +5,7 @@ import React from 'react'
 import { render } from '../src/ink.ts'
 import persistHelp, { EXAMPLES, PERSIST_REFERENCE, SAMPLES, PersistHelp, call } from '../src/commands/persist-help.tsx'
 import { parsePersistArgs } from '../src/skills/bundled/persist.ts'
+import { parseDeliveryReview } from '../src/skills/bundled/persistDelivery.ts'
 
 /**
  * `/persist-help` exists so the persist grammar can be read without asking the
@@ -170,13 +171,26 @@ test('every documented example parses exactly as the help says', () => {
   }
 })
 
-/** The samples are copied into the prompt, so each must be a command the parser accepts. */
-test('every sample prompt is a command the parser accepts', () => {
+/**
+ * The samples are copied into the prompt, so each must be something the engine
+ * accepts: an arming line the argument parser takes, or checkpoint JSON the
+ * delivery parser takes. A sample with a typo would be copied straight into a
+ * refused review, which is the failure the help exists to prevent.
+ */
+test('every sample prompt is a command the engine accepts', () => {
   const goals = SAMPLES.filter(sample => sample.value.startsWith('/persist '))
   assert.ok(goals.length > 0, 'the samples include arming commands')
   for (const sample of goals) {
     const parsed = parsePersistArgs(sample.value.slice('/persist '.length))
     assert.notEqual(parsed.kind, 'error', `${sample.value} is refused by the parser`)
+  }
+
+  const reviews = SAMPLES.filter(sample => sample.value.startsWith('/persist-review '))
+  assert.ok(reviews.length > 0, 'the samples include reviews')
+  for (const sample of reviews) {
+    const json = sample.value.slice('/persist-review '.length)
+    assert.ok(json.startsWith('{'), `${sample.value} is checkpoint JSON`)
+    assert.doesNotThrow(() => parseDeliveryReview(json), `${sample.value} is refused by the delivery parser`)
   }
 })
 
