@@ -1281,12 +1281,10 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       }
       case 'interrupt': result = await interruptLeaf(id); break
       case 'list': result = await listLeaves(); break
-      case 'renamed': {
-        const view = views.get(sourceId)!
-        view.member = await updateLeafMember(familyPath(root), root, sourceId, { name: String(id) })
-        publish()
-        break
-      }
+      // A leaf renamed itself at its own prompt. `sourceId` is the leaf that
+      // asked, and `id` is the name it chose: the row that follows is the
+      // asker's own, never another member's.
+      case 'renamed': await applyLeafRename(root, sourceId, String(id)); break
       case 'checkpoint': case 'model': case 'effort': {
         const view = getLeafViews().find(item => item.member.sessionId === id)
         if (!view) throw new Error('Unknown leaf')
@@ -1563,6 +1561,46 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   if (patch.status === 'open') await launch(member, root)
   await refreshDesignatedParent()
   publish()
+}
+
+/**
+ * Write a member's new name where the whole family reads it.
+ *
+ * One implementation for both directions of the report: a leaf sends the name
+ * to the session hosting its family, and that session - or a session hosting
+ * its own - lands here. The designation is re-read because the member that was
+ * just renamed may be the parent, and the parent's name is the family's name.
+ */
+async function applyLeafRename(root: string, sessionId: string, name: string): Promise<void> {
+  const member = await updateLeafMember(familyPath(root), root, sessionId, { name })
+  const view = views.get(sessionId)
+  if (view) view.member = member
+  await refreshDesignatedParent()
+  publish()
+}
+
+/**
+ * Carry a name typed at the prompt into the family.
+ *
+ * A rename writes the new name to the session's own transcript and nothing
+ * else, but everything the family calls a member by - the carousel label, the
+ * roster, and the label a relaunched child is opened with - comes from the
+ * member row. A rename that stops at the transcript therefore reopens under the
+ * name the member had before. A leaf reports the rename to the session hosting
+ * its family; a session that hosts its own family writes its row directly.
+ *
+ * Best-effort by construction, and never a rejection: the transcript already
+ * holds the new name, so a family that cannot be reached must not turn a
+ * successful rename into a failed one. The member's native title is deliberately
+ * left alone - it is the name that was just chosen, not one to decorate.
+ */
+export async function reportSessionRename(name: string): Promise<void> {
+  const trimmed = name.trim()
+  if (!trimmed || trimmed.length > 200) return
+  try {
+    if (isInteractiveLeaf()) { await requestLeafWorkspace('renamed', [trimmed]); return }
+    await applyLeafRename(await familyRootSessionId(), getSessionId(), trimmed)
+  } catch { /* The transcript is the record; the family was not reachable. */ }
 }
 
 export async function fileLeaf(sessionId: string, tag: string): Promise<void> {

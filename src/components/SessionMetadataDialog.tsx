@@ -24,8 +24,8 @@ import {
   muxMetadataUnavailableText,
   type MuxMetadataResult,
 } from '../utils/muxSessionMetadata.js'
+import { reportSessionRename } from '../utils/leafWorkspace.js'
 import { isTeammate } from '../utils/teammate.js'
-import { isInteractiveLeaf, requestLeafWorkspace } from '../utils/leafTerminal.js'
 
 type Props = {
   readonly onDone: () => void
@@ -89,7 +89,11 @@ export function SessionMetadataDialog({ onDone }: Props): React.ReactNode {
     setSaveError(undefined)
     try {
       saveSessionName(sessionId, newName, fullPath)
-      if (isInteractiveLeaf()) await requestLeafWorkspace('renamed', [newName])
+      // The name is on the transcript now; telling the leaf family is a report it
+      // must not have to wait on. Awaiting it here held the dialog open on the
+      // hosting session, and a report that failed reported a saved name as
+      // unsaved.
+      void reportSessionRename(newName)
       const bridgeSessionId = appStateStore.getState().replBridgeSessionId
       if (bridgeSessionId) {
         const tokenOverride = getBridgeTokenOverride()

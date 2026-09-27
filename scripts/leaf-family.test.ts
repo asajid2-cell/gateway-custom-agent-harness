@@ -1104,3 +1104,62 @@ test('reopening the family leaves the lease with the window that is holding it',
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('a rename at the prompt is the name the family lists and opens the member under', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-native-rename-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    // The resolved root is module state, and the cases before this one left one
+    // pointing into their own temp directory.
+    workspace.forgetLeafFamilyRoot()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    await ensureCreatorMember(family, root, { name: 'Original', transcriptPath: join(directory, 'root.jsonl') })
+    const member = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'newtok', transcriptPath: join(directory, 'member.jsonl'), forkMessageId: randomUUID() })
+
+    const { leaf } = parkedLeaf()
+    const snapshots: { members: { member: { sessionId: string; name: string } }[] }[] = []
+    ;(leaf as unknown as { snapshot: (value: unknown) => void }).snapshot = value => { snapshots.push(value as never) }
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member, process: leaf as never, draft: '' })
+    try {
+      // The leaf renames itself at its own prompt: its process reports the name
+      // to the session hosting the family, which is the one holding the keys here.
+      await workspace.dispatchLeafRequestForTesting(member.sessionId, root, 'renamed', ['newtok2'])
+
+      // Everything the family calls a member by reads this row: the carousel's
+      // `N name` label, the menu, and GATEWAY_LEAF_LABEL when it is opened again.
+      // A rename that stopped at the transcript reopened the member under the name
+      // it had before, which is the reported failure.
+      const row = async (sessionId: string) => (await readLeafFamily(family, root)).members.find(item => item.sessionId === sessionId)!.name
+      assert.equal(await row(member.sessionId), 'newtok2', 'the family row takes the new name')
+      assert.equal(workspace.getLeafViews().find(view => view.member.sessionId === member.sessionId)!.member.name, 'newtok2', 'the running member is renamed in the bar')
+      assert.equal((await workspace.resolveLeafRef('newtok2'))?.sessionId, member.sessionId, 'and the new name is how it is reached from now on')
+      assert.match(await workspace.listLeaves(), /#2 newtok2 \[/, 'the menu lists it by the new name')
+      assert.equal(snapshots.at(-1)?.members.find(entry => entry.member.sessionId === member.sessionId)!.member.name, 'newtok2', 'every other leaf is told the new name too')
+
+      // The session hosting the family renames itself at its own prompt - the
+      // `/rename` command and the footer's Rename control both land here - and it
+      // writes its own row rather than reporting to itself.
+      await workspace.reportSessionRename('Hostname')
+      assert.equal(await row(root), 'Hostname', 'a host renaming itself renames its own row')
+
+      // A name the family cannot use leaves the row alone, and a family that
+      // cannot be reached is not a failed rename: the transcript already holds the
+      // name, and neither case may resurrect a family that is gone.
+      await workspace.reportSessionRename('   ')
+      assert.equal(await row(member.sessionId), 'newtok2', 'an empty name never blanks a member')
+      await rm(family)
+      await workspace.reportSessionRename('Orphan')
+      await assert.rejects(readFile(family, 'utf8'), /ENOENT/, 'a rename never recreates a family that is gone')
+    } finally { unregister() }
+  } finally {
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
