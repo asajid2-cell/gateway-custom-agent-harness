@@ -567,9 +567,11 @@ test('the bottom nav reaches the leaf menu, and the prompt overlay is what shows
   assert.match(prompt, /const leafMenuDialog = showLeafMenu \? <LeafMenu onDone/)
   // Composed into the same portal as the other prompt dialogs, so it floats
   // above the prompt instead of being cropped to a row by the bottom slot.
-  assert.match(prompt, /const promptOverlayDialog = gatewaySessionsDialog \?\? leafMenuDialog \?\? sessionMetadataDialog \?\? autoModeOptInDialog/)
-  // Escape inside the menu must not reach the double-press message selector.
+  assert.match(prompt, /const promptOverlayDialog = gatewaySessionsDialog \?\? sessionUsageDialog \?\? leafMenuDialog \?\? sessionMetadataDialog \?\? autoModeOptInDialog/)
+  // Escape inside the menu - and inside the usage detail - must not reach the
+  // double-press message selector.
   assert.match(prompt, /showGatewaySessions \|\| showLeafMenu \|\| isLocalJSXCommandActive/)
+  assert.match(prompt, /showSessionUsageDialog \|\|/)
   assert.match(prompt, /if \(showLeafMenu && !isFullscreenEnvEnabled\(\)\) return leafMenuDialog/)
 })
 

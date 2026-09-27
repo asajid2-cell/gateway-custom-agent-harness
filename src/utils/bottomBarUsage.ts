@@ -17,6 +17,40 @@ export type CodexQuotaDisplay = {
   remainingPercent: number
 }
 
+/**
+ * This run's charged-token totals, keyed by model. Structural rather than the
+ * bootstrap ModelUsage type so the formatter stays free of that import.
+ */
+export type SessionTokenTotals = {
+  [model: string]: {
+    inputTokens: number
+    outputTokens: number
+    cacheReadInputTokens: number
+    cacheCreationInputTokens: number
+  }
+}
+
+/** Every token the provider billed for: input, output and both cache figures. */
+export function getSessionChargedTokens(totals: SessionTokenTotals): number {
+  let total = 0
+  for (const usage of Object.values(totals)) {
+    total +=
+      usage.inputTokens +
+      usage.outputTokens +
+      usage.cacheReadInputTokens +
+      usage.cacheCreationInputTokens
+  }
+  return total
+}
+
+/**
+ * The one number the bottom bar shows for the session: a plain total, with no
+ * model name and no split - the breakdown lives behind a click.
+ */
+export function formatSessionTokenTotal(totals: SessionTokenTotals): string {
+  return `${formatTokens(getSessionChargedTokens(totals))} total`
+}
+
 export function getContextUsageValues(
   usage: CurrentUsage | null,
   contextWindowSize: number,
