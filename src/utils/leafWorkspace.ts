@@ -414,6 +414,20 @@ async function requireFamilyHost(familyId: string): Promise<void> {
   if (hostState?.forSession === getSessionId() && hostState.displaced) throw new Error(`The family moved to another window (${hostState.hostSessionId}); it manages the leaves now`)
 }
 
+/**
+ * Re-read the lease on behalf of a surface that is about to show it.
+ *
+ * The management gate refreshes before it acts, which is enough to refuse, but
+ * not enough to *say so*: a menu that only read the lease at claim time drew the
+ * managing rows for a family another window had already taken, and the person
+ * found out by picking one and being refused. Asking on open is what makes the
+ * menu report the family moved before a row is chosen.
+ */
+export async function refreshLeafFamilyHost(): Promise<void> {
+  if (isInteractiveLeaf()) return
+  try { await refreshFamilyHost(await familyRootSessionId()) } catch { /* No family to manage is not a failure to report. */ }
+}
+
 /** Whether this session is the one managing the family it is in. */
 export function isFamilyHost(): boolean { return !hostState || hostState.forSession !== getSessionId() || !hostState.displaced }
 /** The session managing this family: this one, or the window it moved to. */

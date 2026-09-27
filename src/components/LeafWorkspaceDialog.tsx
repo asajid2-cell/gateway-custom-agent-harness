@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, isFamilyHost, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, isFamilyHost, listLeafMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -84,6 +84,11 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
   const reload = () => { void listLeafMembers().then(setMembers).catch(() => setMembers([])) }
   useEffect(() => { reload() }, [screen])
+  // One window manages a family at a time and another window may have opened it
+  // since this one last looked. Read the lease on open so the rows are the ones
+  // that will actually work, rather than refusing after the fact; the publish
+  // this triggers re-renders the menu with the answer.
+  useEffect(() => { void refreshLeafFamilyHost() }, [])
 
   const run = async (label: string, action: () => Promise<string | void>) => {
     if (busy) return
