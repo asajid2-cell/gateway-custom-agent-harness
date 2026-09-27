@@ -628,6 +628,27 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   assert.match(workspace, /return \(await currentFamily\(\)\)\.members\.filter\(member => member\.sessionId !== self\)/)
 })
 
+test('both rename surfaces report the name to the family, not only to the transcript', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // The name a member is called by - the carousel label, the roster, and the
+  // label it is opened with - is the family row's, while `/rename` writes only
+  // the transcript. A rename that never reports reopened the member under its old
+  // name, so the report exists for both directions and touches no title.
+  assert.match(workspace, /export async function reportSessionRename\(name: string\): Promise<void>/)
+  assert.match(workspace, /await requestLeafWorkspace\('renamed', \[trimmed\]\)/)
+  assert.match(workspace, /await applyLeafRename\(await familyRootSessionId\(\), getSessionId\(\), trimmed\)/)
+  assert.match(workspace, /const member = await updateLeafMember\(familyPath\(root\), root, sessionId, \{ name \}\)/)
+
+  const rename = await readFile(new URL('../src/commands/rename/rename.ts', import.meta.url), 'utf8')
+  assert.match(rename, /void reportSessionRename\(newName\)/)
+  const dialog = await readFile(new URL('../src/components/SessionMetadataDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /void reportSessionRename\(newName\)/)
+  // The dialog no longer reaches the leaf terminal itself: from a session
+  // hosting its own family it reported nothing, and a request that failed turned
+  // a name already written to the transcript into "unable to save".
+  assert.doesNotMatch(dialog, /requestLeafWorkspace/)
+})
+
 test('every member is an entry point, and the doctrine says so', async () => {
   const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
   // The tool used to describe the family as forks of one session and treat the
@@ -709,4 +730,39 @@ test('archive detaches a leaf without deleting anything', async () => {
   const command = await readFile(new URL('../src/commands/leaf.tsx', import.meta.url), 'utf8')
   assert.match(command, /archive <leaf>/)
   assert.match(command, /\|archive\|promote/)
+})
+
+test('a leaf may start over its own transcript when nothing conversational is in it', async () => {
+  // The launcher decides between starting and resuming a member by asking
+  // whether its transcript holds a turn, and the CLI refuses to start an id that
+  // already exists. Asking a different question on each side refused a leaf
+  // whose prompt had been killed before it ran - a transcript left holding a
+  // queue entry and no turn - and the refusal arrives as exit code 1 before the
+  // member can open its endpoint, which the session that started it can only
+  // report as a leaf that failed to start.
+  const main = await readFile(new URL('../src/main.tsx', import.meta.url), 'utf8')
+  const guard = main.slice(main.indexOf('// Check if session ID already exists'), main.indexOf('if (sessionIdExists(validatedSessionId)'))
+  assert.match(guard, /leafSessionId\(\) === validatedSessionId/)
+  assert.match(guard, /emptyLeaf = !lines\.some\(line => \{ const entry = JSON\.parse\(line\); return entry\.type === 'user' \|\| entry\.type === 'assistant'; \}\)/)
+
+  // The same two row types, asked of the same file, by the launcher.
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const launch = workspace.slice(workspace.indexOf('async function launchOnce'), workspace.indexOf('async function reportReplies'))
+  assert.match(launch, /entry\.type === 'user' \|\| entry\.type === 'assistant'/)
+  assert.match(launch, /hasTranscript \? \['--resume', member\.sessionId\] : \['--session-id', member\.sessionId\]/)
+})
+
+test('a member that dies on its way up is named, not guessed at, and tried again', async () => {
+  const source = await readFile(new URL('../src/utils/leafProcess.ts', import.meta.url), 'utf8')
+  // A member has no console and no shared stdio, so its own exit status and the
+  // last thing it recorded are the only account of a start that failed.
+  assert.match(source, /private async startMember\(/)
+  assert.match(source, /memberLastRecord\(child\.pid, started\)/)
+  assert.match(source, /it recorded nothing about itself before it stopped/)
+  assert.match(source, /function describeExit\(code: number \| null, signal: NodeJS\.Signals \| null\)/)
+  assert.match(source, /throw new Error\(`Leaf session did not open its endpoint: \$\{attempt\.reason\}`\)/)
+  // A second attempt is taken only once the first is known to be dead: two
+  // writers on one transcript is what a retry taken too early would create.
+  assert.match(source, /if \(!attempt\.connected && attempt\.died\) \{/)
+  assert.doesNotMatch(source, /it may have failed to start/)
 })

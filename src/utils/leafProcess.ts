@@ -1,9 +1,12 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import killTree from 'tree-kill'
 import type { LeafTerminalMessage, LeafSnapshot } from './leafTerminal.js'
-import { connectLeafChannel, LeafTakenError, type LeafChannel } from './leafChannel.js'
+import { connectLeafChannel, LeafTakenError, type LeafChannel, type LeafChannelHandlers } from './leafChannel.js'
 
 export type LeafPermission = { id: string; tool: string; input: Record<string, unknown> }
 export type LeafProcessState = 'starting' | 'idle' | 'running' | 'awaiting-approval' | 'closed' | 'failed'
@@ -19,6 +22,69 @@ export type LeafProcessState = 'starting' | 'idle' | 'running' | 'awaiting-appro
  */
 const MEMBER_START_TIMEOUT_MS = 60_000
 const MEMBER_START_POLL_MS = 250
+
+/**
+ * How long to wait before starting a second member in place of one that died.
+ *
+ * Long enough for the failed process to be reaped and for whatever it held - a
+ * transcript lock, the address it was about to bind - to be released, so the
+ * second attempt is a fresh start rather than a collision with the first.
+ */
+const MEMBER_RESTART_PAUSE_MS = 750
+
+/**
+ * How an exit is named in a failure: the code, its fault form when it is one,
+ * and the signal.
+ *
+ * A large or negative code is not a status the program chose; it is how this
+ * platform reports a fault, and the hexadecimal form is the one that can be
+ * looked up - which is the whole value of naming it rather than reporting that
+ * the member "may have failed to start".
+ */
+function describeExit(code: number | null, signal: NodeJS.Signals | null): string {
+  const parts: string[] = []
+  if (code !== null) parts.push(`code ${code}${code < 0 || code > 255 ? ` (0x${(code >>> 0).toString(16).toUpperCase()})` : ''}`)
+  if (signal !== null) parts.push(`signal ${signal}`)
+  return parts.length ? parts.join(', ') : 'no exit status'
+}
+
+/**
+ * What a member we started last recorded about itself.
+ *
+ * A member is spawned with no console and no shared stdio, so a start that fails
+ * leaves nothing behind to explain it - which is why a leaf that never opens its
+ * endpoint has always been reported as one that "may have failed to start". What
+ * it does write is its own harness log, keyed by the pid this process spawned,
+ * and its last line is the closest thing to a reason: whether it reached the CLI
+ * at all, and whether it left through its own shutdown path or threw. Only rows
+ * written after this attempt began count, because a pid is recycled.
+ */
+function memberLastRecord(pid: number | undefined, since: number): string | undefined {
+  // The log exists only where the member runs as a gateway, which it inherits
+  // from this process. Without it there is nothing to read, and reading a
+  // missing file would report a member that started fine as one that never ran.
+  if (!pid || process.env.CLAUDE_CODE_USE_GATEWAY !== '1') return undefined
+  const directory = join(process.env.LOCALAPPDATA ?? homedir(), 'Gateway')
+  const mine: { event?: string; frames?: string[] }[] = []
+  try {
+    for (const line of readFileSync(join(directory, `harness-${pid}.jsonl`), 'utf8').split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const row = JSON.parse(line) as { event?: string; time?: string; frames?: string[] }
+        if (typeof row.time === 'string' && Date.parse(row.time) >= since) mine.push(row)
+      } catch { /* A torn last line is not a reason. */ }
+    }
+  } catch { /* No log at all is the same answer as an empty one. */ }
+  const last = mine[mine.length - 1]
+  if (!last) return 'it recorded nothing about itself before it stopped'
+  if (last.event === 'uncaught-exception' || last.event === 'unhandled-rejection') {
+    const frame = last.frames?.[0]
+    const what = last.event === 'uncaught-exception' ? 'an uncaught exception' : 'an unhandled rejection'
+    return `it reported ${what}${frame ? ` at ${frame}` : ''}`
+  }
+  if (last.event === 'runtime-exit') return 'it left through the CLI\'s own shutdown path, so it refused to start rather than crashed'
+  return 'it reached the CLI and then stopped without recording a reason'
+}
 
 /**
  * Whether a leaf in this state still owns a process.
@@ -192,53 +258,30 @@ export class LeafProcess {
     // answer and starting a copy of it would only be a second writer.
     let connected = await connectLeafChannel(sessionId, handlers)
     if (!connected) {
-      // A member has to outlive this session, so it cannot share this session's
-      // console: the console closing takes every process attached to it with it.
-      // Being detached costs the member its console, and a console-less process
-      // makes the system build a fresh console for every console tool below it -
-      // which Windows 11 hands to Windows Terminal as a visible window that
-      // takes the foreground. Tools therefore have to ask for their console to
-      // be hidden (`windowsHide`); that hidden console is then inherited by
-      // everything they start, so the hiding has to hold at the top of a
-      // factory rather than at every leaf of it.
-      //
-      // Dropping `detached` to give the member a hidden console of its own was
-      // tried and measured: the member does not outlive this session without it
-      // (the leaf harness fails on exactly that), while `windowsHide` beside a
-      // detached spawn does nothing, because `DETACHED_PROCESS` wins over
-      // `CREATE_NO_WINDOW`. Outliving the session is the contract; the console
-      // is a Windows side effect, so it is the side effect that gives way.
-      const child = spawn(this.options.executable, this.options.args, {
-        cwd: this.options.cwd, env: this.options.env, detached: true, windowsHide: true, stdio: 'ignore',
-      })
-      // Neither process keeps the other alive: this handle does not wait on the
-      // member and does not hold the loop open for it.
-      child.unref()
-      // A start that never becomes a process - a missing interpreter - is known
-      // the moment it happens, so it is not worth waiting out the deadline for.
-      let dead = false
-      child.on('error', () => { dead = true; this.fail() })
-      child.on('exit', () => { dead = true })
-      this.child = child
-      this.pid = child.pid
-      const deadline = Date.now() + MEMBER_START_TIMEOUT_MS
-      while (!connected && !dead && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, MEMBER_START_POLL_MS))
-        try { connected = await connectLeafChannel(sessionId, handlers) }
-        catch (error) {
-          // Taken between the start and the reach: the member is somebody
-          // else's now, so it is not ours to clean up and the refusal travels out.
-          if (error instanceof LeafTakenError) throw error
-          // Anything else is a start still in progress.
-        }
+      // A member that dies on its way up is the one start failure a person
+      // actually sees, and a single attempt is not enough for it: the same start
+      // can lose its process to something transient - a launch refused under
+      // memory pressure, an interpreter that briefly would not load - and
+      // succeed the second time. Both attempts are taken only while the member
+      // is known to be dead. A member that is alive and merely slow is never
+      // spawned a second time, because two writers on one transcript is the one
+      // thing this path exists to prevent.
+      let attempt = await this.startMember(sessionId, handlers)
+      if (!attempt.connected && attempt.died) {
+        await new Promise(resolve => setTimeout(resolve, MEMBER_RESTART_PAUSE_MS))
+        attempt = await this.startMember(sessionId, handlers)
       }
-      if (!connected) {
+      if (!attempt.connected) {
         // A member we started but can never reach is ours to clean up: nothing
         // would ever show it, and it is holding the transcript it was told to
-        // resume.
+        // resume. One that already died has nothing left to terminate, and
+        // `reason` says which of the two happened instead of leaving a person to
+        // guess.
+        this.setState('failed')
         await this.terminate().catch(() => {})
-        throw new Error('Leaf session did not open its endpoint; it may have failed to start')
+        throw new Error(`Leaf session did not open its endpoint: ${attempt.reason}`)
       }
+      connected = attempt.connected
     }
     this.channel = connected.channel
     this.pid = connected.identity.pid ?? this.pid
@@ -247,6 +290,76 @@ export class LeafProcess {
     if (isLeafProcessState(connected.identity.state)) this.setState(connected.identity.state)
     await this.control({ subtype: 'initialize' })
     if (this.state === 'starting') this.setState('idle')
+  }
+
+  /**
+   * Start a member and wait for it to answer at its own address.
+   *
+   * Reports how the attempt ended rather than throwing, because the caller has
+   * to tell a member that failed to start from one that is merely slow: the wait
+   * is the same either way, but only the first is worth another attempt, and
+   * only the second is a process this session should kill.
+   */
+  private async startMember(
+    sessionId: string,
+    handlers: LeafChannelHandlers,
+  ): Promise<{ connected: Awaited<ReturnType<typeof connectLeafChannel>>; died: boolean; reason: string }> {
+    // A member has to outlive this session, so it cannot share this session's
+    // console: the console closing takes every process attached to it with it.
+    // Being detached costs the member its console, and a console-less process
+    // makes the system build a fresh console for every console tool below it -
+    // which Windows 11 hands to Windows Terminal as a visible window that
+    // takes the foreground. Tools therefore have to ask for their console to
+    // be hidden (`windowsHide`); that hidden console is then inherited by
+    // everything they start, so the hiding has to hold at the top of a
+    // factory rather than at every leaf of it.
+    //
+    // Dropping `detached` to give the member a hidden console of its own was
+    // tried and measured: the member does not outlive this session without it
+    // (the leaf harness fails on exactly that), while `windowsHide` beside a
+    // detached spawn does nothing, because `DETACHED_PROCESS` wins over
+    // `CREATE_NO_WINDOW`. Outliving the session is the contract; the console
+    // is a Windows side effect, so it is the side effect that gives way.
+    const started = Date.now()
+    const child = spawn(this.options.executable, this.options.args, {
+      cwd: this.options.cwd, env: this.options.env, detached: true, windowsHide: true, stdio: 'ignore',
+    })
+    // Neither process keeps the other alive: this handle does not wait on the
+    // member and does not hold the loop open for it.
+    child.unref()
+    // A start that never becomes a process - a missing interpreter - is known
+    // the moment it happens, so it is not worth waiting out the deadline for.
+    // Neither is a member that exits on its way up, and that is the same
+    // knowledge the caller needs to decide whether a second attempt is worth
+    // taking: one that died left nothing behind to collide with.
+    let died = false
+    let reason = ''
+    child.on('error', (error: Error) => { died = true; reason = `it could not be started (${error.message})` })
+    child.on('exit', (code, signal) => {
+      died = true
+      // A start that never became a process is already explained by its spawn
+      // error, which names the interpreter and says more than a status would.
+      if (!reason) {
+        const record = memberLastRecord(child.pid, started)
+        reason = `the member process exited (${describeExit(code, signal)})${record ? `; ${record}` : ''}`
+      }
+    })
+    this.child = child
+    this.pid = child.pid
+    let connected = await connectLeafChannel(sessionId, handlers)
+    const deadline = Date.now() + MEMBER_START_TIMEOUT_MS
+    while (!connected && !died && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, MEMBER_START_POLL_MS))
+      try { connected = await connectLeafChannel(sessionId, handlers) }
+      catch (error) {
+        // Taken between the start and the reach: the member is somebody
+        // else's now, so it is not ours to clean up and the refusal travels out.
+        if (error instanceof LeafTakenError) throw error
+        // Anything else is a start still in progress.
+      }
+    }
+    if (!connected && !died) reason = `it was still running when the wait ran out after ${MEMBER_START_TIMEOUT_MS / 1000}s`
+    return { connected, died, reason }
   }
 
   private handleTerminalMessage(raw: unknown): void {
