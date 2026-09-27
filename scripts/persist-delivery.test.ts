@@ -18,6 +18,10 @@ test('checkpoint validation and stable outcomes distinguish drift from progress'
   const first = advanceDelivery(undefined, review)
   assert.throws(() => parseDeliveryReview('x'.repeat(16001)))
   assert.throws(() => parseDeliveryReview(JSON.stringify({ ...review, evidence: '' })))
+  // `deferred` is the one field a review may leave out; omitting it must not
+  // refuse an otherwise well-formed review.
+  const { deferred, ...withoutDeferred } = review
+  assert.equal(parseDeliveryReview(JSON.stringify(withoutDeferred)).deferred, '')
   assert.throws(() => advanceDelivery(first, { ...review, outcome: 'Polish a local test' }))
   assert.throws(() => advanceDelivery(first, { ...review, kind: 'delivered', phase: 'harden' }))
   const repeated = advanceDelivery(first, review)

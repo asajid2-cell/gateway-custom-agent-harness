@@ -374,6 +374,26 @@ function progressSignature(state: PersistState, messages: Message[]): string {
   return `${countWork(messages)}|${state.reviewEvidence ?? ''}|${state.delivery ? JSON.stringify(state.delivery) : ''}`
 }
 
+/**
+ * Count a heartbeat that produced nothing, and say whether that reached the
+ * ceiling. Both continuation modes share this so they converge the same way: a
+ * task heartbeat the session answers with prose and a kept session's review
+ * demand the session answers by stopping again are the same event - a reminder
+ * that added no work, no checkpoint and no blocker - so both advance the one
+ * counter and both park at the one ceiling. Keep mode previously allowed the
+ * stopped-again answer outright, which left a kept goal nagging once per turn
+ * forever and never parked.
+ */
+function noteStalledHeartbeat(state: PersistState, messages: Message[]): boolean {
+  const workMark = progressSignature(state, messages)
+  state.stalledHeartbeats =
+    state.workMark !== undefined && workMark === state.workMark
+      ? (state.stalledHeartbeats ?? 0) + 1
+      : 0
+  state.workMark = workMark
+  return state.stalledHeartbeats >= MAX_STALLED_HEARTBEATS
+}
+
 function parseNudges(value: string | undefined): number | undefined {
   if (!value) return DEFAULT_NUDGES
   if (!/^\d+;?$/.test(value)) return undefined
@@ -520,13 +540,7 @@ export function decidePersistStop(
   // last one did is not driving anything; after a short run of those the loop
   // is what it is and the goal goes back to waiting for the user.
   if (isContinuationMode(state)) {
-    const workMark = progressSignature(state, messages)
-    state.stalledHeartbeats =
-      state.workMark !== undefined && workMark === state.workMark
-        ? (state.stalledHeartbeats ?? 0) + 1
-        : 0
-    state.workMark = workMark
-    if (state.stalledHeartbeats >= MAX_STALLED_HEARTBEATS) {
+    if (noteStalledHeartbeat(state, messages)) {
       state.status = 'stalled'
       return { kind: 'allow', reason: 'no-progress' }
     }
@@ -675,7 +689,21 @@ async function installPersistRuntime(
         pendingNudges.set(messages, `Review the kept goal using persist-review checkpoint JSON at a meaningful checkpoint; continue when useful work remains, unrelated for this conversation, blocked with a genuine dependency, or complete only with goal-wide verification evidence. Do not review after every tiny edit. Latest user instructions take precedence. ${deliveryDirection(runtime.state.delivery)}`)
         return false
       }
-      if (requiresReviewAuthorization && (runtime.reviewedChain !== context.chainId || runtime.reviewOutcome !== 'continue')) return true
+      if (requiresReviewAuthorization && (runtime.reviewedChain !== context.chainId || runtime.reviewOutcome !== 'continue')) {
+        // The demand went unanswered: the session stopped again having recorded
+        // nothing. That is a heartbeat with nothing in it, so it counts on the
+        // same ceiling as a task heartbeat, and a kept goal that is repeatedly
+        // declined this way is parked instead of nagged forever.
+        const nextState = { ...runtime.state }
+        if (noteStalledHeartbeat(nextState, messages)) {
+          nextState.status = 'stalled'
+          await queuePersistWrite(sessionId, recordFromState(nextState), transcriptPath)
+          detachPersistRuntime(sessionId)
+        }
+        runtime.state = nextState
+        cacheState(sessionId, nextState)
+        return true
+      }
       context = { ...context, stopHookActive: true }
     }
     const nextState = { ...runtime.state }
@@ -826,7 +854,7 @@ function readPersistReview(args: string): { verb: PersistReviewVerb; payload: st
 export function registerPersistSkill(): void {
   registerBundledSkill({
     name: 'persist-review',
-    description: `At meaningful checkpoints or attempted stops send checkpoint JSON on its own: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}. All other fields are strings. delivered means a milestone, not goal completion. Alternatively use continue, unrelated, blocked, or complete followed by evidence. A review that is refused changes nothing and leaves the goal active, so correct it and resend rather than stopping. ${TASK_BLOCKER_REVIEW_GUIDANCE} Do not review after every edit.`,
+    description: `At meaningful checkpoints or attempted stops send checkpoint JSON on its own: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}. outcome, doneWhen, next and evidence must be non-empty strings; deferred may be empty or omitted. delivered means a milestone, not goal completion. Alternatively use continue, unrelated, blocked, or complete followed by evidence. A review that is refused changes nothing and leaves the goal active, so correct it and resend rather than stopping. ${TASK_BLOCKER_REVIEW_GUIDANCE} Do not review after every edit.`,
     userInvocable: true,
     async getPromptForCommand(args, context) {
       const review = readPersistReview(args)

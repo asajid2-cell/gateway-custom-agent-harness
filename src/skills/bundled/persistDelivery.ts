@@ -38,11 +38,18 @@ export function parseDeliveryReview(input: string): DeliveryReview {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       !['advanced', 'learned', 'delivered', 'detoured'].includes(kind) ||
       !phases.includes(value.phase)) throw new Error('Invalid delivery review kind or phase.')
+  // `deferred` names work deliberately not done yet, so an honest review often
+  // has nothing to put there and the field is the one the loop below lets stand
+  // empty. Demanding the key be present while allowing it to be empty is a rule
+  // the skill never states, and it refused a well-formed review in a live
+  // session, so an absent one reads as empty. Every other field must be present
+  // and non-empty or the review says nothing.
+  const review = { ...value, deferred: value.deferred === undefined ? '' : value.deferred }
   for (const field of fields) {
-    if (typeof value[field] !== 'string' || value[field].length > 1200 ||
-        (field !== 'deferred' && !value[field].trim())) throw new Error(`Invalid delivery field: ${field}.`)
+    if (typeof review[field] !== 'string' || review[field].length > 1200 ||
+        (field !== 'deferred' && !review[field].trim())) throw new Error(`Invalid delivery field: ${field}.`)
   }
-  return { kind, phase: value.phase, ...Object.fromEntries(fields.map(field => [field, value[field].trim()])) } as DeliveryReview
+  return { kind, phase: value.phase, ...Object.fromEntries(fields.map(field => [field, review[field].trim()])) } as DeliveryReview
 }
 
 export function validateDeliveryCheckpoint(value: unknown): DeliveryCheckpoint | undefined {
