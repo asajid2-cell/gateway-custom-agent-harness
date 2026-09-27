@@ -359,12 +359,32 @@ async function hostProcessAlive(claim: LeafFamilyHostClaim): Promise<boolean> {
 async function claimFamilyHost(familyId: string): Promise<void> {
   const self = getSessionId()
   const previous = await readLeafFamilyHostClaim(familyId)
-  if (previous?.hostSessionId === self && hostState?.forSession === self && hostState.token === previous.token) {
-    hostState = { ...hostState, displaced: false }
-    await writeLeafFamilyHostClaim(familyId, { ...previous, pid: process.pid, processStartedAt: hostProcessStartedAt, openMemberIds: heldMemberIds(familyId) }).catch(() => {})
+  // Reading the family is not opening it. The lease goes to the window opened
+  // most recently and stays there: the roster is loaded again every time the
+  // menu is opened, and a restore that took the family back would have the
+  // windows trade it on every repaint, so the one that manages it would be
+  // whichever asked last rather than the one opened last. A claim whose host is
+  // gone is the exception - nothing manages the family then, and the window
+  // that is here takes it.
+  const mine = hostState?.forSession === self && hostState.familyId === familyId
+  const rival = previous !== undefined && previous.hostSessionId !== self && await hostProcessAlive(previous)
+  if (mine && rival) {
+    if (!hostState!.displaced) {
+      hostState = { ...hostState!, displaced: true, hostSessionId: previous!.hostSessionId }
+      publish()
+    }
     return
   }
-  const inherited = previous && previous.hostSessionId !== self && await hostProcessAlive(previous) ? previous.openMemberIds : []
+  if (mine) {
+    const generation = previous && previous.hostSessionId !== self ? previous.generation + 1 : previous?.generation ?? hostState!.generation
+    hostState = { ...hostState!, generation, displaced: false, hostSessionId: self }
+    await writeLeafFamilyHostClaim(familyId, {
+      familyId, hostSessionId: self, pid: process.pid, processStartedAt: hostProcessStartedAt,
+      token: hostState.token, generation, openMemberIds: heldMemberIds(familyId),
+    }).catch(() => {})
+    return
+  }
+  const inherited = rival ? previous!.openMemberIds : []
   const token = randomUUID()
   const generation = (previous?.generation ?? 0) + 1
   hostState = { forSession: self, familyId, token, generation, hostSessionId: self, displaced: false, external: inherited }
@@ -547,6 +567,17 @@ export function familyRootSync(): string {
 
 /** Test seam: drop the cached resolution so a pointer written afterwards is read. */
 export function forgetLeafFamilyRoot(): void { resolvedRoot = undefined }
+
+/**
+ * Test seam: forget which family this session manages, so a case that opens one
+ * starts from a window that has never seen it.
+ *
+ * The lease is module state, and a test process runs a whole file in one of them
+ * - so a case about opening a family would otherwise inherit the lease an earlier
+ * case took and read the opening as a re-open. Production has no equivalent: a
+ * process opens a family once and stays the window that manages it.
+ */
+export function clearFamilyHostClaimForTesting(): void { hostState = undefined }
 
 /**
  * What a member knows about the family's creator.
@@ -1559,10 +1590,12 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
  * reads as the family rather than as a leaf of it.
  *
  * Refused for the member that is already the parent, for a reference that is
- * not in this family, and for a target whose turn is in flight: the titles of
- * both members are rewritten, so the target has to be idle and exclusively
- * ours. Nothing about numbering or context-return receipts changes - a
- * re-parent creates no member and invalidates no dedupe.
+ * not in this family, and for a target whose turn is in flight: both titles are
+ * rewritten, so a member mid-turn is left to finish first. A member that is
+ * merely running is not a refusal - being up is the ordinary state of a leaf
+ * you would want to name the family after. Nothing about numbering or
+ * context-return receipts changes - a re-parent creates no member and
+ * invalidates no dedupe.
  */
 export async function reparentLeaf(sessionId: string): Promise<string> {
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('reparent', [sessionId])
@@ -1576,21 +1609,21 @@ export async function reparentLeaf(sessionId: string): Promise<string> {
   if (current.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family parent`)
   const view = views.get(target.sessionId)
   if (view && !['idle', 'closed', 'failed'].includes(view.process.getState())) throw new Error('Wait for the leaf turn before re-parenting')
-  const { claimGatewaySessionWriter, releaseGatewaySessionWriter } = await import('./gatewaySessionOwnership.js')
-  let claimed = false
-  try {
-    await claimGatewaySessionWriter(target.sessionId)
-    claimed = true
-    // Only the displayed titles move; the rows keep the names they were given.
-    // The new parent's title becomes its bare name, which is what makes the
-    // family read as that conversation; the old parent takes the leaf naming
-    // every other member already uses.
-    saveSessionName(asSessionId(target.sessionId), target.name, target.transcriptPath)
-    saveSessionName(asSessionId(current.sessionId), `Leaf ${current.number}: ${current.name}`, current.transcriptPath)
-    await writeFamilyParentDesignation(root, target.sessionId)
-  } finally {
-    if (claimed) await releaseGatewaySessionWriter(target.sessionId)
-  }
+  // Only the displayed titles move; the rows keep the names they were given.
+  // The new parent's title becomes its bare name, which is what makes the
+  // family read as that conversation; the old parent takes the leaf naming
+  // every other member already uses.
+  //
+  // A title is an append to the target's transcript, and a running session holds
+  // that transcript's writer lock for as long as it lives - so claiming it first
+  // refused every re-parent of a leaf that is up, which is the ordinary case and
+  // the whole point of designating one. The append is what the leaf does to
+  // itself, and two appends do not corrupt a transcript, so nothing is claimed
+  // here. What a re-parent must not do is rewrite a title while the member it is
+  // renaming is mid-turn, and that is the check above.
+  saveSessionName(asSessionId(target.sessionId), target.name, target.transcriptPath)
+  saveSessionName(asSessionId(current.sessionId), `Leaf ${current.number}: ${current.name}`, current.transcriptPath)
+  await writeFamilyParentDesignation(root, target.sessionId)
   // Every pointer is rewritten with the parent the family has now, so a leaf
   // resumed on its own later reads the family it actually belongs to.
   await indexLeafMembers(root, members)

@@ -26,6 +26,7 @@ parser.add_argument('--probe-full-tui', action='store_true')
 parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--probe-selection', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
+parser.add_argument('--probe-parentage', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -312,21 +313,213 @@ class Terminal:
         writes it straight out."""
         return OSC52_RE.findall(self.output)
     def family(self):
+        """The family file this session belongs to.
+
+        The file is named after the family's creator, so a session that is not
+        the creator - a leaf resumed on its own, which is an entry point in its
+        own right - finds it through its own pointer. That is the lookup the app
+        makes; reading the file directly only works for the session the family
+        is named after.
+        """
         path = root / 'leaf-families' / (self.id + '.json')
+        if not path.exists():
+            pointer = root / 'leaf-families' / 'index' / (self.id + '.json')
+            try: path = root / 'leaf-families' / (json.loads(pointer.read_text(encoding='utf-8'))['rootSessionId'] + '.json')
+            except (OSError, ValueError, KeyError): pass
         try:
             self.last_family = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {'members': []}
         except PermissionError:
             return getattr(self, 'last_family', {'members': []})
         return self.last_family
+    def leaves(self):
+        """The members other than the family's creator.
+
+        The creator is an ordinary member row now - a number, a name, a place in
+        the roster, like any leaf - so a probe that means "the leaves", and every
+        count it asserts, has to say so rather than take members[0] and call it
+        the leaf.
+        """
+        family = self.family()
+        creator = family.get('rootSessionId')
+        return [member for member in family.get('members', []) if member['sessionId'] != creator]
+    def all_label(self):
+        """The carousel's own count, read off the screen.
+
+        It counts the session on screen plus the leaves this window holds a live
+        process for. It is not the family file's "open" tally: the creator is a
+        member with status open and is not a leaf in this window's bar.
+
+        Read twice and agreed, because a family file changes before the frame
+        that draws it does, and clicking a count the bar has not caught up to
+        clicks nothing.
+        """
+        previous = None
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            self.pump()
+            counts = re.findall(r'All (\d+)', self.text())
+            current = 'All ' + counts[-1] if counts else None
+            if current and current == previous: return current
+            previous = current
+            time.sleep(.1)
+        assert previous, 'no carousel count on screen'
+        return previous
+    def point_row(self, number):
+        """Click the expanded-list row for a member number.
+
+        The row reads `{number} {name} [{state}]`, and the name is not a stable
+        handle: a leaf's name follows its own session title, which is derived
+        from whatever was typed at it. The number is the family's identity for
+        the member and it never moves.
+
+        Choosing a row collapses the list, so a list that is still open is a
+        press that landed between frames rather than on the row - and a press
+        that misses leaves the session on screen unchanged, which then reads as
+        a member that would not take the terminal. Retried for the same reason
+        `expand_bar` retries its toggle.
+
+        Only the list's own body is searched. `{number} ` also occurs in the
+        transcript above it - the reply to `/leaf model <id>` reads
+        `Leaf #2 Lifecycle model ... updated`, which is a "2 " with a `#` in
+        front of it - and matching there clicked a line of conversation, which
+        has no row behind it, so the switch silently did not happen.
+        """
+        prefix = str(number) + ' '
+        def matches():
+            lines = self.screen.display
+            header = next((row for row, line in enumerate(lines) if 'All sessions - click to switch' in line), None)
+            if header is None: return []
+            for row in range(header + 1, len(lines)):
+                line = lines[row]
+                if 'Previous' in line and 'Close list' in line: break
+                for at in range(len(line)):
+                    if line.startswith(prefix, at) and (at == 0 or not line[at - 1].isdigit()):
+                        return [(at + 1, row + 1)]
+            return []
+        for _ in range(4):
+            self.pause(.6)
+            self.wait(lambda: bool(matches()), 'visible member #' + str(number))
+            x, y = matches()[0]
+            self.proc.write(f'\x1b[<0;{x};{y}M'); self.pause(.08)
+            self.proc.write(f'\x1b[<0;{x};{y}m'); self.pause(.25)
+            try:
+                self.wait(lambda: 'All sessions - click to switch' not in self.text(), 'the list to close', 3)
+                return
+            except AssertionError:
+                pass
+        raise AssertionError('the session bar would not switch to member #' + str(number))
+    def expand_bar(self):
+        """Open the session bar's list, retrying the toggle if it did not take.
+
+        The list is the only way to reach a member, and a press that arrives
+        while the bar is still repainting what it holds toggles nothing - which
+        reads as a bar that cannot be opened rather than as a click that missed.
+        """
+        self.click(self.all_label())
+        for _ in range(3):
+            self.pause(.5)
+            if 'All sessions - click to switch' in self.text(): return
+            self.click(self.all_label())
+        raise AssertionError('the session bar would not expand')
+    def menu(self):
+        """Open the leaf menu, and open it again if the prompt was not free.
+
+        A command typed while a turn is running stays in the composer instead of
+        running, and a turn can start on its own here - a leaf that answers
+        something arrives as a user turn in this window - so the menu is asked
+        for and then asked again, with the composer cleared first, rather than
+        once and hoped for. The footer says which state the prompt is in: the
+        shortcut hint when it is free, `esc to interrupt` when a turn holds it.
+        """
+        for _ in range(4):
+            self.wait(lambda: 'esc to interrupt' not in self.text(), 'the prompt to be free', 60)
+            self.proc.write('\x15'); self.pause(.3)
+            self.submit('/leaf')
+            try:
+                self.wait(lambda: 'Leaves in this family' in self.text(), 'the leaf menu', 10)
+                return
+            except AssertionError: pass
+        raise AssertionError('the leaf menu would not open')
+    def pick(self, label):
+        """Choose a numbered row from a menu, the way a keyboard does.
+
+        The leaf menu floats over the prompt rather than in a dialog of its own,
+        and a click on one of its rows is not what selects it. What selects it is
+        the highlighted row, and the rows are numbered on screen - which is how
+        many steps down the highlight has to move before Enter. The number is
+        read off the row instead of assumed, because the same menu drops its
+        first row when another window manages the family.
+        """
+        self.pause(.6)
+        def number():
+            for line in self.screen.display:
+                if label not in line: continue
+                # The highlighted row carries the select's pointer, so the number
+                # is read past whatever the row is decorated with.
+                found = re.match(r'[^\d]*(\d+)\.\s', line)
+                if found: return int(found.group(1))
+            return None
+        self.wait(lambda: number() is not None, 'visible ' + label)
+        for _ in range(number() - 1):
+            self.proc.write('\x1b[B'); self.pause(.15)
+        self.proc.write('\r')
+        self.pause(.5)
+    def pick_row(self, label):
+        """Choose a row that carries no number, the way a keyboard does.
+
+        Only the rows that are typed into are indexed, and the create wizard's
+        other controls - the start toggle, the create button - are rows all the
+        same. What selects any row is the highlighted one, so the highlight is
+        walked down until it sits on the row that is wanted, which is read from
+        the pointer rather than counted, and the walk stops when it arrives.
+        """
+        self.pause(.6)
+        def focused():
+            # A `>` at the start of a line is either the dialog's pointer or the
+            # prompt the transcript echoes back, and the transcript keeps its
+            # echoes above the dialog - so the pointer is the lowest one.
+            for line in reversed(self.screen.display):
+                stripped = line.strip()
+                if stripped.startswith('>'): return stripped[1:].strip()
+            return None
+        for _ in range(12):
+            current = focused()
+            if current and label in current:
+                self.proc.write('\r'); self.pause(.5); return
+            self.proc.write('\x1b[B'); self.pause(.15)
+        self.dump()
+        raise AssertionError('the highlight would not reach ' + label + ' (screen saved locally)')
+    def point_first_item(self):
+        """Click the carousel's first entry, which is the session on screen.
+
+        Its label is the session's own name, and that is whatever the session
+        has been called - which a leaf can be called too, so matching on the
+        text would sometimes click the leaf. The first row of the expanded list
+        is the session on screen by construction.
+        """
+        self.pause(.6)
+        def matches():
+            lines = self.screen.display
+            for row, line in enumerate(lines):
+                if 'All sessions - click to switch' not in line: continue
+                for below in range(row + 1, len(lines)):
+                    if lines[below].strip(' │'):
+                        return [(len(lines[below]) - len(lines[below].lstrip(' │')) + 1, below + 1)]
+                break
+            return []
+        self.wait(lambda: bool(matches()), 'visible first carousel entry')
+        x, y = matches()[0]
+        self.proc.write(f'\x1b[<0;{x};{y}M'); self.pause(.08)
+        self.proc.write(f'\x1b[<0;{x};{y}m'); self.pause(.25)
     def original(self, draft=None):
-        self.click('All ' + str(sum(member['status'] == 'open' for member in self.family()['members']) + 1))
-        self.click('Original')
+        self.expand_bar()
+        self.point_first_item()
         self.witness(self.id, 'the original session', draft)
         self.pause(.5)
     def leaf(self, index, permission=False, draft=None):
-        self.click('All ' + str(sum(member['status'] == 'open' for member in self.family()['members']) + 1))
-        member = self.family()['members'][index]
-        self.click(str(member['number']) + ' ' + member['name'] + ' [')
+        self.expand_bar()
+        member = self.leaves()[index]
+        self.point_row(member['number'])
         if permission:
             # The pending permission dialog is itself proof of which session is
             # on screen, and is the thing the probe goes on to answer.
@@ -363,7 +556,7 @@ class Terminal:
         self.wait(lambda: not self.proc.isalive(), 'graceful root exit')
         _, alive = psutil.wait_procs(self.running_owned(), timeout=10)
         if family_survives is None:
-            family_survives = any(member['status'] == 'open' for member in self.family()['members'])
+            family_survives = any(member['status'] == 'open' for member in self.leaves())
         if family_survives:
             assert alive, 'Graceful exit closed the family instead of detaching it'
         else:
@@ -375,14 +568,20 @@ class Terminal:
                   'the leaving session released its writer lock')
         if not family_survives:
             self.wait(lambda: not list((root / 'gateway-writers').glob('*.lock')), 'all fixture writer locks released')
-        self.wait(lambda: not list((root / 'projects').rglob('*.leaf-owner.lock')), 'all leaf owner locks released')
+            self.wait(lambda: not list((root / 'projects').rglob('*.leaf-owner.lock')), 'all leaf owner locks released')
+        else:
+            # The family is still up in another window, which is holding the
+            # leaves it has and its own transcript on purpose. What this session
+            # owes back is the transcript it took for itself.
+            self.wait(lambda: not list((root / 'projects').rglob(self.id + '*.leaf-owner.lock')),
+                      'the leaving session released the transcript it held')
 
 def probe_full_tui():
     t = Terminal()
     t.wait(lambda: 'All 1' in t.text(), 'initial normal session', 60)
     t.submit('/leaf new FullSession')
-    t.wait(lambda: len(t.family()['members']) == 1 and 'All 2' in t.text(), 'leaf created', 75)
-    leaf_id = t.family()['members'][0]['sessionId']
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'leaf created', 75)
+    leaf_id = t.leaves()[0]['sessionId']
     t.wait(lambda: 'session:' in t.text(), 'leaf must show its own normal session footer', 75)
     t.assert_view(leaf_id, 'the new leaf', 75)
     t.click('✎ Rename')
@@ -438,10 +637,11 @@ def probe_full_tui():
     assert (root / 'approved-leaf.txt').read_text() == 'APPROVED_LEAF_ONLY'
     t.wait(lambda: 'FIXTURE_REPLY_BACKGROUND' in t.text(), 'tool result turn completes')
     t.resize(60, 28)
-    # At this width the footer's `session:` clause is truncated away (cwd takes
-    # the row), so what a narrow layout still owes the user is the row it does
-    # render and a prompt that still takes what is typed at it.
-    t.wait(lambda: 'All 2' in t.text() and 'cwd:' in t.text(), 'selected full UI resizes')
+    # A narrow layout still owes the user the directory row it renders and a
+    # prompt that takes what is typed at it. The row is labelled `cd:` - the
+    # label the footer has used since it started naming the directory the
+    # conversation is resumed from rather than the live cwd.
+    t.wait(lambda: 'All 2' in t.text() and 'cd:' in t.text(), 'selected full UI resizes')
     t.assert_view(leaf_id, 'the selected leaf at 60 columns')
     t.resize(args.columns, args.rows)
     t.original()
@@ -463,8 +663,8 @@ def probe_selection():
     t.submit('ROOT_CONTEXT_CAFE_世界')
     t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root reply')
     t.submit('/leaf fork original ForkOne')
-    t.wait(lambda: len(t.family()['members']) == 1, 'fork created', 75)
-    t.assert_view(t.family()['members'][0]['sessionId'], 'the fork', 75)
+    t.wait(lambda: len(t.leaves()) == 1, 'fork created', 75)
+    t.assert_view(t.leaves()[0]['sessionId'], 'the fork', 75)
     t.original()
     t.wait(lambda: 'session:' in t.text(), 'original restored')
 
@@ -618,14 +818,14 @@ def probe_lifecycle():
     t.submit('ROOT_CONTEXT_CAFE_')
     t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
     t.submit('/leaf new Lifecycle')
-    t.wait(lambda: len(t.family()['members']) == 1, 'fresh leaf recorded', 75)
-    leaf_id = t.family()['members'][0]['sessionId']
+    t.wait(lambda: len(t.leaves()) == 1, 'fresh leaf recorded', 75)
+    leaf_id = t.leaves()[0]['sessionId']
     t.assert_view(leaf_id, 'the new leaf', 75)
     t.submit('FRESH_ONLY_TASK')
     t.wait(lambda: 'FIXTURE_REPLY_FRESH_ONLY_TASK' in t.text(), 'leaf turn')
     t.submit('/leaf fork original RootCopy')
-    t.wait(lambda: len(t.family()['members']) == 2, 'root fork from leaf', 75)
-    fork = t.family()['members'][1]
+    t.wait(lambda: len(t.leaves()) == 2, 'root fork from leaf', 75)
+    fork = t.leaves()[1]
     assert fork['parentSessionId'] == t.id, 'Explicit original fork used the leaf as source'
     t.assert_view(fork['sessionId'], 'the root fork', 75)
     t.submit('FORK_ONLY_TASK')
@@ -636,32 +836,32 @@ def probe_lifecycle():
     root_logs = list((root / 'projects').rglob(t.id + '.jsonl'))
     assert len(root_logs) == 1 and 'SELECTED_CONTEXT_NOTE' in root_logs[0].read_text(encoding='utf-8'), 'Return did not persist in original'
     t.submit('/clear')
-    t.wait(lambda: len(t.family()['members']) == 3 and t.family()['members'][1]['status'] == 'closed', 'clear updates leaf identity')
-    assert t.family()['members'][1]['status'] == 'closed', 'Clear left old identity live'
-    cleared = t.family()['members'][2]
+    t.wait(lambda: len(t.leaves()) == 3 and t.leaves()[1]['status'] == 'closed', 'clear updates leaf identity')
+    assert t.leaves()[1]['status'] == 'closed', 'Clear left old identity live'
+    cleared = t.leaves()[2]
     t.assert_view(cleared['sessionId'], 'the cleared session')
     t.original()
     t.leaf(2)
     t.original()
     t.submit('/leaf close ' + cleared['sessionId'])
-    t.wait(lambda: t.family()['members'][2]['status'] == 'closed', 'cleared session closes')
+    t.wait(lambda: t.leaves()[2]['status'] == 'closed', 'cleared session closes')
     t.submit('/leaf reopen ' + fork['sessionId'])
-    t.wait(lambda: t.family()['members'][1]['status'] == 'open' and 'Leaf reopen recorded' in t.text(), 'original fork reopens', 75)
+    t.wait(lambda: t.leaves()[1]['status'] == 'open' and 'Leaf reopen recorded' in t.text(), 'original fork reopens', 75)
     t.submit('/leaf model ' + leaf_id + ' claude-haiku-4-5')
-    t.wait(lambda: t.family()['members'][0].get('model') == 'claude-haiku-4-5', 'model saved')
+    t.wait(lambda: t.leaves()[0].get('model') == 'claude-haiku-4-5', 'model saved')
     t.pause(.5)
     t.submit('/leaf effort ' + leaf_id + ' high')
-    t.wait(lambda: t.family()['members'][0].get('effort') == 'high', 'effort saved')
+    t.wait(lambda: t.leaves()[0].get('effort') == 'high', 'effort saved')
     t.pause(.5)
     t.leaf(0)
     t.proc.write('SAVED_DRAFT')
     t.wait(lambda: 'SAVED_DRAFT' in t.text(), 'draft visible before switching')
     t.original()
     t.submit('/leaf close ' + leaf_id)
-    t.wait(lambda: t.family()['members'][0]['status'] == 'closed' and 'All 2' in t.text(), 'leaf closed')
-    assert t.family()['members'][0]['draft'] == 'SAVED_DRAFT', 'Close lost draft'
+    t.wait(lambda: t.leaves()[0]['status'] == 'closed' and 'All 2' in t.text(), 'leaf closed')
+    assert t.leaves()[0]['draft'] == 'SAVED_DRAFT', 'Close lost draft'
     t.submit('/leaf reopen ' + leaf_id)
-    t.wait(lambda: t.family()['members'][0]['status'] == 'open' and 'All 3' in t.text(), 'leaf reopened', 75)
+    t.wait(lambda: t.leaves()[0]['status'] == 'open' and 'All 3' in t.text(), 'leaf reopened', 75)
     t.leaf(0, draft='SAVED_DRAFT')
     t.wait(lambda: 'FRESH_ONLY_TASK' in t.text(), 'Reopen lost draft or transcript')
     t.proc.write('\x15'); t.pause()
@@ -670,7 +870,7 @@ def probe_lifecycle():
     t.original()
     t.submit('/leaf goal ' + leaf_id + ' Verify this local fixture goal')
     t.wait(lambda: 'Leaf goal saved' in t.text(), 'leaf goal saved and reopened', 75)
-    member = t.family()['members'][0]
+    member = t.leaves()[0]
     goal_path = Path(member['transcriptPath']).with_suffix('.persist.json')
     assert json.loads(goal_path.read_text(encoding='utf-8'))['task'] == 'Verify this local fixture goal', 'Goal not persisted'
     t.submit('/leaf goal ' + leaf_id + ' pause')
@@ -681,20 +881,20 @@ def probe_lifecycle():
     # only thing refusing the command; the assertions below are unchanged.
     for _ in range(40):
         t.submit('/leaf file ' + leaf_id + ' lifecycle-fixture')
-        if t.family()['members'][0]['status'] == 'closed':
+        if t.leaves()[0]['status'] == 'closed':
             break
-    t.wait(lambda: t.family()['members'][0]['status'] == 'closed' and 'All 2' in t.text(), 'leaf filed')
+    t.wait(lambda: t.leaves()[0]['status'] == 'closed' and 'All 2' in t.text(), 'leaf filed')
     t.wait(lambda: 'lifecycle-fixture' in Path(member['transcriptPath']).read_text(encoding='utf-8'), 'filed tag persisted')
     t.submit('/leaf promote ' + fork['sessionId'])
-    t.wait(lambda: t.family()['members'][1]['status'] == 'promoted' and 'All 1' in t.text(), 'leaf promoted')
+    t.wait(lambda: t.leaves()[1]['status'] == 'promoted' and 'All 1' in t.text(), 'leaf promoted')
     assert Path(fork['transcriptPath']).exists(), 'Promotion removed transcript'
     subprocess.run(['git', 'init', str(root)], check=True, capture_output=True, timeout=15)
     subprocess.run(['git', '-C', str(root), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@localhost', 'commit', '--allow-empty', '-m', 'Local fixture'], check=True, capture_output=True, timeout=15)
     worktree = root / 'isolated-worktree'
     subprocess.run(['git', '-C', str(root), 'worktree', 'add', '-b', 'fixture-worktree', str(worktree)], check=True, capture_output=True, timeout=15)
     t.submit('/leaf worktree ' + json.dumps(dict(path=str(worktree), name='WorktreeLeaf')))
-    t.wait(lambda: len(t.family()['members']) == 4, 'worktree leaf opens', 75)
-    worktree_member = t.family()['members'][3]
+    t.wait(lambda: len(t.leaves()) == 4, 'worktree leaf opens', 75)
+    worktree_member = t.leaves()[3]
     assert Path(worktree_member['cwd']).resolve() == worktree.resolve(), 'Leaf cwd not isolated'
     t.assert_view(worktree_member['sessionId'], 'the worktree leaf', 75)
     t.submit('FORK_ONLY_TASK_WORKTREE')
@@ -702,45 +902,176 @@ def probe_lifecycle():
     assert 'ROOT_CONTEXT_CAFE_' in json.dumps(requests[-1]), 'Worktree fork lost source context'
     t.original()
     t.submit('/leaf close ' + worktree_member['sessionId'])
-    t.wait(lambda: t.family()['members'][3]['status'] == 'closed', 'worktree leaf closes')
+    t.wait(lambda: t.leaves()[3]['status'] == 'closed', 'worktree leaf closes')
     t.submit('/leaf reopen ' + worktree_member['sessionId'])
     t.wait(lambda: 'All 2' in t.text(), 'worktree leaf reopens', 75)
     t.leaf(3)
     t.wait(lambda: 'FORK_ONLY_TASK_WORKTREE' in t.text(), 'worktree history retained')
     t.submit('/branch NativeBranch')
-    t.wait(lambda: len(t.family()['members']) == 5 and t.family()['members'][3]['status'] == 'closed', 'native branch updates family identity', 75)
-    t.assert_view(t.family()['members'][4]['sessionId'], 'the native branch', 75)
+    t.wait(lambda: len(t.leaves()) == 5 and t.leaves()[3]['status'] == 'closed', 'native branch updates family identity', 75)
+    t.assert_view(t.leaves()[4]['sessionId'], 'the native branch', 75)
     t.submit('/resume ' + worktree_member['sessionId'])
-    t.wait(lambda: t.family()['members'][3]['status'] == 'open' and t.family()['members'][4]['status'] == 'closed', 'native resume restores family identity', 75)
+    t.wait(lambda: t.leaves()[3]['status'] == 'open' and t.leaves()[4]['status'] == 'closed', 'native resume restores family identity', 75)
     t.assert_view(worktree_member['sessionId'], 'the resumed session', 75)
     t.original()
     t.exit()
     print(json.dumps(dict(lifecycle=True, rootFork=True, modelRestart=True, savedDraft=True, goal=True, filing=True, promotion=True, ownedProcessCleanup=True)), flush=True)
 
+def probe_parentage():
+    """A leaf is an entry point, and the parent is a designation that moves.
+
+    The three things the old model could not do, all of them on fresh sessions:
+    a member resumed on its own with `cc --resume <leaf id>` is a full entry
+    point - it finds its family, opens new leaves and reopens existing ones;
+    which member is the parent can be designated, and the family then takes that
+    member's name while the session that was the parent becomes an ordinary
+    leaf; and the window that held the family before reports that it moved and
+    stops managing it, instead of driving a second copy of the same leaves.
+    """
+    def title_of(path):
+        """The session title in force, read out of the transcript.
+
+        saveSessionName appends a custom-title record, so the newest one is the
+        title the UI shows. A session caches its own, and the file is how any
+        other process - this probe included - reads the same string.
+        """
+        found = []
+        for line in Path(path).read_text(encoding='utf-8', errors='replace').splitlines():
+            try: entry = json.loads(line)
+            except ValueError: continue
+            if entry.get('type') == 'custom-title': found.append(entry.get('customTitle'))
+        return found[-1] if found else None
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'alpha created', 75)
+    t.assert_view(t.leaves()[0]['sessionId'], 'the new leaf', 75)
+    t.original()
+    t.submit('/leaf new Beta')
+    t.wait(lambda: len(t.leaves()) == 2 and 'All 3' in t.text(), 'beta created', 75)
+    t.original()
+    alpha, beta = t.leaves()[0], t.leaves()[1]
+    assert alpha['number'] < beta['number'], 'members are not numbered in creation order'
+    # The creator is an ordinary member row now, not only the family's identity.
+    creator = next(member for member in t.family()['members'] if member['sessionId'] == t.id)
+    assert creator['number'] == 1, 'the creator has no ordinary member row: ' + repr(creator['number'])
+    # Alpha stops here so it can be entered on its own. Resuming a member whose
+    # process is still running under another window is the double-driver case,
+    # not the entry point this is about.
+    t.submit('/leaf close ' + alpha['sessionId'])
+    t.wait(lambda: t.leaves()[0]['status'] == 'closed', 'alpha closed for a clean resume')
+    assert t.leaves()[1]['status'] == 'open', 'beta must stay running for the handoff to inherit it'
+
+    # Enter the leaf directly, the way a person would from any terminal.
+    s = Terminal(alpha['sessionId'])
+    s.wait(lambda: 'All ' in s.text(), 'the resumed leaf', 90)
+    s.assert_view(alpha['sessionId'], 'the leaf entered with --resume', 90)
+    assert s.family()['rootSessionId'] == t.id, 'a member resumed on its own did not find its family'
+    assert len(s.leaves()) == 2, 'a member resumed on its own cannot see its siblings'
+    assert s.family()['members'][0]['sessionId'] == t.id, 'the roster a member reads is missing its parent'
+
+    # A full entry point: it opens a new leaf, and that leaf copies the
+    # conversation on screen - the leaf - rather than the parent behind it.
+    s.submit('/leaf new Gamma')
+    s.wait(lambda: len(s.leaves()) == 3, 'gamma created from the leaf', 75)
+    gamma = max(s.leaves(), key=lambda member: member['number'])
+    assert gamma['name'] == 'Gamma', 'the new leaf did not take the name it was given: ' + repr(gamma['name'])
+    assert gamma['parentSessionId'] == alpha['sessionId'], 'a leaf forked the parent instead of itself'
+    s.assert_view(gamma['sessionId'], 'the leaf the leaf opened', 90)
+
+    # Reopening an existing leaf is management, and this window is the one that
+    # manages the family now. Reopening relaunches the member without moving the
+    # session on screen, so the proof is the bar: it holds the members whose
+    # process is alive, and only those, so the reopened leaf leaves it on close
+    # and comes back on reopen.
+    s.submit('/leaf close ' + gamma['sessionId'])
+    s.wait(lambda: max(s.leaves(), key=lambda member: member['number'])['status'] == 'closed', 'gamma closed from the leaf')
+    s.wait(lambda: 'All 1' in s.text(), 'the closed leaf leaves the session bar', 60)
+    s.submit('/leaf reopen ' + gamma['sessionId'])
+    s.wait(lambda: max(s.leaves(), key=lambda member: member['number'])['status'] == 'open', 'gamma reopened from the leaf', 90)
+    s.wait(lambda: 'All 2' in s.text(), 'the reopened leaf running in the session bar', 90)
+
+    # Designate the member we are in as the parent. Nothing is created and no
+    # number moves; what changes is which member the family is named after.
+    before = s.family()
+    s.submit('/leaf reparent ' + beta['sessionId'])
+    s.wait(lambda: 'is now the family parent' in s.text(), 're-parent accepted', 30)
+    after = s.family()
+    assert after['nextNumber'] == before['nextNumber'], 're-parenting created a member'
+    assert len(after['members']) == len(before['members']), 're-parenting changed the roster'
+    assert after['returnedContextIds'] == before['returnedContextIds'], 're-parenting invalidated the context receipts'
+    # The designation lives in the creator's pointer, which is what every member
+    # reads, and every pointer is rewritten with the parent the family has now.
+    designation = json.loads((root / 'leaf-families' / 'index' / (t.id + '.json')).read_text(encoding='utf-8'))
+    assert designation['parentSessionId'] == beta['sessionId'], 'the designation did not move'
+    for member in after['members']:
+        pointer = json.loads((root / 'leaf-families' / 'index' / (member['sessionId'] + '.json')).read_text(encoding='utf-8'))
+        assert pointer.get('parentSessionId') == beta['sessionId'], 'a member pointer still names the old parent'
+    # The titles move, not the rows: the family reads as the member designated
+    # as its parent, and the session that was the parent reads as a leaf of it.
+    assert title_of(beta['transcriptPath']) == beta['name'], 'the new parent did not take the family name: ' + repr(title_of(beta['transcriptPath']))
+    assert title_of(creator['transcriptPath']) == 'Leaf %s: %s' % (creator['number'], creator['name']), 'the old parent did not become a leaf: ' + repr(title_of(creator['transcriptPath']))
+    # The roster agrees with it: the member that was the parent is offered as one
+    # that could be made the parent, and the member that is the parent is not.
+    s.menu()
+    s.pick('Leaves in this family')
+    s.wait(lambda: 'Make parent #%s ' % creator['number'] in s.text(), 'the old parent is offered as a parent again', 30)
+    assert 'Make parent #%s ' % beta['number'] not in s.text(), 'the parent is offered as its own replacement'
+    s.proc.write('\x1b'); s.pause(.5); s.proc.write('\x1b'); s.pause(.5)
+
+    # The window that held the family before is told, rather than left to drive a
+    # second copy of the same leaves.
+    t.submit('/leaf new Delta')
+    t.wait(lambda: 'The family moved to another window' in t.text(), 'management refused in the window that lost the family', 30)
+    t.menu()
+    t.wait(lambda: 'The family moved to the window opened most recently' in t.text(), 'the menu says the family moved', 30)
+    assert 'Create a leaf' not in t.text(), 'a displaced window still offers to create leaves'
+    t.pick('Leaves in this family')
+    t.wait(lambda: '#%s %s' % (alpha['number'], alpha['name']) in t.text(), 'the roster in a displaced window', 30)
+    assert 'Open  #' not in t.text(), 'a displaced window still offers to open leaves'
+    assert 'Close #' not in t.text(), 'a displaced window still offers to close leaves'
+    assert 'Archive #' not in t.text(), 'a displaced window still offers to archive leaves'
+    assert 'Make parent #' not in t.text(), 'a displaced window still offers to re-parent'
+    # What a displaced window keeps is the address of every member: it is not the
+    # manager any more, but every member is still an entry point.
+    assert 'cc --resume ' + alpha['sessionId'] in t.text(), 'the displaced roster does not name how to enter a member'
+    t.pick('Back')
+    t.proc.write('\x1b'); t.pause(.5)
+    # And it keeps the terminals it already attached, which is the other half of
+    # being a follower rather than being shut out.
+    t.leaf(1)
+    t.assert_view(beta['sessionId'], 'the terminal the displaced window kept', 90)
+    t.original()
+    t.exit()
+    s.exit()
+    print(json.dumps(dict(parentage=True, directResume=True, leafOpensLeaves=True, leafReopensLeaves=True, reparent=True, familyTakesNewParentName=True, oldParentBecomesLeaf=True, displacedRefusesManagement=True, displacedKeepsTerminals=True)), flush=True)
+
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
-    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity:
-        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_parity)()
+    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage:
+        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_parentage if args.probe_parentage else probe_parity)()
         raise SystemExit(0)
     t = Terminal()
     t.wait(lambda: 'All 1' in t.text(), 'initial carousel', 60)
     t.submit('ROOT_CONTEXT_CAFE_世界')
     t.wait(lambda: len(requests) >= 1 and 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root response')
     t.submit('/leaf fork original ForkOne')
-    t.wait(lambda: len(t.family()['members']) == 1, 'fork created', 75)
-    t.assert_view(t.family()['members'][0]['sessionId'], 'the fork', 75)
+    t.wait(lambda: len(t.leaves()) == 1, 'fork created', 75)
+    fork_id = t.leaves()[0]['sessionId']
+    t.assert_view(fork_id, 'the fork', 75)
     t.submit('FORK_ONLY_TASK')
     t.wait(lambda: len(requests) >= 2 and 'FIXTURE_REPLY_FORK_ONLY_TASK' in t.text(), 'fork response')
     assert 'ROOT_CONTEXT_CAFE_' in json.dumps(requests[-1]), 'Fork context missing'
     t.click('✎ Rename')
     t.wait(lambda: 'Session metadata' in t.text(), 'normal leaf rename field')
     t.proc.write('\x15'); t.pause(); t.proc.write('RenamedLeaf\r')
-    t.wait(lambda: t.family()['members'][0]['name'] == 'RenamedLeaf', 'leaf rename saved')
+    t.wait(lambda: t.leaves()[0]['name'] == 'RenamedLeaf', 'leaf rename saved')
     t.original()
     t.wait(lambda: 'session:' in t.text(), 'original restored')
     t.submit('/leaf new FreshOne')
-    t.wait(lambda: len(t.family()['members']) == 2, 'fresh leaf created', 75)
-    fresh = t.family()['members'][1]
+    t.wait(lambda: len(t.leaves()) == 2, 'fresh leaf created', 75)
+    fresh = t.leaves()[1]
     t.assert_view(fresh['sessionId'], 'the fresh leaf', 75)
     t.submit('FRESH_ONLY_TASK')
     t.wait(lambda: len(requests) >= 3 and 'FIXTURE_REPLY_FRESH_ONLY_TASK' in t.text(), 'fresh response')
@@ -749,11 +1080,13 @@ try:
     # which is the idle claim, and that it - not the root - is on screen.
     t.assert_view(fresh['sessionId'], 'the fresh leaf, idle before the wheel')
     t.pause(.5)
-    t.wheel('2 FreshOne', False)
-    t.assert_view(t.family()['members'][0]['sessionId'], 'the wheel target')
+    # The row label is `{number} {name}`, and the number is the family's own - it
+    # shifts when a member joins the list, so it is read rather than assumed.
+    t.wheel(f"{fresh['number']} {fresh['name']}", False)
+    t.assert_view(t.leaves()[0]['sessionId'], 'the wheel target')
     t.click('All 3', hold=True)
     t.wait(lambda: 'All sessions' in t.text(), 'hold expanded picker')
-    t.click('2 FreshOne [idle]')
+    t.click(f"{fresh['number']} {fresh['name']} [idle]")
     t.assert_view(fresh['sessionId'], 'the picker target')
     assert 'All sessions' not in t.text(), 'the picker stayed open after a selection'
     t.original()
@@ -762,25 +1095,57 @@ try:
     t.proc.write('\x15'); t.pause(); t.proc.write('RootRenamed\r')
     t.wait(lambda: 'Session metadata' not in t.text() and 'RootRenamed' in t.text(), 'root rename saved')
     t.pause(.5)
+    # Leave a quiet family behind. A member is its own process, and one that is
+    # still up when the window exits is detached and keeps serving its own
+    # address - so a resumed window finds it running and refuses to start a
+    # second copy of it, which is the rule and not what this step is about.
+    # Closing first is what makes the resumed window's own opening the subject.
+    for member in t.leaves():
+        t.submit('/leaf close ' + member['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 60)
     t.exit()
     resumed = Terminal(t.id)
-    resumed.wait(lambda: 'All 3' in resumed.text(), 'restored carousel', 45)
-    resumed.click('All 3')
-    resumed.click('1 RenamedLeaf [idle]')
-    resumed.wait(lambda: 'FORK_ONLY_TASK' in resumed.text(), 'restored leaf history')
+    # A window holds the leaves it started and nothing else: `status: open` is
+    # what a member was doing when it was last seen, not an instruction to boot.
+    # So the resumed session carries itself in the bar, and the family it reads
+    # back is the file - names, numbers and all.
+    resumed.wait(lambda: 'All 1' in resumed.text(), 'restored carousel', 45)
+    assert [item['name'] for item in resumed.leaves()] == ['RenamedLeaf', 'FreshOne'], 'the family was not restored from disk'
+    # The leaf's conversation is still reachable, by reopening it here: the member
+    # resumes its own transcript rather than being handed a new one. Reopening
+    # starts it without taking the screen, so it is then entered from the bar.
+    resumed.submit('/leaf reopen ' + fork_id)
+    resumed.wait(lambda: 'All 2' in resumed.text(), 'the restored leaf is open here', 75)
+    restored = resumed.leaves()[0]
+    resumed.click('All 2')
+    resumed.click(f"{restored['number']} {restored['name']} [idle]")
+    resumed.wait(lambda: 'FORK_ONLY_TASK' in resumed.text(), 'restored leaf history', 75)
     resumed.submit('/leaf')
     resumed.wait(lambda: 'Create a leaf' in resumed.text(), 'creation menu inside leaf')
-    resumed.proc.write('MenuFork'); resumed.pause()
-    resumed.click('Copy context')
-    resumed.wait(lambda: len(resumed.family()['members']) == 3, 'menu context fork', 75)
-    assert resumed.family()['members'][-1]['parentSessionId'] == resumed.family()['members'][0]['sessionId'], 'Menu fork ancestry'
-    resumed.assert_view(resumed.family()['members'][-1]['sessionId'], 'the menu context fork', 75)
+    resumed.pick('Create a leaf')
+    # The wizard opens on the conversation that is on screen and set to fork it,
+    # which is the point of reaching it from a leaf: the leaf you are looking at
+    # is what the next leaf copies. The name is typed into the row that already
+    # holds the keyboard, and the rows that are not typed into carry no number,
+    # so those are walked to.
+    resumed.wait(lambda: 'Start: Fork' in resumed.text(), 'the wizard forks what is on screen')
+    resumed.proc.write('MenuFork')
+    resumed.wait(lambda: '1. MenuFork' in resumed.text(), 'the name typed into the wizard')
+    resumed.pick_row('Create leaf —')
+    resumed.wait(lambda: len(resumed.leaves()) == 3, 'menu context fork', 75)
+    assert resumed.leaves()[-1]['parentSessionId'] == resumed.leaves()[0]['sessionId'], 'Menu fork ancestry'
+    assert resumed.leaves()[-1]['name'] == 'MenuFork', 'the wizard used the name it was given'
+    resumed.assert_view(resumed.leaves()[-1]['sessionId'], 'the menu context fork', 75)
     resumed.submit('/leaf')
     resumed.wait(lambda: 'Create a leaf' in resumed.text(), 'new-chat menu inside leaf')
-    resumed.proc.write('MenuFresh\r')
-    resumed.wait(lambda: len(resumed.family()['members']) == 4, 'menu fresh chat', 75)
-    resumed.assert_view(resumed.family()['members'][-1]['sessionId'], 'the menu fresh chat', 75)
-    assert resumed.family()['members'][-1]['forkMessageId'] is None, 'Menu new copied context'
+    resumed.pick('Create a leaf')
+    resumed.wait(lambda: 'Start: Fork' in resumed.text(), 'the wizard again')
+    resumed.pick_row('Start:')
+    resumed.wait(lambda: 'Start: New chat' in resumed.text(), 'the wizard set to a new chat')
+    resumed.pick_row('Create leaf —')
+    resumed.wait(lambda: len(resumed.leaves()) == 4, 'menu fresh chat', 75)
+    resumed.assert_view(resumed.leaves()[-1]['sessionId'], 'the menu fresh chat', 75)
+    assert resumed.leaves()[-1]['forkMessageId'] is None, 'Menu new copied context'
     print(json.dumps(dict(fullscreen=args.fullscreen, columns=args.columns, rows=args.rows, forkContext=True, freshIsolation=True, clickSwitch=True, wheelSwitch=True, holdPicker=True, rootRename=True, leafRename=True, restoredHistory=True, creationMenu=True, modelRequests=len(requests))), flush=True)
 finally:
     for gate in blocked_turns.values(): gate.set()

@@ -871,7 +871,22 @@ test('re-parenting moves the name and the aliases without touching numbering or 
     const before = await readLeafFamily(family, root)
     const titles = async (path: string) => (await readFile(path, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as { type: string; customTitle?: string }).filter(entry => entry.type === 'custom-title').map(entry => entry.customTitle)
 
-    assert.match(await workspace.reparentLeaf(member.sessionId), /^Leaf #2 Member is now the family parent/)
+    // A re-parent rewrites a title, and a title is an append to the target's own
+    // transcript - which a live session holds the writer lock for as long as it
+    // lives. The lock that refuses a rename must not refuse this, or no leaf that
+    // is up could ever be named the family's parent, which is the ordinary case.
+    const { lock } = await import('../src/utils/lockfile.ts')
+    const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+    process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+    await mkdir(join(directory, 'gateway-writers'), { recursive: true })
+    const writer = await lock(join(directory, 'gateway-writers', member.sessionId), { realpath: false, stale: 30000, retries: 0 })
+    try {
+      assert.match(await workspace.reparentLeaf(member.sessionId), /^Leaf #2 Member is now the family parent/)
+    } finally {
+      await writer()
+      if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+      else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    }
     // Only the displayed titles moved: the new parent's session reads as the
     // family, and the leaf that was the parent reads as a leaf of it.
     assert.equal(workspace.getLeafRootName(), 'Member', 'the family is named after the member that is the parent now')
@@ -939,6 +954,9 @@ test('a displaced host refuses management but keeps the terminals it already att
     })
     await mkdir(join(directory, 'leaf-families', 'index'), { recursive: true })
     await writeFile(claimPath, JSON.stringify(claim(first, 1, [sibling.sessionId])))
+    // A window that has never seen this family is what opens it here; the lease
+    // is module state, and the cases before this one took it.
+    workspace.clearFamilyHostClaimForTesting()
 
     // Opening the family takes the lease, and the member the previous host was
     // holding comes with it as an external one: it is still running there, and
@@ -987,6 +1005,51 @@ test('a displaced host refuses management but keeps the terminals it already att
       assert.equal(snapshots.at(-1)?.hostSessionId, second, 'the leaf is told which window manages its family now')
     } finally { unregister() }
   } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('reopening the family leaves the lease with the window that is holding it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-host-reopen-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  const workspace = await import('../src/utils/leafWorkspace.ts')
+  const root = getSessionId()
+  const family = join(directory, 'leaf-families', `${root}.json`)
+  const claimPath = join(directory, 'leaf-families', 'index', `${root}.host.json`)
+  const holder = randomUUID()
+  const writeClaim = (hostSessionId: string) => writeFile(claimPath, JSON.stringify({
+    familyId: root, hostSessionId, pid: process.pid,
+    processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    token: randomUUID(), generation: 1, openMemberIds: [],
+  }))
+  try {
+    await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Sibling', transcriptPath: join(directory, 'sibling.jsonl'), forkMessageId: randomUUID() })
+    await mkdir(join(directory, 'leaf-families', 'index'), { recursive: true })
+    await writeClaim(holder)
+    workspace.clearFamilyHostClaimForTesting()
+
+    // Opening the family is what takes the lease, so a window that has never seen
+    // it becomes the one that manages it - the most recently opened session wins.
+    await workspace.restoreLeafWorkspace()
+    assert.equal(workspace.isFamilyHost(), true, 'a window with no lease takes it by opening the family')
+
+    // Reading the family is not opening it. The roster is loaded again every time
+    // the menu is drawn, so a restore that took the family back would have two
+    // windows trade it on every repaint - and the one that manages it would be
+    // whichever asked last rather than the one opened last.
+    await writeClaim(holder)
+    await workspace.restoreLeafWorkspace()
+    assert.equal(workspace.isFamilyHost(), false, 'the window that holds it keeps it')
+    assert.equal(workspace.getFamilyHostSessionId(), holder, 'and is named as the manager')
+    assert.equal((JSON.parse(await readFile(claimPath, 'utf8')) as { hostSessionId: string }).hostSessionId, holder, 'the claim the holder wrote is left alone')
+    assert.deepEqual([...workspace.externallyHeldLeafIds()], [], 'a displaced window holds nothing it was not given')
+    assert.match(await workspace.listLeaves(), /Sibling/, 'and still renders the family it cannot manage')
+  } finally {
+    workspace.clearFamilyHostClaimForTesting()
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
     await rm(directory, { recursive: true, force: true })
