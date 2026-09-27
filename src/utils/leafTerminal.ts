@@ -10,6 +10,8 @@ export type LeafSnapshot = {
   rootName: string
   /** Which member is the family's parent now; the family id until one is designated. */
   parentSessionId: string
+  /** The session managing this family, so a leaf can tell when the family moved. */
+  hostSessionId: string
   members: { member: LeafMember; state: LeafProcessState }[]
 }
 export type LeafTerminalControl = { subtype: string; [key: string]: unknown }

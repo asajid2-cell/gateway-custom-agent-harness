@@ -16,6 +16,7 @@ import { LeafTakenError } from './leafChannel.js'
 import { leafColorEnv } from './leafColor.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
+import { isProcessRunning } from './genericProcessUtils.js'
 import { getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
@@ -197,7 +198,7 @@ function publish(): void {
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
   const root = familyRootSync()
-  const snapshot = { rootSessionId: root, rootName: getLeafRootName(), parentSessionId: getLeafParentSessionId(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const snapshot = { rootSessionId: root, rootName: getLeafRootName(), parentSessionId: getLeafParentSessionId(), hostSessionId: getFamilyHostSessionId(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
     if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
@@ -267,10 +268,13 @@ async function readLeafFamilyPointer(sessionId: string): Promise<LeafFamilyPoint
 
 /** Written like the family file itself: temp file, then a rename that Windows may refuse while a reader holds the target. */
 async function writeLeafFamilyPointer(sessionId: string, pointer: LeafFamilyPointer): Promise<void> {
+  await writeIndexFile(familyPointerPath(sessionId), pointer)
+}
+
+async function writeIndexFile(target: string, value: unknown): Promise<void> {
   await mkdir(familyIndexDir(), { recursive: true, mode: 0o700 })
-  const target = familyPointerPath(sessionId)
   const temporary = `${target}.${randomUUID()}.tmp`
-  await writeFile(temporary, JSON.stringify(pointer), { mode: 0o600 })
+  await writeFile(temporary, JSON.stringify(value), { mode: 0o600 })
   for (let attempt = 0; ; attempt++) {
     try { await rename(temporary, target); return }
     catch (error) {
@@ -282,6 +286,140 @@ async function writeLeafFamilyPointer(sessionId: string, pointer: LeafFamilyPoin
     }
   }
 }
+
+/**
+ * Which session manages this family, and what it holds open.
+ *
+ * One manager at a time: two windows both driving the family would each launch
+ * their own copy of the same leaf and only discover each other by colliding over
+ * it. The most recently opened session takes the lease - the person who just
+ * opened the family is the one looking at it - and the previous holder learns it
+ * was displaced the next time it reads the claim, rather than by failing
+ * mid-action.
+ *
+ * A pid alone cannot say whether the holder is still there: pids are recycled,
+ * so a dead host's claim would read as live. The process's own start time is
+ * recorded with it and compared where the platform can be asked cheaply, which
+ * is the same pair the peer roster uses. Nothing that matters rests on the
+ * answer - an inherited member is verified against its own endpoint before
+ * anything is launched - so a wrong answer costs a stale line in the menu.
+ */
+type LeafFamilyHostClaim = {
+  familyId: string
+  hostSessionId: string
+  pid: number
+  processStartedAt: string
+  token: string
+  generation: number
+  openMemberIds: string[]
+}
+
+function familyHostPath(familyId: string): string { return join(familyIndexDir(), `${familyId}.host.json`) }
+
+/** This process's own start, which is what a claim written here records. */
+const hostProcessStartedAt = new Date(Date.now() - process.uptime() * 1000).toISOString()
+
+let hostState: { forSession: string; familyId: string; token: string; generation: number; hostSessionId: string; displaced: boolean; external: string[] } | undefined
+
+async function readLeafFamilyHostClaim(familyId: string): Promise<LeafFamilyHostClaim | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(familyHostPath(familyId), 'utf8')) as LeafFamilyHostClaim
+    return parsed && typeof parsed.hostSessionId === 'string' && Number.isSafeInteger(parsed.generation) ? parsed : undefined
+  } catch { return undefined }
+}
+
+/**
+ * Whether the process that wrote a claim is still running.
+ *
+ * On Linux the process's start time is read from `/proc` and compared with the
+ * claim's, so a recycled pid is caught. Windows has no cheap equivalent, so only
+ * the pid is checked there - the limit the peer roster also has, and why the
+ * members themselves are verified rather than trusted.
+ */
+async function hostProcessAlive(claim: LeafFamilyHostClaim): Promise<boolean> {
+  if (!isProcessRunning(claim.pid)) return false
+  if (process.platform !== 'linux') return true
+  try {
+    const stat = await readFile(`/proc/${claim.pid}/stat`, 'utf8')
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+    const boot = (await readFile('/proc/stat', 'utf8')).split('\n').find(line => line.startsWith('btime '))?.split(' ')[1]
+    if (!boot) return true
+    return Math.abs(Number(boot) * 1000 + Number(fields[19]) * 10 - Date.parse(claim.processStartedAt)) < 2000
+  } catch { return true }
+}
+
+/**
+ * Take the family's lease, or renew the one this session already holds.
+ *
+ * A member the previous host had open is inherited rather than launched: it is
+ * still running in that window, and starting a second copy is the one thing a
+ * family must never do. An inherited member whose host is gone is not inherited
+ * at all - nothing is running to leave alone - so the new host is free to open it.
+ */
+async function claimFamilyHost(familyId: string): Promise<void> {
+  const self = getSessionId()
+  const previous = await readLeafFamilyHostClaim(familyId)
+  if (previous?.hostSessionId === self && hostState?.forSession === self && hostState.token === previous.token) {
+    hostState = { ...hostState, displaced: false }
+    await writeLeafFamilyHostClaim(familyId, { ...previous, pid: process.pid, processStartedAt: hostProcessStartedAt, openMemberIds: heldMemberIds(familyId) }).catch(() => {})
+    return
+  }
+  const inherited = previous && previous.hostSessionId !== self && await hostProcessAlive(previous) ? previous.openMemberIds : []
+  const token = randomUUID()
+  const generation = (previous?.generation ?? 0) + 1
+  hostState = { forSession: self, familyId, token, generation, hostSessionId: self, displaced: false, external: inherited }
+  await writeLeafFamilyHostClaim(familyId, {
+    familyId, hostSessionId: self, pid: process.pid, processStartedAt: hostProcessStartedAt, token, generation,
+    openMemberIds: [...new Set([...heldMemberIds(familyId), ...inherited])],
+  }).catch(() => {})
+}
+
+async function writeLeafFamilyHostClaim(familyId: string, claim: LeafFamilyHostClaim): Promise<void> {
+  await writeIndexFile(familyHostPath(familyId), claim)
+}
+
+/** The members this session has a live process for. */
+function heldMemberIds(familyId: string): string[] {
+  return [...views.values()].filter(view => view.rootSessionId === familyId && !['closed', 'failed'].includes(view.process.getState())).map(view => view.member.sessionId)
+}
+
+/** Re-read the lease, so a host that was displaced learns it before its next action. */
+async function refreshFamilyHost(familyId: string): Promise<void> {
+  const self = getSessionId()
+  if (hostState?.forSession !== self || hostState.familyId !== familyId) return
+  const claim = await readLeafFamilyHostClaim(familyId)
+  // An absent claim is not a rival: it is the file this window itself wrote, gone
+  // for whatever reason, and nobody else is holding the family. Reading that as a
+  // takeover would refuse this window the family it is the only manager of.
+  const displaced = claim !== undefined && claim.hostSessionId !== self
+  const hostSessionId = displaced ? claim!.hostSessionId : self
+  if (hostState.displaced === displaced && hostState.hostSessionId === hostSessionId) return
+  hostState.displaced = displaced
+  hostState.hostSessionId = hostSessionId
+  // The leaves already attached learn the family moved the moment this window
+  // does, rather than at whatever unrelated repaint comes next.
+  publish()
+}
+
+/**
+ * The manage-the-family gate.
+ *
+ * A displaced session keeps the terminals it already attached and can still talk
+ * to them; what it must not do is drive the family, because the window that took
+ * the lease is the one holding it. Refusing here is what stops two windows from
+ * opening the same leaf twice.
+ */
+async function requireFamilyHost(familyId: string): Promise<void> {
+  await refreshFamilyHost(familyId)
+  if (hostState?.forSession === getSessionId() && hostState.displaced) throw new Error(`The family moved to another window (${hostState.hostSessionId}); it manages the leaves now`)
+}
+
+/** Whether this session is the one managing the family it is in. */
+export function isFamilyHost(): boolean { return !hostState || hostState.forSession !== getSessionId() || !hostState.displaced }
+/** The session managing this family: this one, or the window it moved to. */
+export function getFamilyHostSessionId(): string { return hostState?.forSession === getSessionId() ? hostState.hostSessionId : getSessionId() }
+/** Members another window is holding open, which this one must not start again. */
+export function externallyHeldLeafIds(): readonly string[] { return hostState?.forSession === getSessionId() ? hostState.external : [] }
 
 /**
  * Which member is the family's parent.
@@ -723,6 +861,7 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
     if (!member) throw new Error('Unknown or ambiguous leaf reference')
     return requestLeafWorkspace<string>('configure', [member.sessionId, patch])
   }
+  await requireFamilyHost(await familyRootSessionId())
   const { member, view } = await requireLeafView(reference)
   if (view.process.getState() !== 'idle') throw new Error('Leaf must be idle before its settings change')
   if (patch.model !== undefined) await view.process.setModel(patch.model)
@@ -752,6 +891,7 @@ export async function returnLeafContext(reference: string, text: string): Promis
   const member = await resolveLeafRef(reference)
   if (!member) throw new Error('Unknown or ambiguous leaf reference')
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('return', [member.sessionId, text])
+  await requireFamilyHost(await familyRootSessionId())
   if (!contextReturn) throw new Error('The family parent is unavailable')
   return contextReturn(member.sessionId, text)
 }
@@ -1150,6 +1290,7 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   }
   const self = getSessionId()
   const root = await familyRootSessionId()
+  await requireFamilyHost(root)
   // The designation is read here, not only in the roster: a new leaf is created
   // relative to whichever member is the family's parent right now.
   await refreshDesignatedParent()
@@ -1251,6 +1392,9 @@ export async function restoreLeafWorkspace(): Promise<void> {
   // read: nothing new, unless the roster grew while it was hosting.
   await indexLeafMembers(root, members)
   await claimHostOwnership()
+  // Opening the family is what takes its lease: the session looking at it is
+  // the one that manages it, and any window that had it becomes a follower.
+  await claimFamilyHost(root)
   publish()
 }
 
@@ -1284,6 +1428,7 @@ export async function openLeafOnce(reference: string): Promise<string> {
   if (!member) throw new Error('Unknown or ambiguous leaf reference')
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('open-once', [member.sessionId])
   const root = familyRootSync()
+  await requireFamilyHost(root)
   await launch(member, root)
   if (familyRootSync() === root) selectLeaf(member.sessionId)
   return `${memberLabel(member)} opened. It stays in the archive; close it and it is filed away again.`
@@ -1306,6 +1451,7 @@ export async function reviveLeaf(reference: string): Promise<string> {
 export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMember>, 'name' | 'status'>): Promise<void> {
   if (isInteractiveLeaf()) return requestLeafWorkspace('change', [sessionId, patch])
   const root = await familyRootSessionId()
+  await requireFamilyHost(root)
   // A rename of the parent renames the family, so the designation is re-read
   // before and after: the name this session publishes is never a stale one.
   await refreshDesignatedParent()
@@ -1359,6 +1505,7 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
   const normalized = recursivelySanitizeUnicode(tag).trim()
   if (!normalized || normalized.length > 200) throw new Error('Tag must contain 1–200 characters')
   const root = await familyRootSessionId()
+  await requireFamilyHost(root)
   const family = await readLeafFamily(familyPath(root), root)
   const member = family.members.find(item => item.sessionId === sessionId)
   if (!member) throw new Error('Unknown leaf')
@@ -1406,6 +1553,7 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
 export async function reparentLeaf(sessionId: string): Promise<string> {
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('reparent', [sessionId])
   const root = await familyRootSessionId()
+  await requireFamilyHost(root)
   const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
   const target = members.find(member => member.sessionId === sessionId)
   if (!target) throw new Error('Unknown leaf')
@@ -1444,6 +1592,7 @@ export async function setLeafGoal(sessionId: string, args: string): Promise<stri
   const parsed = parsePersistArgs(args)
   if (parsed.kind === 'error') throw new Error(parsed.message)
   const root = await familyRootSessionId()
+  await requireFamilyHost(root)
   const family = await readLeafFamily(familyPath(root), root)
   const member = family.members.find(item => item.sessionId === sessionId)
   if (!member) throw new Error('Unknown leaf')

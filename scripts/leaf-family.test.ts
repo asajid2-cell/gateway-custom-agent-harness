@@ -1,7 +1,7 @@
 import { test, after } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { addLeafMember, ensureCreatorMember, readLeafFamily, updateLeafMember, recordLeafContextReturn } from '../src/utils/leafFamily.ts'
@@ -910,6 +910,82 @@ test('re-parenting moves the name and the aliases without touching numbering or 
       switchSession(asSessionId(root), projectDir, resumeDirectory)
       workspace.forgetLeafFamilyRoot()
     }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a displaced host refuses management but keeps the terminals it already attached', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-host-handoff-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const claimPath = join(directory, 'leaf-families', 'index', `${root}.host.json`)
+    const sibling = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Sibling', transcriptPath: join(directory, 'sibling.jsonl'), forkMessageId: randomUUID() })
+    // A window opened this family first and is holding one of its leaves. The
+    // claim names this process as its pid, so the previous host reads as alive
+    // and the member it was holding is inherited rather than started again.
+    const first = randomUUID()
+    const claim = (hostSessionId: string, generation: number, openMemberIds: string[]) => ({
+      familyId: root, hostSessionId, pid: process.pid,
+      processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      token: randomUUID(), generation, openMemberIds,
+    })
+    await mkdir(join(directory, 'leaf-families', 'index'), { recursive: true })
+    await writeFile(claimPath, JSON.stringify(claim(first, 1, [sibling.sessionId])))
+
+    // Opening the family takes the lease, and the member the previous host was
+    // holding comes with it as an external one: it is still running there, and
+    // starting a second copy is the one thing a family must never do.
+    await workspace.restoreLeafWorkspace()
+    assert.equal(workspace.isFamilyHost(), true, 'the window that opened the family manages it')
+    assert.equal(workspace.getFamilyHostSessionId(), root, 'and names itself as the manager')
+    assert.deepEqual([...workspace.externallyHeldLeafIds()], [sibling.sessionId], 'the members the window it took over from is holding are reported as open there')
+
+    // The terminal this window attached before the handoff is its own.
+    const { leaf, sent } = parkedLeaf()
+    const snapshots: { hostSessionId?: string }[] = []
+    ;(leaf as unknown as { snapshot: (value: unknown) => void }).snapshot = value => { snapshots.push(value as never) }
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: sibling as never, process: leaf as never, draft: '' })
+    try {
+      // Another window opens the family, which is the whole of a handoff: the
+      // most recently opened session is the one that manages it.
+      const second = randomUUID()
+      await writeFile(claimPath, JSON.stringify(claim(second, 2, [sibling.sessionId])))
+
+      // Managing is refused, and refused before anything is written or started.
+      const acts = [
+        ['rename', () => workspace.changeLeaf(sibling.sessionId, { name: 'Renamed' })],
+        ['close', () => workspace.changeLeaf(sibling.sessionId, { status: 'closed' })],
+        ['archive', () => workspace.fileLeaf(sibling.sessionId, 'tag')],
+        ['create', () => workspace.createLeaf('Another')],
+        ['reparent', () => workspace.reparentLeaf(sibling.sessionId)],
+        ['settings', () => workspace.configureLeaf(sibling.sessionId, { effort: 'low' })],
+      ] as const
+      for (const [what, act] of acts) {
+        await assert.rejects(act(), /The family moved to another window/, `${what} must be refused in a window that no longer manages the family`)
+      }
+      assert.equal(workspace.isFamilyHost(), false, 'the window reports itself displaced')
+      assert.equal(workspace.getFamilyHostSessionId(), second, 'and names the window that manages the family now')
+      // Reading the family is not managing it, so a displaced window still renders.
+      assert.match(await workspace.listLeaves(), /Sibling/)
+      assert.match(await workspace.familyRoster(), new RegExp(`^family ${root}$`, 'm'))
+
+      // The terminals already attached are not taken away by the handoff: the
+      // view survives and the leaf still takes a message from this window.
+      assert.deepEqual(workspace.getLeafViews().map(view => view.member.sessionId), [sibling.sessionId], 'the attached terminal is not torn down')
+      assert.match(await workspace.sendLeafMessage('Sibling', 'PING'), /Delivered to Leaf #1 Sibling/)
+      assert.deepEqual(sent.map(item => item.prompt), [`${workspace.PEER_PROMPT_PREFIX}PING`], 'the message reaches the leaf it was already attached to')
+      // A leaf learns the family moved from the snapshot, and the repaint happens
+      // with the refusal rather than at whatever unrelated repaint comes next.
+      assert.equal(snapshots.at(-1)?.hostSessionId, second, 'the leaf is told which window manages its family now')
+    } finally { unregister() }
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved

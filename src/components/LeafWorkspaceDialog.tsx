@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, isFamilyHost, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -141,27 +141,36 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
     const parentId = getLeafParentSessionId()
+    // Displaced, this is a roster and nothing else: the rows that manage leaves
+    // belong to the window holding the lease, and offering them here only
+    // produced a refusal after the fact.
     const options = [
-      ...open.map(member => ({
-        value: `open:${member.sessionId}`,
-        label: `Open  #${member.number} ${member.name}`,
-        description: `${member.status}${member.model ? ` · ${member.model}` : ''}${member.effort ? ` · ${member.effort}` : ''}`,
-      })),
-      ...open.map(member => ({
-        value: `close:${member.sessionId}`,
-        label: `Close #${member.number} ${member.name}`,
-        description: 'Stop its process; the transcript and its place in the family are kept',
-      })),
-      ...open.map(member => ({
-        value: `archive:${member.sessionId}`,
-        label: `Archive #${member.number} ${member.name}`,
-        description: 'Detach it from this family and hide it from this menu; the transcript is kept',
-      })),
-      ...open.filter(member => member.sessionId !== parentId).map(member => ({
-        value: `parent:${member.sessionId}`,
-        label: `Make parent #${member.number} ${member.name}`,
-        description: 'The family takes this member’s name; the member that is the parent now becomes a leaf',
-      })),
+      ...(!isFamilyHost() ? open.map(member => ({
+        value: `member:${member.sessionId}`,
+        label: `#${member.number} ${member.name}`,
+        description: `${member.status}${externallyHeldLeafIds().includes(member.sessionId) ? ' · open in the window that manages it' : ''}`,
+      })) : [
+        ...open.map(member => ({
+          value: `open:${member.sessionId}`,
+          label: `Open  #${member.number} ${member.name}`,
+          description: `${member.status}${member.model ? ` · ${member.model}` : ''}${member.effort ? ` · ${member.effort}` : ''}`,
+        })),
+        ...open.map(member => ({
+          value: `close:${member.sessionId}`,
+          label: `Close #${member.number} ${member.name}`,
+          description: 'Stop its process; the transcript and its place in the family are kept',
+        })),
+        ...open.map(member => ({
+          value: `archive:${member.sessionId}`,
+          label: `Archive #${member.number} ${member.name}`,
+          description: 'Detach it from this family and hide it from this menu; the transcript is kept',
+        })),
+        ...open.filter(member => member.sessionId !== parentId).map(member => ({
+          value: `parent:${member.sessionId}`,
+          label: `Make parent #${member.number} ${member.name}`,
+          description: 'The family takes this member’s name; the member that is the parent now becomes a leaf',
+        })),
+      ]),
       ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
@@ -176,6 +185,8 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         const id = value.slice(value.indexOf(':') + 1)
         const member = members?.find(item => item.sessionId === id)
         const action = value.slice(0, value.indexOf(':'))
+        // A roster row in a window that was displaced is a label, not a verb.
+        if (action === 'member') { setNotice(`${describeSession(member)} is managed in the window the family moved to.`); return }
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
@@ -199,27 +210,29 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   if (screen === 'archives') {
     const archived = members?.filter(member => member.status === 'archived') ?? []
     const running = new Set(getLeafViews().map(view => view.member.sessionId))
+    // Reading an archived conversation is not managing the family, so it stays
+    // available to a displaced window; reviving and running one do not.
     const options = [
-      ...archived.map(member => ({
+      ...(isFamilyHost() ? archived.map(member => ({
         value: `revive:${member.sessionId}`,
         label: `Revive #${member.number} ${member.name}`,
         description: 'Put it back in the leaf list; it stays closed until you open it',
-      })),
-      ...archived.map(member => ({
+      })) : []),
+      ...(isFamilyHost() ? archived.map(member => ({
         value: `open-once:${member.sessionId}`,
         label: `Open once #${member.number} ${member.name}`,
         description: 'Run it now, then file it away again when you close it',
-      })),
+      })) : []),
       ...archived.map(member => ({
         value: `view:${member.sessionId}`,
         label: `View #${member.number} ${member.name}`,
         description: 'Read the saved conversation; nothing is started',
       })),
-      ...archived.filter(member => running.has(member.sessionId)).map(member => ({
+      ...(isFamilyHost() ? archived.filter(member => running.has(member.sessionId)).map(member => ({
         value: `close:${member.sessionId}`,
         label: `Close #${member.number} ${member.name}`,
         description: 'Stop the process it is running now; it stays archived',
-      })),
+      })) : []),
       ...(archived.length === 0 ? [{ value: 'empty', label: 'Nothing is archived', description: 'Leaves you archive are filed here' }] : []),
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
     ]
@@ -270,16 +283,22 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // With nothing selected the source is the session asking, which is not always
   // the family's parent - a member hosting the family forks itself.
   const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafHostName()
+  // One window manages a family at a time. This one is a window onto it: it can
+  // still use the terminals it has attached, but starting or changing leaves
+  // belongs to the session that took the lease.
+  const displaced = !isFamilyHost()
   const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
-    { value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' },
-    { value: 'list', label: 'Leaves in this family', description: members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
-    { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'leaves you archive are filed here') },
+    ...(displaced ? [] : [{ value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' }]),
+    { value: 'list', label: 'Leaves in this family', description: displaced ? 'Read-only: another window manages them now' : members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
+    { value: 'archives', label: 'Archived leaves', description: describeArchives(members, displaced ? 'filed away' : 'leaves you archive are filed here') },
     { value: 'exit', label: 'Cancel', description: 'Leave the leaf workspace' },
   ]
   return <Box flexDirection="column">
     <Text bold>Leaves</Text>
     <Text dimColor>Each leaf is a full independent session. They share your files unless you point one at a separate worktree.</Text>
-    <Text dimColor>Nothing starts until you open it. Creating a leaf forks the session you are looking at: {sourceName}.</Text>
+    {displaced
+      ? <Text dimColor>The family moved to the window opened most recently ({getFamilyHostSessionId()}), which manages its leaves now. The terminals you already have stay yours to use.</Text>
+      : <Text dimColor>Nothing starts until you open it. Creating a leaf forks the session you are looking at: {sourceName}.</Text>}
     <Select options={options} visibleOptionCount={6} onCancel={() => onDone()} onChange={(value: string) => {
       if (value === 'exit') { onDone(); return }
       if (value === 'list') { setScreen('list'); return }
