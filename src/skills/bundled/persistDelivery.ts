@@ -25,14 +25,24 @@ const fields = ['outcome', 'doneWhen', 'next', 'deferred', 'evidence'] as const
 export function parseDeliveryReview(input: string): DeliveryReview {
   if (input.length > 16000) throw new Error('Delivery review is too large.')
   const value = JSON.parse(input)
+  // A missing kind, or the skill's own word "checkpoint" left in its place, is
+  // the most conservative review there is, and validateDeliveryCheckpoint
+  // already reads an absent kind as "advanced" when it restores one - so a
+  // review that survives a resume must not be refused live. Guessing "delivered"
+  // here would be the unsafe direction: it clears the trajectory counters and
+  // permits a phase advance, which is the one thing a review should have to say
+  // explicitly.
+  const kind = value && typeof value === 'object' && (value.kind === undefined || value.kind === 'checkpoint')
+    ? 'advanced'
+    : value?.kind
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
-      !['advanced', 'learned', 'delivered', 'detoured'].includes(value.kind) ||
+      !['advanced', 'learned', 'delivered', 'detoured'].includes(kind) ||
       !phases.includes(value.phase)) throw new Error('Invalid delivery review kind or phase.')
   for (const field of fields) {
     if (typeof value[field] !== 'string' || value[field].length > 1200 ||
         (field !== 'deferred' && !value[field].trim())) throw new Error(`Invalid delivery field: ${field}.`)
   }
-  return { kind: value.kind, phase: value.phase, ...Object.fromEntries(fields.map(field => [field, value[field].trim()])) } as DeliveryReview
+  return { kind, phase: value.phase, ...Object.fromEntries(fields.map(field => [field, value[field].trim()])) } as DeliveryReview
 }
 
 export function validateDeliveryCheckpoint(value: unknown): DeliveryCheckpoint | undefined {

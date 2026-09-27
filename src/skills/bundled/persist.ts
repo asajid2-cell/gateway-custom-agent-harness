@@ -768,13 +768,46 @@ export async function settlePersistDelivery(sessionId: string, chainId: string |
   })
 }
 
+type PersistReviewVerb = 'checkpoint' | 'continue' | 'unrelated' | 'blocked' | 'complete'
+
+/**
+ * Read a goal review the way the skill teaches it, not the way the parser wanted
+ * it. The description tells a session to "use checkpoint JSON: {…}" and that a
+ * blocked review "must be JSON {kind:'blocked',…}", so sending the JSON alone is
+ * the advertised form - but the parser demanded `verb + space + payload`, and
+ * when that failed it answered "requires an active main-session goal". A session
+ * that had just been told it could not close its goal read that as "there is
+ * nothing left to close", stopped in prose, and left the goal armed, so the
+ * heartbeat kept asking. Nineteen reviews in one session failed this way. The
+ * payload's own kind names the verb, and `checkpoint: {…}` is accepted too.
+ */
+function readPersistReview(args: string): { verb: PersistReviewVerb; payload: string } | undefined {
+  const input = args.trim()
+  if (!input) return undefined
+  const explicit = input.match(/^(checkpoint|continue|unrelated|blocked|complete)\b\s*:?\s*([\s\S]*)$/)
+  if (explicit) return { verb: explicit[1] as PersistReviewVerb, payload: explicit[2]!.trim() }
+  if (!input.startsWith('{')) return undefined
+  let kind: unknown
+  try {
+    const value: unknown = JSON.parse(input)
+    kind = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).kind : undefined
+  } catch {
+    // Malformed JSON is still a checkpoint attempt: hand it to the checkpoint
+    // branch so the refusal carries the parser's own reason.
+    return { verb: 'checkpoint', payload: input }
+  }
+  if (kind === 'blocked') return { verb: 'blocked', payload: input }
+  if (kind === 'complete') return { verb: 'complete', payload: input }
+  return { verb: 'checkpoint', payload: input }
+}
+
 export function registerPersistSkill(): void {
   registerBundledSkill({
     name: 'persist-review',
-    description: `At meaningful checkpoints or attempted stops use checkpoint JSON: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}. All other fields are strings. delivered means a milestone, not goal completion. Alternatively use continue, unrelated, blocked, or complete followed by evidence. ${TASK_BLOCKER_REVIEW_GUIDANCE} Do not review after every edit.`,
+    description: `At meaningful checkpoints or attempted stops send checkpoint JSON on its own: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}. All other fields are strings. delivered means a milestone, not goal completion. Alternatively use continue, unrelated, blocked, or complete followed by evidence. A review that is refused changes nothing and leaves the goal active, so correct it and resend rather than stopping. ${TASK_BLOCKER_REVIEW_GUIDANCE} Do not review after every edit.`,
     userInvocable: true,
     async getPromptForCommand(args, context) {
-      const match = args.trim().match(/^(checkpoint|continue|unrelated|blocked|complete)\s+([\s\S]+)$/)
+      const review = readPersistReview(args)
       const sessionId = getSessionId()
       const reviewTranscriptPath = getRuntimeTranscriptPath(context)
       const reviewedGoal = persistRecords.get(sessionId)
@@ -784,34 +817,56 @@ export function registerPersistSkill(): void {
         return [{ type: 'text', text: 'Goal changed before review; review the current goal instead.' }]
       }
       let runtime = persistRuntime.get(sessionId)
-      if (!context.agentId && !runtime && match?.[2]?.trim() && context.queryTracking?.chainId) {
+      if (!context.agentId && !runtime && review && context.queryTracking?.chainId) {
         const record = persistRecords.get(sessionId)
-        if (record?.status === 'exhausted' && (match[1] === 'complete' || match[1] === 'blocked')) {
+        if (record?.status === 'exhausted' && (review.verb === 'complete' || review.verb === 'blocked')) {
           await installPersistRuntime(record, sessionId, context.setAppState, reviewTranscriptPath)
           runtime = persistRuntime.get(sessionId)
         }
       }
-      if (context.agentId || !runtime || !match || !match[2]?.trim() || !context.queryTracking?.chainId) {
+      if (context.agentId || !runtime || !context.queryTracking?.chainId) {
         return [{ type: 'text', text: 'Goal review requires an active main-session goal, query identity, outcome and evidence.' }]
       }
-      let delivery = runtime.state.delivery
-      if (match[1] === 'checkpoint') {
-        try {
-          delivery = advanceDelivery(delivery, parseDeliveryReview(match[2]!))
-        } catch {
-          return [{ type: 'text', text: 'Invalid checkpoint. Supply JSON with kind (advanced|learned|delivered|detoured), phase (implement|integrate|harden), outcome, doneWhen, next, deferred, evidence. Keep outcome and doneWhen until delivered; advance at most one phase on delivery. No continuation authorized.' }]
-        }
-      } else if (match[1] === 'continue' && delivery) {
-        delivery = advanceDelivery(delivery, { ...delivery, kind: 'advanced', evidence: match[2]!.trim().slice(0, 1200) })
+      // An empty or unreadable invocation needs its own answer, and it must
+      // describe the real state. Reporting "no active goal" here read as "there
+      // is nothing left to close", so a session that concluded it had stopped
+      // still left the goal armed and the heartbeat kept asking. A goal is
+      // active at this point, so say so and name the call that closes or parks
+      // it - and the JSON-on-its-own form the description teaches.
+      if (!review || !review.payload) {
+        return [{
+          type: 'text',
+          text: `No review was recorded, and the goal is still active, so the heartbeat keeps asking. Send the review as JSON on its own: {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence} to continue, persist-review complete <concrete evidence> once the doneWhen condition is met to close it, or persist-review blocked {json} to park it. ${TASK_BLOCKER_REVIEW_GUIDANCE}`,
+        }]
       }
-      const reviewedState = { ...runtime.state, delivery, reviewEvidence: match[2]!.trim().slice(0, 8000) }
+      let delivery = runtime.state.delivery
+      if (review.verb === 'checkpoint') {
+        try {
+          delivery = advanceDelivery(delivery, parseDeliveryReview(review.payload))
+        } catch (error) {
+          // Report the real reason. A blanket message made a malformed field, a
+          // drifted outcome and an illegal phase jump indistinguishable, and its
+          // "No continuation authorized." tail read as an instruction to stop -
+          // so a session quoted it, declared itself paused, and left the goal
+          // active, which is a heartbeat that answers itself forever. The
+          // refusal changes no state, so say that too and name the real exits.
+          const reason = (error instanceof Error ? error.message.replace(/\s+/g, ' ').trim() : '').replace(/\.$/, '').slice(0, 300)
+          return [{
+            type: 'text',
+            text: `Checkpoint refused: ${reason || 'the review JSON did not validate'}. Supply {kind: advanced|learned|delivered|detoured, phase: implement|integrate|harden, outcome, doneWhen, next, deferred, evidence}; keep outcome and doneWhen until delivered, and advance at most one phase on delivery. Nothing was recorded and the goal remains active, so the heartbeat will ask again. Correct the JSON and resend it, close the goal with persist-review complete <concrete evidence>, or park it with persist-review blocked {json} if progress is genuinely impossible.`,
+          }]
+        }
+      } else if (review.verb === 'continue' && delivery) {
+        delivery = advanceDelivery(delivery, { ...delivery, kind: 'advanced', evidence: review.payload.trim().slice(0, 1200) })
+      }
+      const reviewedState = { ...runtime.state, delivery, reviewEvidence: review.payload.trim().slice(0, 8000) }
       await queuePersistWrite(sessionId, recordFromState(reviewedState), runtime.transcriptPath)
       if (persistRuntime.get(sessionId) !== runtime || getSessionId() !== sessionId) {
         return [{ type: 'text', text: 'Session or goal changed during review; no continuation authorized.' }]
       }
       runtime.state = reviewedState
       cacheState(sessionId, reviewedState)
-      if (match[1] === 'complete') {
+      if (review.verb === 'complete') {
         if (getTaskMode(runtime.state) === 'task' && !runtime.state.delivery) {
           return [{
             type: 'text',
@@ -820,9 +875,9 @@ export function registerPersistSkill(): void {
         }
         return [{ type: 'text', text: await completePersist(sessionId, runtime.transcriptPath) }]
       }
-      if (match[1] === 'blocked') {
+      if (review.verb === 'blocked') {
         if (getTaskMode(runtime.state) === 'task') {
-          const blocker = parseTaskBlocker(match[2]!)
+          const blocker = parseTaskBlocker(review.payload)
           if (!blocker) {
             return [{ type: 'text', text: `Task mode remains active. ${TASK_BLOCKER_REVIEW_GUIDANCE}` }]
           }
@@ -836,8 +891,8 @@ export function registerPersistSkill(): void {
         return [{ type: 'text', text: 'Goal blocked and retained. Use /persist resume when the blocker is resolved.' }]
       }
       runtime.reviewedChain = context.queryTracking.chainId
-      runtime.reviewOutcome = match[1] === 'checkpoint' ? 'continue' : match[1] as 'continue' | 'unrelated' | 'blocked'
-      return [{ type: 'text' as const, text: `Goal review recorded: ${match[1]}. Original goal retained.` }]
+      runtime.reviewOutcome = review.verb === 'checkpoint' ? 'continue' : review.verb as 'continue' | 'unrelated' | 'blocked'
+      return [{ type: 'text' as const, text: `Goal review recorded: ${review.verb}. Original goal retained.` }]
       })
     },
   })

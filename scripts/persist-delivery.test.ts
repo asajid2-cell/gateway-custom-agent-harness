@@ -63,7 +63,13 @@ test('registered checkpoints survive restore and redirect without exhausting kee
     assert.match(getPersistGoalContext()!, /TRAJECTORY CORRECTION/)
     assert.match(getPersistGoalContext()!, /GUI-independent operations/)
     const invalid = await checkpoint.getPromptForCommand(`checkpoint ${JSON.stringify({ ...review, outcome: 'unrelated polish' })}`, context)
-    assert.match(invalid[0].type === 'text' ? invalid[0].text : '', /Invalid checkpoint/)
+    const refusal = invalid[0].type === 'text' ? invalid[0].text : ''
+    // The refusal carries the drift rule that caught it rather than a blanket
+    // message. The old tail said "No continuation authorized.", which a session
+    // quoted back as an instruction to stop while the goal stayed armed.
+    assert.match(refusal, /Checkpoint refused/)
+    assert.match(refusal, /Keep the selected outcome and acceptance condition/)
+    assert.doesNotMatch(refusal, /No continuation authorized/)
     assert.deepEqual(await readPersistSessionRecord(path), stored)
     await checkpoint.getPromptForCommand(`checkpoint ${JSON.stringify({ ...review, kind: 'delivered', phase: 'integrate' })}`, context)
     assert.equal((await readPersistSessionRecord(path))?.status, 'active')

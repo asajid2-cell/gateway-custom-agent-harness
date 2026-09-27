@@ -449,3 +449,130 @@ test('a leaf holds, injects, and restores its own durable goal', async t => {
   assert.equal(ordinary.getHooks().length, 1)
   assert.match(getPersistGoalContext() ?? '', /finish the leaf work/)
 })
+
+/**
+ * The description tells a session to "send checkpoint JSON on its own" and that
+ * a blocked review "must be JSON {kind:'blocked',…}", so the JSON alone is the
+ * advertised form. The parser demanded `verb + space + payload` and answered a
+ * verb-less review with "requires an active main-session goal", which in one
+ * recorded session happened nineteen times and left a session convinced it had
+ * nothing left to close while the heartbeat kept asking.
+ */
+test('a review sent as JSON on its own is recorded, not refused', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-review-bare-json-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const context = {
+    setAppState: harness.setAppState,
+    transcriptPath: path,
+    queryTracking: { chainId: 'review-bare', depth: 1, stopHookActive: true },
+  } as unknown as ToolUseContext
+  await harness.command.getPromptForCommand('task finish the connected workflow', context)
+
+  const recorded = await harness.review.getPromptForCommand(
+    JSON.stringify({ kind: 'advanced', phase: 'implement', outcome: 'the first outcome', doneWhen: 'the end-to-end journey runs', next: 'connect the second half', deferred: 'none', evidence: 'a test passed' }),
+    context,
+  )
+  assert.match(recorded[0]?.type === 'text' ? recorded[0].text : '', /Goal review recorded: checkpoint/)
+
+  // The same payload with no verb also carries a blocker, which is the review a
+  // session makes when it believes it must stop.
+  const parked = await harness.review.getPromptForCommand(
+    JSON.stringify({ kind: 'blocked', blocker: 'user-input', canProceedWithoutUser: false, next: 'Ask the user to authorize continuation', evidence: 'The user has not authorized further work.' }),
+    context,
+  )
+  assert.match(parked[0]?.type === 'text' ? parked[0].text : '', /blocked and retained/i)
+  assert.equal((await readPersistSessionRecord(path))?.status, 'blocked')
+  assert.equal(harness.getHooks().length, 0)
+})
+
+test('a checkpoint that omits its kind is read as the conservative one, not refused', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-review-kind-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const context = {
+    setAppState: harness.setAppState,
+    transcriptPath: path,
+    queryTracking: { chainId: 'review-kind', depth: 1, stopHookActive: true },
+  } as unknown as ToolUseContext
+  await harness.command.getPromptForCommand('task finish the connected workflow', context)
+
+  // validateDeliveryCheckpoint already reads an absent kind as "advanced" when
+  // it restores a checkpoint, so refusing the same review live was a resume-only
+  // acceptance. Guessing "delivered" instead would clear the trajectory counters
+  // and permit a phase advance, so pin the conservative reading: an "advanced"
+  // review is the one that increments reviewsSinceDelivery.
+  const recorded = await harness.review.getPromptForCommand(
+    '{"phase":"implement","outcome":"the first outcome","doneWhen":"the end-to-end journey runs","next":"connect the second half","deferred":"none","evidence":"a test passed"}',
+    context,
+  )
+  assert.match(recorded[0]?.type === 'text' ? recorded[0].text : '', /Goal review recorded: checkpoint/)
+  await drainPersistWrites()
+  const delivery = (await readPersistSessionRecord(path))?.delivery
+  assert.equal(delivery?.reviewsSinceDelivery, 1)
+  assert.equal(delivery?.detours, 0)
+  assert.equal(delivery?.outcome, 'the first outcome')
+})
+
+test('a refused checkpoint names the reason and leaves the goal armed', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-review-refusal-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const context = {
+    setAppState: harness.setAppState,
+    transcriptPath: path,
+    queryTracking: { chainId: 'review-refusal', depth: 1, stopHookActive: true },
+  } as unknown as ToolUseContext
+  await harness.command.getPromptForCommand('task finish the connected workflow', context)
+  await harness.review.getPromptForCommand(
+    '{"kind":"advanced","phase":"implement","outcome":"the first outcome","doneWhen":"the end-to-end journey runs","next":"connect the second half","deferred":"none","evidence":"a test passed"}',
+    context,
+  )
+
+  // A second review that rewrites the outcome while it is still undelivered is
+  // the drift the delivery rules exist to catch. The refusal must carry the real
+  // reason and must not contain a phrase a session can quote as an instruction
+  // to stop - the old tail read "No continuation authorized.", and the session
+  // that quoted it stopped in prose with the goal still armed.
+  const refused = await harness.review.getPromptForCommand(
+    '{"kind":"advanced","phase":"implement","outcome":"a different outcome entirely","doneWhen":"the end-to-end journey runs","next":"connect the second half","deferred":"none","evidence":"a test passed"}',
+    context,
+  )
+  const text = refused[0]?.type === 'text' ? refused[0].text : ''
+  assert.match(text, /Keep the selected outcome and acceptance condition/)
+  assert.match(text, /remains active/)
+  assert.match(text, /persist-review blocked/)
+  assert.doesNotMatch(text, /No continuation authorized/)
+  assert.equal((await readPersistSessionRecord(path))?.status, 'active')
+  assert.equal(harness.getHooks().length, 1)
+})
+
+test('an argument-less review reports the goal as active and names the call', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-review-empty-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const context = {
+    setAppState: harness.setAppState,
+    transcriptPath: path,
+    queryTracking: { chainId: 'review-empty', depth: 1, stopHookActive: true },
+  } as unknown as ToolUseContext
+  await harness.command.getPromptForCommand('task finish the connected workflow', context)
+
+  // "requires an active main-session goal" was false here and read as "there is
+  // nothing left to close". The goal is active, so say that and name the exits.
+  const empty = await harness.review.getPromptForCommand('', context)
+  const text = empty[0]?.type === 'text' ? empty[0].text : ''
+  assert.match(text, /goal is still active/)
+  assert.match(text, /persist-review complete/)
+  assert.match(text, /persist-review blocked/)
+  assert.doesNotMatch(text, /requires an active main-session goal/)
+  assert.equal(harness.getHooks().length, 1)
+})
