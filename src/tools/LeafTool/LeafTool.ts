@@ -22,6 +22,7 @@ const inputSchema = lazySchema(() =>
         'return',
         'notify',
         'roster',
+        'reparent',
       ])
       .describe('Operation to perform on the leaf family'),
     leaf: z
@@ -97,6 +98,11 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       return workspace.notifyLeafParent(input.message)
     case 'roster':
       return workspace.familyRoster()
+    case 'reparent': {
+      const member = await workspace.resolveLeafRef(requireLeaf())
+      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      return workspace.reparentLeaf(member.sessionId)
+    }
   }
 }
 

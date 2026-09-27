@@ -140,6 +140,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     const self = selectedLeafId()
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
+    const parentId = getLeafParentSessionId()
     const options = [
       ...open.map(member => ({
         value: `open:${member.sessionId}`,
@@ -155,6 +156,11 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         value: `archive:${member.sessionId}`,
         label: `Archive #${member.number} ${member.name}`,
         description: 'Detach it from this family and hide it from this menu; the transcript is kept',
+      })),
+      ...open.filter(member => member.sessionId !== parentId).map(member => ({
+        value: `parent:${member.sessionId}`,
+        label: `Make parent #${member.number} ${member.name}`,
+        description: 'The family takes this member’s name; the member that is the parent now becomes a leaf',
       })),
       ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
@@ -173,6 +179,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
+          if (action === 'parent') return workspace.reparentLeaf(id)
           await workspace.changeLeaf(id, { status: action === 'archive' ? 'archived' : 'closed' })
           selectLeaf(undefined)
           return action === 'archive'

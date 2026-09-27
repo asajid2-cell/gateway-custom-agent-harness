@@ -852,3 +852,67 @@ test('the creator hosted from a member is an ordinary entry, not a root line', a
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('re-parenting moves the name and the aliases without touching numbering or receipts', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-reparent-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
+    const { asSessionId } = await import('../src/types/ids.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const siblingPath = join(directory, 'sibling.jsonl')
+    const memberPath = join(directory, 'member.jsonl')
+    const sibling = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Sibling', transcriptPath: siblingPath, forkMessageId: randomUUID() })
+    const member = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Member', transcriptPath: memberPath, forkMessageId: randomUUID() })
+    await workspace.restoreLeafWorkspace()
+    const before = await readLeafFamily(family, root)
+    const titles = async (path: string) => (await readFile(path, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as { type: string; customTitle?: string }).filter(entry => entry.type === 'custom-title').map(entry => entry.customTitle)
+
+    assert.match(await workspace.reparentLeaf(member.sessionId), /^Leaf #2 Member is now the family parent/)
+    // Only the displayed titles moved: the new parent's session reads as the
+    // family, and the leaf that was the parent reads as a leaf of it.
+    assert.equal(workspace.getLeafRootName(), 'Member', 'the family is named after the member that is the parent now')
+    assert.deepEqual(await titles(memberPath), ['Member'], 'the new parent takes its bare member name as the session title')
+    await assert.rejects(readFile(siblingPath, 'utf8'), /ENOENT/, 'a member that is neither parent has no title written for it at all')
+    // A re-parent creates no member and returns no context, so nothing that is
+    // numbered or receipted can be disturbed by it.
+    const after = await readLeafFamily(family, root)
+    assert.equal(after.nextNumber, before.nextNumber, 'no number is spent')
+    assert.deepEqual(after.returnedContextIds, before.returnedContextIds, 'no receipt is invalidated')
+    assert.deepEqual(after.members.map(item => item.sessionId), before.members.map(item => item.sessionId), 'the same rows in the same order')
+    assert.equal(after.members.find(item => item.sessionId === member.sessionId)!.name, 'Member', 'member names are untouched')
+    // Refusals: a reference outside the family, the member that already holds
+    // the designation, and a target whose turn is in flight.
+    await assert.rejects(workspace.reparentLeaf(randomUUID()), /Unknown leaf/)
+    await assert.rejects(workspace.reparentLeaf(member.sessionId), /already the family parent/)
+    const { leaf } = parkedLeaf()
+    leaf.setState('running')
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: sibling as never, process: leaf as never, draft: '' })
+    try {
+      await assert.rejects(workspace.reparentLeaf(sibling.sessionId), /Wait for the leaf turn/)
+    } finally { unregister() }
+
+    // The alias split is clearest from a member that is neither the parent nor
+    // the creator: the one the session on screen would otherwise be.
+    const projectDir = getSessionProjectDir()
+    const resumeDirectory = getSessionResumeDirectory()
+    switchSession(asSessionId(sibling.sessionId), null, directory)
+    workspace.forgetLeafFamilyRoot()
+    try {
+      assert.equal((await workspace.resolveLeafRef('parent'))?.sessionId, member.sessionId, 'parent is the designated member')
+      assert.equal((await workspace.resolveLeafRef('root'))?.sessionId, member.sessionId, 'and root means the same member')
+      assert.equal((await workspace.resolveLeafRef('original'))?.sessionId, root, 'original stays the creator, wherever the parent goes')
+      assert.equal((await workspace.resolveLeafRef('original'))?.name, before.members.find(item => item.sessionId === root)!.name, 'and keeps the name the family was born with')
+    } finally {
+      switchSession(asSessionId(root), projectDir, resumeDirectory)
+      workspace.forgetLeafFamilyRoot()
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})

@@ -1056,6 +1056,7 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       // forking itself is the one thing it does to itself.
       case 'members': result = (await currentFamily()).members; break
       case 'change': await changeLeaf(id, value); break
+      case 'reparent': result = await reparentLeaf(String(id)); break
       case 'file': await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
       // A leaf reporting its own model/effort only persists them. Applying
@@ -1385,6 +1386,55 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<void> {
       }
     }
   }
+}
+
+/**
+ * Make another member the family's parent.
+ *
+ * The designation is organizational: the family file keeps the name and the
+ * history it was born with, and the member that becomes the parent is an
+ * ordinary row either way. What moves is which member the family is named
+ * after, which member `parent` and `root` resolve to, and which session title
+ * reads as the family rather than as a leaf of it.
+ *
+ * Refused for the member that is already the parent, for a reference that is
+ * not in this family, and for a target whose turn is in flight: the titles of
+ * both members are rewritten, so the target has to be idle and exclusively
+ * ours. Nothing about numbering or context-return receipts changes - a
+ * re-parent creates no member and invalidates no dedupe.
+ */
+export async function reparentLeaf(sessionId: string): Promise<string> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('reparent', [sessionId])
+  const root = await familyRootSessionId()
+  const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
+  const target = members.find(member => member.sessionId === sessionId)
+  if (!target) throw new Error('Unknown leaf')
+  const current = await familyParentMember(members, root)
+  if (!current) throw new Error('The family parent is unavailable')
+  if (current.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family parent`)
+  const view = views.get(target.sessionId)
+  if (view && !['idle', 'closed', 'failed'].includes(view.process.getState())) throw new Error('Wait for the leaf turn before re-parenting')
+  const { claimGatewaySessionWriter, releaseGatewaySessionWriter } = await import('./gatewaySessionOwnership.js')
+  let claimed = false
+  try {
+    await claimGatewaySessionWriter(target.sessionId)
+    claimed = true
+    // Only the displayed titles move; the rows keep the names they were given.
+    // The new parent's title becomes its bare name, which is what makes the
+    // family read as that conversation; the old parent takes the leaf naming
+    // every other member already uses.
+    saveSessionName(asSessionId(target.sessionId), target.name, target.transcriptPath)
+    saveSessionName(asSessionId(current.sessionId), `Leaf ${current.number}: ${current.name}`, current.transcriptPath)
+    await writeFamilyParentDesignation(root, target.sessionId)
+  } finally {
+    if (claimed) await releaseGatewaySessionWriter(target.sessionId)
+  }
+  // Every pointer is rewritten with the parent the family has now, so a leaf
+  // resumed on its own later reads the family it actually belongs to.
+  await indexLeafMembers(root, members)
+  await refreshDesignatedParent()
+  publish()
+  return `${memberLabel(target)} is now the family parent; ${memberLabel(current)} is a leaf of it.`
 }
 
 export async function setLeafGoal(sessionId: string, args: string): Promise<string> {
