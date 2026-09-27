@@ -27,6 +27,7 @@ parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--probe-selection', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
+parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -63,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
         view = VIEW_TAG_RE.search(latest)
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if view:
             # Recorded here and deliberately kept out of `requests`: a view tag
@@ -511,6 +512,33 @@ class Terminal:
         x, y = matches()[0]
         self.proc.write(f'\x1b[<0;{x};{y}M'); self.pause(.08)
         self.proc.write(f'\x1b[<0;{x};{y}m'); self.pause(.25)
+    def first_item_label(self):
+        """The carousel's first entry, as the session on screen draws it.
+
+        That entry is the session this window leaves for, so it carries that
+        session's name. It is read from the expanded list rather than the
+        collapsed bar: the bar truncates to the box width and blanks it when
+        the list is not open, while the list gives the label whole.
+
+        A leaf draws this bar exactly as the window that owns the family draws
+        it, so from a leaf the first entry is the way out of the leaf. It used
+        to be the leaf's own name there - the session you are already in, with
+        the one that owns the family left unnamed in the slot kept for it.
+        """
+        self.expand_bar()
+        lines = self.screen.display
+        header = next((row for row, line in enumerate(lines) if 'All sessions - click to switch' in line), None)
+        assert header is not None, 'the session bar would not expand'
+        label = None
+        for row in range(header + 1, len(lines)):
+            text = lines[row].strip(' │')
+            if text:
+                label = text
+                break
+        self.click('Close list')
+        self.wait(lambda: 'All sessions - click to switch' not in self.text(), 'the list to close', 5)
+        assert label, 'the session bar lists nothing'
+        return label
     def original(self, draft=None):
         self.expand_bar()
         self.point_first_item()
@@ -584,6 +612,19 @@ def probe_full_tui():
     leaf_id = t.leaves()[0]['sessionId']
     t.wait(lambda: 'session:' in t.text(), 'leaf must show its own normal session footer', 75)
     t.assert_view(leaf_id, 'the new leaf', 75)
+    # The bar on screen is the leaf's own here, and its first entry is the way
+    # out of the leaf: the session that owns the family, called by the family's
+    # name. It used to be the leaf, so the parent was unnamed in the slot kept
+    # for it and the leaf appeared twice - once bare, once with its number. The
+    # name is read from the pointer the family writes for this member, the same
+    # value the owning session publishes in the snapshot this leaf draws from,
+    # so the check fails if either end disagrees.
+    leaf_pointer = json.loads((root / 'leaf-families' / 'index' / (leaf_id + '.json')).read_text(encoding='utf-8'))
+    leaf_member = next(member for member in t.family()['members'] if member['sessionId'] == leaf_id)
+    first_item = t.first_item_label()
+    assert first_item == leaf_pointer['rootName'], (
+        'the leaf bar names ' + repr(first_item) + ' where the parent ' + repr(leaf_pointer['rootName']) + ' belongs')
+    assert first_item != leaf_member['name'], 'the leaf names itself in the slot kept for the parent'
     t.click('✎ Rename')
     t.wait(lambda: 'Session metadata' in t.text(), 'leaf must open normal session metadata dialog')
     t.proc.write('\x1b'); t.pause()
@@ -1047,10 +1088,116 @@ def probe_parentage():
     s.exit()
     print(json.dumps(dict(parentage=True, directResume=True, leafOpensLeaves=True, leafReopensLeaves=True, reparent=True, familyTakesNewParentName=True, oldParentBecomesLeaf=True, displacedRefusesManagement=True, displacedKeepsTerminals=True)), flush=True)
 
+def probe_queue():
+    """The message queue: Tab hands a message over instead of sending it.
+
+    The turn is held open by the fixture, so everything the probe does happens
+    while the agent is busy - which is the only time a queue means anything.
+    What is asserted is read from the app's own account of itself: the session
+    transcript records every queue operation with the text it carried, in the
+    order they happened, so "in order" and "waited for the turn" are facts about
+    the app rather than readings of a painted list.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial carousel', 60)
+
+    def queue_ops():
+        rows = []
+        for path in (root / 'projects').rglob(t.id + '*.jsonl'):
+            for line in path.read_text(encoding='utf-8').splitlines():
+                try: entry = json.loads(line)
+                except ValueError: continue
+                if entry.get('type') == 'queue-operation': rows.append(entry)
+        return rows
+
+    def enqueued():
+        return [row.get('content') for row in queue_ops() if row.get('operation') == 'enqueue']
+
+    def popped():
+        return [row.get('content') for row in queue_ops() if row.get('operation') == 'popAll']
+
+    def user_texts():
+        """The queued messages that became the user's own messages, in order.
+
+        Read from the transcript rather than the screen, because the screen is
+        only the last frame and this is about what the session recorded.
+        """
+        rows = []
+        for path in (root / 'projects').rglob(t.id + '*.jsonl'):
+            for line in path.read_text(encoding='utf-8').splitlines():
+                try: entry = json.loads(line)
+                except ValueError: continue
+                if entry.get('type') != 'user': continue
+                content = (entry.get('message') or {}).get('content')
+                text = content if isinstance(content, str) else ' '.join(block.get('text', '') for block in content if isinstance(block, dict) and block.get('type') == 'text')
+                if 'QUEUE_' in text: rows.append(text.strip())
+        return rows
+
+    def type_line(message, key):
+        t.proc.write('\x15'); t.pause(.3)
+        t.proc.write('\x1b[200~' + message + '\x1b[201~'); t.pause(.4)
+        t.proc.write(key); t.pause(.7)
+
+    # Hold the turn open, so every message written below is written mid-turn.
+    t.submit('ROOT_BLOCKED_TASK')
+    t.wait(lambda: 'ROOT_BLOCKED_TASK' in started_turns, 'the turn is held open', 45)
+
+    # Tab on an empty composer keeps its old meaning rather than queueing a blank.
+    t.proc.write('\t'); t.pause(.5)
+    assert enqueued() == [], 'an empty composer queued something'
+
+    for message in ('QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR'):
+        type_line(message, '\t')
+    t.wait(lambda: enqueued() == ['QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR'],
+           'the four messages wait in the order they were written', 30)
+    # Each hand-over emptied the composer, so a Tab now lands on nothing - which
+    # is also the proof that the text is not sitting in the composer any more.
+    t.proc.write('\t'); t.pause(.5)
+    assert enqueued() == ['QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR'], 'a fifth message was queued without being typed'
+    t.wait(lambda: 'to toggle thinking' in t.text(), 'an empty composer still offers the thinking hint', 15)
+    # Nothing has been sent: the queue holds until the turn ends.
+    assert user_texts() == [], 'a queued message was sent before the turn ended'
+
+    # The queue is full at four, and the fifth is refused where it was written
+    # rather than dropping one of the four already waiting.
+    type_line('QUEUE_FIVE', '\t')
+    assert enqueued() == ['QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR'], 'the queue took a fifth message'
+    t.wait(lambda: 'The queue holds 4 messages' in t.text(), 'a full queue says so', 15)
+    assert user_texts() == [], 'the refused message was sent anyway'
+
+    # Up-arrow hands the newest message back, and it is editable: the line typed
+    # after it only reads as one message if the composer already held it.
+    t.proc.write('\x15'); t.pause(.3)
+    t.proc.write('\x1b[A'); t.pause(.6)
+    assert popped() == ['QUEUE_FOUR'], 'up-arrow did not hand back the newest message: ' + repr(popped())
+    t.proc.write('\x1b[200~ EDITED\x1b[201~'); t.pause(.4)
+    t.proc.write('\t'); t.pause(.7)
+    t.wait(lambda: enqueued() == ['QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR', 'QUEUE_FOUR EDITED'],
+           'the edited message went back to the queue', 30)
+
+    # Let the turn finish. The queue drains itself, in the order it was written.
+    blocked_turns['ROOT_BLOCKED_TASK'].set()
+    t.wait(lambda: 'ROOT_BLOCKED_TASK' in finished_turns, 'the held turn completes', 45)
+    t.wait(lambda: user_texts() == ['QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR EDITED'],
+           'the queue drained in order once the turn ended', 90)
+    # And the model saw them in that order too: the drain batches the prompts
+    # into one turn, so order is read off the wire rather than off one request
+    # per message.
+    drained = [body for body in requests if 'QUEUE_ONE' in json.dumps(body)]
+    assert drained, 'the queued messages never reached the model'
+    wire = json.dumps(drained[-1])
+    positions = [wire.index(name) for name in ('QUEUE_ONE', 'QUEUE_TWO', 'QUEUE_THREE', 'QUEUE_FOUR EDITED')]
+    assert positions == sorted(positions), 'the model saw the queued messages out of order'
+    # The refused one is nowhere: not in the transcript, not on the wire.
+    assert 'QUEUE_FIVE' not in json.dumps(requests), 'the refused message was sent after the turn ended'
+    assert all('QUEUE_FIVE' not in text for text in user_texts()), 'the refused message reached the transcript'
+    t.exit()
+    print(json.dumps(dict(queue=True, emptyComposerNotQueued=True, orderHeld=True, waitsForTurnEnd=True, capRefuses=True, upArrowEdits=True, drainsInOrder=True)), flush=True)
+
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
-    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage:
-        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_parentage if args.probe_parentage else probe_parity)()
+    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage or args.probe_queue:
+        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_queue if args.probe_queue else probe_parentage if args.probe_parentage else probe_parity)()
         raise SystemExit(0)
     t = Terminal()
     t.wait(lambda: 'All 1' in t.text(), 'initial carousel', 60)
