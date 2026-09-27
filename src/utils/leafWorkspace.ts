@@ -62,14 +62,27 @@ export function getLeafRootName(): string {
 }
 
 /**
- * The label for the session on screen, which is the carousel's first entry.
+ * The label for the carousel's first entry, which is the session it leaves for.
  *
- * Always the session's own name. It used to borrow the family's name, which is
- * the same string only until the family's parent is designated elsewhere - and
- * then it is the name of a different session, offering a switch to the session
- * you are already in.
+ * A leaf draws the bar exactly as the window that owns the family draws it, and
+ * there the first entry is the way back out of the leaf - so from a leaf it
+ * carries the family's name, which is the name of the member it calls its
+ * parent. Only in the window itself is the first entry the session on screen,
+ * and then it is that session's own name: it used to answer with the session on
+ * screen in both places, which in a leaf named the leaf, offering a switch to
+ * the session you are already in and leaving the parent unnamed. A leaf's own
+ * name is getLeafSelfName()'s question, not this one.
  */
 export function getLeafHostName(): string {
+  const snapshot = getLeafSnapshot()
+  return snapshot ? snapshot.rootName : getLeafSelfName()
+}
+
+/**
+ * The label for the session on screen itself: the session a new leaf forks when
+ * no other source is chosen.
+ */
+export function getLeafSelfName(): string {
   const snapshot = getLeafSnapshot()
   if (snapshot) return snapshot.members.find(entry => entry.member.sessionId === leafSessionId())?.member.name ?? snapshot.rootName
   return getCurrentSessionTitle(getSessionId()) || 'Original'

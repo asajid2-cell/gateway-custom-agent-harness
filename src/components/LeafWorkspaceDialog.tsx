@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, isFamilyHost, listLeafMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafSelfName, getLeafViews, isFamilyHost, listLeafMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -298,7 +298,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   const selected = selectedLeafId()
   // With nothing selected the source is the session asking, which is not always
   // the family's parent - a member hosting the family forks itself.
-  const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafHostName()
+  const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafSelfName()
   // One window manages a family at a time. This one is a window onto it: it can
   // still use the terminals it has attached, but starting or changing leaves
   // belongs to the session that took the lease.

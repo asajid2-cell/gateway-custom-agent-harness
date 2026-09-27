@@ -618,6 +618,7 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   assert.match(workspace, /export function getLeafCarouselViews\(\): LeafView\[\]/)
   assert.match(workspace, /return \[\.\.\.views\.values\(\)\]\.filter\(view => view\.rootSessionId === root\)/)
   assert.match(workspace, /export function getLeafHostName\(\): string/)
+  assert.match(workspace, /export function getLeafSelfName\(\): string/)
   assert.match(workspace, /return \(await currentFamily\(\)\)\.members\.filter\(member => member\.sessionId !== self\)/)
 })
 
@@ -662,8 +663,15 @@ test('the leaf menu treats the parent as an ordinary member', async () => {
   assert.match(dialog, /label: `Open  #\$\{member\.number\} \$\{member\.name\}`/)
   assert.match(dialog, /label: `Archive #\$\{member\.number\} \$\{member\.name\}`/)
   assert.match(dialog, /describeSession/)
-  // The bar's first entry is the session on screen, which is not always the root.
+  // The bar's first entry is the session it leaves for: the parent from a leaf,
+  // and the session on screen in the window that owns the family. One function
+  // cannot answer both - a leaf that labelled the entry with its own name put
+  // the leaf in the slot twice and left the parent unnamed - so the wizard's
+  // "forks the session you are looking at" line names the session asking
+  // instead, which is the other question.
   assert.match(dialog, /label: getLeafHostName\(\)/)
+  assert.match(dialog, /forks the session you are looking at: \{sourceName\}/)
+  assert.match(dialog, /const sourceName = selected \? \(members\?\.find\(member => member\.sessionId === selected\)\?\.name \?\? selected\) : getLeafSelfName\(\)/)
   assert.match(dialog, /views=\{getLeafCarouselViews\(\)\}/)
 })
 
