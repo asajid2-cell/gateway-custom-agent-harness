@@ -117,6 +117,9 @@ async function main() {
   const stderr = { value: '' }
   const child = spawn(process.execPath, [gatewayScript, '--port', '0'], {
     cwd: root,
+    // A console-less parent would otherwise have Windows hand this child a fresh
+    // visible console, which Windows Terminal opens as a tab and focuses.
+    windowsHide: true,
     env: {
       ...process.env,
       MODEL_GATEWAY_UPSTREAM_RETRIES: '2',

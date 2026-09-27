@@ -380,7 +380,7 @@ test('a listing lets go of registrations that are provably dead, and only those'
     // Creates the directory with its private ACL, which the listing validates.
     await seed.start()
     await seed.close()
-    const exited = spawnSync(process.execPath, ['-e', ''])
+    const exited = spawnSync(process.execPath, ['-e', ''], { windowsHide: true })
     assert.ok(exited.pid && exited.pid > 0)
     const abandoned = await write(abandonedId, exited.pid!)
     const crashed = await write(crashedId, exited.pid!)

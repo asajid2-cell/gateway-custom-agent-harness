@@ -14,6 +14,7 @@ function runAudit(cwd) {
     const child = spawn(process.execPath, [auditScript, '--root', cwd, '--all-cwds'], {
       cwd: root,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     })
     let stdout = ''
     let stderr = ''

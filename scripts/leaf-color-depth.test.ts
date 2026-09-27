@@ -34,6 +34,10 @@ function leafColorLevel(env: NodeJS.ProcessEnv): Promise<number> {
   for (const key of ['FORCE_COLOR', 'NO_COLOR', 'GATEWAY_LEAF_COLOR_DEPTH']) delete inherited[key]
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ['-e', code], {
+      // A suite run from a console-less parent - a leaf, a detached harness - would
+      // otherwise have Windows allocate a visible console per child, which Windows
+      // Terminal opens as a tab and pulls focus to.
+      windowsHide: true,
       cwd: ROOT,
       // Piped stdio is what makes fd 1 a non-tty, which is the whole point.
       stdio: ['pipe', 'pipe', 'pipe', 'ipc'],

@@ -40,7 +40,7 @@ export function createFixtureTree(options: FixtureTreeOptions = {}): FixtureTree
   if (options.git === true) {
     // `-b main` keeps the initial branch name off the machine's git config, so
     // the fixture does not depend on `init.defaultBranch`.
-    const init = spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+    const init = spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: root, windowsHide: true });
     if (init.status !== 0) {
       throw new Error(
         `fixture tree could not initialize git in ${root}: ` +

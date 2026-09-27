@@ -90,6 +90,7 @@ test('gateway supervisor restarts a crashed local gateway and keeps the same por
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
   })
   let stderr = ''
   child.stderr.setEncoding('utf8')
@@ -229,6 +230,7 @@ test('consumer recovers across a supervised child restart with the follow-up too
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
   })
   let stderr = ''
   child.stderr.setEncoding('utf8')
@@ -352,6 +354,7 @@ test('gateway supervisor does not abandon a session after repeated child crashes
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '0',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
   })
   let stderr = ''
   child.stderr.setEncoding('utf8')

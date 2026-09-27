@@ -471,6 +471,9 @@ async function main() {
 
   const gateway = spawn(process.execPath, [gatewayScript, '--port', '0'], {
     cwd: root,
+    // A console-less parent would otherwise have Windows hand this child a fresh
+    // visible console, which Windows Terminal opens as a tab and focuses.
+    windowsHide: true,
     env: {
       ...process.env,
       CODEX_HOME: codexHome,
@@ -528,6 +531,7 @@ async function main() {
         'gateway-gpt-luna',
       ], {
         cwd: root,
+        windowsHide: true,
         env: {
           ...commonCliEnv,
           COMPACTION_DEBUG_TRACE: '1',
@@ -596,6 +600,7 @@ async function main() {
       '--verbose',
     ], {
       cwd: root,
+      windowsHide: true,
       env: commonCliEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     })

@@ -21,6 +21,7 @@ const cases = selectedModels?.length
 
 const gateway = spawn(process.execPath, [gatewayScript, '--port', '0'], {
   cwd: root,
+  windowsHide: true,
   env: {
     ...process.env,
     MODEL_GATEWAY_LOG_TIMING: '1',

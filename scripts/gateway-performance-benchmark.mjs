@@ -482,6 +482,9 @@ async function runLoopbackBenchmark() {
 
   const gateway = spawn(process.execPath, [gatewayScript, '--port', '0'], {
     cwd: root,
+    // A console-less parent would otherwise have Windows hand this child a fresh
+    // visible console, which Windows Terminal opens as a tab and focuses.
+    windowsHide: true,
     env: {
       ...process.env,
       CODEX_HOME: authHome,
@@ -724,6 +727,7 @@ async function startCompiledGateway(fixture, effort, model) {
   try {
     gateway = spawn(process.execPath, [gatewayScript, '--port', '0'], {
       cwd: root,
+      windowsHide: true,
       env: {
         ...process.env,
         CODEX_HOME: accountHome,

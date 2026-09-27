@@ -63,7 +63,7 @@ test('the launcher probe errs towards alive', () => {
   assert.equal(isLauncherAlive(1), false)
   // A process that has exited answers a signal-0 probe with ESRCH. spawnSync has
   // already reaped it by the time pid is read, so this is a genuinely dead pid.
-  const exited = spawnSync(process.execPath, ['-e', ''])
+  const exited = spawnSync(process.execPath, ['-e', ''], { windowsHide: true })
   assert.ok(exited.pid && exited.pid > 0, 'the probe needs a real pid to test against')
   assert.equal(isLauncherAlive(exited.pid!), false)
 })

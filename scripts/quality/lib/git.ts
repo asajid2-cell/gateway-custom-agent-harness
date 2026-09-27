@@ -12,6 +12,9 @@ export function git(args: string[], cwd: string): GitCommandResult {
     cwd,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
+    // git is a console program: from a console-less parent it would open a visible
+    // console window that Windows Terminal then foregrounds.
+    windowsHide: true,
   });
   return {
     ok: proc.status === 0,

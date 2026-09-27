@@ -29,6 +29,9 @@ function runProcess(command, args, env, timeoutMs = 15_000) {
       cwd: root,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // Every child here is a console program, and the suite may itself be running
+      // without a console, so the hiding has to be asked for explicitly.
+      windowsHide: true,
     })
     let stdout = ''
     let stderr = ''

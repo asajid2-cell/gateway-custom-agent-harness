@@ -68,6 +68,9 @@ function startChild() {
     cwd: process.cwd(),
     env: process.env,
     stdio: 'inherit',
+    // stdio is inherited, but a console is not: without this a console-less
+    // supervisor parent makes Windows give the child a brand-new visible one.
+    windowsHide: true,
   })
 
   child.once('error', error => {

@@ -674,6 +674,9 @@ function commandTest(args: ParsedArgs): number {
   const proc = spawnSync('bun', ['test', 'scripts/quality/fixtures'], {
     cwd: args.repoRoot,
     stdio: 'inherit',
+    // The quality engine may itself run from a console-less session; without this
+    // Windows hands the child a fresh visible console, which WT tabs and focuses.
+    windowsHide: true,
   });
   return proc.status ?? EXIT.INCOMPLETE;
 }
@@ -692,6 +695,7 @@ function commandDoctor(args: ParsedArgs): number {
   const gitCheck = spawnSync('git', ['rev-parse', '--show-toplevel'], {
     cwd: args.repoRoot,
     encoding: 'utf8',
+    windowsHide: true,
   });
   if (gitCheck.status !== 0) {
     problems.push('not a git checkout; candidate identity will be degraded');

@@ -315,7 +315,7 @@ test('the leaf keeps its identity and its children inherit none of it', { timeou
     const leaf = await import(${JSON.stringify(new URL('../src/utils/leafTerminal.ts', import.meta.url).href)})
     leaf.consumeLeafLaunchEnv()
     const child = await new Promise(resolve => {
-      execFile(process.execPath, ['--version'], { env: process.env }, (error, stdout) => resolve(error ? 'ERR ' + error.message : stdout.trim()))
+      execFile(process.execPath, ['--version'], { env: process.env, windowsHide: true }, (error, stdout) => resolve(error ? 'ERR ' + error.message : stdout.trim()))
     })
     console.log(JSON.stringify({
       stillLeaf: leaf.isInteractiveLeaf(),

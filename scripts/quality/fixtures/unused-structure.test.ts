@@ -347,7 +347,7 @@ function buildTree(options: TreeOptions = {}): FixtureTree {
   tree.write(POLICY_PATH, policy(options.profile ?? 'full', options.entries));
   // `git add` rather than `git commit`: tracked-ness is what `git ls-files`
   // reports, and the launcher scanner reads the repository that way.
-  const added = spawnSync('git', ['add', '-A'], { cwd: tree.root });
+  const added = spawnSync('git', ['add', '-A'], { cwd: tree.root, windowsHide: true });
   if (added.status !== 0) {
     throw new Error(
       `fixture tree could not stage its files: ${added.stderr?.toString()}`

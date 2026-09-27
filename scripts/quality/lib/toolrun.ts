@@ -100,6 +100,8 @@ export function runTool(invocation: ToolInvocation): ToolOutcome {
     maxBuffer: 512 * 1024 * 1024,
     timeout: invocation.timeoutMs,
     shell: invocation.useShell ?? false,
+    // Analyzers are console programs; a console-less parent must not flash one.
+    windowsHide: true,
   });
 
   const stdout = proc.stdout ?? '';
@@ -160,6 +162,7 @@ function runBootstrap(invocation: ToolInvocation): string | null {
     maxBuffer: 64 * 1024 * 1024,
     timeout: Math.min(invocation.timeoutMs, 120_000),
     shell: invocation.useShell ?? false,
+    windowsHide: true,
   });
 
   if (proc.error !== undefined) {

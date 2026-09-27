@@ -81,6 +81,7 @@ async function main() {
   const stderr = { value: '' }
   const child = spawn(process.execPath, [gatewayScript, '--port', '0'], {
     cwd: root,
+    windowsHide: true,
     env: {
       ...process.env,
       MODEL_GATEWAY_UPSTREAM_RETRIES: '1',

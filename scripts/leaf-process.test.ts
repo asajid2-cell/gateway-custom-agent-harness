@@ -50,7 +50,7 @@ test('close removes descendants even when their parent exits cleanly', { timeout
   let descendant = 0
   const orphanFixture = `
 const {spawn}=require('node:child_process');
-const child=spawn(process.execPath,['-e','setTimeout(()=>{},20000)'],{stdio:'ignore'});
+const child=spawn(process.execPath,['-e','setTimeout(()=>{},20000)'],{stdio:'ignore',windowsHide:true});
 child.unref();
 process.stdout.write(JSON.stringify({type:'descendant',pid:child.pid})+'\\n');
 ${fixture}

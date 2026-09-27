@@ -33,6 +33,7 @@ const child = spawn('cmd.exe', ['/d', '/s', '/c', cc, ...args], {
   cwd: process.cwd(),
   env: process.env,
   stdio: ['pipe', 'pipe', 'pipe'],
+  windowsHide: true,
 })
 
 let stdout = ''
