@@ -115,6 +115,20 @@ const CODEX_PROMPT_CACHE_KEY_MODE =
   process.env.MODEL_GATEWAY_CODEX_PROMPT_CACHE_KEY_MODE || 'off'
 const LOG_REQUEST_SHAPE = process.env.MODEL_GATEWAY_LOG_SHAPE === '1'
 const LOG_EVENT_SHAPE = process.env.MODEL_GATEWAY_LOG_EVENT_SHAPE === '1'
+// How long a Codex request may stream without producing caller-visible output
+// before the relay starts telling the caller it is still being served, and how
+// often to repeat that once it starts. A prompt that is answered, refused, or
+// rejected is answered in milliseconds, so the delay keeps the pre-output
+// status contract intact and only covers a provider that is genuinely working
+// invisibly - reasoning for minutes before its answer.
+const CODEX_LIVENESS_AFTER_MS = durationEnvironment(
+  'MODEL_GATEWAY_LIVENESS_AFTER_MS',
+  30_000,
+)
+const CODEX_LIVENESS_INTERVAL_MS = durationEnvironment(
+  'MODEL_GATEWAY_LIVENESS_INTERVAL_MS',
+  5_000,
+)
 
 if (!['fallback', 'balanced', 'compact'].includes(CODEX_TOOL_MODE)) {
   throw new Error(
@@ -2348,6 +2362,9 @@ export async function relayCodexStream(
     }
   }
 
+  const livenessStartedAt = Date.now()
+  let lastLivenessAt = 0
+
   const handleEvent = event => {
     codexEventShape(event)
     const type = event?.type
@@ -2439,6 +2456,25 @@ export async function relayCodexStream(
     }
     if (type === 'response.failed') {
       throw new Error(event.response?.error?.message || 'Codex response failed')
+    }
+    // Whatever else the provider emits — reasoning summaries above all — is
+    // output the caller never sees. A caller running its own deadline reads
+    // that silence as a stall and aborts work that is still under way, so the
+    // provider's pulse is passed along. It rides on a message_delta carrying no
+    // delta because that is the only event a caller can be sent that says
+    // nothing: a `ping` never leaves the transport, where the client SDK stops
+    // it, and a content block would show up as an empty message. Only before
+    // any output, since from the first output on the caller has a stream to
+    // read and every delta on it is proof enough.
+    const now = Date.now()
+    if (
+      !sawOutput &&
+      now - livenessStartedAt >= CODEX_LIVENESS_AFTER_MS &&
+      now - lastLivenessAt >= CODEX_LIVENESS_INTERVAL_MS
+    ) {
+      lastLivenessAt = now
+      startStream()
+      sendEvent(res, 'message_delta', { delta: {} })
     }
   }
 

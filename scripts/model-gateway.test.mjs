@@ -181,6 +181,13 @@ function delayedUpstream(delayMs, events = []) {
   }
 }
 
+function sseDataEvents(body) {
+  return body
+    .split('\n\n')
+    .filter(Boolean)
+    .map(chunk => JSON.parse(chunk.slice(chunk.indexOf('data: ') + 6)))
+}
+
 function traceCapture() {
   const marks = {}
   return {
@@ -202,6 +209,7 @@ const gatewayScript = path.resolve(
 async function startGatewayForTest(env) {
   const child = spawn(process.execPath, [gatewayScript, '--port', '0'], {
     cwd: path.dirname(gatewayScript),
+    windowsHide: true,
     env: {
       ...process.env,
       ...env,
@@ -621,6 +629,25 @@ function emptyCodexHandler(req, res) {
   req.resume()
   res.writeHead(200, { 'content-type': 'text/event-stream' })
   res.end()
+}
+
+function reasoningThenAnswerCodexHandler(state) {
+  return async (req, res) => {
+    state.requests.push(await requestJson(req))
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    const frame = event => res.write(`data: ${JSON.stringify(event)}\n\n`)
+    frame({ type: 'response.created' })
+    frame({ type: 'response.in_progress' })
+    // Reasoning is the whole wait, and none of it reaches the caller: the
+    // answer only starts once the summary text does.
+    frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing the conversation' })
+    await new Promise(resolve => setTimeout(resolve, 120))
+    frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing it again' })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    frame({ type: 'response.output_text.delta', delta: 'condensed summary' })
+    frame({ type: 'response.completed', response: completedCodexResponse('condensed summary') })
+    res.end()
+  }
 }
 
 function contextFailureCodexHandler(req, res) {
@@ -2246,6 +2273,24 @@ test('relay timing observes first byte, output, completion, bytes, and events wi
   assert.equal(response.headers.status, 200)
 })
 
+test('a Codex answer that arrives promptly carries no liveness events', async () => {
+  const response = new CaptureResponse()
+  await relayCodexStream(response, upstreamFromEvents([
+    { type: 'response.created' },
+    { type: 'response.in_progress' },
+    { type: 'response.output_item.added', item: { type: 'reasoning' } },
+    { type: 'response.output_text.delta', delta: 'OK' },
+    { type: 'response.completed', response: completedCodexResponse('OK') },
+  ]), 'claude-gpt-luna')
+
+  // Untranslatable events are not by themselves a reason to pad the stream:
+  // the pre-output status contract depends on a prompt answer staying silent
+  // until it has something to say.
+  const deltas = responseEvents(response).filter(event => event.type === 'message_delta')
+  assert.equal(deltas.length, 1)
+  assert.equal(deltas[0].delta.stop_reason, 'end_turn')
+})
+
 test('DeepSeek delays HTTP 200 until usable output', async () => {
   const response = new CaptureResponse()
   await relayDeepSeekStream(response, deepSeekResponse(deepSeekValidEvents()), traceCapture())
@@ -2496,6 +2541,40 @@ test('a stalled compaction upstream is bounded and cancelled before HTTP 200', a
       })
       assert.equal(await waitForUpstreamCancellation(state, 500), true)
       assert.equal(result.body.includes('event:'), false)
+    },
+  })
+})
+
+test('a compaction whose provider is only reasoning still reports liveness', async () => {
+  await withGatewayAndFakeCodexState({
+    handlerFactory: reasoningThenAnswerCodexHandler,
+    gatewayEnv: {
+      // The real delays exist so a prompt answer is left untouched; shorten
+      // them here rather than waiting out the production ones.
+      MODEL_GATEWAY_LIVENESS_AFTER_MS: '40',
+      MODEL_GATEWAY_LIVENESS_INTERVAL_MS: '20',
+    },
+    run: async ({ gateway }) => {
+      const result = await postCompaction(gateway.port, compactionRequestBody())
+      assert.equal(result.status, 200)
+
+      const events = sseDataEvents(result.body)
+      const textAt = events.findIndex(
+        event =>
+          event.type === 'content_block_delta' &&
+          event.delta?.type === 'text_delta',
+      )
+      const liveness = events
+        .map((event, index) => ({ event, index }))
+        .filter(
+          ({ event }) =>
+            event.type === 'message_delta' && !event.delta?.stop_reason,
+        )
+
+      // The provider was working the whole time it was reasoning, and the
+      // caller has to be able to tell that from a request nothing is serving.
+      assert.ok(liveness.length >= 1)
+      assert.ok(liveness[0].index < textAt)
     },
   })
 })
@@ -3225,6 +3304,28 @@ function openCodeStreamHandler(responseFactory) {
     const events = responseFactory(req.url, body)
     res.end(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''))
   }
+}
+
+function reasoningThenAnswerOpenCodeHandler(req, res) {
+  req.resume()
+  res.writeHead(200, { 'content-type': 'text/event-stream' })
+  const frame = event => res.write(`data: ${JSON.stringify(event)}\n\n`)
+  frame({ type: 'response.created' })
+  frame({ type: 'response.in_progress' })
+  // Reasoning is the whole wait, and none of it reaches the caller: the answer
+  // only starts once the output text does.
+  frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing the conversation' })
+  void (async () => {
+    await new Promise(resolve => setTimeout(resolve, 120))
+    frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing it again' })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    frame({ type: 'response.output_text.delta', delta: 'condensed summary' })
+    frame({
+      type: 'response.completed',
+      response: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'condensed summary' }] }] },
+    })
+    res.end()
+  })()
 }
 
 function deepSeekJsonHandler(responseFactory) {
@@ -4340,6 +4441,63 @@ test('translates a valid OpenCode Responses stream', async () => {
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: 0,
     output_tokens: 2,
+  })
+})
+
+test('an OpenCode Responses answer that arrives promptly carries no liveness events', async () => {
+  const response = new CaptureResponse()
+  await relayOpenCodeResponsesStream(response, openCodeUpstream([
+    { type: 'response.created' },
+    { type: 'response.in_progress' },
+    { type: 'response.reasoning_summary_text.delta', delta: 'thinking' },
+    { type: 'response.output_text.delta', delta: 'OK' },
+    { type: 'response.completed', response: { output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }] } },
+  ]), 'opencode-go/gpt-5.6-luna')
+
+  // Untranslatable events are not by themselves a reason to pad the stream:
+  // the pre-output status contract depends on a prompt answer staying silent
+  // until it has something to say.
+  const deltas = responseEvents(response).filter(event => event.type === 'message_delta')
+  assert.equal(deltas.length, 1)
+  assert.equal(deltas[0].delta.stop_reason, 'end_turn')
+})
+
+test('an OpenCode Responses stream that is only reasoning still reports liveness', async () => {
+  await withGatewayAndFakeOpenCode({
+    handler: reasoningThenAnswerOpenCodeHandler,
+    gatewayEnv: {
+      // The real delays exist so a prompt answer is left untouched; shorten
+      // them here rather than waiting out the production ones.
+      MODEL_GATEWAY_LIVENESS_AFTER_MS: '40',
+      MODEL_GATEWAY_LIVENESS_INTERVAL_MS: '20',
+    },
+    run: async ({ gateway }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'opencode-go/gpt-5.6-luna',
+        stream: true,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'summarize' }],
+      })
+      assert.equal(result.status, 200)
+
+      const events = sseDataEvents(result.body)
+      const textAt = events.findIndex(
+        event =>
+          event.type === 'content_block_delta' &&
+          event.delta?.type === 'text_delta',
+      )
+      const liveness = events
+        .map((event, index) => ({ event, index }))
+        .filter(
+          ({ event }) =>
+            event.type === 'message_delta' && !event.delta?.stop_reason,
+        )
+
+      // The provider was working the whole time it was reasoning, and the
+      // caller has to be able to tell that from a request nothing is serving.
+      assert.ok(liveness.length >= 1)
+      assert.ok(liveness[0].index < textAt)
+    },
   })
 })
 

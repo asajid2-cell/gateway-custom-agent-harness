@@ -15,6 +15,29 @@ export const OPENCODE_GO_BASE_URL =
 
 const PROTOCOLS = new Set(['responses', 'chat-completions', 'anthropic-messages'])
 
+function durationEnvironment(name, fallback) {
+  const raw = process.env[name]
+  if (raw == null || raw === '') return fallback
+  const value = Number(raw)
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative number of milliseconds`)
+  }
+  return Math.trunc(value)
+}
+
+// Same contract as the Codex relay: how long a request may stream without
+// producing caller-visible output before the relay says it is still being
+// served, and how often to repeat that. Kept in step with the Codex knobs so a
+// single pair of environment values governs every route that hides its work.
+const LIVENESS_AFTER_MS = durationEnvironment(
+  'MODEL_GATEWAY_LIVENESS_AFTER_MS',
+  30_000,
+)
+const LIVENESS_INTERVAL_MS = durationEnvironment(
+  'MODEL_GATEWAY_LIVENESS_INTERVAL_MS',
+  5_000,
+)
+
 // The endpoint for a Go model is part of the official model contract. Do not
 // infer it from the model name: OpenCode Go deliberately serves three wire
 // protocols from the same base URL.
@@ -832,6 +855,8 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
   let sawCompletion = false
   let toolCallSeen = false
   let usage = null
+  const livenessStartedAt = Date.now()
+  let lastLivenessAt = 0
   const start = () => {
     if (!streamStarted) {
       startStream(res, model)
@@ -895,6 +920,26 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
         if (!sawOutput) responseOutputFallback(event.response, text, tool)
       } else if (type === 'response.failed' || type === 'response.incomplete') {
         throw new Error(event.response?.error?.message || event.response?.status_details?.reason || 'OpenCode Responses request failed')
+      } else {
+        // Whatever else the provider emits — reasoning summaries above all — is
+        // output the caller never sees. A caller running its own deadline reads
+        // that silence as a stall and aborts work that is still under way, so
+        // the provider's pulse is passed along. It rides on a message_delta
+        // carrying no delta because that is the only event a caller can be sent
+        // that says nothing: a `ping` never leaves the transport, where the
+        // client SDK stops it, and a content block would show up as an empty
+        // message. Only before any output, since from the first output on the
+        // caller has a stream to read and every delta on it is proof enough.
+        const now = Date.now()
+        if (
+          !sawOutput &&
+          now - livenessStartedAt >= LIVENESS_AFTER_MS &&
+          now - lastLivenessAt >= LIVENESS_INTERVAL_MS
+        ) {
+          lastLivenessAt = now
+          start()
+          eventLine(res, { type: 'message_delta', delta: {} })
+        }
       }
     }, trace, options.signal)
     if (!sawCompletion) throw new Error('OpenCode Responses stream ended before response.completed')

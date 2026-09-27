@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  compactionRefusalMessage,
   createCompactionContext,
   startCompactProgressHeartbeat,
 } from '../src/services/compact/compactProgress.ts'
@@ -69,6 +70,33 @@ test('real output progress extends compaction idle deadline, heartbeat does not'
   }
 })
 
+test('activity that is not summary text still extends the compaction deadline', async () => {
+  const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+  process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '100'
+  const operation = createCompactionContext({
+    abortController: new AbortController(),
+  })
+  try {
+    // A provider reasoning past the deadline without having written a word of
+    // the summary is still serving the request. The deadline has to hold on
+    // every pulse it sends, or it is measuring "no prose arrived yet" and
+    // aborting work that is under way.
+    for (let i = 0; i < 6; i++) {
+      await wait(10)
+      operation.noteActivity()
+    }
+    assert.equal(operation.didTimeout(), false)
+
+    // Nothing pulsing any more, so the deadline means what it says again.
+    await wait(150)
+    assert.equal(operation.didTimeout(), true)
+  } finally {
+    operation.cleanup()
+    if (previous === undefined) delete process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+    else process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = previous
+  }
+})
+
 test('continuous output still reaches the compaction hard deadline', async () => {
   const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
   process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '20'
@@ -83,6 +111,49 @@ test('continuous output still reaches the compaction hard deadline', async () =>
     if (previous === undefined) delete process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
     else process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = previous
   }
+})
+
+test('a refusal seen before any output survives the deadline and explains it', async () => {
+  const previous = process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+  process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = '10'
+  const operation = createCompactionContext({
+    abortController: new AbortController(),
+  })
+  try {
+    operation.noteRefusal({ status: 429, message: 'rate limited' })
+    assert.deepEqual(operation.lastRefusal(), {
+      status: 429,
+      message: 'rate limited',
+    })
+
+    await wait(25)
+    assert.equal(operation.didTimeout(), true)
+    assert.equal(operation.lastRefusal()?.status, 429)
+  } finally {
+    operation.cleanup()
+    if (previous === undefined) delete process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS
+    else process.env.CLAUDE_CODE_COMPACTION_TIMEOUT_MS = previous
+  }
+})
+
+test('a refusal seen after the summary streamed is not the deadline cause', () => {
+  const operation = createCompactionContext({
+    abortController: new AbortController(),
+  })
+  try {
+    operation.context.setResponseLength(5)
+    operation.noteRefusal({ status: 429, message: 'rate limited' })
+    assert.equal(operation.lastRefusal(), null)
+  } finally {
+    operation.cleanup()
+  }
+})
+
+test('the refusal message names the status and points off the refusing route', () => {
+  const message = compactionRefusalMessage(429)
+  assert.match(message, /429/)
+  assert.match(message, /refused/)
+  assert.match(message, /switch models/)
 })
 
 test('compaction timeout aborts only the child context and cleans up', async () => {
