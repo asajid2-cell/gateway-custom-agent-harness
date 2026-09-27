@@ -8,7 +8,7 @@ Everyone in the family sees everyone else. A leaf you forked can list and messag
 Actions:
 - list: show every leaf with its number, name, live state, session ID, model and effort.
 - status: alias of list.
-- roster: the family view, and the one to use when you need to address the parent. It adds the root line (marked \`[parent]\`, or \`[this session]\` here), which \`list\` does not include. Inside a leaf, this is how you get the session ID that \`original\`/\`parent\`/\`root\` resolve to.
+- roster: the family view. It names the family id and marks the parent row \`[parent]\`, which is how you get the session ID that \`original\`/\`parent\`/\`root\` resolve to. \`list\` shows the same members without the family line.
 - fork: fork the current session (or an existing leaf/session named by \`leaf\`) into a new leaf. This is how you extend the current work into a parallel branch.
 - new: start a leaf with no copied context.
 - send: hand a leaf a message. A leaf that is running takes it at its next step boundary and answers from there, so a question comes back without waiting for the leaf to finish its whole turn; a leaf that is idle starts a turn with it. Either way it is not added to this conversation.

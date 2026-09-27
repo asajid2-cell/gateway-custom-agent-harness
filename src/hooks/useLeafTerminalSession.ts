@@ -38,9 +38,11 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
   useEffect(() => {
     if (isInteractiveLeaf()) return
     // A leaf handing its parent a turn. Unlike `leaf_prompt` (which the parent
-    // injects into a child's input stream), the root has no input-injection
+    // injects into a child's input stream), the parent has no input-injection
     // channel of its own, so the message is appended to this conversation as a
     // meta user turn - the same path `return` already uses for leaf context.
+    // This session is the one holding the family, which is the designated
+    // parent in the ordinary case; the message follows whoever hosts it.
     return registerLeafContextNotify(async (id, text) => {
       const { createUserMessage } = await import('../utils/messages.js')
       const source = (await import('../utils/leafWorkspace.js')).getLeafViews().find(view => view.member.sessionId === id)
@@ -66,7 +68,7 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
           isMeta: true,
           origin: { kind: 'gateway-peer' },
         })
-        return 'Delivered to the original session.'
+        return 'Delivered to the session hosting this family.'
       }
       const message = createUserMessage({
         content,
@@ -74,7 +76,7 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
         origin: { kind: 'task-notification' },
       })
       latest.current.setMessages(previous => previous.some(item => item.uuid === message.uuid) ? previous : [...previous, message])
-      return 'Delivered to the original session.'
+      return 'Delivered to the session hosting this family.'
     })
   }, [])
   useEffect(() => {

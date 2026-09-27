@@ -95,6 +95,44 @@ export function addLeafMember(path: string, rootSessionId: string, input: Omit<L
   })
 }
 
+/**
+ * Record the session that created the family as one of its members.
+ *
+ * The creator used to exist only as the family's identity: it had no row, every
+ * reader synthesized one for it, and that is what made "the parent" a
+ * structural role instead of a member - it could not be renamed, archived or
+ * forked, and designating a different member as the parent had nowhere to be
+ * recorded. It is an ordinary row now.
+ *
+ * This is the only path allowed to write it: `addLeafMember` still refuses the
+ * family's own id, so ordinary creation can never produce a second creator.
+ * Idempotent, so every session that opens the family can call it. For a family
+ * that predates this the creator is numbered last, which is deliberate - numbers
+ * are never recycled, and a member joining the list late should not displace
+ * anyone.
+ */
+export function ensureCreatorMember(path: string, familyId: string, metadata: { name: string; transcriptPath: string; cwd?: string }): Promise<LeafMember | undefined> {
+  return mutateFamily(path, familyId, family => {
+    if (family.members.some(member => member.sessionId === familyId)) return undefined
+    if (!Number.isSafeInteger(family.nextNumber + 1)) throw new Error('Leaf sequence exhausted')
+    const member = memberSchema.parse({
+      sessionId: familyId,
+      // Its own id: the conversation it came from is itself. Ancestry for the
+      // record, never an edge anything walks.
+      parentSessionId: familyId,
+      number: family.nextNumber++,
+      name: metadata.name,
+      transcriptPath: metadata.transcriptPath,
+      forkMessageId: null,
+      createdAt: new Date().toISOString(),
+      status: 'open',
+      ...(metadata.cwd ? { cwd: metadata.cwd } : {}),
+    })
+    family.members.push(member)
+    return member
+  })
+}
+
 export async function recordLeafContextReturn(path: string, rootSessionId: string, id: string, persist: () => Promise<void>): Promise<boolean> {
   return mutateFamily(path, rootSessionId, async family => {
     if (family.returnedContextIds.includes(id)) return false

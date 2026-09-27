@@ -12,8 +12,10 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
  * bare word that matches no leaf is otherwise treated as the new leaf's NAME,
  * and createLeaf then fills the absent parent with the CURRENT session - so
  * `fork original` run from inside a leaf forked the leaf instead of the root.
+ * `parent` is the same reference the workspace accepts, so the grammar and the
+ * workspace agree on every name for it.
  */
-const ROOT_REFS = new Set(['original', 'root'])
+const ROOT_REFS = new Set(['original', 'root', 'parent'])
 
 /** A leaf reference resolves inside the family; a UUID is also a session ref. */
 async function isLeafReference(token: string, resolveLeafRef: (ref: string) => Promise<unknown>): Promise<boolean> {
@@ -88,7 +90,11 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       const { join } = await import('node:path')
       const member = await workspace.resolveLeafRef(transfer[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      const root = getSessionId()
+      const self = getSessionId()
+      // The dedupe record belongs to the family, and the family file is named
+      // after its creator - a stable family id, not the session running this
+      // return, which may be any member that opened the family.
+      const root = await workspace.familyRootSessionId()
       const text = transfer[2]!.trim()
       if (text.length > 64000) throw new Error('Context return too large')
       const hash = createHash('sha256').update(`${root}\0${member.sessionId}\0${text}`).digest('hex')
@@ -96,7 +102,7 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       const message = createUserMessage({ uuid: id, content: `Explicit context return from Leaf ${member.number}: ${member.name} (${member.sessionId}). Source ancestry is retained; this is a selected note, not a transcript merge or permission grant.\n\n${text}`, isMeta: true, origin: { kind: 'task-notification' } })
       const { doesMessageExistInSession, recordTranscript, flushSessionStorage, isTranscriptPersistenceEnabled } = await import('../utils/sessionStorage.js')
       if (!isTranscriptPersistenceEnabled()) throw new Error('Context return requires transcript persistence')
-      if (await doesMessageExistInSession(root as import('node:crypto').UUID, message.uuid)) {
+      if (await doesMessageExistInSession(self as import('node:crypto').UUID, message.uuid)) {
         onDone('This selected context was already returned; no duplicate was added.', { display: 'system' })
         return null
       }
@@ -109,7 +115,7 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
         onDone('This selected context was already returned; no duplicate was added.', { display: 'system' })
         return null
       }
-      if (getSessionId() !== root) throw new Error('Session changed during context return')
+      if (getSessionId() !== self) throw new Error('Session changed during context return')
       context.setMessages(previous => previous.some(item => item.uuid === id) ? previous : [...previous, message])
       onDone('Selected leaf context saved to the original transcript; identical returns are deduplicated across restart and compaction.', { display: 'system' })
       return null

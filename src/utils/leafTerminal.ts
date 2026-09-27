@@ -8,6 +8,8 @@ import { registerCleanup } from './cleanupRegistry.js'
 export type LeafSnapshot = {
   rootSessionId: string
   rootName: string
+  /** Which member is the family's parent now; the family id until one is designated. */
+  parentSessionId: string
   members: { member: LeafMember; state: LeafProcessState }[]
 }
 export type LeafTerminalControl = { subtype: string; [key: string]: unknown }

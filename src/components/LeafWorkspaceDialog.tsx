@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafRootName, getLeafViews, leafParentIsOpen, leafParentMember, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafViews, listLeafMembers, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -38,12 +38,12 @@ function modelLabel(value: string): string {
 }
 
 /**
- * How a session is named in a result. The parent has no leaf number, so calling
- * it "Leaf #0" would misname the one session that is not a leaf.
+ * How a session is named in a result. Every member is a leaf, the creator
+ * included, so one form names them all.
  */
 function describeSession(member?: { number: number; name: string }): string {
   if (!member) return 'That session'
-  return member.number === 0 ? `The parent session ${member.name}` : `Leaf #${member.number} ${member.name}`
+  return `Leaf #${member.number} ${member.name}`
 }
 
 /**
@@ -76,7 +76,6 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // The transcript an archive row asked to read, with the member it belongs to:
   // the viewer is read-only, and Enter in it resumes that member once.
   const [viewing, setViewing] = useState<{ member: LeafMember; log: LogOption } | undefined>(undefined)
-  const [parent, setParent] = useState<LeafMember | undefined>(undefined)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -84,11 +83,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // Refresh the family roster whenever the workspace publishes a change.
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
   const reload = () => { void listLeafMembers().then(setMembers).catch(() => setMembers([])) }
-  // The parent session is a member of its own family but not a row in the family
-  // file, so it is asked for separately. From the parent itself there is none:
-  // the session on screen is not a target.
-  const reloadParent = () => { void leafParentMember().then(setParent).catch(() => setParent(undefined)) }
-  useEffect(() => { reload(); reloadParent() }, [screen])
+  useEffect(() => { reload() }, [screen])
 
   const run = async (label: string, action: () => Promise<string | void>) => {
     if (busy) return
@@ -145,21 +140,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     const self = selectedLeafId()
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
-    const parentOpen = Boolean(parent) && leafParentIsOpen()
     const options = [
-      // The parent is the family's permanent session: it can be opened, closed
-      // and reopened from here, but never archived or renamed - there would be
-      // nothing left to name the family.
-      ...(parent ? [{
-        value: `open:${parent.sessionId}`,
-        label: `Open the parent session ${parent.name}`,
-        description: parentOpen ? 'The conversation this family was forked from; it is open now' : 'The conversation this family was forked from',
-      }] : []),
-      ...(parent && parentOpen ? [{
-        value: `close:${parent.sessionId}`,
-        label: `Close the parent session ${parent.name}`,
-        description: 'Stop it here; it stays this family\'s permanent session and reopens from this menu',
-      }] : []),
       ...open.map(member => ({
         value: `open:${member.sessionId}`,
         label: `Open  #${member.number} ${member.name}`,
@@ -175,7 +156,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         label: `Archive #${member.number} ${member.name}`,
         description: 'Detach it from this family and hide it from this menu; the transcript is kept',
       })),
-      ...(open.length === 0 && !parent ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
+      ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
       { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
     ]
@@ -183,12 +164,11 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
       <Text bold>Leaves in this family</Text>
       <Text dimColor>Opening a leaf is the only thing that starts its process. Closed leaves stay closed until you open them again.</Text>
       {mine && <Text dimColor>These rows act on the rest of the family: {describeSession(mine)} is the session you are in.</Text>}
-      {parent && <Text dimColor>This family also has a parent session: the conversation everything here was forked from. It is always resumable and is never archived.</Text>}
       <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
         if (value === 'back' || value === 'empty') { setScreen('home'); return }
         if (value === 'archives') { setScreen('archives'); return }
         const id = value.slice(value.indexOf(':') + 1)
-        const member = members?.find(item => item.sessionId === id) ?? (parent?.sessionId === id ? parent : undefined)
+        const member = members?.find(item => item.sessionId === id)
         const action = value.slice(0, value.indexOf(':'))
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
@@ -280,7 +260,9 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   }
 
   const selected = selectedLeafId()
-  const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafRootName()
+  // With nothing selected the source is the session asking, which is not always
+  // the family's parent - a member hosting the family forks itself.
+  const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafHostName()
   const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
     { value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' },
     { value: 'list', label: 'Leaves in this family', description: members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
@@ -330,9 +312,12 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
   const [error, setError] = useState('')
   const creating = useRef(false)
 
+  // The designated parent gets the first row, so it is not listed twice: it is
+  // a member now, and its own row would otherwise sit beside this one.
+  const parentId = getLeafParentSessionId()
   const sources = [
-    { value: 'root', label: rootName, description: 'The conversation this family was forked from' },
-    ...(members ?? []).filter(member => member.status !== 'archived').map(member => ({
+    { value: 'root', label: rootName, description: 'The member designated as this family’s parent' },
+    ...(members ?? []).filter(member => member.status !== 'archived' && member.sessionId !== parentId).map(member => ({
       value: member.sessionId,
       label: `#${member.number} ${member.name}`,
       description: member.status,
