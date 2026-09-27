@@ -333,10 +333,32 @@ function getLastUserText(messages: Message[]): string {
  * goal. Comparing counts rather than inspecting the tail keeps it cheap and
  * treats a shorter array (a fresh chain) as progress rather than a stall.
  */
+/**
+ * The pivot the heartbeat's stall counter turns on, and the reason it cannot be
+ * a plain tool count. A review is a Skill call, so a session that answers every
+ * heartbeat with `persist-review` and is refused every time looks like a session
+ * doing tool work - the counter reset each turn and the heartbeat could ask
+ * forever while nothing was ever recorded. Reviews are the goal's own
+ * bookkeeping, not work on it: a review moves the marker by changing the review
+ * or delivery state below, and only then. Real tools - a Read, an Edit, a test
+ * run - still count, so genuine work is never mistaken for a stall.
+ */
 function countWork(messages: Message[]): number {
   let count = 0
   for (const message of messages) {
-    if (isToolUseRequestMessage(message)) count += 1
+    if (message.type !== 'assistant') continue
+    for (const block of message.message.content) {
+      if (block.type !== 'tool_use') continue
+      if (
+        block.name === 'Skill' &&
+        typeof block.input === 'object' &&
+        block.input !== null &&
+        'skill' in block.input &&
+        typeof block.input.skill === 'string' &&
+        block.input.skill.startsWith('persist')
+      ) continue
+      count += 1
+    }
   }
   return count
 }

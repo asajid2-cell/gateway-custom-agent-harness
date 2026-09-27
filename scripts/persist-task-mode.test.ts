@@ -140,6 +140,39 @@ function toolWork(id: string) {
   })
 }
 
+/** The `persist-review` call a heartbeat is answered with when the review is refused. */
+function reviewAttempt(id: string) {
+  return createAssistantMessage({
+    content: [{ type: 'tool_use' as const, id, name: 'Skill', input: { skill: 'persist-review', args: 'checkpoint {"phase":"integrate"}' } }],
+  })
+}
+
+test('a review that records nothing does not count as the work a heartbeat is asking for', () => {
+  const context = { chainId: 'stall-review', depth: 1, stopHookActive: true }
+  const state = makeState({ taskMode: 'task', nudgesRemaining: 0 })
+  // The recorded loop: every heartbeat was answered with a persist-review call,
+  // and every review was refused. A review is a Skill call, so a raw tool count
+  // moved on each turn and the stall ceiling never tripped - which is how a
+  // session could be refused forever while the heartbeat kept asking.
+  let messages: Parameters<typeof decidePersistStop>[1] = []
+  for (let i = 0; i < 3; i += 1) {
+    messages = [...messages, reviewAttempt(`toolu_review_${i}`)]
+    assert.equal(decidePersistStop(state, messages, undefined, context).kind, 'nudge')
+  }
+  assert.deepEqual(decidePersistStop(state, messages, undefined, context), {
+    kind: 'allow',
+    reason: 'no-progress',
+  })
+  assert.equal(state.status, 'stalled')
+
+  // The exclusion is only for the goal's own bookkeeping: the same heartbeat
+  // that also did real work is nudged, so the ceiling never lands on a session
+  // that is working.
+  const working = makeState({ taskMode: 'task', nudgesRemaining: 0 })
+  const mixed = [...messages, toolWork('toolu_review_real_work')]
+  assert.equal(decidePersistStop(working, mixed, undefined, context).kind, 'nudge')
+  assert.equal(working.stalledHeartbeats, 0)
+})
 test('a continuation heartbeat disarms after repeated tool-free stops', () => {
   const context = { chainId: 'stall-chain', depth: 1, stopHookActive: true }
   const state = makeState({ taskMode: 'task', nudgesRemaining: 0 })
@@ -249,6 +282,47 @@ test('a stalled heartbeat retires the hook and keeps the goal', async t => {
     assert.equal(record?.status, 'stalled')
     assert.equal(record?.task, 'finish the stalled delivery')
     assert.match(getPersistGoalContext() ?? '', /Do not automatically pursue it/)
+  } finally {
+    await harness.command.getPromptForCommand('clear', context)
+  }
+})
+
+/**
+ * The recorded flood, end to end. The session answered every heartbeat with a
+ * `persist-review` call whose payload was refused, so no review was ever
+ * recorded, the goal never closed, and the heartbeat asked again - three times
+ * past the point the session had already declared itself stopped. A review is a
+ * Skill call, so counting raw tool use read every one of those refusals as work
+ * and the ceiling never tripped.
+ */
+test('a heartbeat answered only by refused reviews is parked, not asked forever', async t => {
+  const directory = await mkdtemp(join(tmpdir(), 'persist-refused-review-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const path = join(directory, 'session.jsonl')
+  const harness = createHarness()
+  t.after(clearBundledSkills)
+  const chain = { chainId: 'refused-review', depth: 1, stopHookActive: true }
+  const context = { setAppState: harness.setAppState, transcriptPath: path, queryTracking: chain } as unknown as ToolUseContext
+  const currentHook = () => {
+    const hook = harness.getHooks()[0]?.hook
+    assert.ok(hook?.type === 'function')
+    return hook
+  }
+  try {
+    await harness.command.getPromptForCommand('task --nudges 1 finish the connected delivery', context)
+    let messages: Parameters<typeof decidePersistStop>[1] = []
+    for (let i = 0; i < 3; i += 1) {
+      const refused = await harness.review.getPromptForCommand('checkpoint {"phase":"integrate"}', context)
+      assert.match(refused[0]?.type === 'text' ? refused[0].text : '', /Checkpoint refused/)
+      messages = [...messages, reviewAttempt(`toolu_refused_${i}`)]
+      assert.equal(await currentHook().callback(messages, undefined, chain), false)
+      await settlePersistDelivery(getSessionId(), chain.chainId, true)
+    }
+    assert.equal(await currentHook().callback(messages, undefined, chain), true)
+    assert.equal(harness.getHooks().length, 0)
+    await drainPersistWrites()
+    assert.equal((await readPersistSessionRecord(path))?.status, 'stalled')
+    assert.equal((await readPersistSessionRecord(path))?.task, 'finish the connected delivery')
   } finally {
     await harness.command.getPromptForCommand('clear', context)
   }
