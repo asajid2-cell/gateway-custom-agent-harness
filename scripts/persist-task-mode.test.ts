@@ -149,11 +149,20 @@ test('a continuation heartbeat disarms after repeated tool-free stops', () => {
 
   // Bounded mode disarms on its budget. A continuation heartbeat is armed
   // forever, so this is the only ceiling that ends the loop.
-  assert.deepEqual(
-    [0, 1, 2].map(() => decidePersistStop(state, stalled, undefined, context).kind),
-    ['nudge', 'nudge', 'nudge'],
-  )
+  const decisions = [0, 1, 2].map(() => decidePersistStop(state, stalled, undefined, context))
+  assert.deepEqual(decisions.map(decision => decision.kind), ['nudge', 'nudge', 'nudge'])
   assert.equal(state.nudgesSent, 3)
+  // The first heartbeat asks for work. Once a heartbeat has produced nothing
+  // the nudge stops asking and names the exits instead - closing the goal is
+  // the model's job, and the flood is what happened when nothing ever said so.
+  const texts = decisions.map(decision => (decision.kind === 'nudge' ? decision.message : ''))
+  assert.match(texts[0]!, /task heartbeat remains armed/i)
+  assert.doesNotMatch(texts[0]!, /close the loop now/i)
+  assert.match(texts[1]!, /no progress 1 of 3/)
+  assert.match(texts[1]!, /close the loop now with persist-review complete/)
+  assert.match(texts[1]!, /persist-review blocked/)
+  assert.match(texts[2]!, /no progress 2 of 3/)
+  assert.match(texts[2]!, /parked and the heartbeat stops/)
   assert.deepEqual(decidePersistStop(state, stalled, undefined, context), {
     kind: 'allow',
     reason: 'no-progress',
@@ -189,6 +198,20 @@ test('one tool call between heartbeats clears the stall count', () => {
   // Counting resumes from the new mark rather than from the old one.
   decidePersistStop(state, worked, undefined, context)
   assert.equal(state.stalledHeartbeats, 1)
+})
+
+test('real work keeps the heartbeat armed well past the stall window', () => {
+  const context = { chainId: 'work-chain', depth: 1, stopHookActive: true }
+  const state = makeState({ taskMode: 'task', nudgesRemaining: 0 })
+  // The stall window is a ceiling on heartbeats that do nothing, never on the
+  // work itself: a session that keeps producing tool work is nudged past it.
+  let messages: Parameters<typeof decidePersistStop>[1] = []
+  for (let i = 0; i < 6; i += 1) {
+    messages = [...messages, toolWork(`toolu_work_${i}`)]
+    assert.equal(decidePersistStop(state, messages, undefined, context).kind, 'nudge')
+    assert.equal(state.stalledHeartbeats, 0)
+  }
+  assert.equal(state.nudgesSent, 6)
 })
 
 test('a stalled heartbeat retires the hook and keeps the goal', async t => {

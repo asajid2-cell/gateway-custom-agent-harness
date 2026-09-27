@@ -144,7 +144,7 @@ export function getPersistGoalContext(): string | undefined {
     : taskMode === 'keep'
       ? 'Keep mode retains goal custody until explicit completion or release.'
       : 'Bounded mode stops automatic continuation when its reminder budget is exhausted.'
-  return `Durable session goal (${record.status}, ${taskMode}):\n<goal>\n${escapeXml(record.task)}\n</goal>\n${continuation} The latest user instruction takes precedence. Side conversations do not erase this goal. Check completion criteria and verification evidence before declaring completion. Do not spend reminders on unrelated discussion. At meaningful checkpoints or attempted stops use the persist-review skill with checkpoint, continue, unrelated, blocked, or complete followed by concrete evidence. This is self-assessment, not independent verification. Review unrelated for side conversations, blocked when user input is needed, and complete only when completion criteria are met. Goal controls: /persist status, /persist pause, /persist complete, /persist clear.\n${deliveryDirection(record.delivery)}`
+  return `Durable session goal (${record.status}, ${taskMode}):\n<goal>\n${escapeXml(record.task)}\n</goal>\n${continuation} The latest user instruction takes precedence. Side conversations do not erase this goal. Check completion criteria and verification evidence before declaring completion, and when the work is finished close the goal with persist-review complete rather than letting the heartbeat repeat - saying the work is done in prose closes nothing, and a goal left open keeps asking. Do not spend reminders on unrelated discussion. At meaningful checkpoints or attempted stops use the persist-review skill with checkpoint, continue, unrelated, blocked, or complete followed by concrete evidence. This is self-assessment, not independent verification. Review unrelated for side conversations, blocked when user input is needed, and complete only when completion criteria are met. Goal controls: /persist status, /persist pause, /persist complete, /persist clear.\n${deliveryDirection(record.delivery)}`
 }
 function publishPersist(): void {
   for (const listener of persistListeners) listener()
@@ -517,15 +517,22 @@ export function decidePersistStop(
   const userContext = lastUser
     ? ` Latest user context: ${tail(lastUser, MAX_USER_CONTEXT_LENGTH)}`
     : ''
+  const stalled = isContinuationMode(state) ? (state.stalledHeartbeats ?? 0) : 0
   const countText = isContinuationMode(state)
-    ? `${state.nudgesSent}`
+    ? `${state.nudgesSent}${stalled ? `, no progress ${stalled} of ${MAX_STALLED_HEARTBEATS}` : ''}`
     : `${state.nudgesSent} of ${state.nudgesSent + state.nudgesRemaining}`
   const continuationText = taskMode === 'task'
     ? ' Task heartbeat remains armed beyond the initial nudge budget. Continue through useful implementation, integration, and verification work. Do not yield after a small step or claim completion without goal-wide doneWhen evidence recorded through persist-review complete. Stop for explicit pause, complete, or clear; abort or provider/API failure; persist-review blocked; or a genuine unworkable blocker.'
     : taskMode === 'keep'
       ? ' This task remains active until explicit completion through persist-review complete with evidence or /persist complete; do not infer completion from prose.'
       : ' Stop normally only if the task is genuinely complete or all remaining work has an unworkable blocker requiring user input or access.'
-  const message = `Persist ${taskMode === 'task' ? 'task heartbeat' : 'reminder'} (${countText}). Active task: ${task}.${userContext} ${deliveryDirection(state.delivery)}${continuationText}`
+  // A heartbeat that added nothing is the moment the loop has to be decided,
+  // not just repeated. Asking the model to continue is what produced the field
+  // flood: it answered "Complete" in prose while the goal stayed open, so the
+  // nudge names the exits instead. Closing the goal is the model's job, and
+  // this is the message that tells it so before the heartbeat gives up.
+  const closureText = ` The previous ${stalled} ${plural(stalled, 'heartbeat')} produced no tool work, no checkpoint, and no blocker. If the goal's doneWhen condition is already satisfied, close the loop now with persist-review complete and its concrete evidence. If a genuine dependency prevents progress, record it with persist-review blocked. Otherwise do the work. Answering this heartbeat again without doing the work or recording one of those outcomes is not progress, and after ${MAX_STALLED_HEARTBEATS} such heartbeats the goal is parked and the heartbeat stops.`
+  const message = `Persist ${taskMode === 'task' ? 'task heartbeat' : 'reminder'} (${countText}). Active task: ${task}.${userContext} ${deliveryDirection(state.delivery)}${stalled ? closureText : continuationText}`
   return {
     kind: 'nudge',
     nudgesRemaining: state.nudgesRemaining,
