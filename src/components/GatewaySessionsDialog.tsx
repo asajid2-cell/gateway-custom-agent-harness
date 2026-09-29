@@ -1,22 +1,30 @@
 import React, { useEffect, useState } from 'react'
 import { Box, Text, useInput } from '../ink.js'
 import { getSessionId } from '../bootstrap/state.js'
-import { getGatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
+import { gatewaySessionCommsProblem, getGatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
 import type { GatewayPeer } from '../utils/gatewaySessionProtocol.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 
 export function GatewaySessionsDialog({ onDone }: { onDone: () => void }): React.ReactNode {
   useRegisterOverlay('gateway-sessions', true)
-  const runtime = getGatewaySessionRuntime(getSessionId())
+  // Re-read on refresh rather than capturing it once: a session whose
+  // registration was still being retried when the panel opened becomes live
+  // while the panel is up, and R is what the panel's own help line promises.
+  const [runtime, setRuntime] = useState(() => getGatewaySessionRuntime(getSessionId()))
   const [peers, setPeers] = useState<GatewayPeer[]>([])
   const [error, setError] = useState('')
   const [page, setPage] = useState(0)
   const [inbox, setInbox] = useState(false)
   const { rows } = useTerminalSize()
   const pageSize = Math.max(1, Math.floor((rows - 6) / 3))
-  const refresh = () => { void runtime?.list().then(setPeers).catch(() => setError('Session discovery unavailable.')) }
-  useEffect(() => { refresh() }, [runtime])
+  const refresh = () => {
+    const current = getGatewaySessionRuntime(getSessionId())
+    setRuntime(current)
+    if (!current) { setError(''); return }
+    void current.list().then(setPeers).catch(() => setError('Session discovery unavailable.'))
+  }
+  useEffect(() => { refresh() }, [])
   useInput((input, key) => {
     if (key.escape) onDone()
     if (input === 'r') refresh()
@@ -29,7 +37,7 @@ export function GatewaySessionsDialog({ onDone }: { onDone: () => void }): React
   return <Box flexDirection="column">
     <Text bold>Gateway sessions — Escape closes; R refreshes; I toggles inbox</Text>
     <Text>PgUp/PgDn pages; A accept / H hold / F refuse incoming messages</Text>
-    {!runtime && <Text>Communication is not active in this runtime.</Text>}
+    {!runtime && <Text>Peer comms is not active: {gatewaySessionCommsProblem(getSessionId()) ?? 'the peer runtime is not attached to this context'}. R re-checks.</Text>}
     {inbox ? records.slice(page * pageSize, (page + 1) * pageSize).map(record => <Box key={record.message.id} flexDirection="column"><Text>{record.state}: {record.senderName} — {record.message.summary}</Text><Text>{record.message.id}</Text></Box>) : peers.slice(page * pageSize, (page + 1) * pageSize).map(peer => <Box key={peer.sessionId} flexDirection="column"><Text>[{peer.status}] {peer.purpose.trim() || peer.name}</Text><Text dimColor>{peer.name} · {peer.sessionId}</Text><Text dimColor>{peer.cwd}</Text></Box>)}
     <Text dimColor>Use /sessions purpose &lt;intent&gt; to say what this session is working on; /sessions send &lt;id|leaf&gt; &lt;message&gt;</Text>
     {error && <Text>{error}</Text>}

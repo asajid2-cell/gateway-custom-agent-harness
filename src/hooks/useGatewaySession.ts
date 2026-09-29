@@ -36,6 +36,19 @@ function sessionPurposeSeed(messages: Message[] | undefined, name: string): stri
   return leafLabel()?.slice(0, 1000) ?? deriveSessionPurpose(messages, name)
 }
 
+/**
+ * How long to wait before re-attempting the bus registration, and so how many
+ * re-attempts to make.
+ *
+ * The failure this exists for is a writer lock left behind by a process that is
+ * gone: proper-lockfile keeps treating it as held until its 30-second staleness
+ * window passes, and no attempt made inside that window can succeed. The waits
+ * accumulate, so what has to outlast the window is their total rather than any
+ * single one: the last attempt happens 42 seconds in, with the whole sequence
+ * still completing inside the life of the session trying to register itself.
+ */
+const GATEWAY_REGISTRATION_RETRY_MS = [2_000, 10_000, 30_000]
+
 export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiting', sessionMessages: Message[] | undefined): void {
   const sessionId = getSessionId()
   const peerName = sessionPeerName(name)
@@ -58,37 +71,76 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
     // listing that read it could name a directory this session cannot be
     // resumed from. This effect re-runs on every session switch, so a resume
     // picks up the directory that switch just set.
-    const runtime = new GatewaySessionRuntime(sessionId, getSessionResumeDirectory(), name)
     let disposed = false
+    // The runtime the attempt loop currently owns. Held here rather than only in
+    // the ref because a failed attempt is discarded and replaced, and cleanup has
+    // to close whichever one exists then - including none, between attempts.
+    let active: GatewaySessionRuntime | undefined
+    // Ends the backoff below early, so that closing never waits out a retry.
+    let wake: (() => void) | undefined
     const started = closing.current.then(async () => {
-      if (disposed) return
-      await runtime.start(gatewayMessageIds(sessionMessages ?? []))
-      if (disposed || getSessionId() !== sessionId) return
-      runtimeRef.current = runtime
-      // The Stop hook is the turn-boundary half of delivery. The queue half is
-      // already live inside the runtime; without this a busy session only sees
-      // peer traffic mid-turn, as injection this hook exists to replace.
-      const stopHook = registerGatewayPeerStopHook(setAppState, runtime)
-      if (disposed) {
-        stopHook.remove()
+      // Registration used to be a single attempt whose failure went to a debug
+      // log that is a no-op outside debug mode, so a session that lost the writer
+      // claim - or was refused because a lock a crashed process left behind still
+      // looked fresh - stayed off the bus for its whole life with nothing
+      // anywhere saying so. The attempt is retried over a window longer than that
+      // lock's own staleness, which is the failure that heals itself: the lock
+      // becomes acquirable the moment the window passes.
+      for (let attempt = 0; !disposed; attempt++) {
+        if (getSessionId() !== sessionId) return
+        const runtime = new GatewaySessionRuntime(sessionId, getSessionResumeDirectory(), name)
+        active = runtime
+        try {
+          await runtime.start(gatewayMessageIds(sessionMessages ?? []))
+        } catch (error) {
+          if (active === runtime) active = undefined
+          await runtime.close().catch(() => {})
+          if (disposed) return
+          if (attempt >= GATEWAY_REGISTRATION_RETRY_MS.length) {
+            logForDebugging(`Gateway session communication could not start: ${error instanceof Error ? error.message : String(error)}`)
+            return
+          }
+          await new Promise<void>(resolve => {
+            const timer = setTimeout(() => { wake = undefined; resolve() }, GATEWAY_REGISTRATION_RETRY_MS[attempt]!)
+            wake = () => { clearTimeout(timer); wake = undefined; resolve() }
+          })
+          continue
+        }
+        if (disposed || getSessionId() !== sessionId) {
+          if (active === runtime) active = undefined
+          await runtime.close().catch(() => {})
+          return
+        }
+        runtimeRef.current = runtime
+        // The Stop hook is the turn-boundary half of delivery. The queue half is
+        // already live inside the runtime; without this a busy session only sees
+        // peer traffic mid-turn, as injection this hook exists to replace.
+        const stopHook = registerGatewayPeerStopHook(setAppState, runtime)
+        if (disposed) {
+          stopHook.remove()
+          if (active === runtime) active = undefined
+          await runtime.close().catch(() => {})
+          return
+        }
+        stopHookRef.current = stopHook
+        // Seed intent only while it is unstated. An explicit declaration outranks
+        // the derived one, and a later name/status refresh must never clobber it.
+        const purpose = runtime.transport.peer.purpose.trim() ? runtime.transport.peer.purpose : sessionPurposeSeed(sessionMessages, name)
+        await runtime.transport.update({ name: latest.current.name, status: latest.current.status === 'busy' ? 'running' : latest.current.status === 'waiting' ? 'awaiting-approval' : 'idle', purpose }).catch(() => { logForDebugging('Gateway session status update failed.') })
         return
       }
-      stopHookRef.current = stopHook
-      // Seed intent only while it is unstated. An explicit declaration outranks
-      // the derived one, and a later name/status refresh must never clobber it.
-      const purpose = runtime.transport.peer.purpose.trim() ? runtime.transport.peer.purpose : sessionPurposeSeed(sessionMessages, name)
-      await runtime.transport.update({ name: latest.current.name, status: latest.current.status === 'busy' ? 'running' : latest.current.status === 'waiting' ? 'awaiting-approval' : 'idle', purpose })
     }).catch(() => { logForDebugging('Gateway session communication could not start.') })
     const close = async () => {
       disposed = true
+      wake?.()
       // Before the transport closes: a turn ending mid-shutdown would otherwise
       // fire the callback against a closed inbox.
       stopHookRef.current?.remove()
       stopHookRef.current = undefined
-      runtime.delivery.close()
+      active?.delivery.close()
       await started
-      if (runtimeRef.current === runtime) runtimeRef.current = undefined
-      await runtime.close().catch(() => { logForDebugging('Gateway session communication cleanup failed.') })
+      if (runtimeRef.current === active) runtimeRef.current = undefined
+      await active?.close().catch(() => { logForDebugging('Gateway session communication cleanup failed.') })
     }
     const unregister = registerCleanup(close)
     return () => {

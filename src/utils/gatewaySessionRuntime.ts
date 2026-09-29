@@ -12,6 +12,51 @@ import type { GatewayPeer, GatewayInboundPolicy } from './gatewaySessionProtocol
 const runtimes = new Map<string, GatewaySessionRuntime>()
 export function getGatewaySessionRuntime(sessionId: string): GatewaySessionRuntime | undefined { return runtimes.get(sessionId) }
 
+/**
+ * Why a session's bus registration is not live, when it has tried and failed.
+ *
+ * Registration is attempted once per session id from the REPL's mount effect,
+ * and every failure used to be swallowed into a debug log that is a no-op unless
+ * debug mode is on. A session that never reached the bus therefore looked
+ * exactly like one that had: `/sessions`, the panel and the peer skill all said
+ * "unavailable", and a peer that tried to reach it was told the session had
+ * exited. The reason is kept here so those surfaces can say what actually
+ * happened, and so the answer survives the runtime that failed.
+ */
+const startFailures = new Map<string, string>()
+
+/** What the comms surfaces should say about a session that has no runtime. */
+export type GatewaySessionCommsState =
+  | { state: 'live' }
+  | { state: 'starting' }
+  | { state: 'failed'; reason: string }
+  | { state: 'disabled'; reason: string }
+
+export function gatewaySessionCommsState(sessionId: string): GatewaySessionCommsState {
+  if (runtimes.has(sessionId)) return { state: 'live' }
+  // Checked before the recorded failure: the env gate is why no attempt was
+  // made at all. A session launched outside the launcher that sets it (a
+  // hand-run cli, a probe build) never registers, and nothing about its own
+  // configuration says so - this is the only place that can name the reason.
+  if (process.env.CLAUDE_CODE_USE_GATEWAY !== '1') {
+    return { state: 'disabled', reason: 'this session was launched without peer comms enabled (CLAUDE_CODE_USE_GATEWAY is not 1)' }
+  }
+  const reason = startFailures.get(sessionId)
+  return reason === undefined ? { state: 'starting' } : { state: 'failed', reason }
+}
+
+/**
+ * One line a surface can show when it has found no runtime for this session.
+ *
+ * Undefined only when the session really is live, so a caller that already knows
+ * it is not can report the reason without deciding which case it is in.
+ */
+export function gatewaySessionCommsProblem(sessionId: string): string | undefined {
+  const state = gatewaySessionCommsState(sessionId)
+  if (state.state === 'live') return undefined
+  return state.state === 'starting' ? 'this session is still registering on the peer bus' : state.reason
+}
+
 export class GatewaySessionRuntime {
   readonly transport: GatewaySessionTransport
   readonly delivery: GatewaySessionDelivery
@@ -53,6 +98,7 @@ export class GatewaySessionRuntime {
         await this.delivery.reconcilePersisted(persistedIds)
         if (this.closing) return
         runtimes.set(this.transport.peer.sessionId, this)
+        startFailures.delete(this.transport.peer.sessionId)
         this.ready = true
         // Registered is the moment this process becomes something nobody can
         // attribute and nothing closes, so it is also the moment the idle rules
@@ -61,10 +107,17 @@ export class GatewaySessionRuntime {
         this.stopReaper = startSessionReaper()
         this.delivery.drain()
       } catch (error) {
+        // The attempt is not retried by this runtime - its transport is closed -
+        // so the reason has to outlive it for the surfaces to be able to report
+        // it. The caller may well build a fresh runtime and succeed. Recorded
+        // before the teardown below, because teardown is best-effort: an error
+        // about the cleanup must not be able to replace the reason this start
+        // failed, or leave the session reading as "still registering" forever.
+        startFailures.set(this.transport.peer.sessionId, error instanceof Error ? error.message : String(error))
         this.unsubscribeSwitch?.()
         this.unsubscribeSwitch = undefined
         this.delivery.close()
-        await this.transport.close()
+        await this.transport.close().catch(() => {})
         throw error
       }
     })()
