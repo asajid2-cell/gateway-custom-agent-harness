@@ -28,6 +28,8 @@ parser.add_argument('--probe-selection', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
 parser.add_argument('--probe-close-parent', action='store_true')
+parser.add_argument('--probe-comms', action='store_true')
+parser.add_argument('--probe-read', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -58,15 +60,46 @@ def session_of(body):
 # screen, to learn who received it.
 VIEW_TAG_RE = re.compile(r'VIEW_TAG_[0-9a-f]{8}')
 
+def view_tag(content):
+    """The view tag the app typed, read from the message's own text.
+
+    A tag means "this keystroke landed here", so it is only a reading when it
+    *is* the message. Searching the whole message instead is not the same fact:
+    a read renders another session's conversation, and that text quotes replies,
+    so a digest line ends in `FIXTURE_REPLY_VIEW_TAG_<hex>` - a tag-shaped
+    string that has nothing to do with who received anything. A probe hit
+    exactly that: the digest rode along in the same message as the newly typed
+    tag, the search answered the quotation, and the previous turn's reply
+    appeared under the new turn's question. Only a block that is nothing but a
+    tag counts.
+    """
+    blocks = content if isinstance(content, list) else [content]
+    found = None
+    for block in blocks:
+        text = block if isinstance(block, str) else (block.get('text', '') if isinstance(block, dict) else '')
+        match = VIEW_TAG_RE.fullmatch(text.strip()) if isinstance(text, str) else None
+        if match: found = match
+    return found
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
-        view = VIEW_TAG_RE.search(latest)
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_') if value in latest), 'BACKGROUND')
+        view = view_tag(messages[-1].get('content', '') if messages else '')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
+        if os.environ.get('LEAF_POINTER_LOG'):
+            # What the app actually asked for. A probe that fails on a reply it
+            # never saw needs to know whether the request carried the marker
+            # that was typed, so this records the raw last message rather than
+            # the answer the fixture decided to give it.
+            with open(root / 'requests.log', 'a', encoding='utf-8') as log:
+                log.write(json.dumps(dict(
+                    view=(view.group(0) if view else None), marker=marker,
+                    session=session_of(body), tail=latest[-240:],
+                ), ensure_ascii=False) + '\n')
         if view:
             # Recorded here and deliberately kept out of `requests`: a view tag
             # is an instrument reading, not one of the turns the probes count
@@ -228,6 +261,28 @@ class Terminal:
         while time.monotonic() < end:
             self.pump(); time.sleep(.02)
     def text(self): return '\n'.join(self.screen.display)
+    def after(self, marker):
+        """What is on screen from the last `marker` onwards.
+
+        What a command printed stays on screen above whatever comes after it, so
+        a check against the whole screen can be satisfied by an older answer to an
+        older question - a listing that still shows a checkpoint after it was
+        dropped, because the listing from before the drop is still up there. The
+        newest occurrence is what the last command wrote.
+        """
+        at = self.text().rfind(marker)
+        return self.text()[at:] if at >= 0 else ''
+    def check(self, predicate, label):
+        """An assertion about what is on screen, with the screen kept on failure.
+
+        `wait` already saves the screen when it gives up; a bare assert does not,
+        and a probe that fails on a screen reading with no screen to read is a
+        probe nobody can diagnose.
+        """
+        self.pump()
+        if not predicate():
+            self.dump()
+            raise AssertionError(label + ' (screen saved locally)')
     def submit(self, text):
         self.capture_owned()
         self.proc.write('\x1b[200~' + text + '\x1b[201~'); self.pause(.5); self.proc.write('\r')
@@ -1236,10 +1291,254 @@ def probe_queue():
     t.exit()
     print(json.dumps(dict(queue=True, emptyComposerNotQueued=True, orderHeld=True, waitsForTurnEnd=True, capRefuses=True, upArrowEdits=True, drainsInOrder=True)), flush=True)
 
+def probe_read():
+    """Reading a member's work on demand, on real sessions, from both ends.
+
+    Three surfaces, all of them real CLIs at a real prompt: the parent reads a
+    member's chat and the family digest, a leaf reads a sibling (which the host
+    serves, since a leaf holds no transcript paths), and a live session outside
+    the family is read over the peer bus. A read is a file read on the target's
+    side and never a turn, so none of this waits on, or interrupts, the work it
+    is looking at.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+    t.submit('/leaf fork original Gamma')
+    t.wait(lambda: len(t.leaves()) == 1, 'the gamma leaf', 75)
+    gamma = t.leaves()[0]
+    t.assert_view(gamma['sessionId'], 'the gamma leaf', 75)
+    t.submit('GAMMA_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_GAMMA_TURN' in t.text(), 'gamma turn')
+
+    # A second member, so the leaf-side read has a target whose work exists
+    # nowhere on the reading leaf's own screen.
+    t.original()
+    t.submit('/leaf fork original Delta')
+    t.wait(lambda: len(t.leaves()) == 2, 'the delta leaf', 75)
+    delta = t.leaves()[1]
+    t.assert_view(delta['sessionId'], 'the delta leaf', 75)
+    t.submit('DELTA_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_DELTA_TURN' in t.text(), 'delta turn')
+
+    # The family digest: every member at a glance, with the parent that holds the
+    # member list and the transcript paths answering for all of them.
+    t.original()
+    t.submit('/leaf read')
+    t.wait(lambda: 'family ' + t.id in t.text(), 'the family digest', 45)
+    digest = t.after('family ' + t.id)
+    assert 'Gamma' in digest and 'Delta' in digest, 'the digest does not name the members it summarises'
+
+    # One member's own chat, read from the parent. The header is the reader's own
+    # label, so the assertion cannot be satisfied by the turn itself still being
+    # on some other screen.
+    t.submit('/leaf read ' + gamma['sessionId'])
+    t.wait(lambda: '[peer session transcript' in t.text(), 'the labelled member chat', 45)
+    assert 'GAMMA_TURN' in t.text(), 'the member chat did not carry the member work'
+    assert 'cursor ' in t.text(), 'a read hands back a cursor so following along is cheap'
+
+    # A bounded read, and the cursor played back. Following along has to be
+    # cheap, which means asking for a short window and for only what is new -
+    # and a read that ignored either would look exactly like a working one
+    # until the conversation got long.
+    t.submit('/leaf read ' + gamma['sessionId'] + ' tail=1')
+    t.wait(lambda: 'cursor ' in t.after('tail=1'), 'a bounded read', 45)
+    bounded = t.after('tail=1')
+    assert 'FIXTURE_REPLY_GAMMA_TURN' in bounded, 'tail=1 dropped the newest turn'
+    assert 'ROOT_CONTEXT_CAFE_' not in bounded, 'tail=1 kept turns it was told to leave out'
+    handed = re.search(r'cursor ([0-9a-f-]{36})', bounded)
+    assert handed, 'a read handed back no cursor to follow from'
+
+    t.leaf(0)
+    t.submit('GAMMA_LATER_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_GAMMA_LATER_TURN' in t.text(), 'the member works on')
+    t.original()
+    t.submit('/leaf read ' + gamma['sessionId'] + ' since=' + handed.group(1))
+    t.wait(lambda: 'GAMMA_LATER_TURN' in t.after('since='), 'a read from a cursor', 45)
+    followed = t.after('since=')
+    assert 'FIXTURE_REPLY_GAMMA_LATER_TURN' in followed, 'the read from a cursor missed the turn that came after it'
+    assert 'ROOT_CONTEXT_CAFE_' not in followed, 'the read from a cursor re-sent turns that were already read'
+
+    # A leaf reading a sibling. The leaf has no member list and no paths, so the
+    # only way this answer exists is the host serving it over the leaf wire - and
+    # DELTA_TURN is nowhere on Gamma's own screen for it to be confused with.
+    t.leaf(0)
+    t.submit('/leaf read ' + delta['sessionId'])
+    t.wait(lambda: '[peer session transcript' in t.text(), 'the sibling read', 60)
+    assert 'DELTA_TURN' in t.text(), 'the sibling read did not reach the sibling conversation'
+
+    # A live session outside the family, over the peer bus. The listing comes
+    # first because discovery and the read are two different faults: a peer the
+    # listing cannot see is one the read can never be addressed to, and the two
+    # must not be reported as one failure. It is asked until the target shows
+    # up, because a session publishes its registration a moment after its
+    # prompt appears - asking once would test the timing of the spawn, not the
+    # read.
+    t.original()
+    other = Terminal()
+    other.wait(lambda: 'All 1' in other.text(), 'the second session', 60)
+    other.submit('OTHER_TURN_MARKER')
+    other.wait(lambda: 'FIXTURE_REPLY_OTHER_TURN_MARKER' in other.text(), 'the second session turn')
+    deadline = time.monotonic() + 90
+    while True:
+        t.submit('/sessions list')
+        t.wait(lambda: 'live sessions' in t.after('/sessions list'), 'the live session list', 45)
+        if other.id[:8] in t.after('/sessions list') or time.monotonic() > deadline: break
+        t.pause(2)
+    t.check(lambda: other.id[:8] in t.after('/sessions list'),
+            'the second session never published a registration: ' + repr(t.after('/sessions list')[-600:]))
+    t.submit('/sessions read ' + other.id)
+    t.wait(lambda: 'OTHER_TURN_MARKER' in t.after('/sessions read'), 'a live non-family session is read on demand', 60)
+    assert '[peer session transcript' in t.after('/sessions read'), 'the peer read was not labelled as peer-authored text'
+
+    for member in t.leaves():
+        t.submit('/leaf close ' + member['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 60)
+
+    # A closed member is still readable. Its bytes are on disk and the parent
+    # holds the path, so reading never depends on the member running - which is
+    # the difference between reading work and starting it, and the reason a read
+    # is instant.
+    t.submit('/leaf read')
+    t.wait(lambda: 'family ' + t.id in t.after('/leaf read'), 'the digest over closed members', 45)
+    closed_digest = t.after('/leaf read')
+    assert 'Gamma' in closed_digest and 'Delta' in closed_digest, 'the digest dropped members that had closed'
+    t.submit('/leaf read ' + gamma['sessionId'])
+    t.wait(lambda: 'GAMMA_TURN' in t.after('/leaf read ' + gamma['sessionId']), 'a closed member is read on demand', 45)
+    assert '[peer session transcript' in t.after('/leaf read ' + gamma['sessionId']), 'the closed member read was not labelled as peer text'
+
+    # The second session is nobody's leaf, so it leaves on its own and gives its
+    # own writer claim back first. A session still running is still writing, and
+    # the assertion at the end is about what THIS window left behind - taking it
+    # while a stranger held a lock would have read as a leak it is not.
+    other.submit('/exit')
+    other.wait(lambda: not other.proc.isalive(), 'the second session leaves')
+    other.wait(lambda: not (root / 'gateway-writers' / (other.id + '.lock')).exists(), 'the second session released its writer lock')
+    t.exit()
+    print(json.dumps(dict(read=True, digest=True, memberChat=True, leafSibling=True, peerRead=True)), flush=True)
+
+def probe_comms():
+    """Checkpoints and branching from one, on real sessions.
+
+    A member snapshots itself from its own prompt, the family lists the
+    snapshot, a repeat label takes the next ordinal and an ambiguous one is
+    refused rather than guessed, and a branch taken from `#1` carries the
+    conversation as it stood at the checkpoint rather than as it stands now.
+    Dropping keeps the branch; purging empties the collection.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+    t.submit('/leaf fork original Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'the alpha leaf', 75)
+    alpha = t.leaves()[0]
+    t.assert_view(alpha['sessionId'], 'the alpha leaf', 75)
+    t.submit('ALPHA_FIRST_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_FIRST_TURN' in t.text(), 'alpha first turn')
+
+    # The member snapshots itself. The request crosses the leaf wire, and the
+    # host - which holds the member's transcript path and is the only party that
+    # can flush it - takes the copy.
+    t.submit('/leaf checkpoint ' + alpha['sessionId'] + ' alpha-snap')
+    t.wait(lambda: 'Checkpoint #1 alpha-snap' in t.text(), 'alpha checkpoints itself', 75)
+
+    # Alpha keeps working. The snapshot must not follow it.
+    t.submit('ALPHA_LATER_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_LATER_TURN' in t.text(), 'alpha keeps working')
+
+    frozen = root / 'leaf-families' / 'checkpoints' / t.id
+    assert frozen.is_dir(), 'the checkpoint collection was not created at ' + str(frozen)
+    assert len(list(frozen.glob('*.jsonl'))) == 1, 'the frozen conversation was not written'
+
+    t.original()
+    t.submit('/leaf checkpoints')
+    t.wait(lambda: '#1 alpha-snap' in t.after('checkpoints for family'), 'the checkpoint is listed', 45)
+
+    # A second tip under the same label: a new ordinal, and a name that now
+    # answers to two snapshots is refused rather than guessed.
+    t.submit('/leaf checkpoint ' + alpha['sessionId'] + ' alpha-snap')
+    t.wait(lambda: 'Checkpoint #2 alpha-snap' in t.text(), 'a repeat label takes the next ordinal', 75)
+    t.submit('/leaf fork alpha-snap Ambiguous')
+    t.wait(lambda: 'Ambiguous checkpoint' in t.text(), 'an ambiguous label is refused', 45)
+    assert len(t.leaves()) == 1, 'a refused fork created a leaf anyway'
+
+    # The branch of #1 must carry the conversation as it stood at the checkpoint.
+    t.submit('/leaf fork #1 Beta')
+    t.wait(lambda: len(t.leaves()) == 2, 'the checkpoint branch', 90)
+    beta = t.leaves()[1]
+    assert beta['parentSessionId'] == alpha['sessionId'], 'the branch is not attributed to the member the checkpoint came from'
+    pointer = json.loads((root / 'leaf-families' / 'index' / (beta['sessionId'] + '.json')).read_text(encoding='utf-8'))
+    assert pointer.get('fromCheckpointId'), 'the branch does not record which checkpoint it came from'
+    branch_text = Path(beta['transcriptPath']).read_text(encoding='utf-8')
+    assert 'ALPHA_FIRST_TURN' in branch_text, 'the branch did not carry the checkpointed conversation'
+    assert 'ALPHA_LATER_TURN' not in branch_text, 'the branch followed the source past the checkpoint'
+
+    t.assert_view(beta['sessionId'], 'the checkpoint branch', 90)
+    t.original()
+
+    # #2 was taken after Alpha kept working, so a branch from it is the same
+    # conversation frozen at a different point. Two ordinals that produced the
+    # same bytes would make the numbering a decoration.
+    t.submit('/leaf fork #2 Beta2')
+    t.wait(lambda: len(t.leaves()) == 3, 'the second checkpoint branch', 90)
+    later = t.leaves()[2]
+    later_text = Path(later['transcriptPath']).read_text(encoding='utf-8')
+    assert 'ALPHA_FIRST_TURN' in later_text, 'the #2 branch lost the start of the conversation'
+    assert 'ALPHA_LATER_TURN' in later_text, 'a branch from #2 did not carry the turn #2 was taken after'
+    t.assert_view(later['sessionId'], 'the second checkpoint branch', 90)
+    t.original()
+
+    # Dropping keeps the bytes, so the branch taken from the snapshot survives.
+    t.submit('/leaf checkpoint-drop #1')
+    t.wait(lambda: 'dropped' in t.text(), 'the checkpoint is dropped', 45)
+    # The newest listing, not the one from before the drop: the dropped entry has
+    # to be gone from the list while the surviving one is still on it.
+    t.submit('/leaf checkpoints')
+    t.wait(lambda: '#2 alpha-snap' in t.after('checkpoints for family') and '#1 alpha-snap' not in t.after('checkpoints for family'),
+           'the listing dropped #1 and kept #2', 45)
+    assert 'ALPHA_FIRST_TURN' in Path(beta['transcriptPath']).read_text(encoding='utf-8'), 'dropping the checkpoint disturbed the branch taken from it'
+
+    t.submit('/leaf checkpoint-purge #2')
+    t.wait(lambda: 'purged' in t.text(), 'the checkpoint is purged', 45)
+    t.submit('/leaf checkpoints')
+    t.wait(lambda: 'No checkpoints for family' in t.text() and '#2 alpha-snap' not in t.after('checkpoints for family'),
+           'the collection is empty', 45)
+
+    # A checkpoint of a member that is no longer running. The parent holds the
+    # path and the bytes are on disk, so a snapshot never needs the member awake -
+    # which is the difference between freezing a conversation and continuing it.
+    # The ordinal is also proof that a dropped or purged number is never handed
+    # out twice: #1 and #2 are gone, and this one cannot be either of them.
+    t.submit('/leaf close ' + later['sessionId'])
+    t.wait(lambda: not any(item['sessionId'] == later['sessionId'] and item['status'] == 'open' for item in t.leaves()),
+           'the second branch closes', 60)
+    t.submit('/leaf checkpoint ' + later['sessionId'] + ' closed-snap')
+    t.wait(lambda: 'Checkpoint #3 closed-snap' in t.text(), 'a closed member is snapshotted on demand', 75)
+    t.submit('/leaf checkpoints')
+    t.wait(lambda: '#3 closed-snap' in t.after('checkpoints for family'), 'the closed member snapshot is listed', 45)
+    held = ''.join(path.read_text(encoding='utf-8') for path in frozen.glob('*.jsonl'))
+    assert 'ALPHA_LATER_TURN' in held, 'the closed member snapshot did not carry the conversation it was taken from'
+
+    for member in t.leaves():
+        t.submit('/leaf close ' + member['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 60)
+    t.exit()
+    print(json.dumps(dict(comms=True, selfCheckpoint=True, listed=True, repeatOrdinal=True, ambiguousRefused=True, branchFromCheckpoint=True, branchFromSecond=True, dropKeepsBranch=True, purgeEmpties=True, closedCheckpoint=True)), flush=True)
+
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
-    if args.probe_full_tui or args.probe_lifecycle or args.probe_selection or args.probe_parity or args.probe_parentage or args.probe_queue or args.probe_close_parent:
-        (probe_full_tui if args.probe_full_tui else probe_lifecycle if args.probe_lifecycle else probe_selection if args.probe_selection else probe_queue if args.probe_queue else probe_close_parent if args.probe_close_parent else probe_parentage if args.probe_parentage else probe_parity)()
+    probes = [
+        (args.probe_full_tui, probe_full_tui), (args.probe_lifecycle, probe_lifecycle),
+        (args.probe_selection, probe_selection), (args.probe_parity, probe_parity),
+        (args.probe_parentage, probe_parentage), (args.probe_queue, probe_queue),
+        (args.probe_close_parent, probe_close_parent), (args.probe_read, probe_read),
+        (args.probe_comms, probe_comms),
+    ]
+    chosen = next((probe for wanted, probe in probes if wanted), None)
+    if chosen:
+        chosen()
         raise SystemExit(0)
     t = Terminal()
     t.wait(lambda: 'All 1' in t.text(), 'initial carousel', 60)

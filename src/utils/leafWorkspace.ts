@@ -1,6 +1,7 @@
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { StringDecoder } from 'node:string_decoder'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { getSessionId, getSessionResumeDirectory } from '../bootstrap/state.js'
@@ -16,10 +17,16 @@ import { LeafTakenError } from './leafChannel.js'
 import { leafColorEnv } from './leafColor.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
+import { withResolvers } from './withResolvers.js'
 import { isProcessRunning } from './genericProcessUtils.js'
 import { getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
+import { readFileTail, readTranscriptSlice, renderTranscriptSlice, TRANSCRIPT_TAIL_WINDOW, type TranscriptReadOptions } from './transcriptRead.js'
+import {
+  checkpointTranscriptPath, defaultCheckpointLabel, dropCheckpoint, findCheckpoint, listCheckpoints,
+  purgeCheckpoint, recordCheckpoint, renderCheckpoints, sizeLabel, slugLabel, type LeafCheckpoint,
+} from './leafCheckpoints.js'
 
 export type LeafView = { rootSessionId: string; member: LeafMember; process: Pick<LeafProcess, 'getState' | 'checkpoint' | 'setModel' | 'setEffort'>; draft: string }
 type OwnedLeafView = LeafView & { process: LeafProcess }
@@ -27,7 +34,24 @@ const views = new Map<string, OwnedLeafView>()
 const ownerReleases = new Map<string, () => Promise<void>>()
 const listeners = new Set<() => void>()
 const selected = new Map<string, string>()
-const launches = new Map<string, Promise<OwnedLeafView>>()
+/**
+ * One launch, in two halves.
+ *
+ * `view` is the member as a row and as something to enter, and it is ready as
+ * soon as the member is recorded. `started` is the member actually listening,
+ * which takes as long as a cold session takes to reach its input loop. They are
+ * split because they are waited on by different callers: whoever opened the
+ * member on the person's behalf has nothing to do with the second half, and
+ * awaiting it held this session's input loop shut for the whole boot. A caller
+ * whose answer depends on the member being up - it is about to send it
+ * something, or to refuse because another window already has it - awaits
+ * `started`.
+ *
+ * A refusal, which is a transcript another window is writing, reaches both
+ * halves, so either await reports it.
+ */
+type Launching = { view: Promise<OwnedLeafView>; started: Promise<void> }
+const launches = new Map<string, Launching>()
 export function selectedLeafId(): string | undefined { return isInteractiveLeaf() ? getSessionId() : selected.get(getSessionId()) }
 
 /**
@@ -265,11 +289,11 @@ export function getLeafCarouselViews(): LeafView[] {
  * one that knows its transcript path and directory), so any member can find the
  * family and reopen the rest of it - including the parent.
  */
-type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string }
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string; fromCheckpointId?: string }
 let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
 
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
-function familyIndexDir(): string { return join(getClaudeConfigHomeDir(), 'leaf-families', 'index') }
+export function familyIndexDir(): string { return join(getClaudeConfigHomeDir(), 'leaf-families', 'index') }
 function familyPointerPath(sessionId: string): string { return join(familyIndexDir(), `${sessionId}.json`) }
 
 async function readLeafFamilyPointer(sessionId: string): Promise<LeafFamilyPointer | undefined> {
@@ -279,12 +303,16 @@ async function readLeafFamilyPointer(sessionId: string): Promise<LeafFamilyPoint
   } catch { return undefined }
 }
 
-/** Written like the family file itself: temp file, then a rename that Windows may refuse while a reader holds the target. */
 async function writeLeafFamilyPointer(sessionId: string, pointer: LeafFamilyPointer): Promise<void> {
   await writeIndexFile(familyPointerPath(sessionId), pointer)
 }
 
-async function writeIndexFile(target: string, value: unknown): Promise<void> {
+/**
+ * Written like the family file itself: temp file, then a rename that Windows may
+ * refuse while a reader holds the target. Shared with the LED store, which keeps
+ * its own file in this directory and has the same reason to write it this way.
+ */
+export async function writeIndexFile(target: string, value: unknown): Promise<void> {
   await mkdir(familyIndexDir(), { recursive: true, mode: 0o700 })
   const temporary = `${target}.${randomUUID()}.tmp`
   await writeFile(temporary, JSON.stringify(value), { mode: 0o600 })
@@ -529,11 +557,11 @@ function rootPointerInfo(root: string): LeafFamilyPointer {
  * written costs a member its standalone discovery, never the family it is
  * already in.
  */
-function indexLeafMembers(root: string, members: readonly LeafMember[]): Promise<void> {
+function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: Partial<LeafFamilyPointer>): Promise<void> {
   return (async () => {
     // The designation is read before it is written: the family-id pointer is
     // the authority, and re-indexing must republish it rather than drop it.
-    const pointer = { ...rootPointerInfo(root), parentSessionId: await familyParentSessionId(root) }
+    const pointer = { ...rootPointerInfo(root), parentSessionId: await familyParentSessionId(root), ...extra }
     await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, pointer).catch(() => {})))
   })()
 }
@@ -769,6 +797,98 @@ export async function listLeaves(): Promise<string> {
   }).join('\n')
 }
 
+export type LeafReadOptions = TranscriptReadOptions
+
+/** One line of prose for a digest row; a transcript line is not a paragraph. */
+function singleLine(text: string): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat
+}
+
+/**
+ * A member a `read` can be aimed at, resolved against the whole family.
+ *
+ * `resolveLeafRef` is the reference rule everywhere else, and it is deliberately
+ * blind to this session - the session on screen is not a target to open. A read
+ * is not an open, though, and the caller asking is usually a leaf reading *up*:
+ * the creator arrives here as `original`, and refusing it would leave a leaf
+ * unable to see the conversation its family came from. So the full member list
+ * answers, and the aliases are resolved against it.
+ */
+function resolveReadTarget(members: readonly LeafMember[], reference: string): LeafMember | undefined {
+  const direct = resolveLeafMember(members, reference)
+  if (direct) return direct
+  const ref = reference.trim().toLowerCase()
+  if (ref === 'original') return members.find(member => member.sessionId === familyRootSync())
+  if (ref === 'parent' || ref === 'root') return members.find(member => member.sessionId === designatedParent?.sessionId)
+  return undefined
+}
+
+/**
+ * Every member at a glance: who they are, what they are doing, and the last
+ * thing each of them said.
+ *
+ * One bounded read per member (a tail window, never the file), so the cost is
+ * the window times the family size rather than the family's total bytes. It
+ * works for a closed or archived member too: the transcript is on disk whether
+ * or not a process is behind it, which is the whole reason reading can be
+ * instant and never has to wait on a peer's turn.
+ */
+async function familyDigest(members: readonly LeafMember[]): Promise<string> {
+  const self = getSessionId()
+  const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
+  const lines = [`family ${familyRootSync()}`]
+  for (const member of members) {
+    const state = states.get(member.sessionId) ?? member.status
+    const marks = [member.sessionId === self ? 'you' : '', member.sessionId === designatedParent?.sessionId ? 'parent' : ''].filter(Boolean)
+    const head = `#${member.number} ${member.name} [${state}]${marks.length ? ` (${marks.join(', ')})` : ''} ${member.sessionId}`
+    try {
+      const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, { tail: 1, maxChars: 1600 })
+      const last = slice.turns.at(-1)
+      const when = last?.at ? `${last.at.slice(5, 16).replace('T', ' ')} ` : ''
+      const kind = !last ? '' : last.meta ? 'peer ' : last.role === 'assistant' ? '' : `${last.role} `
+      const count = slice.chainLength === undefined ? '' : `${slice.chainLength} turns · `
+      lines.push(`${head}\n  ${count}${last ? `${when}${kind}${singleLine(last.text)}` : '(no turns)'} — cursor ${slice.cursor}`)
+    } catch {
+      lines.push(`${head}\n  (transcript unavailable)`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/** The host's half of `read`, where every member's transcript path is known. */
+async function readFamilyTranscript(reference: string | undefined, options: LeafReadOptions): Promise<string> {
+  await refreshDesignatedParent()
+  const members = (await currentFamily()).members
+  if (!reference) return familyDigest(members)
+  const member = resolveReadTarget(members, reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, options)
+  return renderTranscriptSlice(slice, `${memberLabel(member)} (${member.sessionId})`)
+}
+
+/**
+ * Read what a member of this family has been doing, on demand.
+ *
+ * With a reference this is that member's own chat, newest turns last, bounded
+ * and chain-correct. With none it is the family at a glance - one summary line
+ * and a cursor per member - which is what "stay on top of five leaves" costs
+ * when you do not yet know which one matters.
+ *
+ * It is a file read and never a turn: a busy member cannot take a peer message,
+ * but its transcript is append-only and readable, so nothing here waits for, or
+ * interrupts, the work being watched. What comes back is peer-authored text, and
+ * it is labelled as such when rendered.
+ */
+export async function readLeafTranscript(reference?: string, options: LeafReadOptions = {}): Promise<string> {
+  const ref = reference?.trim()
+  // Inside a leaf the host holds the member list and the transcript paths; the
+  // leaf holds a snapshot of neither. Same split as `list`, `roster` and
+  // `members`, and the answer is rendered host-side either way.
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('read', [ref || undefined, options])
+  return readFamilyTranscript(ref || undefined, options)
+}
+
 export const LEAF_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode'] as const
 
 async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
@@ -779,7 +899,10 @@ async function requireLeafView(reference: string): Promise<{ member: LeafMember;
   if (view && view.rootSessionId !== root) view = undefined
   if (!view || !isLeafProcessAlive(view.process.getState())) {
     if (member.status !== 'open') throw new Error(`${memberLabel(member)} is ${member.status}`)
-    view = await launch(member, root)
+    const launched = launch(member, root)
+    // This view is about to be sent input, so it has to be listening first.
+    await launched.started
+    view = await launched.view
   }
   return { member, view }
 }
@@ -900,15 +1023,100 @@ export async function interruptLeaf(reference: string): Promise<string> {
   return `Interrupted ${memberLabel(member)}.`
 }
 
-export async function checkpointLeaf(reference: string, name?: string): Promise<string> {
+/**
+ * Freeze a member's conversation as a named checkpoint.
+ *
+ * A live member is flushed first - its own process holds the write queue, and
+ * the copy has to be of the conversation as it stands, not of the conversation
+ * as it stood before its last turn. A member snapshotting itself is the one case
+ * that cannot flush: its turn is this request, so what is on disk is everything
+ * up to its last turn boundary, which is all a mid-turn copy can honestly hold.
+ */
+async function recordLeafCheckpoint(reference: string, label: string | undefined, requestedBy?: string): Promise<{ checkpoint: LeafCheckpoint; existed: boolean }> {
+  const root = await familyRootSessionId()
+  await requireFamilyHost(root)
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  const view = views.get(member.sessionId)
+  if (view && isLeafProcessAlive(view.process.getState())) {
+    try { await view.process.checkpoint() }
+    catch (error) { if (requestedBy !== member.sessionId) throw error }
+  }
+  const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, { tail: 1 })
+  if (!slice.cursor) throw new Error(`${memberLabel(member)} has nothing to checkpoint yet`)
+  return recordCheckpoint({
+    familyId: root, sourceSessionId: member.sessionId, sourceName: member.name,
+    sourceTip: slice.cursor, sourceTipAt: slice.turns.at(-1)?.at ?? null, turns: slice.chainLength ?? null,
+    transcriptPath: member.transcriptPath,
+    label: label?.trim() ? slugLabel(label) : defaultCheckpointLabel(member.name),
+  })
+}
+
+function describeCheckpoint(result: { checkpoint: LeafCheckpoint; existed: boolean }): string {
+  const { checkpoint, existed } = result
+  const scale = `${checkpoint.turns === null ? '' : `${checkpoint.turns} turns · `}${sizeLabel(checkpoint.bytes)}`
+  if (existed) return `Checkpoint #${checkpoint.ordinal} ${checkpoint.label} already covers this conversation; nothing new was saved.`
+  return `Checkpoint #${checkpoint.ordinal} ${checkpoint.label} taken from ${checkpoint.sourceName} (${scale}). Branch it any time with \`/leaf fork #${checkpoint.ordinal}\`.`
+}
+
+export async function checkpointLeaf(reference: string, label?: string): Promise<string> {
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
     if (!member) throw new Error('Unknown or ambiguous leaf reference')
-    return requestLeafWorkspace<string>('checkpoint', [member.sessionId, name])
+    // The host holds the member list and the transcript paths, and it is the
+    // party that can flush the member being snapshotted.
+    return requestLeafWorkspace<string>('checkpoint', [member.sessionId, label])
   }
-  const { member, view } = await requireLeafView(reference)
-  await view.process.checkpoint(name)
-  return `Checkpointed ${memberLabel(member)}.`
+  return describeCheckpoint(await recordLeafCheckpoint(reference, label, getSessionId()))
+}
+
+/** The checkpoints a family has taken, or the ones a single member produced. */
+export async function listLeafCheckpoints(reference?: string): Promise<string> {
+  const root = await familyRootSessionId()
+  const ref = reference?.trim()
+  if (!ref) return renderCheckpoints(await listCheckpoints(root), root)
+  const member = await resolveLeafRef(ref)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  return renderCheckpoints(await listCheckpoints(root, member.sessionId), root)
+}
+
+/** Stop offering a checkpoint; its bytes, and every branch from it, stay. */
+export async function dropLeafCheckpoint(reference: string): Promise<string> {
+  const checkpoint = await dropCheckpoint(await familyRootSessionId(), reference)
+  return `Checkpoint #${checkpoint.ordinal} ${checkpoint.label} dropped. Its bytes are kept: branches taken from it still work, and it can still be purged.`
+}
+
+/** Delete a checkpoint's bytes, leaving every branch from it alone. */
+export async function purgeLeafCheckpoint(reference: string): Promise<string> {
+  const checkpoint = await purgeCheckpoint(await familyRootSessionId(), reference)
+  return `Checkpoint #${checkpoint.ordinal} ${checkpoint.label} purged. Branches taken from it are untouched.`
+}
+
+/**
+ * The conversation a branch from a checkpoint starts at.
+ *
+ * Returned as a fork source - the frozen copy and the tip it froze - so a branch
+ * copies the checkpoint's bytes rather than whatever the member has said since.
+ */
+export async function checkpointSource(reference: string): Promise<{ checkpoint: LeafCheckpoint; sessionId: string; transcriptPath: string }> {
+  const root = await familyRootSessionId()
+  const checkpoint = await findCheckpoint(root, reference, { includeDropped: true })
+  if (!checkpoint) throw new Error('Unknown checkpoint')
+  return { checkpoint, sessionId: checkpoint.sourceSessionId, transcriptPath: checkpointTranscriptPath(root, checkpoint.id) }
+}
+
+/**
+ * Whether a reference names a checkpoint rather than a live conversation.
+ *
+ * A grammar that has to tell "fork this" from "fork a branch of this" asks this
+ * first, because a label looks exactly like a leaf name and only the store knows
+ * whether anything answers to it. An ambiguous label refuses here rather than
+ * being read as a name to fork the current session under.
+ */
+export async function isCheckpointReference(reference: string): Promise<boolean> {
+  const ref = reference.trim()
+  if (!ref) return false
+  return Boolean(await findCheckpoint(await familyRootSessionId(), ref))
 }
 
 export async function configureLeaf(reference: string, patch: { model?: string; effort?: string }): Promise<string> {
@@ -967,32 +1175,91 @@ function leafSelfLabel(member: LeafMember, rootSessionId: string): string {
     : `Leaf ${member.number}: ${member.name} (of session ${rootSessionId})`
 }
 
-function launch(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
+/** A transcript entry that means the conversation has been started. */
+function holdsTurn(line: string): boolean {
+  if (!line.trim()) return false
+  const entry = JSON.parse(line) as { type?: string }
+  return entry.type === 'user' || entry.type === 'assistant'
+}
+
+/**
+ * How much of a transcript is read while looking for its first turn.
+ *
+ * The question is whether the conversation was ever started, and the answer is
+ * in its first records, so this reads a head window and stops at the first
+ * turn. The whole file was read to ask it - ~185 ms and a 237 MB allocation on
+ * the path that opens a leaf - to look at data that cannot be past the start.
+ */
+const TRANSCRIPT_SCAN_WINDOW = 256 * 1024
+
+async function transcriptHasTurn(path: string): Promise<boolean> {
+  const handle = await open(path, 'r')
+  const decoder = new StringDecoder('utf8')
+  try {
+    const buffer = Buffer.allocUnsafe(TRANSCRIPT_SCAN_WINDOW)
+    // A read boundary can fall inside a line, and inside a character with it;
+    // the decoder holds the partial character and `carry` holds the partial line
+    // so neither is mistaken for an entry of its own.
+    let carry = ''
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null)
+      const lines = (carry + decoder.write(buffer.subarray(0, bytesRead))).split('\n')
+      carry = lines.pop() ?? ''
+      if (lines.some(holdsTurn)) return true
+      if (bytesRead === 0) return holdsTurn(carry)
+    }
+  } finally { await handle.close() }
+}
+
+function launch(member: LeafMember, rootSessionId: string): Launching {
   const pending = launches.get(member.sessionId)
   if (pending) return pending
-  const launching = launchOnce(member, rootSessionId).finally(() => launches.delete(member.sessionId))
+  const halves = { view: withResolvers<OwnedLeafView>(), started: withResolvers<void>() }
+  const launching: Launching = { view: halves.view.promise, started: halves.started.promise }
+  // Registered before the first await, so two opens in the same tick join one
+  // launch instead of racing each other for the transcript.
   launches.set(member.sessionId, launching)
+  const settle = () => { if (launches.get(member.sessionId) === launching) launches.delete(member.sessionId) }
+  // The entry lives until the member is listening, not until its row exists:
+  // inside that window a second open has to join this launch rather than start
+  // a rival member for one transcript.
+  void launching.started.then(settle, settle)
+  // Neither half is always awaited, and an unhandled rejection is a process
+  // warning rather than a report, so both are claimed here.
+  void halves.view.promise.catch(() => {})
+  void launchOnce(member, rootSessionId, halves)
   return launching
 }
 
-async function launchOnce(member: LeafMember, rootSessionId: string): Promise<OwnedLeafView> {
+async function launchOnce(
+  member: LeafMember,
+  rootSessionId: string,
+  halves: { view: PromiseWithResolvers<OwnedLeafView>; started: PromiseWithResolvers<void> },
+): Promise<void> {
+  const refuse = (error: unknown) => { halves.view.reject(error); halves.started.reject(error) }
   const existing = views.get(member.sessionId)
-  if (existing && !['closed', 'failed'].includes(existing.process.getState())) return existing
+  if (existing && !['closed', 'failed'].includes(existing.process.getState())) {
+    halves.view.resolve(existing)
+    halves.started.resolve(undefined)
+    return
+  }
   let release: () => Promise<void>
   try { release = await lock(`${member.transcriptPath}.leaf-owner`, { realpath: false, stale: 10000, retries: 0 }) }
   // A collision means a second member is being started for one transcript right
   // now, which is the one thing that must not happen. It is only that: a member
   // that is already up holds nothing here, so opening a running leaf is an
   // attach, not a refusal.
-  catch { throw new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`) }
+  catch { refuse(new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`)); return }
   // A member with a fork point is always resumed. A fresh member - and the
   // family's creator, which has no fork point - is resumed when its transcript
   // already holds a turn, and started under `--session-id` when it does not:
   // resuming a conversation with nothing in it would shadow it with an empty one.
   let hasTranscript = member.forkMessageId !== null
   if (!hasTranscript) {
-    try { hasTranscript = (await readFile(member.transcriptPath, 'utf8')).split('\n').filter(line => line.trim()).some(line => { const entry = JSON.parse(line); return entry.type === 'user' || entry.type === 'assistant' }) }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await release(); throw error } }
+    try { hasTranscript = await transcriptHasTurn(member.transcriptPath) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { await release(); refuse(error); return }
+    }
   }
   const processArgs = [process.argv[1]!, ...(hasTranscript ? ['--resume', member.sessionId] : ['--session-id', member.sessionId])]
   if (member.model) processArgs.push('--model', member.model)
@@ -1061,6 +1328,9 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
   const view: OwnedLeafView = { rootSessionId, member, process: child, draft: existing?.draft ?? member.draft ?? '' }
   views.set(member.sessionId, view)
   publish()
+  // The row exists from here on; the member behind it does not yet. Whoever
+  // only needs the row stops waiting now.
+  halves.view.resolve(view)
   try {
     await child.start()
     if (member.model) await child.setModel(member.model)
@@ -1074,8 +1344,8 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     publish()
     // Naming the member is the whole value of this error: "that session is
     // already open" leaves a person to guess which one they asked for.
-    if (error instanceof LeafTakenError) throw new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`)
-    throw error
+    halves.started.reject(error instanceof LeafTakenError ? new Error(`${memberLabel(member)} is already open in another window; close it there before opening it here`) : error)
+    return
   }
   finally {
     // The claim covers the start, not the member's life. Once it is listening
@@ -1085,7 +1355,7 @@ async function launchOnce(member: LeafMember, rootSessionId: string): Promise<Ow
     await release().catch(() => {})
   }
   publish()
-  return view
+  halves.started.resolve(undefined)
 }
 
 /**
@@ -1148,17 +1418,44 @@ async function reportEarlyLeafAnswers(view: OwnedLeafView, question: string, ans
   } finally { reportsInFlight.delete(id) }
 }
 
-/** The text of the turn that just finished, so a reply can be quoted, not guessed. */
+/** The text of the last assistant message in these lines, as a reply writes it. */
+function lastAssistantText(lines: readonly string[]): string | undefined {
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]!
+    if (!line.trim()) continue
+    let entry: { type?: string; message?: { content?: unknown } }
+    // A window's first line was cut mid-line, so an unparseable line is skipped
+    // rather than treated as the end of the transcript.
+    try { entry = JSON.parse(line) as typeof entry } catch { continue }
+    if (entry.type !== 'assistant') continue
+    const content = entry.message?.content
+    const text = (Array.isArray(content) ? content : [])
+      .filter((part: { type?: string; text?: string }) => part?.type === 'text' && typeof part.text === 'string')
+      .map(part => part.text!)
+      .join('\n')
+      .trim()
+    if (text) return text.length > 4000 ? `${text.slice(0, 4000)}…` : text
+  }
+  return undefined
+}
+
+/**
+ * The text of the turn that just finished, so a reply can be quoted, not guessed.
+ *
+ * Read from the end, because the turn's own words are in the last records.
+ * Reading the whole transcript for them cost ~152 ms and a 237 MB allocation in
+ * the process the person is typing into, and this runs every time a member
+ * reports a finished turn. The whole file is still read when the tail holds no
+ * assistant text, so a reply is never lost to the shorter read.
+ */
 async function lastLeafTurnText(view: OwnedLeafView): Promise<string | undefined> {
+  const path = view.member.transcriptPath
   try {
-    const lines = (await readFile(view.member.transcriptPath, 'utf8')).split('\n').filter(line => line.trim())
-    for (let index = lines.length - 1; index >= 0; index--) {
-      const entry = JSON.parse(lines[index]!)
-      if (entry.type !== 'assistant') continue
-      const content = entry.message?.content
-      const text = (Array.isArray(content) ? content : []).filter((part: any) => part?.type === 'text' && typeof part.text === 'string').map((part: any) => part.text).join('\n').trim()
-      if (text) return text.length > 4000 ? `${text.slice(0, 4000)}…` : text
-    }
+    const fromTail = lastAssistantText((await readFileTail(path, TRANSCRIPT_TAIL_WINDOW)).split('\n'))
+    if (fromTail) return fromTail
+  } catch { /* An unreadable tail is retried whole below. */ }
+  try {
+    return lastAssistantText((await readFile(path, 'utf8')).split('\n'))
   } catch { /* No transcript yet means nothing to report. */ }
   return undefined
 }
@@ -1281,15 +1578,31 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       }
       case 'interrupt': result = await interruptLeaf(id); break
       case 'list': result = await listLeaves(); break
+      // Reading is served here for the same reason `members` is: the host is the
+      // party holding every member's transcript path. It touches no member's
+      // process, so a busy sibling is read rather than interrupted.
+      case 'read':
+        result = await readFamilyTranscript(typeof id === 'string' && id.trim() ? id : undefined, (value ?? {}) as LeafReadOptions)
+        break
       // A leaf renamed itself at its own prompt. `sourceId` is the leaf that
       // asked, and `id` is the name it chose: the row that follows is the
       // asker's own, never another member's.
       case 'renamed': await applyLeafRename(root, sourceId, String(id)); break
-      case 'checkpoint': case 'model': case 'effort': {
+      // A checkpoint taken from inside a leaf is taken here: the host holds the
+      // member's transcript path, and it is the party that can flush the member
+      // whose conversation is being copied.
+      case 'checkpoint':
+        result = describeCheckpoint(await recordLeafCheckpoint(String(id), typeof value === 'string' ? value : undefined, sourceId))
+        break
+      // Checkpoints belong to the family, not to a window: any member can list,
+      // branch, drop or purge them, and none of it needs the family lease.
+      case 'checkpoints': result = await listLeafCheckpoints(typeof id === 'string' ? id : undefined); break
+      case 'checkpoint-drop': result = await dropLeafCheckpoint(String(id)); break
+      case 'checkpoint-purge': result = await purgeLeafCheckpoint(String(id)); break
+      case 'model': case 'effort': {
         const view = getLeafViews().find(item => item.member.sessionId === id)
         if (!view) throw new Error('Unknown leaf')
-        if (message.action === 'checkpoint') await view.process.checkpoint(value)
-        else if (message.action === 'model') await view.process.setModel(value)
+        if (message.action === 'model') await view.process.setModel(value)
         else await view.process.setEffort(value)
         break
       }
@@ -1367,15 +1680,27 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   // transcript exists on disk can seed a leaf. Refusing it here is what made
   // "fork this session into a leaf" unreliable for anything but a live leaf.
   let source: { sessionId: string; transcriptPath: string } | undefined
+  // A checkpoint is the third thing a source can be: not a live member and not a
+  // session on disk, but a frozen conversation of its own. It is only consulted
+  // when nothing live answers, so a leaf named `auth-split` wins over a
+  // checkpoint labelled `auth-split` - the live thing is the one being pointed at.
+  let checkpointBranch: LeafCheckpoint | undefined
   if (!fromSelf && !parent) {
     const transcriptPath = resolvedParentId === root
       ? (await leafCreatorMember())?.transcriptPath ?? getTranscriptPathForSession(resolvedParentId)
       : getTranscriptPathForSession(resolvedParentId)
-    try { await access(transcriptPath) }
-    catch { throw new Error(`No session or open leaf matches ${resolvedParentId}`) }
-    source = { sessionId: resolvedParentId, transcriptPath }
+    try { await access(transcriptPath); source = { sessionId: resolvedParentId, transcriptPath } }
+    catch {
+      checkpointBranch = await findCheckpoint(root, resolvedParentId)
+      if (!checkpointBranch) throw new Error(`No session or open leaf matches ${resolvedParentId}`)
+      source = { sessionId: checkpointBranch.sourceSessionId, transcriptPath: checkpointTranscriptPath(root, checkpointBranch.id) }
+    }
   }
   let cwd = parent?.member.cwd ?? getCwd()
+  // A branch of a checkpoint belongs where the conversation it branches came
+  // from: the worktree is part of what is being resumed.
+  const branchedFrom = checkpointBranch ? (await currentFamily()).members.find(member => member.sessionId === checkpointBranch!.sourceSessionId) : undefined
+  if (branchedFrom?.cwd) cwd = branchedFrom.cwd
   if (worktree) {
     const git = promisify(execFile)
     const options = { timeout: 10000, maxBuffer: 65536, windowsHide: true }
@@ -1399,17 +1724,30 @@ export async function createLeaf(name?: string, parentSessionId?: string, worktr
   const fork = options.fresh ? undefined : await createFork(undefined, parent ? { sessionId: parent.member.sessionId, transcriptPath: parent.member.transcriptPath } : source)
   if (getSessionId() !== self) throw new Error('Session changed before leaf creation')
   const member = await addLeafMember(familyPath(root), root, {
-    sessionId: fork?.sessionId ?? freshId, parentSessionId: parent?.member.sessionId ?? resolvedParentId,
-    name: name || (options.fresh ? 'New conversation' : parent?.member.name || getLeafRootName()),
+    sessionId: fork?.sessionId ?? freshId,
+    // A branch of a checkpoint belongs to the member the checkpoint was taken
+    // from: the checkpoint is a point in that member's conversation, so the
+    // member plus the checkpoint id - on the new member's pointer - is the
+    // provenance pair, and the family file keeps its shape.
+    parentSessionId: parent?.member.sessionId ?? checkpointBranch?.sourceSessionId ?? resolvedParentId,
+    name: name || (options.fresh ? 'New conversation' : parent?.member.name || branchedFrom?.name || getLeafRootName()),
     transcriptPath: fork?.forkPath ?? join(getProjectDir(cwd), `${freshId}.jsonl`), forkMessageId: fork?.serializedMessages.at(-1)?.uuid ?? null,
     cwd, model: options.model ?? parent?.member.model, effort: options.effort ?? parent?.member.effort,
   })
   saveSessionName(asSessionId(member.sessionId), `Leaf ${member.number}: ${member.name}`, member.transcriptPath)
   // The new member gets its pointer now, so it can find this family if it is
   // ever resumed on its own.
-  void indexLeafMembers(root, [member])
-  const view = await launch(member, root)
-  if (familyRootSync() === root) selectLeaf(member.sessionId)
+  void indexLeafMembers(root, [member], checkpointBranch ? { fromCheckpointId: checkpointBranch.id } : undefined)
+  const launched = launch(member, root)
+  const view = await launched.view
+  // Entering the member is deferred to the moment its process is listening:
+  // the pane can only be drawn once there is a terminal behind it, and the
+  // member takes as long to reach its input loop as a cold session does. The
+  // row is up either way, so a leaf opened from here no longer holds this
+  // session's input shut for the length of that boot.
+  void launched.started.then(() => {
+    if (familyRootSync() === root && views.has(member.sessionId)) selectLeaf(member.sessionId)
+  }, () => {})
   return view
 }
 
@@ -1490,7 +1828,10 @@ export async function openLeafOnce(reference: string): Promise<string> {
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('open-once', [member.sessionId])
   const root = familyRootSync()
   await requireFamilyHost(root)
-  await launch(member, root)
+  // "Opened" is the claim this returns, and a member another window is already
+  // writing is a refusal rather than an opening - so this waits for the member
+  // to be up instead of only for its row.
+  await launch(member, root).started
   if (familyRootSync() === root) selectLeaf(member.sessionId)
   return `${memberLabel(member)} opened. It stays in the archive; close it and it is filed away again.`
 }
@@ -1558,7 +1899,9 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
     views.delete(sessionId)
     if (selected.get(self) === sessionId) selected.delete(self)
   }
-  if (patch.status === 'open') await launch(member, root)
+  // A reopen is asked for by reference, so a member another window already has
+  // is a refusal this call owes the person who typed it: await the start.
+  if (patch.status === 'open') await launch(member, root).started
   await refreshDesignatedParent()
   publish()
 }

@@ -316,7 +316,7 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent', 'read']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
@@ -518,7 +518,10 @@ test('creating a leaf forks what you are looking at, not the root behind it', as
   // The session asking is the source when nothing else is named, so a member
   // opens new leaves from itself rather than from the conversation behind it.
   assert.match(create, /const fromSelf = resolvedParentId === self/)
-  assert.match(create, /parentSessionId: parent\?\.member\.sessionId \?\? resolvedParentId/)
+  // A branch of a checkpoint records the member the checkpoint came from as its
+  // parent: the checkpoint is a point in that member's conversation, so that
+  // member - not the checkpoint id - is the ancestry the family file holds.
+  assert.match(create, /parentSessionId: parent\?\.member\.sessionId \?\? checkpointBranch\?\.sourceSessionId \?\? resolvedParentId/)
   // The resolved id, not the raw argument, seeds the fork and the fallback.
   assert.match(create, /getTranscriptPathForSession\(resolvedParentId\)/)
   assert.match(create, /source = \{ sessionId: resolvedParentId, transcriptPath \}/)
@@ -567,10 +570,13 @@ test('the bottom nav reaches the leaf menu, and the prompt overlay is what shows
   assert.match(prompt, /const leafMenuDialog = showLeafMenu \? <LeafMenu onDone/)
   // Composed into the same portal as the other prompt dialogs, so it floats
   // above the prompt instead of being cropped to a row by the bottom slot.
-  assert.match(prompt, /const promptOverlayDialog = gatewaySessionsDialog \?\? sessionUsageDialog \?\? leafMenuDialog \?\? sessionMetadataDialog \?\? autoModeOptInDialog/)
+  // What is promised is the leaf menu's place in that chain, not its
+  // neighbours: pinning every one of them makes the test fail the moment any
+  // other dialog joins the portal, which is not a leaf regression.
+  assert.match(prompt, /const promptOverlayDialog = gatewaySessionsDialog \?\? .*leafMenuDialog \?\? .*sessionMetadataDialog \?\? autoModeOptInDialog/)
   // Escape inside the menu - and inside the usage detail - must not reach the
   // double-press message selector.
-  assert.match(prompt, /showGatewaySessions \|\| showLeafMenu \|\| isLocalJSXCommandActive/)
+  assert.match(prompt, /showGatewaySessions \|\| .*showLeafMenu \|\| .*isLocalJSXCommandActive/)
   assert.match(prompt, /showSessionUsageDialog \|\|/)
   assert.match(prompt, /if \(showLeafMenu && !isFullscreenEnvEnabled\(\)\) return leafMenuDialog/)
 })
@@ -579,7 +585,10 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   // A member's own pointer is what makes membership survive the parent process:
   // the family file is keyed by the root's id, which only the root can know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string }'))
+  // The pointer is also where a branch of a checkpoint records which checkpoint
+  // it came from: the family file is strict, so this loose per-session record is
+  // the only place an extra field can go without an older reader having to know.
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string; fromCheckpointId?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)
@@ -745,11 +754,17 @@ test('a leaf may start over its own transcript when nothing conversational is in
   assert.match(guard, /leafSessionId\(\) === validatedSessionId/)
   assert.match(guard, /emptyLeaf = !lines\.some\(line => \{ const entry = JSON\.parse\(line\); return entry\.type === 'user' \|\| entry\.type === 'assistant'; \}\)/)
 
-  // The same two row types, asked of the same file, by the launcher.
+  // The same two row types, asked of the same file, by the launcher. The
+  // launcher asks them of a head window rather than the whole transcript - the
+  // answer is in its first records, and reading 237 MB for it cost ~185 ms on
+  // the path that opens a leaf - so the predicate is named, and named once.
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const predicate = workspace.slice(workspace.indexOf('function holdsTurn'), workspace.indexOf('const TRANSCRIPT_SCAN_WINDOW'))
+  assert.match(predicate, /entry\.type === 'user' \|\| entry\.type === 'assistant'/)
   const launch = workspace.slice(workspace.indexOf('async function launchOnce'), workspace.indexOf('async function reportReplies'))
-  assert.match(launch, /entry\.type === 'user' \|\| entry\.type === 'assistant'/)
+  assert.match(launch, /hasTranscript = await transcriptHasTurn\(member\.transcriptPath\)/)
   assert.match(launch, /hasTranscript \? \['--resume', member\.sessionId\] : \['--session-id', member\.sessionId\]/)
+  assert.doesNotMatch(launch, /readFile\(member\.transcriptPath/)
 })
 
 test('a member that dies on its way up is named, not guessed at, and tried again', async () => {

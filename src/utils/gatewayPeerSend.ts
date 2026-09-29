@@ -1,8 +1,9 @@
 import { join } from 'path'
 import { getSessionId } from '../bootstrap/state.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
-import { getGatewaySessionRuntime } from './gatewaySessionRuntime.js'
+import { gatewaySessionCommsProblem, getGatewaySessionRuntime } from './gatewaySessionRuntime.js'
 import { listGatewayPeers } from './gatewaySessionTransport.js'
+import { renderTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 import type { PeerMessageKind } from './gatewaySessionProtocol.js'
 
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -70,6 +71,35 @@ export async function resolveGatewayPeer(
   }
 }
 
+export type GatewayPeerReadResult =
+  | { ok: true; message: string; cursor: string; slice: TranscriptSlice }
+  | { ok: false; message: string }
+
+/**
+ * Read what another live session has been doing, without asking it for a turn.
+ *
+ * The target serves the reply from its own transcript, so this works on a busy,
+ * closed or archived peer alike and never disturbs the work it is watching. The
+ * reply is peer-authored text, labelled as such, and `since` takes the cursor a
+ * previous read returned so following along costs only the turns that are new.
+ */
+export async function readViaGatewayPeer(
+  address: string,
+  options: { tail?: number; since?: string } = {},
+): Promise<GatewayPeerReadResult> {
+  const runtime = getGatewaySessionRuntime(getSessionId())
+  if (!runtime) return { ok: false, message: `This session is not registered on the Gateway peer bus, so nothing could be read. Reason: ${gatewaySessionCommsProblem(getSessionId()) ?? 'the peer runtime is not attached to this context'}.` }
+  const resolved = await resolveGatewayPeer(address)
+  if ('error' in resolved) return { ok: false, message: resolved.error }
+  try {
+    const slice = await runtime.transport.readPeer(resolved.sessionId, options)
+    return { ok: true, cursor: slice.cursor, slice, message: renderTranscriptSlice(slice, resolved.label) }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
+    return { ok: false, message: `Reading ${resolved.label} failed: ${reason || 'transport error'}` }
+  }
+}
+
 /** Send through the Gateway peer transport, never through the teammate mailbox. */
 export async function sendViaGatewayPeer(
   address: string,
@@ -83,7 +113,7 @@ export async function sendViaGatewayPeer(
     return {
       ok: false,
       message:
-        'This session is not registered on the Gateway peer bus, so the message was not sent. Check /sessions list.',
+        `This session is not registered on the Gateway peer bus, so the message was not sent. Reason: ${gatewaySessionCommsProblem(getSessionId()) ?? 'the peer runtime is not attached to this context'}.`,
     }
   }
   const resolved = await resolveGatewayPeer(address)

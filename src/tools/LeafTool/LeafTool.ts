@@ -23,15 +23,21 @@ const inputSchema = lazySchema(() =>
         'notify',
         'roster',
         'reparent',
+        'read',
+        'checkpoints',
+        'checkpoint-drop',
+        'checkpoint-purge',
       ])
       .describe('Operation to perform on the leaf family'),
     leaf: z
       .string()
       .optional()
-      .describe('Leaf reference: session ID, number, N:name, or name'),
-    name: z.string().optional().describe('Name for a new leaf, or a checkpoint name'),
+      .describe('Leaf reference: session ID, number, N:name, or name. A checkpoint reference is #number, or a label'),
+    name: z.string().optional().describe('Name for a new leaf, or a label for a checkpoint'),
     message: z.string().optional().describe('Text for send or for a context return'),
     value: z.string().optional().describe('Model name or effort level'),
+    tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
+    since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -61,10 +67,14 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
         const view = await workspace.createLeaf(input.name?.trim() || undefined, undefined, undefined, options)
         return `Forked the current session into leaf #${view.member.number} ${view.member.name} (${view.member.sessionId}).`
       }
+      // A member reference is resolved to its session id; anything else is
+      // handed to createLeaf unresolved, because a checkpoint reference - `#2`
+      // or a label - is a source it knows and this surface does not.
       const member = await workspace.resolveLeafRef(input.leaf)
-      if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      const view = await workspace.createLeaf(input.name?.trim() || undefined, member.sessionId, undefined, options)
-      return `Forked leaf #${member.number} ${member.name} into leaf #${view.member.number} ${view.member.name} (${view.member.sessionId}).`
+      const requested = input.leaf.trim()
+      const view = await workspace.createLeaf(input.name?.trim() || undefined, member?.sessionId ?? requested, undefined, options)
+      const origin = member ? `leaf #${member.number} ${member.name}` : requested
+      return `Forked ${origin} into leaf #${view.member.number} ${view.member.name} (${view.member.sessionId}).`
     }
     case 'new': {
       const options = { fresh: true, model: context.getAppState?.().mainLoopModel ?? undefined, effort: context.getAppState?.().effortValue as import('../../utils/leafFamily.js').LeafMember['effort'] }
@@ -98,11 +108,22 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       return workspace.notifyLeafParent(input.message)
     case 'roster':
       return workspace.familyRoster()
+    case 'read':
+      return workspace.readLeafTranscript(input.leaf?.trim() || undefined, {
+        ...(input.tail !== undefined ? { tail: input.tail } : {}),
+        ...(input.since?.trim() ? { since: input.since.trim() } : {}),
+      })
     case 'reparent': {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       return workspace.reparentLeaf(member.sessionId)
     }
+    case 'checkpoints':
+      return workspace.listLeafCheckpoints(input.leaf?.trim() || undefined)
+    case 'checkpoint-drop':
+      return workspace.dropLeafCheckpoint(requireLeaf())
+    case 'checkpoint-purge':
+      return workspace.purgeLeafCheckpoint(requireLeaf())
   }
 }
 

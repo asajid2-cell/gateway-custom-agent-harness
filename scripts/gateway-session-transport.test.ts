@@ -3,7 +3,7 @@ import { strict as assert } from 'node:assert'
 import { spawnSync } from 'node:child_process'
 import { mkdtemp, rm, mkdir, rename, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setCommandLifecycleListener, subscribeCommandLifecycle, notifyCommandLifecycle } from '../src/utils/commandLifecycle.ts'
 import { GatewaySessionTransport, callGatewayPeer, listGatewayPeers } from '../src/utils/gatewaySessionTransport.ts'
@@ -345,6 +345,47 @@ test('independent peers authenticate, discover, hold, release, acknowledge and p
   } finally {
     await a.close()
     await b.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a peer read is served from the target transcript, and never asks the target for a turn', { timeout: 30000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-read-'))
+  const directory = join(root, 'private')
+  const savedConfigDir = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = join(root, 'config')
+  const a = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Reader', cwd: root })
+  const b = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Read target', cwd: root })
+  try {
+    await a.start()
+    await b.start()
+    const { getTranscriptPath } = await import('../src/utils/sessionStorage.ts')
+    const transcript = getTranscriptPath()
+    await mkdir(dirname(transcript), { recursive: true })
+    const turn = (uuid: string, parentUuid: string | null, text: string) => JSON.stringify({ type: 'user', uuid, parentUuid, sessionId: b.peer.sessionId, isSidechain: false, message: { role: 'user', content: text }, timestamp: '2026-09-29T00:00:00.000Z' })
+    await writeFile(transcript, `${turn('t1', null, 'PEER_WORK')}\n${turn('t2', 't1', 'MORE_PEER_WORK')}\n`)
+
+    const slice = await a.readPeer(b.peer.sessionId)
+    assert.deepEqual(slice.turns.map(item => item.text), ['PEER_WORK', 'MORE_PEER_WORK'])
+    assert.equal(slice.cursor, 't2')
+    assert.equal(slice.chainLength, 2)
+    // The reply came from the file: the target took no message and ran no turn.
+    assert.equal(b.inbox().length, 0)
+    assert.equal(b.historyEntries().length, 0)
+    // Following along costs only the turns that are new.
+    await writeFile(transcript, `${turn('t1', null, 'PEER_WORK')}\n${turn('t2', 't1', 'MORE_PEER_WORK')}\n${turn('t3', 't2', 'NEWEST')}\n`)
+    const next = await a.readPeer(b.peer.sessionId, { since: slice.cursor })
+    assert.deepEqual(next.turns.map(item => item.text), ['NEWEST'])
+    // A reader has to be a registered peer, exactly as a sender does.
+    const denied = await callGatewayPeer(b.peer.endpoint, { type: 'read', token: b.token, senderToken: 'not-a-token', fromSessionId: a.peer.sessionId, fromRuntimeId: a.peer.runtimeId }) as { ok?: boolean }
+    assert.equal(denied.ok, false)
+    await assert.rejects(a.readPeer(a.peer.sessionId), /this session/)
+    await assert.rejects(a.readPeer(randomUUID()), /No live session/)
+  } finally {
+    await a.close()
+    await b.close()
+    if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = savedConfigDir
     await rm(root, { recursive: true, force: true })
   }
 })

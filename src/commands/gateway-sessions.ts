@@ -3,13 +3,22 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 import { getSessionId } from '../bootstrap/state.js'
-import { getGatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
+import { gatewaySessionCommsProblem, getGatewaySessionRuntime } from '../utils/gatewaySessionRuntime.js'
 import { formatGatewayPeerLine } from '../utils/gatewaySessionProtocol.js'
 
 export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContext & LocalJSXCommandContext, args: string): Promise<React.ReactNode> {
   const runtime = getGatewaySessionRuntime(getSessionId())
   if (!runtime || context.agentId) {
-    onDone('Gateway session communication is unavailable in this runtime.', { display: 'system' })
+    // One blanket line used to cover every reason, so a session that never
+    // reached the bus was indistinguishable from one whose comms was switched
+    // off - and there was nothing anywhere else to ask. Name the reason when it
+    // is knowable; a failed registration keeps its own error message.
+    onDone(
+      context.agentId
+        ? 'Gateway session communication is unavailable inside a subagent; the session that owns the bus is the one that talks to peers.'
+        : `Gateway session communication is not active: ${gatewaySessionCommsProblem(getSessionId()) ?? 'the peer runtime is not attached to this context'}.`,
+      { display: 'system' },
+    )
     return null
   }
   const input = args.trim()
@@ -77,6 +86,33 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     } else if (/^receipt\s+\S+\s+\S+$/.test(input)) {
       const [, peerId, messageId] = input.split(/\s+/)
       result = JSON.stringify(await runtime.transport.receipt(peerId!, messageId!))
+    } else if (input === 'read' || input.startsWith('read ')) {
+      const [address, ...rest] = input.slice(4).trim().split(/\s+/).filter(Boolean)
+      if (!address) throw new Error('Usage: /sessions read <id|leaf #|leaf name> [tail=N] [since=<cursor>]')
+      const options: { tail?: number; since?: string } = {}
+      for (const token of rest) {
+        const tail = token.match(/^tail=(\d+)$/)
+        if (tail) { options.tail = Number(tail[1]); continue }
+        const since = token.match(/^since=(\S+)$/)
+        if (since) { options.since = since[1]!; continue }
+        throw new Error(`Unrecognized read option ${JSON.stringify(token)}; use tail=N or since=<cursor>`)
+      }
+      // The same addressing rule as send: a leaf-shaped reference is resolved
+      // through the family, anything else through the live session bus. Reading
+      // disturbs nothing - it is a file read on the target's side, so a busy
+      // session answers it exactly as an idle one does.
+      const { leafFamilyReference, resolveLeafRef, readLeafTranscript } = await import('../utils/leafWorkspace.js')
+      const leaf = await resolveLeafRef(address).catch(error => {
+        if (leafFamilyReference(address)) throw error
+        return undefined
+      })
+      if (leaf) result = await readLeafTranscript(address, options)
+      else {
+        const { readViaGatewayPeer } = await import('../utils/gatewayPeerSend.js')
+        const outcome = await readViaGatewayPeer(address, options)
+        if (!outcome.ok) throw new Error(outcome.message)
+        result = outcome.message
+      }
     } else if (input === 'inbox') {
       result = runtime.transport.inbox().map(r => `${r.message.id}  ${r.state}  from ${JSON.stringify(r.senderName)} (${r.message.fromSessionId})\n${r.message.summary}\n${r.message.text}`).join('\n\n') || 'Inbox is empty.'
     } else if (input === 'messages' || input.startsWith('messages ')) {
@@ -88,7 +124,7 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       result = `Inbound message policy: ${input}.`
     } else {
       const send = input.match(/^send\s+(\S+)\s+([\s\S]+)$/)
-      if (!send) result = 'Usage: /sessions [list|panel|start [name]|history <title>|resume <id>|inbox|messages [peer-id]|accept|hold|refuse|watch-idle <id>|receipt <peer-id> <message-id>|purpose [what this session is working on]|send <id|leaf #|leaf name> <message>]'
+      if (!send) result = 'Usage: /sessions [list|panel|start [name]|history <title>|resume <id>|inbox|messages [peer-id]|read <id|leaf #|leaf name> [tail=N] [since=<cursor>]|accept|hold|refuse|watch-idle <id>|receipt <peer-id> <message-id>|purpose [what this session is working on]|send <id|leaf #|leaf name> <message>]'
       else {
         // Peer transport needs an exact session ID; a leaf number or name is
         // resolved through the family so session comms addresses leaves too.
@@ -131,6 +167,6 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
 
 export default {
   type: 'local-jsx', name: 'sessions', description: 'Discover Gateway sessions and control peer messaging', immediate: true,
-  argumentHint: '[list|panel|start [name]|history <title>|resume <id>|inbox|messages [peer-id]|accept|hold|refuse|watch-idle <id>|receipt <peer-id> <message-id>|purpose [what this session is working on]|send <id|leaf #|leaf name> <message>]',
+  argumentHint: '[list|panel|start [name]|history <title>|resume <id>|inbox|messages [peer-id]|read <id|leaf #|leaf name> [tail=N] [since=<cursor>]|accept|hold|refuse|watch-idle <id>|receipt <peer-id> <message-id>|purpose [what this session is working on]|send <id|leaf #|leaf name> <message>]',
   load: async () => ({ call }),
 } satisfies Command

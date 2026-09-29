@@ -12,8 +12,31 @@ import {
   type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
+import { readTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 
 const execFileAsync = promisify(execFile)
+
+/**
+ * The sender of a request that carried this session's own token, but whose
+ * registration could not be resolved - the sender is not on the bus.
+ *
+ * Worth naming separately from a refusal: the request proved it could read our
+ * registration, so the only thing wrong is that the sender has none of its own,
+ * which is exactly the state a session is in when its own registration failed or
+ * was reaped, and which a generic "unauthorized" hides behind a transport bug.
+ */
+class UnregisteredSenderError extends Error {}
+
+/**
+ * The registration being read is not on disk at all.
+ *
+ * Kept apart from the other read failures because it is not one: it is the
+ * ordinary state of a session that has been deregistered - by its own close, by
+ * a restart that has not published yet, or by a listing that proved it dead -
+ * and a caller whose job is to remove or replace that registration needs to
+ * tell "already gone" apart from "unreadable".
+ */
+class NoRegistrationError extends Error {}
 
 const directoryChecks = new Map<string, Promise<void>>()
 function validatePrivateDirectory(directory: string): Promise<void> {
@@ -61,6 +84,14 @@ export async function sendGatewayHookMessage(env: NodeJS.ProcessEnv, toSessionId
 // JSON can expand one control character to six ASCII bytes (\\u0000).
 const RESPONSE_TIMEOUT_MS = 15000
 const MAX_FRAME = MAX_PEER_MESSAGE_BYTES * 6 + 8192
+/**
+ * How much of a transcript one peer read may carry.
+ *
+ * A read reply is a JSON frame like any other and has to fit `MAX_FRAME` after
+ * escaping, so the transcript text is capped well below it: a peer asking to see
+ * what another is doing needs the shape of the work, not a whole rollout.
+ */
+const MAX_PEER_READ_CHARS = 12_000
 const MAX_INBOX_BYTES = (MAX_PEER_QUEUE * 2 + MAX_PEER_HISTORY) * MAX_FRAME
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -131,7 +162,7 @@ async function readRegistrationUnchecked(directory: string, sessionId: string): 
   let before
   try { before = await lstat(path) }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No live session ${sessionId}; run /sessions list to see current peers`)
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new NoRegistrationError(`No live session ${sessionId}; run /sessions list to see current peers`)
     throw error
   }
   if (!before.isFile() || before.isSymbolicLink()) throw new Error('Invalid session registration')
@@ -348,15 +379,22 @@ export class GatewaySessionTransport {
           catch { socket.end(`${JSON.stringify({ ok: false, reason: 'Invalid request' })}\n`); return }
           // Start registration checks together, but reserve mutation order now.
           // Otherwise every queued message pays for a separate PowerShell ACL check.
-          const sender = this.authenticateSender(request).then(value => ({ value }), () => ({ value: undefined }))
+          const sender = this.authenticateSender(request).then(value => ({ value, fault: undefined as Error | undefined }), (error: unknown) => ({ value: undefined, fault: error instanceof Error ? error : new Error('Invalid sender') }))
           void this.serial(async () => {
             let response: unknown
             try {
               const authenticated = await sender
-              if (request.type !== 'ping' && !authenticated.value) throw new Error('Invalid sender')
+              if (request.type !== 'ping' && !authenticated.value) {
+                if (authenticated.fault instanceof UnregisteredSenderError) throw authenticated.fault
+                throw new Error('Invalid sender')
+              }
               response = await this.handle(request, authenticated.value)
             }
-            catch { response = { ok: false, reason: 'Invalid or unauthorized peer request' } }
+            catch (error) {
+              response = error instanceof UnregisteredSenderError
+                ? { ok: false, reason: `The sender is not registered on this bus, so its message cannot be attributed: ${error.message}` }
+                : { ok: false, reason: 'Invalid or unauthorized peer request' }
+            }
             socket.end(`${JSON.stringify(response)}\n`)
           }).catch(() => socket.destroy())
         })
@@ -375,7 +413,17 @@ export class GatewaySessionTransport {
   private async authenticateSender(request: any): Promise<{ peer: GatewayPeer; token: string } | undefined> {
     if (typeof request?.token !== 'string' || request.token !== this.token) throw new Error('Unauthorized')
     if (request.type === 'ping') return undefined
-    return readRegistration(this.options.directory, request.type === 'message' ? request.message?.fromSessionId : request.fromSessionId)
+    const senderId = request.type === 'message' ? request.message?.fromSessionId : request.fromSessionId
+    try {
+      return await readRegistration(this.options.directory, senderId)
+    } catch (error) {
+      // The token was ours, so this is not an unknown caller: it is a session
+      // whose own registration is missing or unreadable. In a leaf family that
+      // is a specific, fixable state - the sender can say where it is and be
+      // re-registered - and calling it unauthorized sends the two sessions
+      // looking for a transport fault that is not there.
+      throw new UnregisteredSenderError(error instanceof Error ? error.message : 'the sender has no registration')
+    }
   }
 
   private async handle(request: any, authenticatedSender?: { peer: GatewayPeer; token: string }): Promise<unknown> {
@@ -397,6 +445,26 @@ export class GatewaySessionTransport {
       if (sender.peer.runtimeId !== request.fromRuntimeId || sender.token !== request.senderToken) throw new Error('Invalid sender')
       const record = this.records.find(record => record.message.id === request.id && record.message.fromSessionId === sender.peer.sessionId)
       return { ok: true, id: request.id, state: record?.state ?? 'unknown', meaning: 'delivered means transcript-persisted, not task completion' }
+    }
+    // A read is served by the session being read, from its own file. It is the
+    // only party that knows where its transcript lives, so no caller has to
+    // guess a project directory from a session id - and because the answer is a
+    // bounded file read rather than a turn, a busy session answers it as
+    // readily as an idle one.
+    if (request.type === 'read') {
+      const sender = authenticatedSender ?? await readRegistration(this.options.directory, request.fromSessionId)
+      if (sender.peer.runtimeId !== request.fromRuntimeId || sender.token !== request.senderToken || sender.peer.sessionId === this.peer.sessionId) throw new Error('Invalid reader')
+      try {
+        const { getTranscriptPath } = await import('./sessionStorage.js')
+        const slice = await readTranscriptSlice(getTranscriptPath(), this.peer.sessionId, {
+          ...(typeof request.tail === 'number' ? { tail: request.tail } : {}),
+          ...(typeof request.since === 'string' ? { since: request.since } : {}),
+          maxChars: MAX_PEER_READ_CHARS,
+        })
+        return { ok: true, slice }
+      } catch {
+        return { ok: false, reason: 'This session has no readable transcript yet' }
+      }
     }
     if (request.type !== 'message') throw new Error('Unsupported request')
     const message = parsePeerMessage(request.message)
@@ -527,6 +595,28 @@ export class GatewaySessionTransport {
     return callGatewayPeer(target.peer.endpoint, { type: 'watch_idle', token: target.token, senderToken: this.token, fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId })
   }
 
+  /**
+   * Read what a peer has been doing, without disturbing it.
+   *
+   * The target serves the reply from its own transcript, so a peer that is
+   * mid-turn - or closed, or archived - still answers: nothing is asked of its
+   * model, and the read never competes with the work it is watching. `since`
+   * takes the cursor a previous read returned, so following along costs only the
+   * turns that are new.
+   */
+  async readPeer(toSessionId: string, options: { tail?: number; since?: string } = {}): Promise<TranscriptSlice> {
+    const target = await readRegistration(this.options.directory, toSessionId)
+    if (target.peer.sessionId === this.peer.sessionId) throw new Error('That is this session; its own turns are already in front of you')
+    const response = await callGatewayPeer(target.peer.endpoint, {
+      type: 'read', token: target.token, senderToken: this.token,
+      fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
+      ...(options.tail !== undefined ? { tail: options.tail } : {}),
+      ...(options.since ? { since: options.since } : {}),
+    }) as { ok?: boolean; slice?: TranscriptSlice; reason?: string }
+    if (response?.ok !== true || !response.slice) throw new Error(String(response?.reason ?? 'Peer read returned nothing'))
+    return response.slice
+  }
+
   async setPolicy(policy: GatewayInboundPolicy, withdraw?: () => { ids: ReadonlySet<string>; rollback: () => void; commit: () => void }): Promise<void> {
     await this.serial(async () => {
       if (!['accept', 'hold', 'refuse'].includes(policy)) throw new Error('Invalid inbound policy')
@@ -587,7 +677,17 @@ export class GatewaySessionTransport {
       try {
         const current = await readRegistration(this.options.directory, this.peer.sessionId)
         if (current.peer.runtimeId === this.peer.runtimeId) await unlink(this.registrationPath)
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      } catch (error) {
+        // A registration that is already gone is the outcome this is reaching
+        // for, not a failure, so it must not be reported as one. The check here
+        // used to be for ENOENT, which readRegistration never emits: it turns a
+        // missing file into its own error. So closing a session whose
+        // registration had been removed threw, and the throw landed in teardown
+        // - where it turns a clean shutdown into a failure - and in the
+        // start-failure path, where it replaced the reason the start failed.
+        // A genuinely unreadable registration is still surfaced.
+        if (!(error instanceof NoRegistrationError) && (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
     })()
     return this.closing
   }

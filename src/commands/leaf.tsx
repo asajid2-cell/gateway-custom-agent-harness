@@ -3,7 +3,7 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|checkpoint <leaf> [name]|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|reparent <leaf>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|reparent <leaf>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -35,6 +35,26 @@ export function parseForkRequest(input: string): string | null {
   if (input === 'new fork') return ''
   if (input.startsWith('new fork ')) return input.slice(8).trim()
   return null
+}
+
+/**
+ * The `read` grammar: an optional leaf reference, plus `tail=N` and
+ * `since=<cursor>` in any order. A bare `read` is the family digest. Kept pure
+ * so the grammar is testable without a live workspace.
+ */
+export function parseReadRequest(input: string): { reference?: string; options: { tail?: number; since?: string } } | null {
+  if (input !== 'read' && !input.startsWith('read ')) return null
+  const request: { reference?: string; options: { tail?: number; since?: string } } = { options: {} }
+  for (const token of input.slice(4).trim().split(/\s+/).filter(Boolean)) {
+    const tail = token.match(/^tail=(\d+)$/)
+    if (tail) { request.options.tail = Number(tail[1]); continue }
+    const since = token.match(/^since=(\S+)$/)
+    if (since) { request.options.since = since[1]!; continue }
+    // One reference: a second bare token is a mistake, not another leaf.
+    if (request.reference) throw new Error(`Usage: /leaf ${USAGE}`)
+    request.reference = token
+  }
+  return request
 }
 
 export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContext & LocalJSXCommandContext, args: string): Promise<React.ReactNode> {
@@ -69,6 +89,20 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
 
     const checkpoint = input.match(/^checkpoint\s+(\S+)(?:\s+([\s\S]+))?$/)
     if (checkpoint) { onDone(await workspace.checkpointLeaf(checkpoint[1]!, checkpoint[2]?.trim() || undefined), { display: 'system' }); return null }
+
+    const checkpoints = input.match(/^checkpoints(?:\s+(\S+))?$/)
+    if (checkpoints) { onDone(await workspace.listLeafCheckpoints(checkpoints[1]), { display: 'system' }); return null }
+
+    const checkpointChange = input.match(/^checkpoint-(drop|purge)\s+(#?\S+)$/)
+    if (checkpointChange) {
+      onDone(
+        checkpointChange[1] === 'drop'
+          ? await workspace.dropLeafCheckpoint(checkpointChange[2]!)
+          : await workspace.purgeLeafCheckpoint(checkpointChange[2]!),
+        { display: 'system' },
+      )
+      return null
+    }
 
     const reparent = input.match(/^reparent\s+(\S+)$/)
     if (reparent) {
@@ -153,6 +187,12 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       return null
     }
 
+    const reading = parseReadRequest(input)
+    if (reading) {
+      onDone(await workspace.readLeafTranscript(reading.reference, reading.options), { display: 'system' })
+      return null
+    }
+
     // `new fork <ref> [name]` and `fork <ref> [name]` both fork an existing
     // session or leaf; bare `fork` forks the current session. A token that is
     // not a leaf/session reference is treated as the new leaf's name.
@@ -161,7 +201,11 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       if (!forkRequest) await workspace.createLeaf(undefined, undefined, undefined, options)
       else {
         const [first, ...tail] = forkRequest.split(/\s+/)
-        if (await isLeafReference(first!, workspace.resolveLeafRef)) await workspace.createLeaf(tail.join(' ').trim() || undefined, first, undefined, options)
+        // `#2` and a checkpoint label name a frozen point rather than a live
+        // conversation. A token that answers to neither is the new leaf's name,
+        // which is what makes `fork my-new-leaf` fork the current session.
+        const source = await isLeafReference(first!, workspace.resolveLeafRef) || await workspace.isCheckpointReference(first!)
+        if (source) await workspace.createLeaf(tail.join(' ').trim() || undefined, first, undefined, options)
         else await workspace.createLeaf(forkRequest, undefined, undefined, options)
       }
     } else if (input === 'new' || input.startsWith('new ')) {
