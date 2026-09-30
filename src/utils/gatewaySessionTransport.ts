@@ -108,6 +108,36 @@ const MAX_PEER_READ_CHARS = 12_000
 const MAX_INBOX_BYTES = (MAX_PEER_QUEUE * 2 + MAX_PEER_HISTORY) * MAX_FRAME
 const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+/**
+ * Windows refuses a rename whose destination another process holds open without
+ * sharing. That is the ordinary way a scanner, the search indexer or a backup
+ * agent touches a file, and it lasts milliseconds, so the refusal is transient
+ * and has nothing to do with this code. It matters here because both files this
+ * writes are rewritten often - the registration on every status change, the
+ * inbox on every message - and because a refused publish is not a small loss: a
+ * registration that never lands marks the session's start failed for the rest of
+ * its life, and the session is then unreachable on the peer bus while it runs
+ * perfectly well. Retrying briefly is the whole fix; the holder always lets go.
+ *
+ * Only Windows retries. On the other platforms these codes are not a sharing
+ * refusal - EACCES there is a directory permission, which retrying cannot fix -
+ * so a failure is reported at once rather than paid for with a delay.
+ */
+const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
+const RENAME_ATTEMPTS = 6
+
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  const attempts = process.platform === 'win32' ? RENAME_ATTEMPTS : 1
+  for (let attempt = 1; ; attempt++) {
+    try { return await rename(from, to) }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (attempt >= attempts || code === undefined || !TRANSIENT_RENAME_CODES.has(code)) throw error
+      await new Promise(resolve => setTimeout(resolve, 20 * attempt))
+    }
+  }
+}
+
 async function atomicJson(path: string, value: unknown): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`
   const handle = await open(temporary, 'wx', 0o600)
@@ -116,7 +146,7 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
       await handle.writeFile(JSON.stringify(value))
       await handle.sync()
     } finally { await handle.close() }
-    await rename(temporary, path)
+    await renameWithRetry(temporary, path)
   } finally { await unlink(temporary).catch(() => {}) }
 }
 

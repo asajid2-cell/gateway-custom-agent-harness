@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { once } from 'node:events'
 import { createConnection } from 'node:net'
-import { mkdtemp, rm, mkdir, rename, readFile, utimes, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, mkdir, rename, readdir, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -529,6 +530,126 @@ test('a listing lets go of registrations that are provably dead, and only those'
     assert.ok((await readFile(join(directory, `${aliveId}.json`), 'utf8')).includes(`"pid":${process.pid}`))
   } finally {
     await seed.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a registration held open by another process is published anyway', { timeout: 30000, skip: process.platform !== 'win32' }, async () => {
+  // Windows refuses a rename whose destination another process holds open
+  // without sharing, which is how a scanner, the search indexer or a backup
+  // agent touches a file. The refusal lasts milliseconds and says nothing about
+  // this code, but a registration that never lands is not a small loss: the
+  // start is recorded as failed for the whole life of the session, so a session
+  // running perfectly well is unreachable on the peer bus and reads as
+  // "unavailable" on every surface that would have shown it. The publish retries
+  // briefly instead. Both directions are pinned here, because retrying must not
+  // become waiting: a holder that does let go is survivable, and one that never
+  // does is still reported rather than slept through.
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-held-'))
+  const directory = join(root, 'private')
+  const seed = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Seed', cwd: root })
+  await seed.start()
+  await seed.close()
+  // Hold a registration the way a scanner would - Open, Read, share None - from
+  // a separate process, so what is exercised is a refusal this process cannot
+  // produce for itself. The file is the one a crashed session left: a dead pid,
+  // nothing listening, and a fresh mtime, so the listing's grace window keeps it
+  // and the restart path reaches the publish rather than deleting it first.
+  const hold = async (sessionId: string, milliseconds: number): Promise<() => Promise<void>> => {
+    const registrationPath = join(directory, `${sessionId}.json`)
+    await writeFile(registrationPath, JSON.stringify({
+      peer: {
+        protocol: 1, sessionId, runtimeId: randomUUID(), name: 'Crashed', cwd: root, purpose: '',
+        pid: 0, startedAt: new Date().toISOString(), status: 'idle',
+        endpoint: `\\\\.\\pipe\\gateway-${randomUUID()}`,
+      },
+      token: 'a'.repeat(64),
+    }))
+    const marker = join(root, `${sessionId}.held`)
+    const script = `$ErrorActionPreference='Stop'; $fs=[System.IO.File]::Open($env:GATEWAY_HELD,'Open','Read','None'); [System.IO.File]::WriteAllText($env:GATEWAY_HELD_MARKER,'held'); Start-Sleep -Milliseconds ${milliseconds}; $fs.Dispose()`
+    const holder = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+      env: { ...process.env, GATEWAY_HELD: registrationPath, GATEWAY_HELD_MARKER: marker }, windowsHide: true,
+    })
+    for (let attempt = 0; attempt < 200; attempt++) {
+      try { await readFile(marker); break } catch { await new Promise(resolve => setTimeout(resolve, 25)) }
+    }
+    // Waiting for the exit, not just the signal: the handle is released when the
+    // process dies, so a kill that returns first leaves the file busy and the
+    // cleanup below racing a holder that is still there.
+    return async () => {
+      if (holder.exitCode !== null || holder.signalCode !== null) return
+      holder.kill()
+      await once(holder, 'exit').catch(() => {})
+    }
+  }
+  try {
+    const momentaryId = randomUUID()
+    const releaseMomentary = await hold(momentaryId, 200)
+    const momentary = new GatewaySessionTransport({ directory, sessionId: momentaryId, name: 'Restarted', cwd: root })
+    try {
+      await momentary.start()
+      // The publish landed, and it landed over the file that was in its way.
+      const published = JSON.parse(await readFile(join(directory, `${momentaryId}.json`), 'utf8'))
+      assert.equal(published.peer.runtimeId, momentary.peer.runtimeId)
+    } finally { await momentary.close(); await releaseMomentary() }
+
+    const stuckId = randomUUID()
+    const releaseStuck = await hold(stuckId, 5000)
+    const stuck = new GatewaySessionTransport({ directory, sessionId: stuckId, name: 'Restarted', cwd: root })
+    try {
+      await assert.rejects(stuck.start(), /EPERM|EBUSY|EACCES/)
+      // A refused publish must not leave its temp file in the directory every
+      // listing reads.
+      assert.deepEqual((await readdir(directory)).filter(name => name.includes('.tmp')), [])
+    } finally { await stuck.close().catch(() => {}); await releaseStuck() }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a session restarted after a crash keeps its intent and is reachable again', { timeout: 30000 }, async () => {
+  // A process that dies without closing leaves its registration behind, and the
+  // listing keeps it on purpose: a session about to be resumed reads its own
+  // registration back for the intent it had already declared, which is what
+  // stops a resumed session reappearing as an unnamed stranger. The restart then
+  // publishes over that file rather than beside it. The suite's other restart
+  // coverage closes cleanly first, so it never meets this state - and a listing
+  // that dropped the file, or a restart that refused to publish over it, would
+  // both look like a healthy peer bus from there.
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-crash-'))
+  const directory = join(root, 'private')
+  const sessionId = randomUUID()
+  const staleRuntimeId = randomUUID()
+  const seed = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Seed', cwd: root })
+  await seed.start()
+  await seed.close()
+  const exited = spawnSync(process.execPath, ['-e', ''], { windowsHide: true })
+  assert.ok(exited.pid && exited.pid > 0)
+  await writeFile(join(directory, `${sessionId}.json`), JSON.stringify({
+    peer: {
+      protocol: 1, sessionId, runtimeId: staleRuntimeId, name: 'Crashed', cwd: root,
+      purpose: 'declared before the crash', pid: exited.pid!, startedAt: new Date().toISOString(), status: 'running',
+      endpoint: `\\\\.\\pipe\\gateway-${staleRuntimeId}`,
+    },
+    token: 'a'.repeat(64),
+  }))
+  const restarted = new GatewaySessionTransport({ directory, sessionId, name: 'Restarted', cwd: root })
+  const sender = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Sender', cwd: root })
+  try {
+    // Nothing is listening, so the listing does not call it live - and the file
+    // stays, because the restart it is waiting for is still plausible.
+    assert.deepEqual(await listGatewayPeers(directory), [])
+    await restarted.start()
+    await sender.start()
+    assert.equal(restarted.peer.purpose, 'declared before the crash')
+    const published = JSON.parse(await readFile(join(directory, `${sessionId}.json`), 'utf8'))
+    assert.equal(published.peer.runtimeId, restarted.peer.runtimeId)
+    assert.notEqual(published.peer.runtimeId, staleRuntimeId)
+    // Reachable again, which is the whole point of recovering at all.
+    assert.equal((await sender.send(sessionId, 'after the restart', 'Restart') as any).state, 'queued')
+  } finally {
+    await restarted.close()
+    await sender.close()
     await rm(root, { recursive: true, force: true })
   }
 })
