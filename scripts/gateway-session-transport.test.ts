@@ -37,9 +37,12 @@ test('a ping is answered without waiting for the transport chain', { timeout: 30
   try {
     await peer.start()
     const token = peer.hookEnvironment().GATEWAY_PEER_TOKEN!
-    // Occupies the chain: an unregistered sender still has to have its own
-    // registration read (a directory validation) before the request can be
-    // refused, and that read is what the chain is waiting on.
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const blocked = (peer as any).serial(async () => { entered(); await gate })
+    await started
     const blocker = exchange('message', {
       type: 'message', token, senderToken: token,
       message: {
@@ -47,9 +50,13 @@ test('a ping is answered without waiting for the transport chain', { timeout: 30
         toSessionId: peer.peer.sessionId, text: 'busy', summary: 'busy', createdAt: new Date().toISOString(),
       },
     })
-    await new Promise(resolve => setTimeout(resolve, 50))
-    const ping = exchange('ping', { type: 'ping', token })
-    await Promise.all([blocker, ping])
+    try {
+      await exchange('ping', { type: 'ping', token })
+      assert.deepEqual(order, ['ping'], 'ping completes while the mutation chain is blocked')
+    } finally {
+      release()
+    }
+    await Promise.all([blocked, blocker])
     assert.deepEqual(order, ['ping', 'message'], 'the probe is answered before the request that holds the chain')
   } finally {
     await peer.close()
