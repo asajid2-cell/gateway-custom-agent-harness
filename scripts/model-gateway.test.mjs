@@ -44,6 +44,8 @@ import {
   openCodeZenHeaders,
 } from './opencode-zen.mjs'
 import {
+  AGENT_SDK_IDENTITY,
+  CLI_IDENTITY_PREFIXES,
   GATEWAY_QUERY_SOURCE_HEADER,
   COMPACTION_RUNTIME_TOOL_CONTRACT,
   gatewayQuerySource,
@@ -286,6 +288,11 @@ async function postGateway(port, body, extraHeaders = {}) {
   }
 }
 
+async function getGatewayJson(port, pathname) {
+  const response = await fetch(`http://127.0.0.1:${port}${pathname}`)
+  return { status: response.status, body: await response.text() }
+}
+
 async function abortGatewayAfterHeaders(port, body) {
   return new Promise((resolve, reject) => {
     const request = httpRequest(`http://127.0.0.1:${port}/v1/messages`, {
@@ -472,6 +479,28 @@ async function withGatewayAndFakeDeepSeek({ handler, run, gatewayEnv = {} }) {
   const gateway = await startGatewayForTest({
     DEEPSEEK_API_KEY: randomUUID(),
     DEEPSEEK_API_URL: `http://127.0.0.1:${fake.port}/messages`,
+    MODEL_GATEWAY_LOG_TIMING: '1',
+    MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
+    MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
+    ...gatewayEnv,
+  })
+  try {
+    return await run({ gateway, state })
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => fake.server.close(resolve))
+  }
+}
+
+// The subscription itself, reached the way the gateway reaches it: an upstream
+// that speaks Anthropic Messages. The credential is the API-key escape hatch so
+// the test never touches a real Claude.ai session.
+async function withGatewayAndFakeAnthropic({ handler, run, gatewayEnv = {} }) {
+  const state = { requests: [] }
+  const fake = await fakeCodexServer((req, res) => handler(req, res, state))
+  const gateway = await startGatewayForTest({
+    ANTHROPIC_API_KEY: randomUUID(),
+    MODEL_GATEWAY_ANTHROPIC_URL: `http://127.0.0.1:${fake.port}/v1/messages`,
     MODEL_GATEWAY_LOG_TIMING: '1',
     MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
     MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
@@ -1561,6 +1590,69 @@ test('split legacy summary blocks are sanitized as one historical message', () =
   assert.match(text, /inspect the gateway and run the regression suite/i)
 })
 
+test('a text block the gateway emptied is dropped, never forwarded empty', () => {
+  // Anthropic answers 400 twice over: "cache_control cannot be set for empty
+  // text blocks" while the client's marker still rides an emptied block, and
+  // "text content blocks must be non-empty" once the marker is off it. Emptying
+  // a block is not a repair, so the block goes - and the marker with it.
+  const marker = { type: 'ephemeral', ttl: '1h' }
+  const empties = blocks =>
+    blocks.filter(
+      block =>
+        block &&
+        typeof block === 'object' &&
+        block.type === 'text' &&
+        block.text === '',
+    )
+
+  const collapsed = sanitizeLegacyCompactionContent([
+    {
+      type: 'text',
+      text: 'This session is being continued from a previous conversation that ran out of context.\nSummary:',
+    },
+    {
+      type: 'text',
+      text: 'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.',
+    },
+    {
+      type: 'text',
+      text: 'The actual task was to inspect the gateway and run the regression suite.',
+      cache_control: marker,
+    },
+  ])
+  // Three blocks in, one out: the collapse ran, and the two blocks it emptied
+  // were dropped rather than carried.
+  assert.equal(collapsed.length, 1)
+  assert.deepEqual(empties(collapsed), [])
+  assert.match(
+    collapsed.map(block => block.text).join('\n'),
+    /inspect the gateway and run the regression suite/,
+  )
+
+  // A block the harness sent empty itself is the same hazard even when nothing
+  // is collapsed, and the text beside it has to survive.
+  const untouched = sanitizeStaleToolCapabilityContent([
+    { type: 'text', text: '', cache_control: marker },
+    { type: 'text', text: 'The actual task is to inspect the gateway.' },
+  ])
+  assert.deepEqual(empties(untouched), [])
+  assert.match(
+    untouched.map(block => block.text).join('\n'),
+    /inspect the gateway/,
+  )
+
+  // A message that was nothing but stale control text cannot be left with no
+  // content at all, so it keeps a placeholder instead.
+  const onlyControlText = sanitizeStaleToolCapabilityContent([
+    {
+      type: 'text',
+      text: 'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.',
+    },
+  ])
+  assert.equal(onlyControlText.length, 1)
+  assert.equal(onlyControlText[0].text, 'Historical control text removed.')
+})
+
 test('historical assistant capability claims are removed without losing the task', () => {
   const sanitized = sanitizeStaleToolCapabilityContent([
     'I don\u2019t have a callable tandem/task tool namespace exposed in this turn, so I cannot honestly claim the retries have run.',
@@ -2416,6 +2508,316 @@ test('HTTP boundary keeps omitted-stream DeepSeek fallback JSON', async () => {
   })
 })
 
+test('the gateway remembers the subscription limit Anthropic reports', async () => {
+  await withGatewayAndFakeAnthropic({
+    handler: async (req, res, state) => {
+      state.requests.push(await requestJson(req))
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-5h-utilization': '37',
+        'anthropic-ratelimit-unified-5h-reset': '1790000000',
+        'anthropic-ratelimit-unified-7d-utilization': '88',
+        'anthropic-ratelimit-unified-7d-reset': '1791000000',
+      })
+      res.end(JSON.stringify({
+        id: 'msg-anthropic-usage',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'OK' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 3, output_tokens: 1 },
+      }))
+    },
+    run: async ({ gateway, state }) => {
+      // Nothing has reached Anthropic yet, so the readout has no figure to give.
+      // An empty object means "never seen a limit", not "no limit left".
+      const before = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+      assert.equal(before.status, 200)
+      assert.deepEqual(JSON.parse(before.body), {})
+
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-claude-opus-5-5',
+        stream: false,
+        max_tokens: 8,
+        output_config: { effort: 'low' },
+        messages: [{ role: 'user', content: 'ping' }],
+      })
+      assert.equal(result.status, 200)
+      // The visible route relays to the subscription's own model id.
+      assert.equal(state.requests[0].model, 'claude-opus-5-5')
+
+      const after = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+      assert.equal(after.status, 200)
+      assert.deepEqual(JSON.parse(after.body), {
+        five_hour: { utilization: 37, resets_at: 1790000000 },
+        seven_day: { utilization: 88, resets_at: 1791000000 },
+      })
+    },
+  })
+})
+
+test('the usage route reads the subscription window without spending a turn', async () => {
+  // The footer's figure has to be there when the session starts rather than
+  // only once Anthropic has answered something, and reading it may not spend
+  // the limit it reports. The subscription's usage endpoint costs no tokens, so
+  // the gateway asks it directly - this is the whole point of the read.
+  const configDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-usage-config-'))
+  await writeFile(
+    path.join(configDir, '.credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'subscription-token',
+        refreshToken: 'subscription-refresh',
+        expiresAt: Date.now() + 3_600_000,
+      },
+    }),
+  )
+  const reads = []
+  const usage = await fakeCodexServer((req, res) => {
+    reads.push({ url: req.url, authorization: req.headers.authorization })
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      five_hour: { utilization: 1, resets_at: '2026-09-30T06:50:00+00:00' },
+      seven_day: { utilization: 0, resets_at: '2026-10-02T10:00:00+00:00' },
+      seven_day_opus: null,
+      extra_usage: null,
+    }))
+  })
+  // The key would take the passthrough off the subscription, so this scenario
+  // signs in the way the launcher runs: credentials on disk, no key.
+  const previousKey = process.env.ANTHROPIC_API_KEY
+  delete process.env.ANTHROPIC_API_KEY
+  let gateway
+  try {
+    gateway = await startGatewayForTest({
+      CLAUDE_CONFIG_DIR: configDir,
+      MODEL_GATEWAY_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${usage.port}/api/oauth/usage`,
+    })
+    // No request of any kind has reached a model at this point: the figure
+    // comes from the usage read alone.
+    const [first, concurrent] = await Promise.all([
+      getGatewayJson(gateway.port, '/gateway/anthropic-usage'),
+      getGatewayJson(gateway.port, '/gateway/anthropic-usage'),
+    ])
+    assert.equal(concurrent.body, first.body)
+    assert.equal(first.status, 200)
+    assert.deepEqual(JSON.parse(first.body), {
+      five_hour: { utilization: 1, resets_at: '2026-09-30T06:50:00+00:00' },
+      seven_day: { utilization: 0, resets_at: '2026-10-02T10:00:00+00:00' },
+    })
+    assert.deepEqual(reads, [
+      {
+        url: '/api/oauth/usage',
+        authorization: 'Bearer subscription-token',
+      },
+    ])
+
+    // The endpoint is cheap, but every session on this Gateway asks about the
+    // same account, so the window is read once and served from there.
+    const second = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+    assert.equal(second.status, 200)
+    assert.deepEqual(JSON.parse(second.body), JSON.parse(first.body))
+    assert.equal(reads.length, 1)
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = previousKey
+    await new Promise(resolve => usage.server.close(resolve))
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
+test('an API key has no subscription window to read', async () => {
+  // A key bills per token and reports no window, so asking would only turn a
+  // working key into a 401 - and the readout must say nothing rather than
+  // invent a figure for an account that has no limit to report.
+  const reads = []
+  const usage = await fakeCodexServer((req, res) => {
+    reads.push(req.url)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ five_hour: { utilization: 42 } }))
+  })
+  const previousKey = process.env.ANTHROPIC_API_KEY
+  process.env.ANTHROPIC_API_KEY = randomUUID()
+  let gateway
+  try {
+    gateway = await startGatewayForTest({
+      MODEL_GATEWAY_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${usage.port}/api/oauth/usage`,
+    })
+    const read = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+    assert.equal(read.status, 200)
+    assert.deepEqual(JSON.parse(read.body), {})
+    assert.deepEqual(reads, [])
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = previousKey
+    await new Promise(resolve => usage.server.close(resolve))
+  }
+})
+
+test('an Anthropic route never forwards an emptied text block', async () => {
+  // The live 400 this covers, in both of its forms: "messages.1.content.13.text:
+  // cache_control cannot be set for empty text blocks", and - once the marker is
+  // off the emptied block - "messages: text content blocks must be non-empty".
+  // The harness puts its breakpoint on the last block of a message, so a split
+  // legacy summary whose tail block carries the marker reaches the provider as
+  // an emptied block unless the sanitizer drops the block with the text.
+  await withGatewayAndFakeAnthropic({
+    handler: async (req, res, state) => {
+      state.requests.push(await requestJson(req))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'msg-anthropic-sanitized',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'OK' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 3, output_tokens: 1 },
+      }))
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'gateway-claude-opus-5-5',
+        stream: false,
+        max_tokens: 8,
+        messages: [
+          { role: 'user', content: 'hello' },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'This session is being continued from a previous conversation that ran out of context.\nSummary:',
+              },
+              {
+                type: 'text',
+                text: 'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nNo filesystem, task, or shell tools are available in this session.',
+              },
+              {
+                type: 'text',
+                text: 'The actual task was to inspect the gateway.',
+                cache_control: { type: 'ephemeral', ttl: '1h' },
+              },
+            ],
+          },
+        ],
+      })
+      assert.equal(result.status, 200)
+
+      const forwarded = state.requests[0]
+      const content = forwarded.messages[1].content
+      // The collapse ran: the stale control text is gone and one block holds the
+      // surviving summary. The two blocks it emptied are dropped rather than
+      // forwarded - a sanitizer that stopped firing would leave three blocks
+      // here, so the assertion cannot pass vacuously.
+      assert.equal(content.length, 1)
+      assert.match(content[0].text, /inspect the gateway/)
+      const illegal = content.some(block => block?.type === 'text' && block.text === '')
+      assert.equal(illegal, false)
+
+      const ordinary = await postGateway(gateway.port, {
+        model: 'gateway-claude-opus-5-5',
+        max_tokens: 8,
+        messages: [
+          { role: 'user', content: [
+            { type: 'text', text: '', cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: 'hello' },
+          ] },
+          { role: 'assistant', content: [
+            { type: 'thinking', thinking: 'Foreign provider reasoning.' },
+            { type: 'thinking', thinking: 'Signed reasoning.', signature: 'provider-signature' },
+            { type: 'tool_use', id: 'tool-1', name: 'example', input: {} },
+          ] },
+          { role: 'user', content: [
+            { type: 'tool_result', tool_use_id: 'tool-1', content: [
+              { type: 'text', text: '', cache_control: { type: 'ephemeral' } },
+            ] },
+          ] },
+          { role: 'user', content: '' },
+        ],
+      })
+      assert.equal(ordinary.status, 200)
+      const messages = state.requests[1].messages
+      assert.deepEqual(messages[0].content, [{ type: 'text', text: 'hello' }])
+      assert.deepEqual(messages[1].content, [
+        { type: 'thinking', thinking: 'Signed reasoning.', signature: 'provider-signature' },
+        { type: 'tool_use', id: 'tool-1', name: 'example', input: {} },
+      ])
+      assert.deepEqual(messages[2].content, [
+        { type: 'tool_result', tool_use_id: 'tool-1', content: [] },
+      ])
+      assert.deepEqual(messages[3].content, [{ type: 'text', text: 'Empty message.' }])
+    },
+  })
+})
+
+test('an Anthropic route leads with a recognised client identity', async () => {
+  // The live 429 this covers: the subscription endpoint reads the LEADING
+  // system block to identify the caller and answers an unrecognised one with a
+  // rate_limit_error carrying no rate-limit headers at all - a refusal of the
+  // caller's identity, not of its usage. Measured against claude-opus-5-5 on
+  // 2026-09-30, one change per request with an unmodified control between each:
+  // the Gateway persona alone answered 429, and that same persona with the
+  // identity block in front of it answered 200 every time.
+  await withGatewayAndFakeAnthropic({
+    handler: async (req, res, state) => {
+      state.requests.push(await requestJson(req))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'msg-anthropic-identity',
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'text', text: 'OK' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 3, output_tokens: 1 },
+      }))
+    },
+    run: async ({ gateway, state }) => {
+      const ok = await postGateway(gateway.port, {
+        model: 'gateway-claude-opus-5-5',
+        max_tokens: 8,
+        system: 'You are the Gateway coding assistant.',
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      assert.equal(ok.status, 200)
+
+      // The identity is its own block, in front of the caller's text: the
+      // endpoint does not accept the line glued to the caller's own block.
+      const persona = state.requests[0].system
+      assert.deepEqual(persona[0], { type: 'text', text: AGENT_SDK_IDENTITY })
+      assert.equal(persona.length, 2)
+      assert.match(persona[1].text, /^You are the Gateway coding assistant\./)
+      assert.match(persona[1].text, /Runtime tool contract/)
+
+      // A caller that already leads with a recognised identity keeps its own
+      // blocks - the marker included - and gains only the appended contract.
+      await postGateway(gateway.port, {
+        model: 'gateway-claude-opus-5-5',
+        max_tokens: 8,
+        system: [
+          {
+            type: 'text',
+            text: CLI_IDENTITY_PREFIXES[0],
+            cache_control: { type: 'ephemeral' },
+          },
+          { type: 'text', text: 'Caller instructions.' },
+        ],
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      const prepared = state.requests[1].system
+      assert.equal(prepared.length, 3)
+      assert.deepEqual(prepared[0], {
+        type: 'text',
+        text: CLI_IDENTITY_PREFIXES[0],
+        cache_control: { type: 'ephemeral' },
+      })
+      assert.equal(prepared[1].text, 'Caller instructions.')
+      assert.match(prepared[2].text, /Runtime tool contract/)
+    },
+  })
+})
+
 test('DeepSeek v4.1 Flash uses the canonical direct model ID', async () => {
   await withGatewayAndFakeDeepSeek({
     handler: async (req, res, state) => {
@@ -2439,6 +2841,10 @@ test('DeepSeek v4.1 Flash uses the canonical direct model ID', async () => {
       assert.equal(result.status, 200)
       assert.equal(JSON.parse(result.body).content[0].text, 'deepseek-v41-ok')
       assert.equal(state.requests[0].model, 'deepseek-flash')
+      // Only the subscription gates on who is asking, so the identity block is
+      // the first-party provider's alone: the same protocol through DeepSeek
+      // forwards the caller's system untouched.
+      assert.equal(state.requests[0].system, RUNTIME_TOOL_CONTRACT)
     },
   })
 })

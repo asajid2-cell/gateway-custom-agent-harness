@@ -184,6 +184,53 @@ test('catalog drift verifier is discriminating', () => {
   assert.deepEqual(gatewayCatalogDrift(optionIds).missingRoutes, [])
 })
 
+test('Anthropic routes sit below the GPT block and carry the subscription ladders', () => {
+  const anthropic = optionIds.filter(id => id.startsWith('gateway-claude-'))
+  assert.equal(anthropic.length, 13)
+  // The subscription models were deliberately left at the bottom of the picker.
+  assert.deepEqual(optionIds.slice(-anthropic.length), anthropic)
+
+  const data = modelsResponse().data
+  // The advertised ladder is per model: the provider 400s a level the model does
+  // not implement, so the route may only offer the set that model accepts.
+  const ladderByRoute = {
+    'gateway-claude-opus-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-sonnet-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-fable-5-1': ['low', 'medium', 'high'],
+    'gateway-claude-opus-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-fable-5': ['low', 'medium', 'high'],
+    'gateway-claude-opus-4-8': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-opus-4-7': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-sonnet-4-6': ['low', 'medium', 'high', 'max'],
+    'gateway-claude-opus-4-6': ['low', 'medium', 'high', 'max'],
+    'gateway-claude-opus-4-5-20251101': ['low', 'medium', 'high'],
+    'gateway-claude-haiku-4-5-20251001': [],
+    'gateway-claude-sonnet-4-5-20250929': [],
+  }
+  for (const id of anthropic) {
+    const entry = data.find(model => model.id === id)
+    assert.ok(entry, `${id} must be discoverable`)
+    assert.equal(entry.owned_by, 'anthropic')
+    // `upstream` is the provider's own id and the passthrough forwards the body
+    // as-is, so the rewritten model string must be exactly what Anthropic
+    // serves - the Gateway id minus its prefix.
+    assert.equal(entry.display_name, id.slice('gateway-'.length))
+    assert.deepEqual(entry.effort_levels, ladderByRoute[id], `${id} ladder`)
+  }
+
+  // The native spellings stay routable for direct callers and stale
+  // transcripts, but must not appear in discovery beside their visible route.
+  const discoveredIds = new Set(data.map(model => model.id))
+  for (const id of anthropic) {
+    assert.equal(
+      discoveredIds.has(id.slice('gateway-'.length)),
+      false,
+      `${id} native alias must stay hidden`,
+    )
+  }
+})
+
 test('Command Code routes stay grouped and carry provider-native upstream ids', () => {
   const commandCode = optionIds.filter(id => id.startsWith('gateway-commandcode-'))
   assert.deepEqual(commandCode, [

@@ -10,8 +10,10 @@ import { normalizeGatewayModelId } from './gatewayModelIds.js'
  * files all of OpenCode's traffic under one of them. Attribution is the whole
  * point of a usage ledger, so it is looked up rather than guessed.
  *
- * `anthropic` means "no Gateway route was involved" - the request went to a
- * first-party model, not through a backend.
+ * `anthropic` is the subscription's own provider. It covers a first-party model
+ * that never reaches a Gateway, and equally the `gateway-claude-*` routes, which
+ * reach that same provider on the same credential - either way the spend lands
+ * on one Anthropic account.
  */
 export type ModelBackend =
   | 'anthropic'
@@ -45,7 +47,7 @@ export function resolveModelBackend(model: string): ModelBackend {
   const canonical = normalizeGatewayModelId(model)
   const lower = canonical.toLowerCase()
 
-  // Every first-party model (claude-*) lands here: it never reaches a backend.
+  // Anything without the Gateway namespace never reaches a backend.
   if (!lower.startsWith('gateway-')) return 'anthropic'
 
   // The two OpenCode backends share one Gateway prefix, so the upstream id -
@@ -61,6 +63,9 @@ export function resolveModelBackend(model: string): ModelBackend {
   if (lower.startsWith('gateway-amd-')) return 'amd-radeon'
   if (lower.startsWith('gateway-ds-')) return 'deepseek'
   if (lower.startsWith('gateway-gpt-')) return 'codex'
+  // The subscription's own models, reached through the Gateway rather than
+  // directly. Same provider, same credential, same account.
+  if (lower.startsWith('gateway-claude-')) return 'anthropic'
 
   // A Gateway route this build does not know about. Reported as unknown rather
   // than folded into a neighbour's total.

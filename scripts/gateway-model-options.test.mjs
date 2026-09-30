@@ -22,7 +22,7 @@ test('gateway model options parse and deduplicate provider-qualified entries', a
   const options = await loadWithEnv(JSON.stringify([
     { value: 'claude-gpt-luna', label: 'GPT 5.6 Luna', description: 'Regular gateway' },
     { value: 'claude-opencode-deepseek-v4-pro', label: 'OpenCode DeepSeek', description: 'OpenCode' },
-    { value: 'claude-opus-4-6', label: 'stale Anthropic model', description: 'must be ignored' },
+    { value: 'claude-3-opus-20240229', label: 'stale Anthropic model', description: 'must be ignored' },
     { value: 'claude-opencode-deepseek-v4-pro', label: 'duplicate' },
     { value: '', label: 'ignored' },
     { value: 42, label: 'ignored' },
@@ -73,6 +73,34 @@ test('gateway display labels preserve Gateway identities and normalize provider 
     getGatewayModelDisplayName('opencode-zen/mimo-v2.5-free'),
     'OpenCode Mimo v2.5 Free',
   )
+  // The Anthropic subscription routes resolve under both spellings, like the
+  // GPT routes above.
+  assert.equal(getGatewayModelDisplayName('gateway-claude-opus-5-5'), 'Claude Opus 5.5')
+  assert.equal(getGatewayModelDisplayName('claude-opus-5-5'), 'Claude Opus 5.5')
+  assert.equal(
+    getGatewayModelDisplayName('gateway-claude-haiku-4-5-20251001'),
+    'Claude Haiku 4.5',
+  )
+  assert.equal(
+    getGatewayModelDisplayName('claude-haiku-4-5-20251001'),
+    'Claude Haiku 4.5',
+  )
+})
+
+test('gateway model options accept the Anthropic spellings and normalize them', async () => {
+  const options = await loadWithEnv(JSON.stringify([
+    { value: 'gateway-claude-opus-5-5', label: 'Claude Opus 5.5', description: 'Anthropic' },
+    { value: 'claude-opus-5-5', label: 'duplicate' },
+    { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', description: 'Anthropic' },
+  ]))
+  assert.deepEqual(options, [
+    { value: 'gateway-claude-opus-5-5', label: 'Claude Opus 5.5', description: 'Anthropic' },
+    {
+      value: 'gateway-claude-haiku-4-5-20251001',
+      label: 'Claude Haiku 4.5',
+      description: 'Anthropic',
+    },
+  ])
 })
 
 test('gateway model options fail closed outside gateway mode and on malformed JSON', async () => {

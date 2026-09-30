@@ -36,6 +36,7 @@ import {
 } from './commandcode.mjs'
 import {
   gatewayCatalogDrift,
+  ANTHROPIC_EFFORT_LEVELS_BY_MODEL,
   ASTRA_EFFORT_LEVELS,
   GPT61_SOL_EFFORT_LEVELS,
   GPT_LUNA_EFFORT_LEVELS,
@@ -45,6 +46,7 @@ import {
 } from './effort-capabilities.mjs'
 import {
   appendRuntimeToolContract,
+  ensureAgentIdentityPrefix,
   gatewayQuerySource,
   isCompactionRequest,
   isNativeSummaryRequest,
@@ -64,6 +66,26 @@ const DEEPSEEK_ENDPOINT =
 // namespace, so it gets its own backend rather than riding on DEEPSEEK_ENDPOINT.
 const AMD_RADEON_ENDPOINT =
   process.env.AMD_RADEON_API_URL || 'https://developer.amd.com.cn/radeon/api/v1/messages'
+// The user's own Anthropic subscription, forwarded verbatim to the first-party
+// API. Credentials come from the Claude Code OAuth credential file rather than
+// an env var, because the launcher strips ANTHROPIC_* from the environment it
+// starts the Gateway in; ANTHROPIC_API_KEY stays supported as an explicit
+// escape hatch for manual launches.
+const ANTHROPIC_ENDPOINT =
+  process.env.MODEL_GATEWAY_ANTHROPIC_URL ||
+  'https://api.anthropic.com/v1/messages'
+// Anthropic version-gates model availability by client user-agent: the fork's
+// own MACRO.VERSION is 1.0.0-research, which the endpoint answers 400 "does not
+// support" for these models. Measured 2026-09-29 - claude-cli/2.0.0 is refused,
+// claude-cli/3.1.0 is served - so the Gateway pins a serving version instead of
+// reporting the version it is built from.
+const ANTHROPIC_USER_AGENT =
+  process.env.MODEL_GATEWAY_ANTHROPIC_USER_AGENT ||
+  'claude-cli/3.1.0 (external, cli)'
+const ANTHROPIC_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
+const ANTHROPIC_OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
+const ANTHROPIC_OAUTH_SCOPES =
+  'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 const CODEX_REASONING_EFFORT =
   process.env.MODEL_GATEWAY_CODEX_REASONING_EFFORT || 'max'
 const CODEX_SYSTEM_INSTRUCTION =
@@ -151,6 +173,44 @@ function integerEnvironment(name, fallback) {
   }
   return value
 }
+
+// The models the user's own Anthropic subscription serves, newest first. Each
+// one gets a visible `gateway-` route plus a hidden provider-native alias, so
+// stale transcripts and direct callers that spell the first-party id still
+// route.
+//
+// Effort is per model, not per generation: the provider rejects a level a model
+// does not implement with a 400 naming that model's own accepted set, so one
+// shared ladder sends values the next model over refuses. A 2026-09-30 sweep
+// against the live endpoint - one deliberately invalid level per model - measured
+// `xhigh` accepted by opus-5-5, sonnet-5-5, opus-5, sonnet-5, opus-4-8 and
+// opus-4-7, rejected by opus-4-6 and sonnet-4-6 ("Supported levels: high, low,
+// max, medium") and by opus-4-5-20251101 ("high, low, medium", which refuses
+// `max` too). Each ladder is declared per model in the `gateway-claude-*`
+// entries of scripts/effort-capabilities.json `gatewayAliases` and applied
+// here, so the catalog stays the single declaration surface. The two
+// 4.5-generation models reject the effort parameter outright and declare an
+// empty ladder, which makes the gateway refuse a level locally rather than
+// forward a request the provider rejects; the two fable models answer 429
+// "Usage credits are required for this model" to every request, so their ladder
+// could not be probed and stays at the CLI's conservative first-party default.
+const ANTHROPIC_GATEWAY_MODELS = [
+  ['gateway-claude-opus-5-5', 'claude-opus-5-5'],
+  ['gateway-claude-sonnet-5-5', 'claude-sonnet-5-5'],
+  ['gateway-claude-fable-5-1', 'claude-fable-5-1'],
+  ['gateway-claude-opus-5', 'claude-opus-5'],
+  ['gateway-claude-sonnet-5', 'claude-sonnet-5'],
+  ['gateway-claude-fable-5', 'claude-fable-5'],
+  ['gateway-claude-opus-4-8', 'claude-opus-4-8'],
+  ['gateway-claude-opus-4-7', 'claude-opus-4-7'],
+  ['gateway-claude-sonnet-4-6', 'claude-sonnet-4-6'],
+  ['gateway-claude-opus-4-6', 'claude-opus-4-6'],
+  ['gateway-claude-opus-4-5-20251101', 'claude-opus-4-5-20251101'],
+  ['gateway-claude-haiku-4-5-20251001', 'claude-haiku-4-5-20251001'],
+  ['gateway-claude-sonnet-4-5-20250929', 'claude-sonnet-4-5-20250929'],
+]
+
+
 
 const DEFAULT_MODELS = {
   // Provider-native IDs remain routable for old scripts and direct callers,
@@ -259,6 +319,15 @@ const DEFAULT_MODELS = {
   'gateway-amd-qwen3.8-flash-next': { backend: 'amd-radeon', upstream: 'Qwen3.8-Flash-Next', effortLevels: ['low', 'medium', 'xhigh'] },
   'gateway-amd-qwen3.8-27b': { backend: 'amd-radeon', upstream: 'Qwen3.8-27B', effortLevels: ['low', 'medium', 'xhigh'] },
   'gateway-amd-minicpm5-2b': { backend: 'amd-radeon', upstream: 'MiniCPM5-2B', effortLevels: ['low', 'medium', 'high'] },
+  ...Object.fromEntries(
+    ANTHROPIC_GATEWAY_MODELS.flatMap(([id, upstream]) => {
+      const effortLevels = ANTHROPIC_EFFORT_LEVELS_BY_MODEL[upstream] ?? []
+      return [
+        [id, { backend: 'anthropic', upstream, effortLevels }],
+        [upstream, { backend: 'anthropic', upstream, effortLevels, hidden: true }],
+      ]
+    }),
+  ),
   // Command Code. The provider fronts third-party models behind one Bearer key
   // and its OSS models only answer on /provider/v1/chat/completions (the
   // Anthropic endpoint rejects them by name), so this backend speaks chat
@@ -344,6 +413,7 @@ function loadModels() {
       value.backend !== 'codex' &&
       value.backend !== 'deepseek' &&
       value.backend !== 'amd-radeon' &&
+      value.backend !== 'anthropic' &&
       value.backend !== 'opencode-go' &&
       value.backend !== 'opencode-zen' &&
       value.backend !== 'commandcode'
@@ -3018,33 +3088,6 @@ async function handleCodex(body, req, res, modelName, route) {
   }
 }
 
-function deepSeekHeaders(req, apiKey, stream = false) {
-  const hopByHop = new Set([
-    'connection',
-    'content-length',
-    'host',
-    'keep-alive',
-    'proxy-authenticate',
-    'proxy-authorization',
-    'te',
-    'trailer',
-    'transfer-encoding',
-    'upgrade',
-    'x-api-key',
-    'authorization',
-    'accept',
-  ])
-  const headers = new Headers()
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (value == null || hopByHop.has(name.toLowerCase())) continue
-    headers.set(name, Array.isArray(value) ? value.join(', ') : value)
-  }
-  headers.set('x-api-key', apiKey)
-  headers.set('accept', stream ? 'text/event-stream' : 'application/json')
-  if (!headers.has('content-type')) headers.set('content-type', 'application/json')
-  return headers
-}
-
 async function handleOpenCodeGo(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
   const sessionId = upstreamSessionId(req, body)
@@ -3365,23 +3408,406 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
   }
 }
 
+// A passthrough provider that cannot present credentials refuses the request
+// locally. The status is carried on the error because the same failure means
+// "sign in again" (401) or "the provider is unreachable" (502) depending on
+// where it happened.
+class PassthroughCredentialError extends Error {
+  constructor(message, status = 401) {
+    super(message)
+    this.name = 'PassthroughCredentialError'
+    this.status = status
+  }
+}
+
+// The caller's own headers minus everything hop-by-hop, and in particular
+// minus the Gateway's Authorization header: the Gateway token authenticates the
+// client to this process and must never reach a provider.
+function passthroughCopyHeaders(req, stream = false) {
+  const hopByHop = new Set([
+    'connection',
+    'content-length',
+    'host',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+    'x-api-key',
+    'authorization',
+    'accept',
+  ])
+  const headers = new Headers()
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value == null || hopByHop.has(name.toLowerCase())) continue
+    headers.set(name, Array.isArray(value) ? value.join(', ') : value)
+  }
+  headers.set('accept', stream ? 'text/event-stream' : 'application/json')
+  if (!headers.has('content-type')) headers.set('content-type', 'application/json')
+  return headers
+}
+
+function apiKeyHeaders(req, apiKey, stream = false) {
+  const headers = passthroughCopyHeaders(req, stream)
+  headers.set('x-api-key', apiKey)
+  return headers
+}
+
+function anthropicCredentialsPath() {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
+  return path.join(configDir, '.credentials.json')
+}
+
+function anthropicExpiresAt(oauth) {
+  return typeof oauth?.expiresAt === 'number' ? oauth.expiresAt : 0
+}
+
+// The subscription credential, read from the same file the CLI maintains. Null
+// means nothing usable is stored, so the caller refuses rather than forwarding
+// an unauthenticated request.
+async function readAnthropicCredential() {
+  try {
+    const stored = JSON.parse(await fs.readFile(anthropicCredentialsPath(), 'utf8'))
+    const oauth = stored?.claudeAiOauth
+    if (
+      !oauth ||
+      typeof oauth.accessToken !== 'string' ||
+      typeof oauth.refreshToken !== 'string'
+    ) {
+      return null
+    }
+    return { stored, oauth }
+  } catch {
+    return null
+  }
+}
+
+// Exactly one refresh may be in flight: the provider's refresh tokens are
+// single-use, so concurrent turns that each exchanged one would invalidate the
+// other's result.
+let anthropicRefreshInFlight = null
+
+function mergeAnthropicBetas(existing, required) {
+  const values = []
+  for (const raw of [existing, required]) {
+    for (const part of String(raw ?? '').split(',')) {
+      const value = part.trim()
+      if (value && !values.includes(value)) values.push(value)
+    }
+  }
+  return values.join(',')
+}
+
+async function refreshAnthropicCredential(credential) {
+  const { oauth } = credential
+  let response
+  try {
+    response = await fetch(ANTHROPIC_OAUTH_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'refresh_token',
+        refresh_token: oauth.refreshToken,
+        client_id: ANTHROPIC_OAUTH_CLIENT_ID,
+        // The backend allows scope expansion on refresh, so the full Claude AI
+        // set is requested rather than only what the stored grant carried.
+        scope: ANTHROPIC_OAUTH_SCOPES,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    })
+  } catch (error) {
+    throw new PassthroughCredentialError(
+      `Anthropic credential refresh failed: ${errorMessage(error)}`,
+      502,
+    )
+  }
+  if (!response.ok) {
+    // A rejected grant means the stored sign-in is finished; anything else is
+    // the provider having a bad moment.
+    const status = response.status === 400 || response.status === 401 ? 401 : 502
+    throw new PassthroughCredentialError(
+      status === 401
+        ? 'Anthropic sign-in is no longer valid; sign in again with Claude Code'
+        : `Anthropic credential refresh failed with HTTP ${response.status}`,
+      status,
+    )
+  }
+  let tokens
+  try {
+    tokens = await response.json()
+  } catch (error) {
+    throw new PassthroughCredentialError(
+      `Anthropic credential refresh returned an unreadable body: ${errorMessage(error)}`,
+      502,
+    )
+  }
+  if (typeof tokens?.access_token !== 'string' || tokens.access_token === '') {
+    throw new PassthroughCredentialError(
+      'Anthropic credential refresh returned no access token',
+      502,
+    )
+  }
+  const refreshed = {
+    accessToken: tokens.access_token,
+    refreshToken:
+      typeof tokens.refresh_token === 'string' && tokens.refresh_token !== ''
+        ? tokens.refresh_token
+        : oauth.refreshToken,
+    expiresAt:
+      typeof tokens.expires_in === 'number'
+        ? Date.now() + tokens.expires_in * 1000
+        : Date.now() + 3_600_000,
+  }
+  await persistAnthropicCredential(credential, refreshed)
+  return refreshed.accessToken
+}
+
+// Write the rotated token back the way the CLI stores it: whole file replaced
+// through a same-directory temp file, so a reader never sees a partial
+// credential. A refresh token that changed on disk meanwhile came from another
+// writer that already rotated the pair, and is left alone.
+async function persistAnthropicCredential(credential, refreshed) {
+  const target = anthropicCredentialsPath()
+  const current = await readAnthropicCredential()
+  if (!current || current.oauth.refreshToken !== credential.oauth.refreshToken) return
+  current.stored.claudeAiOauth = {
+    ...current.stored.claudeAiOauth,
+    accessToken: refreshed.accessToken,
+    refreshToken: refreshed.refreshToken,
+    expiresAt: refreshed.expiresAt,
+  }
+  const temporary = `${target}.${randomUUID()}.tmp`
+  try {
+    const handle = await fs.open(temporary, 'w', 0o600)
+    try {
+      await handle.writeFile(JSON.stringify(current.stored))
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await fs.rename(temporary, target)
+  } catch (error) {
+    // A credential that could not be persisted is still usable for this turn.
+    await fs.rm(temporary, { force: true }).catch(() => {})
+    process.stderr.write(
+      `model-gateway warning: could not persist refreshed Anthropic credential: ${errorMessage(error)}\n`,
+    )
+  }
+}
+
+async function anthropicAccessToken() {
+  const credential = await readAnthropicCredential()
+  if (!credential) {
+    throw new PassthroughCredentialError(
+      'Anthropic credentials are not configured: sign in with Claude Code, or set ANTHROPIC_API_KEY',
+    )
+  }
+  const { oauth } = credential
+  if (anthropicExpiresAt(oauth) > Date.now() + 60_000) return oauth.accessToken
+  if (anthropicRefreshInFlight === null) {
+    anthropicRefreshInFlight = refreshAnthropicCredential(credential).finally(() => {
+      anthropicRefreshInFlight = null
+    })
+  }
+  return anthropicRefreshInFlight
+}
+
+async function anthropicHeaders(req, { stream, body }) {
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  const token = apiKey ? null : await anthropicAccessToken()
+  const headers = passthroughCopyHeaders(req, stream)
+  if (apiKey) {
+    headers.set('x-api-key', apiKey)
+  } else {
+    headers.set('authorization', `Bearer ${token}`)
+    headers.set('x-app', 'cli')
+  }
+  headers.set('anthropic-version', '2023-06-01')
+  // Load-bearing: the endpoint gates model availability on the reported client
+  // version, so the caller's own user-agent is never forwarded.
+  headers.set('user-agent', ANTHROPIC_USER_AGENT)
+  const effort = body?.output_config?.effort ?? body?.reasoning?.effort ?? null
+  headers.set(
+    'anthropic-beta',
+    // The caller already sends its own beta list; this only ever adds to it.
+    mergeAnthropicBetas(
+      headers.get('anthropic-beta'),
+      [
+        apiKey ? null : 'oauth-2025-04-20',
+        'claude-code-20250219',
+        effort != null ? 'effort-2025-11-24' : null,
+      ]
+        .filter(Boolean)
+        .join(','),
+    ),
+  )
+  return { headers, secret: apiKey || token }
+}
+
 // Providers that speak the Anthropic Messages protocol verbatim: the request
 // body is forwarded unchanged apart from effort normalization, and the reply is
 // relayed as-is. DeepSeek and AMD Radeon Cloud both fit, so they share this path
-// rather than maintaining two copies of the same relay.
+// rather than maintaining two copies of the same relay. Anthropic itself joins
+// them, with subscription OAuth credentials in place of a static key.
 const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
   deepseek: {
     label: 'DeepSeek',
     endpoint: DEEPSEEK_ENDPOINT,
-    keyEnv: 'DEEPSEEK_API_KEY',
     backend: 'deepseek',
+    headers: (req, { stream }) => {
+      const apiKey = process.env.DEEPSEEK_API_KEY
+      if (!apiKey) {
+        throw new PassthroughCredentialError('DeepSeek API key is not configured')
+      }
+      return { headers: apiKeyHeaders(req, apiKey, stream), secret: apiKey }
+    },
   },
   'amd-radeon': {
     label: 'AMD Radeon',
     endpoint: AMD_RADEON_ENDPOINT,
-    keyEnv: 'AMD_API_KEY',
     backend: 'amd-radeon',
+    headers: (req, { stream }) => {
+      const apiKey = process.env.AMD_API_KEY
+      if (!apiKey) {
+        throw new PassthroughCredentialError('AMD Radeon API key is not configured')
+      }
+      return { headers: apiKeyHeaders(req, apiKey, stream), secret: apiKey }
+    },
   },
+  anthropic: {
+    label: 'Anthropic',
+    endpoint: ANTHROPIC_ENDPOINT,
+    backend: 'anthropic',
+    headers: (req, context) => anthropicHeaders(req, context),
+  },
+}
+
+/**
+ * The subscription's own usage window, read on demand. The footer needs it in
+ * the same slot as the Codex figure, and a gateway session is barred from
+ * reading Claude.ai state itself (the client's auth module refuses by design)
+ * while the credential it describes belongs to the gateway process, so the
+ * gateway is the one that reads it.
+ *
+ * Read from the usage endpoint rather than from the reply headers below: a
+ * header only describes the turn that just finished, so a session that has not
+ * answered yet - or that only just started - shows nothing at all, which is too
+ * late to be worth the space. This endpoint answers immediately and spends no
+ * tokens, so the figure is current at the moment the footer asks for it.
+ *
+ * Probe-verified 2026-09-30: 200 with the subscription's own token, under both
+ * a `claude-code` and the passthrough's `claude-cli` user-agent, so the pinned
+ * agent is reused rather than a second version guessed at.
+ */
+const ANTHROPIC_USAGE_ENDPOINT =
+  process.env.MODEL_GATEWAY_ANTHROPIC_USAGE_URL ||
+  'https://api.anthropic.com/api/oauth/usage'
+// The endpoint is cheap, but every session on this Gateway asks about the same
+// account, so one read per window serves them all. Short enough that a figure
+// the user just changed is visible on the next poll.
+const ANTHROPIC_USAGE_TTL_MS = 30_000
+let anthropicUsageRead = null
+let anthropicUsageInFlight = null
+
+function anthropicUsageWindows(payload) {
+  const windows = {}
+  for (const key of ['five_hour', 'seven_day']) {
+    const window = payload?.[key]
+    const utilization = window?.utilization
+    if (typeof utilization !== 'number' || !Number.isFinite(utilization)) continue
+    windows[key] = { utilization, resets_at: window?.resets_at ?? null }
+  }
+  return windows
+}
+
+async function readAnthropicSubscriptionUsage() {
+  if (anthropicUsageInFlight) return anthropicUsageInFlight
+  anthropicUsageInFlight = fetchAnthropicSubscriptionUsage()
+  try {
+    return await anthropicUsageInFlight
+  } finally {
+    anthropicUsageInFlight = null
+  }
+}
+
+async function fetchAnthropicSubscriptionUsage() {
+  // A key is not a subscription: there is no window to report, and the endpoint
+  // would only answer 401.
+  if (process.env.ANTHROPIC_API_KEY) return {}
+  const cached = anthropicUsageRead
+  if (cached && Date.now() - cached.at < ANTHROPIC_USAGE_TTL_MS) {
+    return cached.windows
+  }
+  let windows
+  try {
+    const token = await anthropicAccessToken()
+    const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
+      headers: {
+        'content-type': 'application/json',
+        'user-agent': ANTHROPIC_USER_AGENT,
+        authorization: `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+      signal: AbortSignal.timeout(5_000),
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    windows = anthropicUsageWindows(await response.json())
+  } catch (error) {
+    // Deliberately not cached, so the next poll retries instead of holding the
+    // failure for the whole window.
+    process.stderr.write(
+      `model-gateway warning: could not read the Anthropic subscription usage: ${errorMessage(error)}\n`,
+    )
+    return {}
+  }
+  anthropicUsageRead = { at: Date.now(), windows }
+  return windows
+}
+
+/**
+ * What Anthropic last reported about the subscription's own limit, taken from
+ * the unified rate-limit headers on every real reply. Kept as the fallback for
+ * the live read above: when the usage endpoint cannot be reached, the figure
+ * the last real reply carried is still a figure, and reporting nothing would
+ * read as "no limit" rather than "not known right now".
+ */
+let anthropicSubscriptionWindows = null
+
+function recordAnthropicSubscriptionWindows(upstream) {
+  const windows = {}
+  for (const [key, abbrev] of [['five_hour', '5h'], ['seven_day', '7d']]) {
+    const utilization = upstream.headers.get(
+      `anthropic-ratelimit-unified-${abbrev}-utilization`,
+    )
+    if (utilization === null) continue
+    const reset = upstream.headers.get(`anthropic-ratelimit-unified-${abbrev}-reset`)
+    windows[key] = {
+      utilization: Number(utilization),
+      resets_at: reset === null ? null : Number(reset),
+    }
+  }
+  // An API-key session answers without these headers, and a failed reply may
+  // too; a reading nobody sent is not a reading, so the last real one stands.
+  if (Object.keys(windows).length > 0) anthropicSubscriptionWindows = windows
+}
+
+function normalizeAnthropicContent(content, nested = false) {
+  if (typeof content === 'string') {
+    return content === '' && !nested ? [{ type: 'text', text: 'Empty message.' }] : content
+  }
+  if (!Array.isArray(content)) return content
+  const blocks = content
+    .filter(block => !(block?.type === 'text' && block.text === '') &&
+      !(block?.type === 'thinking' &&
+        (typeof block.signature !== 'string' || block.signature === '')))
+    .map(block => block?.type === 'tool_result'
+      ? { ...block, content: normalizeAnthropicContent(block.content, true) }
+      : block)
+  return blocks.length === 0 && !nested
+    ? [{ type: 'text', text: 'Empty message.' }]
+    : blocks
 }
 
 async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, providerName) {
@@ -3396,15 +3822,23 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
     return
   }
   try {
+    const system = appendRuntimeToolContract(body.system, querySource)
     body = normalizeGatewayEffort({
       ...body,
-      system: appendRuntimeToolContract(body.system, querySource),
+      // The subscription endpoint identifies the caller from the leading system
+      // block, and refuses an unrecognised one with a headerless 429 rather than
+      // serving the turn. Only the first-party provider gates on it, so only
+      // that provider gets the identity block in front - DeepSeek and Radeon
+      // speak the same protocol without caring who is asking.
+      system: providerName === 'anthropic'
+        ? ensureAgentIdentityPrefix(system)
+        : system,
       messages: Array.isArray(body.messages)
         ? body.messages.map(message => ({
             ...message,
-            content: message.role === 'assistant'
+            content: normalizeAnthropicContent(message.role === 'assistant'
               ? sanitizeStaleToolCapabilityContent(message.content)
-              : sanitizeLegacyCompactionContent(message.content),
+              : sanitizeLegacyCompactionContent(message.content)),
           }))
         : body.messages,
     }, MODELS[modelName], querySource)
@@ -3416,13 +3850,17 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
   const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: provider.backend, protocol: 'anthropic-messages' })
   const control = createRequestControl(req, res, trace)
-  const apiKey = process.env[provider.keyEnv]
-  if (!apiKey) {
-    anthropicError(res, 401, `${label} API key is not configured`)
-    trace.finish('auth-error', null, 401)
+  let credentials
+  try {
+    credentials = await provider.headers(req, { stream: wantsStream, body })
+  } catch (error) {
+    const status = error instanceof PassthroughCredentialError ? error.status : 502
+    anthropicError(res, status, errorMessage(error))
+    trace.finish('auth-error', error, status)
     control.cleanup()
     return
   }
+  const { headers, secret } = credentials
 
   const upstreamUrl = new URL(provider.endpoint)
   upstreamUrl.search = requestUrl.search
@@ -3443,7 +3881,7 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
       url: upstreamUrl,
       options: {
         method: 'POST',
-        headers: deepSeekHeaders(req, apiKey, wantsStream),
+        headers,
         body: rawBody,
         signal: control.signal,
       },
@@ -3459,6 +3897,8 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
     return
   }
 
+  if (providerName === 'anthropic') recordAnthropicSubscriptionWindows(upstream)
+
   if (!upstream.ok) {
     const status = upstream.status >= 500 ? 502 : upstream.status
     let detail
@@ -3466,7 +3906,7 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
       detail = await safeUpstreamResponseError(
         upstream,
         label,
-        apiKey,
+        secret,
         {
           signal: control.signal,
           timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
@@ -3631,11 +4071,13 @@ export function modelsResponse() {
             ? 'deepseek'
             : backend === 'amd-radeon'
               ? 'amd-radeon'
-              : backend === 'commandcode'
-                ? 'commandcode'
-                : backend === 'opencode-zen'
-                  ? 'opencode-zen'
-                  : 'opencode-go',
+              : backend === 'anthropic'
+                ? 'anthropic'
+                : backend === 'commandcode'
+                  ? 'commandcode'
+                  : backend === 'opencode-zen'
+                    ? 'opencode-zen'
+                    : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
       effort_levels: Array.isArray(MODELS[id].effortLevels)
         ? [...MODELS[id].effortLevels]
@@ -3662,6 +4104,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/v1/models') {
     process.stderr.write('model-gateway route path=/v1/models backend=models\n')
     json(res, 200, modelsResponse())
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/anthropic-usage') {
+    process.stderr.write('model-gateway route path=/gateway/anthropic-usage backend=anthropic-usage\n')
+    const live = await readAnthropicSubscriptionUsage()
+    json(
+      res,
+      200,
+      Object.keys(live).length > 0 ? live : anthropicSubscriptionWindows ?? {},
+    )
     return
   }
 
@@ -3722,6 +4175,19 @@ const server = http.createServer(async (req, res) => {
       } catch { /* malformed body: let the handler surface the real error */ }
     }
     await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'amd-radeon')
+    return
+  }
+  // The Anthropic body is forwarded as-is, so a hidden native alias has to
+  // reach the provider under the id it knows.
+  if (route.backend === 'anthropic') {
+    if (typeof route.upstream === 'string' && route.upstream !== modelName) {
+      try {
+        const obj = JSON.parse(rawBody.toString('utf8'))
+        obj.model = route.upstream
+        rawBody = Buffer.from(JSON.stringify(obj))
+      } catch { /* malformed body: let the handler surface the real error */ }
+    }
+    await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'anthropic')
     return
   }
 

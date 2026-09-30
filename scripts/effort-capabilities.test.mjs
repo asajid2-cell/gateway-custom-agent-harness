@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import {
+  ANTHROPIC_EFFORT_LEVELS_BY_MODEL,
   ASTRA_EFFORT_LEVELS,
   GPT56_EFFORT_LEVELS,
   GPT61_SOL_EFFORT_LEVELS,
@@ -47,6 +48,60 @@ test('shared effort catalog preserves model-specific GPT ladders', () => {
   assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('none'), false)
   assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('minimal'), false)
   assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('ultra'), false)
+})
+
+test('Anthropic routes declare the subscription ladders', () => {
+  // Measured 2026-09-30 against the live endpoint, one invalid level per model:
+  // the provider names the accepted set in its rejection, and that set differs
+  // per model even inside one generation. A shared ladder is what sent `xhigh`
+  // to the 4.6 pair and 4.5, which answer 400.
+  const FULL = ['low', 'medium', 'high', 'xhigh', 'max']
+  const NO_XHIGH = ['low', 'medium', 'high', 'max']
+  const BASE = ['low', 'medium', 'high']
+  const expectedByRoute = {
+    'gateway-claude-opus-5-5': FULL,
+    'gateway-claude-sonnet-5-5': FULL,
+    'gateway-claude-opus-5': FULL,
+    'gateway-claude-sonnet-5': FULL,
+    'gateway-claude-opus-4-8': FULL,
+    'gateway-claude-opus-4-7': FULL,
+    // 429 "Usage credits are required for this model" - unprobed, so the CLI's
+    // conservative first-party default rather than an unearned wider ladder.
+    'gateway-claude-fable-5-1': BASE,
+    'gateway-claude-fable-5': BASE,
+    // "'xhigh' is not supported ... Supported levels: high, low, max, medium"
+    'gateway-claude-sonnet-4-6': NO_XHIGH,
+    'gateway-claude-opus-4-6': NO_XHIGH,
+    // "Supported levels: high, low, medium" - refuses `max` as well.
+    'gateway-claude-opus-4-5-20251101': BASE,
+    // These two reject the effort parameter outright, so they advertise nothing
+    // and the gateway refuses a level locally instead of forwarding it.
+    'gateway-claude-haiku-4-5-20251001': [],
+    'gateway-claude-sonnet-4-5-20250929': [],
+  }
+  const routes = Object.keys(catalog.gatewayAliases).filter(id =>
+    id.startsWith('gateway-claude-'),
+  )
+  assert.equal(routes.length, 13)
+  for (const id of routes) {
+    const expected = expectedByRoute[id]
+    assert.ok(expected, `${id} has a recorded ladder`)
+    const native = id.slice('gateway-'.length)
+    assert.deepEqual(catalog.gatewayAliases[id], expected, `${id} ladder`)
+    assert.deepEqual(catalog.legacyAliases[native], expected, `${native} legacy ladder`)
+    assert.deepEqual(catalog.gatewayModelAliases[id], [native], `${id} alias`)
+    assert.deepEqual(getGatewayNativeEffortLevels(id), expected, `${id} client ladder`)
+    assert.deepEqual(getGatewayNativeEffortLevels(native), expected, `${native} client ladder`)
+    assert.deepEqual(
+      ANTHROPIC_EFFORT_LEVELS_BY_MODEL[native],
+      expected,
+      `${native} route ladder`,
+    )
+  }
+  // The map the route table reads is keyed by the provider's own model id.
+  assert.deepEqual(Object.keys(ANTHROPIC_EFFORT_LEVELS_BY_MODEL).sort(), routes
+    .map(id => id.slice('gateway-'.length))
+    .sort())
 })
 
 test('every OpenCode Go route has explicit capability metadata', () => {

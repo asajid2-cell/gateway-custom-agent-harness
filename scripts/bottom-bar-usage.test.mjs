@@ -4,9 +4,11 @@ import test from 'node:test'
 import {
   formatBottomBarUsage,
   formatSessionResumeCommand,
+  getAnthropicRemainingPercent,
   getContextUsageValues,
   getGatewayProviderLabel,
   getWeeklyRemainingPercent,
+  isAnthropicGatewayModel,
 } from '../src/utils/bottomBarUsage.ts'
 
 test('context usage exposes used and remaining tokens and percentages', () => {
@@ -122,5 +124,64 @@ test('bottom bar identifies Gateway providers without inventing quota data', () 
       { utilization: 0.2 },
     ),
     /weekly 80% left$/,
+  )
+})
+
+test('an Anthropic route reports the subscription limit the way Codex does', () => {
+  assert.equal(getGatewayProviderLabel('gateway-claude-opus-5-5'), 'Anthropic')
+  assert.equal(isAnthropicGatewayModel('gateway-claude-opus-5-5'), true)
+  assert.equal(isAnthropicGatewayModel('gateway-gpt-luna'), false)
+  assert.equal(isAnthropicGatewayModel('opus'), false)
+
+  // The window nearest its limit is the one that governs, and each figure is a
+  // fraction of the limit that has been used - the scale the endpoint actually
+  // answers (`five_hour.utilization = 0.05` for five percent) and the one the
+  // reply headers carry.
+  assert.equal(
+    getAnthropicRemainingPercent({ five_hour: { utilization: 0.37 } }),
+    63,
+  )
+  assert.equal(
+    getAnthropicRemainingPercent({
+      five_hour: { utilization: 0.12 },
+      seven_day: { utilization: 0.88 },
+    }),
+    12,
+  )
+  // A figure read at the wrong scale is the bug this pins: 0.05 used is 95%
+  // left, not 100% left.
+  assert.equal(
+    getAnthropicRemainingPercent({
+      five_hour: { utilization: 0.05 },
+      seven_day: { utilization: 0.01 },
+    }),
+    95,
+  )
+  // Nothing to report must read as nothing, not as an empty limit.
+  assert.equal(getAnthropicRemainingPercent({}), null)
+  assert.equal(getAnthropicRemainingPercent(null), null)
+  assert.equal(getAnthropicRemainingPercent(undefined), null)
+  assert.equal(
+    getAnthropicRemainingPercent({ five_hour: { utilization: null } }),
+    null,
+  )
+  assert.equal(
+    getAnthropicRemainingPercent({ five_hour: { utilization: 1.4 } }),
+    0,
+  )
+
+  assert.match(
+    formatBottomBarUsage('gateway-claude-opus-5-5', null, 200_000, undefined, {
+      remainingPercent: 63,
+    }),
+    /^(model gateway-claude-opus-5-5 · )?Anthropic remaining 63% · /,
+  )
+  // The label names the model's provider, so a quota handed to a route from a
+  // different provider is not printed under someone else's name.
+  assert.doesNotMatch(
+    formatBottomBarUsage('gateway-ds-flash', null, 200_000, undefined, {
+      remainingPercent: 63,
+    }),
+    /remaining 63%/,
   )
 })

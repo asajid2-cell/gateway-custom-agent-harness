@@ -64,7 +64,11 @@ test('a backend is resolved from the catalog, not from the model name', () => {
   assert.equal(resolveModelBackend('opencode-zen/hy3-free'), 'opencode-zen')
   assert.equal(resolveModelBackend('claude-opencode-glm-5.3'), 'opencode-go')
 
-  // A first-party model never reaches a backend.
+  // The subscription's own models, visible route and provider-native spelling
+  // alike: a Gateway route to Anthropic spends the same account a first-party
+  // session would, so it is attributed to the provider, not left unresolved.
+  assert.equal(resolveModelBackend('gateway-claude-opus-5-5'), 'anthropic')
+  assert.equal(resolveModelBackend('gateway-claude-haiku-4-5-20251001'), 'anthropic')
   assert.equal(resolveModelBackend('claude-opus-4-6'), 'anthropic')
   assert.equal(resolveModelBackend('claude-haiku-4-5-20251001'), 'anthropic')
 

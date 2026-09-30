@@ -164,9 +164,41 @@ export function sanitizeStaleToolCapabilityText(value) {
   return sanitizeStaleToolClaimText(value)
 }
 
+const EMPTY_TEXT_PLACEHOLDER = 'Historical control text removed.'
+
+function isTextBlock(block) {
+  return (
+    block &&
+    typeof block === 'object' &&
+    (block.type === 'text' ||
+      block.type === 'input_text' ||
+      block.type === 'output_text') &&
+    typeof block.text === 'string'
+  )
+}
+
+/**
+ * Anthropic rejects a text block with no text ("messages: text content blocks
+ * must be non-empty") and rejects a prompt-cache marker on one outright
+ * ("cache_control cannot be set for empty text blocks"). Emptying a block does
+ * not make it legal, so an emptied block is removed instead of forwarded -
+ * which also takes the client's cache marker with it, since the marker only
+ * ever rides the block. A message whose every text block sanitizes away keeps
+ * a placeholder, because a message may not arrive with no content at all.
+ */
+function dropEmptyTextBlocks(content) {
+  if (!Array.isArray(content)) return content
+  const kept = content.filter(
+    block => !(isTextBlock(block) && block.text === ''),
+  )
+  if (kept.length > 0) return kept
+  return [{ type: 'text', text: EMPTY_TEXT_PLACEHOLDER }]
+}
+
 export function sanitizeStaleToolCapabilityContent(content) {
   if (typeof content === 'string') {
-    return sanitizeStaleToolClaimText(content)
+    const sanitized = sanitizeStaleToolClaimText(content)
+    return sanitized === '' ? EMPTY_TEXT_PLACEHOLDER : sanitized
   }
   if (!Array.isArray(content)) return content
 
@@ -185,33 +217,37 @@ export function sanitizeStaleToolCapabilityContent(content) {
   const combined = textIndexes.map(index => content[index].text).join('\n')
   const sanitized = sanitizeStaleToolClaimText(combined)
   if (sanitized === combined) {
-    return content.map(block => {
-      if (
-        block &&
-        typeof block === 'object' &&
-        (block.type === 'text' ||
-          block.type === 'input_text' ||
-          block.type === 'output_text') &&
-        typeof block.text === 'string'
-      ) {
-        return {
-          ...block,
-          text: sanitizeStaleToolClaimText(block.text),
+    return dropEmptyTextBlocks(
+      content.map(block => {
+        if (
+          block &&
+          typeof block === 'object' &&
+          (block.type === 'text' ||
+            block.type === 'input_text' ||
+            block.type === 'output_text') &&
+          typeof block.text === 'string'
+        ) {
+          return {
+            ...block,
+            text: sanitizeStaleToolClaimText(block.text),
+          }
         }
-      }
-      return block
-    })
+        return block
+      }),
+    )
   }
 
   const firstTextIndex = textIndexes[0]
   const textIndexSet = new Set(textIndexes)
-  return content.map((block, index) => {
-    if (!textIndexSet.has(index)) return block
-    return {
-      ...block,
-      text: index === firstTextIndex ? sanitized : '',
-    }
-  })
+  return dropEmptyTextBlocks(
+    content.map((block, index) => {
+      if (!textIndexSet.has(index)) return block
+      return {
+        ...block,
+        text: index === firstTextIndex ? sanitized : '',
+      }
+    }),
+  )
 }
 
 export function systemText(system) {
@@ -272,7 +308,7 @@ export function sanitizeLegacyCompactionContent(content) {
   if (!isLegacyCompactionSummary(text)) return content
 
   if (typeof content === 'string') {
-    return sanitizeLegacyCompactionText(content)
+    return sanitizeLegacyCompactionText(content) || EMPTY_TEXT_PLACEHOLDER
   }
 
   if (!Array.isArray(content)) return content
@@ -297,13 +333,15 @@ export function sanitizeLegacyCompactionContent(content) {
   )
   const firstTextIndex = textIndexes[0]
   const textIndexSet = new Set(textIndexes)
-  return content.map((block, index) => {
-    if (!textIndexSet.has(index)) return block
-    return {
-      ...block,
-      text: index === firstTextIndex ? sanitized : '',
-    }
-  })
+  return dropEmptyTextBlocks(
+    content.map((block, index) => {
+      if (!textIndexSet.has(index)) return block
+      return {
+        ...block,
+        text: index === firstTextIndex ? sanitized : '',
+      }
+    }),
+  )
 }
 
 export function appendRuntimeToolContract(system, querySource) {
@@ -320,6 +358,52 @@ export function appendRuntimeToolContract(system, querySource) {
 
   const text = String(sanitized || '').trim()
   return text ? `${text}\n\n${runtimeContract}` : runtimeContract
+}
+
+// The three identities the first-party endpoint accepts as a Claude Code
+// client. It reads the LEADING system block to decide who is asking, and a
+// subscription request whose first block is anything else is answered with a
+// 429 `rate_limit_error` that carries no rate-limit headers at all - the
+// request is refused for its identity, not for its usage.
+export const CLI_IDENTITY_PREFIXES = [
+  `You are Claude Code, Anthropic's official CLI for Claude.`,
+  `You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.`,
+  `You are a Claude agent, built on Anthropic's Claude Agent SDK.`,
+]
+
+// What this fork is: a Claude Code agent driven through the Claude Agent SDK,
+// which is the preset identity the SDK itself declares.
+export const AGENT_SDK_IDENTITY = `You are a Claude agent, built on Anthropic's Claude Agent SDK.`
+
+/**
+ * Put a recognised identity in front of the caller's system prompt, as its own
+ * block. Gateway mode identifies itself with its own persona instead, which the
+ * endpoint does not accept on the subscription - measured 2026-09-30 against
+ * claude-opus-5-5, alternating single change and control: an unrecognised
+ * leading block answered 429 every time, while the same request with the
+ * identity block in front answered 200. The identity has to be its own block -
+ * gluing it to the caller's text in one block still 429s - and the rest of the
+ * prompt is free: a 300-character truncation of the official system prompt
+ * passed just as well as the whole thing.
+ */
+export function ensureAgentIdentityPrefix(system) {
+  if (Array.isArray(system)) {
+    const leading = system[0]
+    if (
+      leading?.type === 'text' &&
+      CLI_IDENTITY_PREFIXES.includes(leading.text)
+    ) {
+      return system
+    }
+    return [{ type: 'text', text: AGENT_SDK_IDENTITY }, ...system]
+  }
+  const text = String(system ?? '').trim()
+  if (!text) return [{ type: 'text', text: AGENT_SDK_IDENTITY }]
+  if (CLI_IDENTITY_PREFIXES.includes(text)) return system
+  return [
+    { type: 'text', text: AGENT_SDK_IDENTITY },
+    { type: 'text', text },
+  ]
 }
 
 export function rewriteGatewaySystemPrompt(

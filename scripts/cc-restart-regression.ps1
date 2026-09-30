@@ -55,6 +55,25 @@ try {
     Where-Object { $_ -like 'gateway-options=*' } |
     Select-Object -First 1
   $nativeCompactDisabled = $resumeStateText -match 'disable-sm=1'
+  # Every exported option has to be a Gateway-namespaced route. The catalog now
+  # carries the subscription's own Claude models as `gateway-claude-*`, so the
+  # absence of the substring `claude-` no longer separates a legitimate option
+  # from the native identity this scenario poisons the environment with
+  # (ANTHROPIC_MODEL=claude-opus-4-6). Asserting the namespace on each id still
+  # forbids that native spelling - and every other - without banning the
+  # catalog's own Anthropic routes.
+  $gatewayOptionValues = @()
+  if ($gatewayOptionsLine) {
+    $gatewayOptionValues = @(
+      ($gatewayOptionsLine -replace '^gateway-options=', '') |
+        ConvertFrom-Json |
+        ForEach-Object { [string]$_.value }
+    )
+  }
+  $gatewayOptionsNamespaced = (
+    $gatewayOptionValues.Count -gt 0 -and
+    @($gatewayOptionValues | Where-Object { $_ -notlike 'gateway-*' }).Count -eq 0
+  )
     $gatewayIdentity = (
     $resumeStateLines -contains ('codex-home=' + (Join-Path $env:USERPROFILE '.codex')) -and
     $resumeStateLines -contains 'model=gateway-gpt-luna' -and
@@ -71,7 +90,7 @@ try {
     $resumeStateLines -contains 'vertex-provider-present=0' -and
     $resumeStateLines -contains 'foundry-provider-present=0' -and
     $gatewayOptionsLine -match '^gateway-options=.*gateway-' -and
-    $gatewayOptionsLine -notmatch 'claude-'
+    $gatewayOptionsNamespaced
   )
 
   Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue

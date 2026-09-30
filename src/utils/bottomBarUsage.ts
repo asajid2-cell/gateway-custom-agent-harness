@@ -13,7 +13,13 @@ export type WeeklyUtilization = {
   utilization: number
 }
 
-export type CodexQuotaDisplay = {
+/**
+ * The one figure a provider quota contributes to the readout: how much of the
+ * subscription's limit is left. Codex answers from its rollout rate limits and
+ * Anthropic from the utilization endpoint, but both reduce to a percentage, so
+ * the formatter takes this shape rather than either provider's own type.
+ */
+export type ProviderQuotaRemaining = {
   remainingPercent: number
 }
 
@@ -93,8 +99,42 @@ export function getWeeklyRemainingPercent(
 export function getGatewayProviderLabel(model: string): string {
   const lower = model.toLowerCase()
   if (lower.includes('opencode')) return 'OpenCode'
+  if (lower.includes('gateway-claude-')) return 'Anthropic'
   if (lower.includes('gateway-gpt-')) return 'Codex'
   return 'Gateway'
+}
+
+export function isAnthropicGatewayModel(model: string): boolean {
+  return model.toLowerCase().includes('gateway-claude-')
+}
+
+/**
+ * The subscription's own limit as `/gateway/anthropic-usage` reports it: the
+ * session window and the weekly window, each a fraction of its limit that has
+ * been used. The readout carries one number, so it reports the window nearest
+ * its limit - the same reduction the Codex reader applies across its windows.
+ *
+ * `utilization` is a fraction, not a percentage: the provider answers
+ * `five_hour.utilization = 0.05` for five percent used, the same scale the
+ * `anthropic-ratelimit-unified-*-utilization` reply headers carry, and the same
+ * scale the rest of this client assumes - StatusLine and rateLimitMessages both
+ * multiply it by 100 to display it.
+ */
+export function getAnthropicRemainingPercent(
+  utilization:
+    | {
+        five_hour?: { utilization: number | null } | null
+        seven_day?: { utilization: number | null } | null
+      }
+    | null
+    | undefined,
+): number | null {
+  if (!utilization) return null
+  const used = [utilization.five_hour, utilization.seven_day]
+    .map(window => window?.utilization)
+    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  if (used.length === 0) return null
+  return Math.round(Math.max(0, Math.min(100, (1 - Math.max(...used)) * 100)))
 }
 
 // A session can be resumed by id or by name: `cc --resume <name>` resolves the
@@ -116,7 +156,7 @@ export function formatBottomBarUsage(
   usage: CurrentUsage | null,
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
-  codexQuota?: CodexQuotaDisplay | null,
+  providerQuota?: ProviderQuotaRemaining | null,
   options?: { includeModel?: boolean },
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
@@ -135,8 +175,14 @@ export function formatBottomBarUsage(
     parts.push(`model ${model}`)
   }
 
-  if (codexQuota && getGatewayProviderLabel(model) === 'Codex') {
-    parts.push(`Codex remaining ${codexQuota.remainingPercent}%`)
+  // Both providers report one remaining figure, so the label is what tells
+  // them apart - and it is only ever printed for the provider the model
+  // belongs to, because the caller reads the quota of that same provider.
+  if (providerQuota) {
+    const provider = getGatewayProviderLabel(model)
+    if (provider === 'Codex' || provider === 'Anthropic' || provider === 'OpenCode') {
+      parts.push(`${provider} remaining ${providerQuota.remainingPercent}%`)
+    }
   }
 
   if (usage) {
