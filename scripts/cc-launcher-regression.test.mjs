@@ -196,6 +196,97 @@ test('launcher honors the picker-written default model below explicit overrides'
   )
 })
 
+test('launcher re-sorts the catalog by the picker-written reorder', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.match(
+    script,
+    /Join-Path \$env:USERPROFILE '\.claude\\gateway-model-order\.json'/,
+    'the stored order must live in the location the picker writes',
+  )
+  // The order has to be applied between the catalog read and the export,
+  // because the export is what the picker renders its order from.
+  assert.match(
+    script,
+    /\$GatewayModelOptions = @\(\$CapabilityCatalog\.gatewayModelOptions\)[\s\S]*\$env:MODEL_GATEWAY_MODEL_OPTIONS = \(\$GatewayModelOptions \| ConvertTo-Json -Compress\)/,
+    'the stored order must be applied before the catalog is exported',
+  )
+  assert.match(
+    script,
+    /if \(-not \$OptionsByValue\.ContainsKey\(\$ModelId\)\) \{ continue \}/,
+    'ids the catalog cannot serve must be dropped rather than injected',
+  )
+  assert.match(
+    script,
+    /if \(\$LeadingOptions\.Count -gt 0\) \{/,
+    'an empty or unusable stored order must leave the catalog untouched',
+  )
+})
+
+test('the model picker moves a model to the top on t and reorders it on r', async () => {
+  const bindings = await readFile(
+    new URL('../src/keybindings/defaultBindings.ts', import.meta.url),
+    'utf8',
+  )
+  const schema = await readFile(
+    new URL('../src/keybindings/schema.ts', import.meta.url),
+    'utf8',
+  )
+  const picker = await readFile(
+    new URL('../src/components/ModelPicker.tsx', import.meta.url),
+    'utf8',
+  )
+  const selectInput = await readFile(
+    new URL('../src/components/CustomSelect/use-select-input.ts', import.meta.url),
+    'utf8',
+  )
+  assert.match(
+    bindings,
+    /context: 'ModelPicker',\s*bindings: \{[\s\S]*?t: 'modelPicker:moveToTop'[\s\S]*?r: 'modelPicker:liftReorder'/,
+    't and r must resolve inside the picker context',
+  )
+  assert.match(
+    bindings,
+    /up: 'modelPicker:moveUp',\s*down: 'modelPicker:moveDown',\s*escape: 'modelPicker:cancelReorder'/,
+    'the arrows and escape must be the picker\'s while a row is lifted',
+  )
+  for (const action of [
+    'modelPicker:moveToTop',
+    'modelPicker:liftReorder',
+    'modelPicker:moveUp',
+    'modelPicker:moveDown',
+    'modelPicker:cancelReorder',
+  ]) {
+    assert.ok(
+      schema.includes(`'${action}'`),
+      `${action} must be a declared action`,
+    )
+  }
+  assert.match(picker, /"modelPicker:moveToTop": \(\) => \{/)
+  assert.match(picker, /"modelPicker:liftReorder": \(\) => \{/)
+  // Every reordering path persists through the same helper, so a move the
+  // screen shows is a move the next launch reads.
+  assert.match(picker, /await persistModelOrder\(next, setNotice\)/)
+  assert.match(picker, /await writeGatewayModelOrder\(ids\)/)
+  assert.match(
+    picker,
+    /setNotice\("Could not save the model order\."\)/,
+    'a failed write must say so instead of reading as a saved order',
+  )
+  // The arrows and escape belong to the picker only while a row is lifted, so
+  // ordinary navigation and Escape-to-exit are untouched the rest of the time.
+  assert.match(picker, /\.\.\.\(lifted \? \{/)
+  assert.match(
+    picker,
+    /const navigationSuspended = lifted !== null;/,
+    'the Select must be suspended exactly while a row is lifted',
+  )
+  assert.match(
+    selectInput,
+    /if \(!navigationSuspended\) \{\s*handlers\['select:next'\]/,
+    'a suspended Select must drop its own navigation and cancel bindings',
+  )
+})
+
 test('an explicit --effort the model lacks fails at launch instead of at request time', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
   assert.match(script, /function Assert-GatewayEffortSupported \{/)

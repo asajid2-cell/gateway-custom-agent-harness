@@ -834,6 +834,47 @@ $env:MODEL_GATEWAY_EFFORT_CAPABILITIES = (
   $CapabilityCatalog.gatewayAliases | ConvertTo-Json -Compress
 )
 $GatewayModelOptions = @($CapabilityCatalog.gatewayModelOptions)
+# The picker's `t` (move to top) and `r` (lift and place) shortcuts write the
+# order they leave behind to this file. The picker reads its order from the
+# environment snapshot taken here, so re-sorting the catalog before the export
+# is the only way a saved order reaches the next launch. Ids the catalog no
+# longer offers are dropped rather than injected, and routes added since the
+# file was written keep their catalog position at the bottom.
+$GatewayModelOrderPath = Join-Path $env:USERPROFILE '.claude\gateway-model-order.json'
+if (Test-Path -LiteralPath $GatewayModelOrderPath -PathType Leaf) {
+  $StoredModelOrder = @()
+  try {
+    $StoredModelOrder = @(
+      (Get-Content -Raw -LiteralPath $GatewayModelOrderPath | ConvertFrom-Json)
+    )
+  } catch {
+    $StoredModelOrder = @()
+  }
+  if ($StoredModelOrder.Count -gt 0) {
+    $OptionsByValue = @{}
+    foreach ($Option in $GatewayModelOptions) {
+      $OptionsByValue[[string]$Option.value] = $Option
+    }
+    $PlacedOrder = @{}
+    $LeadingOptions = @()
+    foreach ($ModelId in $StoredModelOrder) {
+      if ($ModelId -isnot [string]) { continue }
+      if (-not $OptionsByValue.ContainsKey($ModelId)) { continue }
+      if ($PlacedOrder.ContainsKey($ModelId)) { continue }
+      $LeadingOptions += $OptionsByValue[$ModelId]
+      $PlacedOrder[$ModelId] = $true
+    }
+    if ($LeadingOptions.Count -gt 0) {
+      $TrailingOptions = @()
+      foreach ($Option in $GatewayModelOptions) {
+        if (-not $PlacedOrder.ContainsKey([string]$Option.value)) {
+          $TrailingOptions += $Option
+        }
+      }
+      $GatewayModelOptions = @($LeadingOptions + $TrailingOptions)
+    }
+  }
+}
 $env:MODEL_GATEWAY_MODEL_OPTIONS = ($GatewayModelOptions | ConvertTo-Json -Compress)
 $env:CLAUDE_CODE_EFFORT_LEVEL = $null
 $env:CLAUDE_CODE_WORKFLOWS = 'true'
