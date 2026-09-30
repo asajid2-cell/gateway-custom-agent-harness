@@ -28,8 +28,15 @@ parser.add_argument('--probe-selection', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
 parser.add_argument('--probe-close-parent', action='store_true')
+parser.add_argument('--probe-owner-cascade', action='store_true')
+parser.add_argument('--probe-resumed-member', action='store_true')
+parser.add_argument('--probe-creator-after-reparent', action='store_true')
 parser.add_argument('--probe-comms', action='store_true')
 parser.add_argument('--probe-read', action='store_true')
+parser.add_argument('--probe-merge', action='store_true')
+parser.add_argument('--probe-compact', action='store_true')
+parser.add_argument('--probe-merge-stress', action='store_true')
+parser.add_argument('--probe-merge-roles', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -88,7 +95,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
         view = view_tag(messages[-1].get('content', '') if messages else '')
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -146,6 +153,12 @@ class Handler(BaseHTTPRequestHandler):
                 frames[1] = dict(type='content_block_start', index=0, content_block=dict(type='tool_use', id='tool_monitor_fixture', name=tool_name, input={}))
                 frames[2] = dict(type='content_block_delta', index=0, delta=dict(type='input_json_delta', partial_json=json.dumps(dict(command='sleep 90', description='Local fixture background task', run_in_background=True))))
                 frames[4]['delta']['stop_reason'] = 'tool_use'
+        if marker == 'BULK_TURN_':
+            # One long turn, repeated, is how a seed's conversation is pushed
+            # past the size a merge carries - the branch that decides what a
+            # bounded merge does rather than the one that only ever sees a
+            # handful of short turns.
+            frames[2]['delta']['text'] = 'FIXTURE_REPLY_BULK_TURN_' + ('x' * 1400)
         for frame in frames:
             self.wfile.write(('event: ' + frame['type'] + '\ndata: ' + json.dumps(frame) + '\n\n').encode())
         self.wfile.flush()
@@ -1182,8 +1195,236 @@ def probe_close_parent():
     # The window the person is looking through is still running: the close is the
     # member's, not the session that carries it out.
     assert t.proc.isalive(), 'the window ended when a leaf closed its parent'
+    # The designation moves down with the departure, and the move is the whole
+    # point of it: a parent that has gone takes the family's name with it, and a
+    # designation naming a session that is no longer a member is ignored by every
+    # reader - so the family would otherwise be named after a conversation that is
+    # no longer in it and `parent` would resolve to nothing. The successor is the
+    # lowest-numbered member still in the family, which here is the leaf that did
+    # the closing, and every member's own pointer has to agree or a member
+    # resumed later reads the family it used to belong to.
+    designation = json.loads((root / 'leaf-families' / 'index' / (t.id + '.json')).read_text(encoding='utf-8'))
+    assert designation.get('parentSessionId') == alpha['sessionId'], (
+        'closing the parent did not move the designation: ' + repr(designation.get('parentSessionId')))
+    for member in t.family()['members']:
+        pointer = json.loads((root / 'leaf-families' / 'index' / (member['sessionId'] + '.json')).read_text(encoding='utf-8'))
+        assert pointer.get('parentSessionId') == alpha['sessionId'], 'a member pointer still names the closed parent'
+    # And the move is said out loud where the close was asked for, so the person
+    # watching the leaf is told the family they are still in has a new parent.
+    t.assert_view(alpha['sessionId'], 'promoted conversation owns the terminal', 75)
+    claim = json.loads((root / 'leaf-families' / 'index' / (t.id + '.host.json')).read_text(encoding='utf-8'))
+    assert claim['hostSessionId'] == alpha['sessionId'], 'designation changed without transferring session ownership'
     t.proc.terminate(force=True)
-    print(json.dumps(dict(leafClosesParent=True, selfCloseRefused=True, hostSurvivesClose=True)), flush=True)
+    print(json.dumps(dict(leafClosesParent=True, selfCloseRefused=True, hostSurvivesClose=True, closePromotes=True, sessionOwnerTransferred=True)), flush=True)
+
+def leaf_process(session_id):
+    """The process running a member's own conversation, found by the id it runs under.
+
+    A leaf is spawned detached, so it is not reliably a child of the window that
+    made it - and it is exactly that independence this probe is about. The
+    session id it was started with is on its command line and belongs to nothing
+    else on the machine.
+    """
+    for process in psutil.process_iter(['pid', 'cmdline']):
+        try: line = process.info['cmdline'] or []
+        except psutil.NoSuchProcess: continue
+        if any(session_id in part for part in line): return process
+    return None
+
+def exited(process, born, timeout):
+    """Whether a process ended, without being fooled by a recycled pid."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            if not process.is_running() or process.create_time() != born: return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied): return True
+        time.sleep(.2)
+    return False
+
+def probe_owner_cascade():
+    """The leaves go when the session that owns them goes, and only then.
+
+    A leaf outliving its launcher is the ordinary case for the transport - the
+    launcher exiting is only "nobody is watching", and the leaf is picked up
+    again by whoever opens it next. That is the wrong answer when the launcher is
+    the session parent: the leaves belong to that session, so a crash, a Ctrl-C
+    or a closed terminal takes them with it. A pid cannot prove the owner,
+    because Windows hands a dead process's number to whatever starts next; the
+    owner answers on a private endpoint instead, and the leaf ends when that
+    endpoint stops answering.
+
+    The other half is the isolation, and it is why the two are checked together:
+    one leaf leaving is one leaf leaving, and the window and its siblings must not
+    notice.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'alpha created', 75)
+    t.submit('/leaf new Beta')
+    t.wait(lambda: len(t.leaves()) == 2 and 'All 3' in t.text(), 'beta created', 75)
+    alpha, beta = t.leaves()[0], t.leaves()[1]
+    alpha_proc, beta_proc = leaf_process(alpha['sessionId']), leaf_process(beta['sessionId'])
+    assert alpha_proc and beta_proc, 'a leaf runs as a process of its own'
+    alpha_born, beta_born = alpha_proc.create_time(), beta_proc.create_time()
+
+    # One leaf leaving, on its own.
+    t.submit('/leaf close ' + alpha['sessionId'])
+    t.wait(lambda: next(member for member in t.family()['members'] if member['sessionId'] == alpha['sessionId'])['status'] == 'closed',
+           'one leaf closes', 45)
+    assert exited(alpha_proc, alpha_born, 15), 'a closed leaf kept running'
+    assert t.proc.isalive(), 'closing a leaf took the window with it'
+    assert beta_proc.is_running() and beta_proc.create_time() == beta_born, 'closing a leaf took its sibling with it'
+
+    # The crash. The window is killed outright, so no cleanup runs and nothing
+    # gets to say goodbye - which is the case the owner endpoint exists for. Only
+    # the window's own process is killed: a kill that took the tree would prove
+    # nothing, because the leaves would be gone by force rather than by the rule.
+    psutil.Process(t.proc.pid).kill()
+    assert exited(beta_proc, beta_born, 40), 'a leaf outlived the session parent that owned it'
+    print(json.dumps(dict(leafExitIsolated=True, ownerCrashCascades=True)), flush=True)
+
+def probe_resumed_member():
+    """A member entered on its own is that member, not the family's parent.
+
+    `cc --resume <leaf id>` is the address the leaf menu prints for every
+    member, and it is the door a person uses - but it carries none of the launch
+    environment a spawn carries, so the window it opens has to know the member
+    from the family's own records rather than from how it was started. It is not
+    a leaf by that test and its bar is drawn as the window that owns the family
+    draws it, so what is read here is the part a person acts on: the roster's
+    own "the session you are in" line, and the source the create wizard already
+    holds when it opens. The wizard is the surface the family surface is
+    entered through, and its source is the row that decides which conversation
+    the next leaf copies.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'alpha created', 75)
+    alpha = t.leaves()[0]
+    # Creating a leaf leaves it on screen, and a keystroke typed into a member
+    # before its REPL reaches its input loop is lost - which reads as a member
+    # that ignored the command rather than as one that was not listening yet.
+    t.assert_view(alpha['sessionId'], 'the new leaf', 75)
+    t.original()
+    # A member whose process is still up is the double-driver case; a clean
+    # resume wants it finished first, exactly as the parentage probe does. The
+    # close is typed in the window showing the original, which is what makes it
+    # the original closing the leaf rather than the leaf closing itself.
+    t.submit('/leaf close ' + alpha['sessionId'])
+    t.wait(lambda: t.leaves()[0]['status'] == 'closed', 'alpha closed for a clean resume')
+    # What the window that owns the family draws in the slot kept for the
+    # session it leaves for: the family's name, because the session on screen is
+    # the family's parent. The resumed member is read against this.
+    parent_name = t.first_item_label()
+
+    # Enter the leaf directly, the way a person would from any terminal.
+    s = Terminal(alpha['sessionId'])
+    s.wait(lambda: 'All ' in s.text(), 'the resumed leaf', 90)
+    s.assert_view(alpha['sessionId'], 'the leaf entered with --resume', 90)
+    bar = s.first_item_label()
+    # The menu's own sentence about what a new leaf copies. It is the first place
+    # the window's answer to "which member am I" is visible, and the wizard opens
+    # holding the same reading.
+    s.menu()
+    # The sentence is written from the roster, and the roster is a file read: the
+    # first frame names the session it has not looked up yet by its id. What a
+    # person reads is the settled screen.
+    s.wait(lambda: 'saved —' in s.text() or 'Read-only' in s.text(), 'the menu roster', 30)
+    home = s.text()
+    readings = dict(member=alpha['name'], parent_name=parent_name, bar=bar, home=home)
+    assert 'forks the session you are looking at: %s.' % alpha['name'] in home, (
+        'the menu does not name the member on screen as the conversation a leaf copies: ' + json.dumps(readings))
+    # The wizard's own source row, which is what "fork from this leaf" means.
+    s.pick('Create a leaf')
+    s.wait(lambda: 'Fork source:' in s.text(), 'the create wizard', 30)
+    source_row = next((line.strip() for line in s.screen.display if 'Fork source:' in line), '')
+    readings['source_row'] = source_row
+    # A leaf entered on its own offers itself as the conversation a new leaf
+    # copies; naming the family's parent here is the failure.
+    assert source_row, 'the wizard has no source row'
+    assert 'Fork source:' in source_row and alpha['name'] in source_row, (
+        'the wizard does not fork the member on screen: ' + json.dumps(readings))
+    # The same fact read on the roster: the window says which member it is, so
+    # its own row is not offered to it as somebody else's to open or close. Read
+    # before anything is started: a fork's own boot switches the pane, and the
+    # overlay goes with it, so the roster is up only while nothing is launching.
+    s.proc.write('\x1b'); s.pause(.6)
+    s.pick('Leaves in this family')
+    s.wait(lambda: 'is the session you are in' in s.text(), 'the roster', 30)
+    roster = s.after('Leaves in this family')
+    readings['roster'] = roster
+    assert 'is the session you are in' in roster, 'the window does not say which member it is: ' + json.dumps(readings)
+    assert 'Close #%s ' % alpha['number'] not in roster, 'the window offers its own row for closing: ' + json.dumps(readings)
+    # Now make the fork the reading is about.
+    s.proc.write('\x1b'); s.pause(.6)
+    s.pick('Create a leaf')
+    s.wait(lambda: 'Fork source:' in s.text(), 'the create wizard', 30)
+    s.proc.write('ResumedFork')
+    s.pick_row('Create leaf —')
+    s.wait(lambda: len(s.leaves()) == 2, 'fork made by the resumed member', 75)
+    made = max(s.leaves(), key=lambda member: member['number'])
+    readings['made_parent'] = made['parentSessionId']
+    assert made['parentSessionId'] == alpha['sessionId'], 'the resumed member forked the family parent: ' + json.dumps(readings)
+    # The fork took the pane: a member is drawn by the window that made it, and
+    # keystrokes go to whatever is drawn. Step back onto the session this window
+    # is - the bar's first entry - before leaving, or `/exit` lands on the leaf.
+    s.proc.write('\x1b'); s.pause(.5)
+    s.original()
+    print(json.dumps(dict(resumedMember=True, wizardForksMember=True, rosterNamesSelf=True, readings=readings)), flush=True)
+    s.exit()
+    # The member's own leave is the detach this checks: the fork it started keeps
+    # running, so the family outlives the window that was in it. The creator is
+    # leaving last with a live leaf under it again - the member it closed is
+    # reopened, which is what puts a process of this window's back - so its own
+    # leave is the same detach rather than the last session out of a family.
+    t.submit('/leaf reopen ' + alpha['sessionId'])
+    t.wait(lambda: any(member['sessionId'] == alpha['sessionId'] and member['status'] == 'open' for member in t.leaves()), 'the member reopened under its creator', 90)
+    t.exit()
+
+def probe_creator_after_reparent():
+    """A family designation must not change the window's identity or default fork."""
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Tokens')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'Tokens created', 75)
+    tokens = t.leaves()[0]
+    t.assert_view(tokens['sessionId'], 'Tokens', 75)
+    t.original()
+    before = t.first_item_label()
+    t.submit('/leaf reparent ' + tokens['sessionId'])
+    t.wait(lambda: 'is now the family parent' in t.text(), 'Tokens designated', 30)
+    t.assert_view(t.id, 'creator remains the conversation on screen')
+    t.leaf(0)
+    leaf_host_label = t.first_item_label()
+    t.original()
+    bar = t.first_item_label()
+    t.menu()
+    t.wait(lambda: 'saved —' in t.text(), 'menu roster', 30)
+    home = t.text()
+    t.pick('Create a leaf')
+    t.wait(lambda: 'Fork source:' in t.text(), 'wizard', 30)
+    source_row = next(line.strip() for line in t.screen.display if 'Fork source:' in line)
+    t.proc.write('CreatorFork')
+    t.pick_row('Create leaf —')
+    t.wait(lambda: len(t.leaves()) == 2, 'fork created', 75)
+    made = max(t.leaves(), key=lambda member: member['number'])
+    t.assert_view(made['sessionId'], 'new fork', 75)
+    result = dict(before=before, bar=bar, leaf_host_label=leaf_host_label, source_row=source_row, creator=t.id,
+                  designated_parent=tokens['sessionId'], made_parent=made['parentSessionId'])
+    print(json.dumps(result), flush=True)
+    t.check(lambda: made['parentSessionId'] == t.id, 'wizard forked the designated parent instead of the creator on screen')
+    t.check(lambda: 'Tokens' not in leaf_host_label, 'leaf return-to-host slot is labeled Tokens')
+    t.check(lambda: 'Tokens' not in bar, 'creator slot is labeled Tokens')
+    t.check(lambda: 'Tokens' not in source_row, 'default source names Tokens')
+    t.expand_bar()
+    t.point_first_item()
+    t.proc.write('\x1b'); t.pause(.5)
+    t.proc.write('\x1b'); t.pause(.5)
+    t.assert_view(t.id, 'creator after closing its menu')
+    t.exit()
+
 
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
@@ -1527,14 +1768,710 @@ def probe_comms():
     t.exit()
     print(json.dumps(dict(comms=True, selfCheckpoint=True, listed=True, repeatOrdinal=True, ambiguousRefused=True, branchFromCheckpoint=True, branchFromSecond=True, dropKeepsBranch=True, purgeEmpties=True, closedCheckpoint=True)), flush=True)
 
+def probe_merge():
+    """Seeds, seedlings, and merging one back into its seed, on real sessions.
+
+    A seed is a fork that is also a merge target and a seedling is a bounded fork
+    of it; the role is recorded where a role can be recorded - the loose pointer -
+    and nothing in the family file changes. The merge itself is an injected turn,
+    never a write to a transcript file, and it is reported only once the id it
+    carried is witnessed in the seed's own transcript - so what this checks is
+    the seed gaining the seedling's work, the ledger form carrying the report and
+    not the working, and the refusals that keep a merge off a member it does not
+    belong to.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+
+    # The seed. Its role is the only thing that tells a merge where to land, and
+    # the family file is strict and shared with older readers, so it lives in the
+    # per-session pointer beside the parent designation.
+    t.submit('/leaf seed original Curator')
+    t.wait(lambda: len(t.leaves()) == 1, 'the seed', 75)
+    seed = t.leaves()[0]
+    t.assert_view(seed['sessionId'], 'the seed', 75)
+    seed_pointer = json.loads((root / 'leaf-families' / 'index' / (seed['sessionId'] + '.json')).read_text(encoding='utf-8'))
+    assert seed_pointer.get('role') == 'seed', 'the seed role was not recorded in the loose pointer'
+
+    # A seedling: a fork of the seed that names the seed it belongs to.
+    t.original()
+    t.submit('/leaf seedling ' + str(seed['number']) + ' Blot')
+    t.wait(lambda: len(t.leaves()) == 2, 'the first seedling', 90)
+    blot = t.leaves()[1]
+    blot_pointer = json.loads((root / 'leaf-families' / 'index' / (blot['sessionId'] + '.json')).read_text(encoding='utf-8'))
+    assert blot_pointer.get('role') == 'seedling', 'the seedling role was not recorded in the loose pointer'
+    assert blot_pointer.get('seedOf') == seed['sessionId'], 'the seedling did not record the seed it was forked from'
+    assert blot['parentSessionId'] == seed['sessionId'], 'the seedling is not a fork of its seed'
+
+    # The seedling does one bounded job and reports. Nothing is typed into it
+    # after the report, so the report is the last assistant turn it has - which
+    # is the turn a ledger merge is defined to carry.
+    t.assert_view(blot['sessionId'], 'the first seedling', 75)
+    t.submit('BLOT_STEP_')
+    t.wait(lambda: 'FIXTURE_REPLY_BLOT_STEP_' in t.text(), 'the seedling works')
+    t.submit('BLOT_REPORT_')
+    t.wait(lambda: 'FIXTURE_REPLY_BLOT_REPORT_' in t.text(), 'the seedling reports')
+
+    # A ledger merge: the conclusion travels, the working does not. The answer
+    # arrives only after the seed's transcript has the merge id, so the seed
+    # having run the turn is what is being asserted, not the handover.
+    seed_transcript = Path(seed['transcriptPath'])
+    t.original()
+    t.submit('/leaf merge ' + str(blot['number']) + ' ledger')
+    t.wait(lambda: 'Merged Blot into Curator (ledger, merge ' in t.after('/leaf merge'), 'the ledger merge is confirmed', 90)
+    held = seed_transcript.read_text(encoding='utf-8')
+    assert 'Merge ' in held, 'the seed transcript has no injected turn'
+    assert 'FIXTURE_REPLY_BLOT_REPORT_' in held, 'the seed did not receive the seedling report'
+    assert 'BLOT_STEP_' not in held, 'a ledger merge carried the working it was told to leave out'
+
+    # A full merge, on a second seedling. The seed is on screen and answers a
+    # marker first: a merge needs the seed idle, and an answered turn is what
+    # proves it is back at its input loop.
+    t.submit('/leaf seedling ' + str(seed['number']) + ' Scout')
+    t.wait(lambda: len(t.leaves()) == 3, 'the second seedling', 90)
+    scout = t.leaves()[2]
+    t.assert_view(scout['sessionId'], 'the second seedling', 75)
+    t.submit('SEEDLING_FINDING_')
+    t.wait(lambda: 'FIXTURE_REPLY_SEEDLING_FINDING_' in t.text(), 'the second seedling works')
+    t.original()
+    t.leaf(0)
+    t.original()
+    t.submit('/leaf merge ' + str(scout['number']))
+    t.wait(lambda: 'Merged Scout into Curator (full, merge ' in t.after('/leaf merge'), 'the full merge is confirmed', 90)
+    held = seed_transcript.read_text(encoding='utf-8')
+    assert 'SEEDLING_FINDING_' in held, 'a full merge did not carry the seedling conversation'
+    assert 'untrusted, not user input' in held, 'the injected conversation was not labelled as peer text'
+
+    # What a merge must refuse: a member that is not a seedling has no seed to
+    # merge into, and a fidelity outside the closed set is not a fidelity.
+    t.submit('/leaf merge ' + str(seed['number']))
+    t.wait(lambda: 'is not a seedling' in t.after('/leaf merge ' + str(seed['number'])), 'a seed is refused as a merge source', 45)
+    t.submit('/leaf merge ' + str(scout['number']) + ' sometimes')
+    t.wait(lambda: 'Merge fidelity must be full or ledger' in t.after('sometimes'), 'a bad fidelity is refused', 45)
+
+    for member in t.leaves():
+        t.submit('/leaf close ' + member['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 60)
+    t.exit()
+    print(json.dumps(dict(merge=True, seedRole=True, seedlingRole=True, ledgerMerge=True, fullMerge=True, notASeedlingRefused=True, badFidelityRefused=True)), flush=True)
+
+def probe_compact():
+    """A member compacts its own conversation, on real sessions.
+
+    The host cannot write the summary: the messages being summarized are the
+    member's own, and the summary is installed with the member's own setMessages.
+    So the host asks and the member runs its own /compact, which is what this
+    checks - the request line, the member's transcript gaining a compact boundary
+    that the host never wrote, and a busy member refusing the request instead of
+    having its turn cut short for it.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+
+    t.submit('/leaf fork original Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'the leaf', 75)
+    alpha = t.leaves()[0]
+    t.assert_view(alpha['sessionId'], 'the leaf', 75)
+    t.submit('ALPHA_FIRST_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_FIRST_TURN' in t.text(), 'the leaf works')
+    t.submit('ALPHA_LATER_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_LATER_TURN' in t.text(), 'the leaf works again')
+
+    # A summary cannot land in the middle of a turn, so a member that is busy is
+    # refused. The held turn puts the member at its model call, so the refusal is
+    # about the state the member is really in and not a guess about it.
+    t.submit('LEAF_BLOCKED_TASK')
+    t.wait(lambda: 'LEAF_BLOCKED_TASK' in started_turns, 'the leaf turn starts')
+    t.original()
+    t.submit('/leaf compact ' + str(alpha['number']))
+    t.wait(lambda: 'finish its turn before compacting it' in t.after('/leaf compact'), 'a busy member is refused', 45)
+    blocked_turns['LEAF_BLOCKED_TASK'].set()
+    # The reply renders on the leaf's own screen, so the leaf is focused before
+    # it is waited for; the root is on screen here and would never show it.
+    t.wait(lambda: 'LEAF_BLOCKED_TASK' in finished_turns, 'the held turn completes', 90)
+    t.leaf(0)
+    t.wait(lambda: 'FIXTURE_REPLY_LEAF_BLOCKED_TASK' in t.text(), 'the held turn result is on the leaf', 30)
+    t.original()
+
+    # The real request, from the root, against a member that is back at its input
+    # loop. What proves the member ran it is the member's own transcript: the
+    # boundary is written by the member's process, and the host only asked.
+    t.submit('/leaf compact ' + str(alpha['number']))
+    t.wait(lambda: 'was asked to compact its conversation' in t.after('/leaf compact'), 'the compact request is accepted', 90)
+    transcript = Path(alpha['transcriptPath'])
+    t.wait(lambda: 'compact_boundary' in transcript.read_text(encoding='utf-8'), 'the member compacted its own conversation', 120)
+    held = transcript.read_text(encoding='utf-8')
+    assert '<local-command-stdout>' in held, 'the member did not run the /compact command it was asked for'
+    assert 'local-command-stderr' not in held, 'the member tried to compact and failed'
+
+    for member in t.leaves():
+        t.submit('/leaf close ' + member['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 60)
+    t.exit()
+    print(json.dumps(dict(compact=True, busyRefused=True, boundaryInMember=True, commandRanInMember=True)), flush=True)
+
+def probe_merge_stress():
+    """Seeding and merging under pressure, on real sessions.
+
+    The claim being stressed is the merge's *context*: the seed must end up with
+    the seedling's work inside its own live conversation - not merely in a file -
+    bounded, marked as peer text, and with the conclusion kept distinct from the
+    working that produced it. So this drives the awkward shapes rather than the
+    happy path: a seedling whose turn is still running, the same seedling merged
+    twice in both fidelities, a ledger merge of a seedling that has compacted
+    itself, a merge into a seed that has compacted, a seedling long enough to run
+    past the payload cap, a closed seedling, and a closed seed.
+
+    Every check is recorded rather than raised. What this run is for is the
+    matrix: an unexpected entry is the finding, and a probe that dies on the
+    first surprise reports one row of it.
+    """
+    results = {}
+    merge_id_re = re.compile(r'Merge ([0-9a-f-]{36}) from seedling')
+
+    def step(label, body):
+        try:
+            body()
+            results.setdefault(label, True)
+        except Exception as error:  # a stress run records; the matrix is the point
+            results[label] = 'FAIL: ' + ' '.join(str(error).split())[:180]
+
+    def member(session_id):
+        return next(item for item in t.leaves() if item['sessionId'] == session_id)
+
+    def number(session_id):
+        return member(session_id)['number']
+
+    def focus(session_id):
+        t.expand_bar()
+        t.point_row(number(session_id))
+        t.witness(session_id, 'the member')
+
+    def transcript_of(session_id):
+        return Path(member(session_id)['transcriptPath']).read_text(encoding='utf-8', errors='replace')
+
+    def chain_rows(session_id):
+        """The transcript records that are conversation turns.
+
+        A delivery writes its text twice: the queue-operation row the session's
+        queue leaves behind (no uuid, no parent) and the user turn itself. Only
+        the latter is a turn - the reader admits just user/assistant/system/
+        attachment into the chain, so it skips the former - which means a raw
+        text search counts every merge twice and reads a bookkeeping row as the
+        turn that carried it.
+        """
+        rows = []
+        for row in transcript_of(session_id).splitlines():
+            try:
+                record = json.loads(row)
+            except ValueError:
+                continue
+            if record.get('type') == 'user' and record.get('parentUuid'):
+                rows.append(row)
+        return rows
+
+    def merge_ids(session_id):
+        """Distinct merge ids, in the order they first appear.
+
+        Distinct because a merge is one event that surfaces more than once - the
+        queue-operation row and the turn, and again inside a later merge that
+        carried a seedling forked from this conversation. A count of matches is
+        a count of appearances, not of merges; a count of first appearances is
+        the merges, and the last of them is the newest.
+        """
+        return list(dict.fromkeys(
+            found for row in chain_rows(session_id) for found in merge_id_re.findall(row)))
+
+    def line_with(session_id, needle):
+        return next((row for row in chain_rows(session_id) if needle in row), '')
+
+    def ask(command, wanted, label, timeout=120, tries=4):
+        """Submit a command until it answers the way it was asked to.
+
+        A member's screen settles before the host's own view of it does, so a
+        command sent the instant a reply renders can meet a host still holding
+        that member as busy and come back refused - a correct refusal, and not
+        the answer this is asking for. The same command once the state has
+        caught up is the reading; a refusal performed nothing, so pressing
+        again asks the question rather than repeating a merge.
+        """
+        for _ in range(tries):
+            t.submit(command)
+            end = time.monotonic() + timeout
+            while time.monotonic() < end:
+                t.pump()
+                shown = t.after(command)
+                if wanted in shown: return shown
+                # The two gates refuse in their own words: the host refuses a
+                # busy target, and the member refuses a compact it is not idle
+                # to take.
+                if 'finish its turn before' in shown or 'be idle before' in shown: break
+                time.sleep(.03)
+            time.sleep(1.5)
+        t.dump()
+        raise AssertionError(label + ' (screen saved locally)')
+
+    def answer_to(command, needles, timeout=90):
+        """Run a command whose answer is the finding, and wait for it to arrive.
+
+        A record-only step cannot name the answer in advance, so it names the
+        answers that would end the wait - one of them, or none if it really did
+        nothing - rather than pausing for a guess at how long the work takes.
+        The merge this wraps waits on a witness poll, so a fixed pause reads the
+        screen before the answer has been written and calls it no output.
+        """
+        t.submit(command)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if any(needle in shown for needle in needles): return shown
+            time.sleep(.05)
+        t.dump()
+        return t.after(command)
+
+    def request_with_last(marker):
+        """The request whose newest message is `marker`, as one JSON string.
+
+        A marker that is only ever typed once is its own instrument: the turn it
+        became is the turn the request carries, so finding the request is finding
+        the fact. The whole body is returned, because what a merge has to be
+        seen in is the seed's own message history rather than its next question.
+        """
+        for body in reversed(requests):
+            messages = body.get('messages', [])
+            if messages and marker in json.dumps(messages[-1].get('content', '')):
+                return json.dumps(body)
+        return None
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+
+    # A seed and two seedlings: the durable line, and two bounded jobs off it.
+    t.submit('/leaf seed original Curator')
+    t.wait(lambda: len(t.leaves()) == 1, 'the seed', 90)
+    seed = t.leaves()[0]['sessionId']
+    t.assert_view(seed, 'the seed', 75)
+    results['seedRole'] = json.loads((root / 'leaf-families' / 'index' / (seed + '.json')).read_text(encoding='utf-8')).get('role')
+    t.original()
+    t.submit('/leaf seedling ' + str(number(seed)) + ' Blot')
+    t.wait(lambda: len(t.leaves()) == 2, 'the first seedling', 90)
+    blot = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Blot')
+    # A member's row lands before its pane does, and switching away from a pane
+    # that has not finished coming up clicks a bar that is not there yet.
+    t.assert_view(blot, 'the first seedling', 90)
+    t.original()
+    t.submit('/leaf seedling ' + str(number(seed)) + ' Scout')
+    t.wait(lambda: len(t.leaves()) == 3, 'the second seedling', 90)
+    scout = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Scout')
+    t.assert_view(scout, 'the second seedling', 90)
+    results['seedlingRoles'] = [
+        json.loads((root / 'leaf-families' / 'index' / (sid + '.json')).read_text(encoding='utf-8')).get('seedOf') == seed
+        for sid in (blot, scout)
+    ]
+
+    # A seedling mid-turn cannot be merged: the merge reads its transcript, and a
+    # running member still has its newest work in a queue this cannot see.
+    def busy_source():
+        focus(blot)
+        t.submit('LEAF_BLOCKED_TASK')
+        t.wait(lambda: 'LEAF_BLOCKED_TASK' in started_turns, 'the seedling turn starts', 45)
+        t.original()
+        t.submit('/leaf merge ' + str(number(blot)))
+        t.wait(lambda: 'finish its turn before merging it' in t.after('/leaf merge ' + str(number(blot))),
+               'a busy seedling is refused', 45)
+        blocked_turns['LEAF_BLOCKED_TASK'].set()
+        t.wait(lambda: 'LEAF_BLOCKED_TASK' in finished_turns, 'the held seedling turn completes', 90)
+        t.pause(.8)
+        focus(blot)
+        t.wait(lambda: 'FIXTURE_REPLY_LEAF_BLOCKED_TASK' in t.text(), 'the held result on the seedling', 45)
+        t.original()
+    step('busySeedlingRefused', busy_source)
+
+    def seedling_works():
+        focus(blot)
+        t.submit('BLOT_STEP_')
+        t.wait(lambda: 'FIXTURE_REPLY_BLOT_STEP_' in t.text(), 'the seedling works')
+        t.submit('BLOT_REPORT_')
+        t.wait(lambda: 'FIXTURE_REPLY_BLOT_REPORT_' in t.text(), 'the seedling reports')
+        t.original()
+    step('seedlingWork', seedling_works)
+
+    # A full merge carries the seedling's own chain, marked as peer text.
+    def full_merge():
+        t.original()
+        command = '/leaf merge ' + str(number(blot))
+        ask(command, 'Merged Blot into Curator (full, merge ', 'the full merge', 120)
+        ids = merge_ids(seed)
+        assert len(ids) == 1, 'the first merge did not leave exactly one id, saw ' + str(len(ids))
+        line = line_with(seed, ids[0])
+        assert 'untrusted, not user input' in line, 'the merged conversation reached the seed unlabelled'
+        assert 'BLOT_STEP_' in line and 'FIXTURE_REPLY_BLOT_REPORT_' in line, 'the full merge lost the seedling working'
+        results['fullMergeId'] = ids[0]
+    step('fullMerge', full_merge)
+
+    # The merge has to be in the seed's own conversation, not just its file: the
+    # seed's next turn is the reading, because its request carries the message
+    # history it is actually thinking with.
+    def merged_context_in_seed():
+        focus(seed)
+        t.submit('SEED_ACK_1')
+        t.wait(lambda: request_with_last('SEED_ACK_1') is not None, 'the seed answers after the merge', 60)
+        carried = request_with_last('SEED_ACK_1')
+        assert results['fullMergeId'] in carried, 'the merged turn is not in the seed own conversation'
+        assert 'untrusted, not user input' in carried, 'the seed holds the merge unlabelled'
+        assert 'BLOT_STEP_' in carried and 'FIXTURE_REPLY_BLOT_REPORT_' in carried, 'the seed holds a merge missing the working'
+        t.original()
+    step('mergeInSeedContext', merged_context_in_seed)
+
+    # The same seedling again, in the cheap fidelity: the conclusion travels and
+    # the working does not, and the second merge is its own merge, not a replay.
+    def ledger_second_merge():
+        before = merge_ids(seed)
+        t.original()
+        command = '/leaf merge ' + str(number(blot)) + ' ledger'
+        ask(command, 'Merged Blot into Curator (ledger, merge ', 'the ledger merge', 120)
+        ids = merge_ids(seed)
+        assert len(ids) == len(before) + 1, 'the second merge did not add exactly one id'
+        assert ids[-1] != before[-1], 'two merges of one seedling shared a merge id'
+        line = line_with(seed, ids[-1])
+        assert 'FIXTURE_REPLY_BLOT_REPORT_' in line, 'the ledger merge carried no report'
+        assert 'BLOT_STEP_' not in line, 'the ledger merge carried the working it was told to leave out'
+        results['ledgerMergeId'] = ids[-1]
+    step('ledgerSecondMerge', ledger_second_merge)
+
+    # A ledger merge of a seedling that has compacted itself: what a ledger is
+    # defined to carry is the closing report, and compaction moves what the
+    # closing turn is.
+    # A leaf asking to compact itself. The family host serves the ask and refuses
+    # a target that is not idle - but the leaf is not idle precisely because it
+    # is waiting for this answer, so the request cannot be satisfied by asking.
+    # Recorded rather than asserted: what the surface does here is the finding,
+    # and the workaround is a different one from either side.
+    def self_compact():
+        focus(scout)
+        command = '/leaf compact ' + str(number(scout))
+        t.submit(command)
+        end = time.monotonic() + 45
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if 'was asked to compact' in shown or 'Leaf operation failed' in shown: break
+            time.sleep(.05)
+        shown = t.after(command)
+        refusal = next((line.strip() for line in shown.splitlines() if 'Leaf operation failed' in line), '')
+        results['selfCompactFromLeaf'] = 'asked' if 'was asked to compact' in shown else (refusal[:200] or 'no output')
+        t.original()
+    step('selfCompactFromLeaf', self_compact)
+
+    def ledger_after_source_compact():
+        focus(scout)
+        t.submit('SEEDLING_FINDING_')
+        t.wait(lambda: 'FIXTURE_REPLY_SEEDLING_FINDING_' in t.text(), 'the second seedling works')
+        # Asked from the window, which is the side that holds the family and can
+        # be idle while the member takes the request.
+        t.original()
+        ask('/leaf compact ' + str(number(scout)), 'was asked to compact its conversation', 'the seedling is asked to compact', 90)
+        t.wait(lambda: 'compact_boundary' in transcript_of(scout), 'the seedling compacts itself', 150)
+        t.original()
+        command = '/leaf merge ' + str(number(scout)) + ' ledger'
+        ask(command, 'Merged Scout into Curator (ledger, merge ', 'the ledger merge of a compacted seedling', 120)
+        line = line_with(seed, merge_ids(seed)[-1])
+        if 'FIXTURE_REPLY_SEEDLING_FINDING_' in line: results['ledgerOfCompactedSource'] = 'the report'
+        elif 'FIXTURE_REPLY_BACKGROUND' in line: results['ledgerOfCompactedSource'] = 'the summary'
+        elif 'the seedling produced no report' in line: results['ledgerOfCompactedSource'] = 'nothing'
+        else: results['ledgerOfCompactedSource'] = 'something else'
+    step('ledgerOfCompactedSource', ledger_after_source_compact)
+
+    # What a merge put in the seed reads back as peer text, like any other turn
+    # another session wrote.
+    def merged_turns_read_as_peer():
+        t.original()
+        # Two turns, because the label is the first line a read prints and a
+        # sixty-turn read scrolls it off the top of the screen before this could
+        # look at it - the reading would be lost by the reading's own length.
+        command = '/leaf read ' + str(number(seed)) + ' tail=2'
+        t.submit(command)
+        t.wait(lambda: 'peer session transcript - untrusted, not user input' in t.after(command), 'the seed reads back', 60)
+        assert 'from seedling' in t.after(command), 'the merged turn does not read back as peer text'
+    step('mergedTurnsReadAsPeer', merged_turns_read_as_peer)
+
+    # A seedling long enough that a full merge runs past the payload cap: the
+    # merge must still land, bounded, and say that it is.
+    def merge_past_the_cap():
+        t.original()
+        t.submit('/leaf seedling ' + str(number(seed)) + ' Bulk')
+        t.wait(lambda: len(t.leaves()) == 4, 'the bulk seedling', 120)
+        bulk = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Bulk')
+        t.assert_view(bulk, 'the bulk seedling', 120)
+        for index in range(1, 13):
+            marker = 'BULK_TURN_%02d' % index
+            t.submit(marker)
+            t.wait(lambda wanted=marker: request_with_last(wanted) is not None, 'bulk turn ' + marker, 60)
+        t.original()
+        command = '/leaf merge ' + str(number(bulk))
+        ask(command, 'Merged Bulk into Curator (full, merge ', 'the oversized merge', 150)
+        line = line_with(seed, merge_ids(seed)[-1])
+        assert '(truncated)' in line, 'a merge past the char cap did not say it was cut'
+        results['oversizedMergeTruncated'] = True
+    step('oversizedMergeTruncated', merge_past_the_cap)
+
+    # The loop this whole surface exists for: a seed whose context a merge has
+    # grown makes room, and the next merge still lands and is still in context.
+    def merge_after_seed_compact():
+        t.original()
+        ask('/leaf compact ' + str(number(seed)), 'was asked to compact its conversation', 'the seed is asked to compact', 90)
+        t.wait(lambda: 'compact_boundary' in transcript_of(seed), 'the seed compacts itself', 150)
+        t.original()
+        command = '/leaf merge ' + str(number(scout))
+        ask(command, 'Merged Scout into Curator (full, merge ', 'a merge into a compacted seed', 120)
+        new_id = merge_ids(seed)[-1]
+        focus(seed)
+        t.submit('SEED_ACK_2')
+        t.wait(lambda: request_with_last('SEED_ACK_2') is not None, 'the compacted seed answers', 60)
+        carried = request_with_last('SEED_ACK_2')
+        assert new_id in carried, 'the merge after a compaction is not in the seed own conversation'
+        assert results['fullMergeId'] not in carried, 'the compaction did not replace the context it summarized'
+        t.original()
+        results['mergeAfterCompactId'] = new_id
+    step('mergeAfterSeedCompact', merge_after_seed_compact)
+
+    # A closed seedling and a closed seed. A closed seedling has no live view, so
+    # the merge reads its transcript off disk - its work is done, so that is what
+    # a merge of it means. A closed seed is a different thing: its process is the
+    # only party that can be handed a turn, so this records the refusal.
+    def closed_source():
+        t.original()
+        t.submit('/leaf close ' + scout)
+        t.wait(lambda: member(scout)['status'] == 'closed', 'the seedling closes', 60)
+        command = '/leaf merge ' + str(number(scout))
+        shown = answer_to(command, ('Merged Scout into Curator', 'Leaf operation failed', 'dropped'))
+        if 'Merged Scout into Curator' in shown: results['closedSeedling'] = 'merged'
+        else:
+            refusal = next((line.strip() for line in shown.splitlines() if 'Leaf operation failed' in line), '')
+            results['closedSeedling'] = refusal[:200] or 'no output'
+    step('closedSource', closed_source)
+
+    def closed_seed():
+        t.original()
+        t.submit('/leaf close ' + seed)
+        t.wait(lambda: member(seed)['status'] == 'closed', 'the seed closes', 60)
+        command = '/leaf merge ' + str(number(blot))
+        shown = answer_to(command, ('Merged Blot into Curator', 'Leaf operation failed', 'dropped'))
+        if 'Merged Blot into Curator' in shown: results['closedSeed'] = 'merged'
+        else:
+            refusal = next((line.strip() for line in shown.splitlines() if 'Leaf operation failed' in line), '')
+            results['closedSeed'] = refusal[:200] or 'no output'
+        assert 'Merged Blot into Curator' not in shown, 'a merge into a closed seed was reported as done'
+        t.submit('/leaf reopen ' + seed)
+        t.wait(lambda: member(seed)['status'] == 'open', 'the seed reopens', 60)
+        t.original()
+        command = '/leaf merge ' + str(number(blot))
+        ask(command, 'Merged Blot into Curator', 'a merge after the seed was reopened', 120)
+        results['reopenThenMerge'] = True
+    step('closedSeedThenReopen', closed_seed)
+
+    # A seedling asked to hand itself back - the shape a bounded job reporting in
+    # when it is done takes. A merge needs both ends idle and the seedling asking
+    # is the seedling working, so this asks whether a seedling can merge itself.
+    def self_merge():
+        t.original()
+        t.submit('/leaf seedling ' + str(number(seed)) + ' Solo')
+        t.wait(lambda: any(item['name'] == 'Solo' for item in t.leaves()), 'a third seedling', 120)
+        solo = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Solo')
+        t.assert_view(solo, 'the third seedling', 120)
+        t.submit('SOLO_REPORT_')
+        t.wait(lambda: 'FIXTURE_REPLY_SOLO_REPORT_' in t.text(), 'the third seedling works', 60)
+        command = '/leaf merge ' + str(number(solo))
+        t.submit(command)
+        end = time.monotonic() + 45
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if 'Merged Solo into' in shown or 'Leaf operation failed' in shown: break
+            time.sleep(.05)
+        shown = t.after(command)
+        if 'Merged Solo into' in shown: results['selfMergeFromLeaf'] = 'merged'
+        else:
+            refusal = next((line.strip() for line in shown.splitlines() if 'Leaf operation failed' in line), '')
+            results['selfMergeFromLeaf'] = refusal[:200] or 'no output'
+        t.original()
+    step('selfMergeFromLeaf', self_merge)
+
+    for item in t.leaves():
+        t.submit('/leaf close ' + item['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 90)
+    t.exit()
+    print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+def probe_merge_roles():
+    """Who a seedling is forked from, and where its merge can land.
+
+    A seedling is defined by its seed: the role on its pointer names the member a
+    merge injects into, and the surface promises the seed is what you give it.
+    The question this asks is whether that is enforced, because two shapes say it
+    is not: a seedling forked off an ordinary leaf, whose merge then writes to a
+    member the family never made a seed of - so the durable line a seed exists to
+    insulate is exactly the line that gets written to - and a seedling of the
+    session the family came from, which is the window holding the family rather
+    than a member with a process of its own, so no merge can ever reach it.
+
+    Neither is asserted away: the surface is asked, and what it does is the
+    result. Run it against a fresh config tree; it reads and writes only its own
+    family.
+    """
+    results = {}
+    merge_id_re = re.compile(r'Merge ([0-9a-f-]{36}) from seedling')
+
+    def member(session_id):
+        return next(item for item in t.leaves() if item['sessionId'] == session_id)
+
+    def pointer_of(session_id, timeout=15):
+        # The member reaches the family file a beat before its pointer reaches
+        # the index, so a read straight off the row can outrun the write.
+        path = root / 'leaf-families' / 'index' / (session_id + '.json')
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                return json.loads(path.read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                t.pump()
+                time.sleep(.05)
+        raise AssertionError('no pointer written for ' + session_id)
+
+    def brief(shown):
+        return 'merged' if 'Merged ' in shown else (' '.join(shown.split())[-160:] or 'no output')
+
+    def refusal_line(shown):
+        for line in shown.splitlines():
+            if 'Leaf operation failed' in line:
+                return ' '.join(line.split())[-200:]
+        return ''
+
+    def answered(command, needles, timeout=120):
+        """Submit a command and stop at the first answer it is known by.
+
+        A refusal is a result here, not a failure - the probe is asking what the
+        surface does, so an answer it did not expect is still an answer, and the
+        interesting one is often the refusal.
+        """
+        t.submit(command)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if any(needle in shown for needle in needles):
+                return shown
+            time.sleep(.05)
+        return t.after(command)
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('ROOT_CONTEXT_CAFE_')
+    t.wait(lambda: 'FIXTURE_REPLY_ROOT_CONTEXT_CAFE_' in t.text(), 'root context')
+
+    # An ordinary fork. It is a leaf; nothing about it was made a merge target.
+    t.submit('/leaf fork original Plain')
+    t.wait(lambda: len(t.leaves()) == 1, 'a plain leaf', 90)
+    plain = t.leaves()[0]['sessionId']
+    t.assert_view(plain, 'the plain leaf', 90)
+    results['plainRole'] = pointer_of(plain).get('role', 'absent')
+
+    # A seedling asked to fork off that leaf. A seed is what the role means, so
+    # a fork here would make the merge below land in a member the family never
+    # made a seed of - the durable line a seed exists to insulate.
+    t.original()
+    shown = answered('/leaf seedling ' + str(member(plain)['number']) + ' Sub',
+                     ('is a seedling of its seed', 'Leaf operation failed'))
+    if 'is a seedling of its seed' in shown:
+        sub = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Sub')
+        pointer = pointer_of(sub)
+        results['seedlingOfPlainLeaf'] = dict(role=pointer.get('role'), seedOfIsPlainLeaf=pointer.get('seedOf') == plain)
+        t.assert_view(sub, 'the seedling of a plain leaf', 90)
+        t.original()
+        shown = answered('/leaf merge ' + str(member(sub)['number']), ('Merged Sub into Plain', 'Leaf operation failed'))
+        results['mergeIntoNonSeed'] = brief(shown)
+        results['plainLeafCarriesMerge'] = bool(merge_id_re.search(Path(member(plain)['transcriptPath']).read_text(encoding='utf-8')))
+    else:
+        results['seedlingOfPlainLeaf'] = refusal_line(shown) or 'no output'
+
+    # A seedling of the session the family came from: that session is the window
+    # holding the family, not a member this window holds a process for, so a
+    # merge into it could never be delivered. Asked by the alias and by the
+    # number the family file gives it, because a guard on one is not a guard on
+    # the other - the alias resolves through the creator, the number through the
+    # member row, and only the row is what a merge reads.
+    for label, ref in (('rootAsSeedAlias', 'original'), ('rootAsSeedNumber', '1')):
+        before = {item['sessionId'] for item in t.leaves()}
+        t.original()
+        shown = answered('/leaf seedling ' + ref + ' Nested', ('is a seedling of its seed', 'Leaf operation failed'))
+        added = [item for item in t.leaves() if item['sessionId'] not in before]
+        if not added:
+            results[label] = refusal_line(shown) or 'no output'
+            continue
+        nested = added[0]
+        pointer = pointer_of(nested['sessionId'])
+        results[label] = dict(role=pointer.get('role'), seedOfIsTheWindow=pointer.get('seedOf') == t.id)
+        t.original()
+        shown = answered('/leaf merge ' + str(nested['number']), ('Merged Nested into', 'Leaf operation failed'))
+        results[label + 'Merge'] = brief(shown)
+
+    # The creator is offered as a target only from inside a member - the window
+    # holding the family does not offer itself - so the shape a merge could never
+    # reach has to be asked for from one. A seed first, because a seedling needs
+    # a seed to be forked off at all.
+    t.original()
+    shown = answered('/leaf seed original Curator', ('is a seed', 'Leaf operation failed'))
+    if 'is a seed' not in shown:
+        results['creatorAsSeedFromLeaf'] = refusal_line(shown) or 'no output'
+    else:
+        curator = next(item['sessionId'] for item in t.leaves() if item['name'] == 'Curator')
+        t.assert_view(curator, 'the seed', 90)
+        command = '/leaf seedling original Nested'
+        t.submit(command)
+        end = time.monotonic() + 90
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if any(needle in shown for needle in ('is a seedling of its seed', 'Leaf operation failed', 'No open leaf matches')):
+                break
+            time.sleep(.05)
+        nested = [item for item in t.leaves() if item['name'] == 'Nested']
+        if nested:
+            pointer = pointer_of(nested[0]['sessionId'])
+            results['creatorAsSeedFromLeaf'] = dict(role=pointer.get('role'), seedOfIsTheWindow=pointer.get('seedOf') == t.id)
+            t.original()
+            shown = answered('/leaf merge ' + str(nested[0]['number']), ('Merged Nested into', 'Leaf operation failed'))
+            results['creatorAsSeedFromLeafMerge'] = brief(shown)
+        else:
+            results['creatorAsSeedFromLeaf'] = refusal_line(t.after(command)) or ' '.join(t.after(command).split())[-160:] or 'no output'
+        t.original()
+
+    for item in t.leaves():
+        t.submit('/leaf close ' + item['sessionId'])
+    t.wait(lambda: not any(item['status'] == 'open' for item in t.leaves()), 'leaves closed before the window leaves', 90)
+    t.exit()
+    print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
     probes = [
         (args.probe_full_tui, probe_full_tui), (args.probe_lifecycle, probe_lifecycle),
         (args.probe_selection, probe_selection), (args.probe_parity, probe_parity),
         (args.probe_parentage, probe_parentage), (args.probe_queue, probe_queue),
-        (args.probe_close_parent, probe_close_parent), (args.probe_read, probe_read),
-        (args.probe_comms, probe_comms),
+        (args.probe_close_parent, probe_close_parent), (args.probe_resumed_member, probe_resumed_member),
+        (args.probe_owner_cascade, probe_owner_cascade),
+        (args.probe_creator_after_reparent, probe_creator_after_reparent),
+        (args.probe_read, probe_read),
+        (args.probe_comms, probe_comms), (args.probe_merge, probe_merge),
+        (args.probe_compact, probe_compact), (args.probe_merge_stress, probe_merge_stress),
+        (args.probe_merge_roles, probe_merge_roles),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
     if chosen:

@@ -54,11 +54,14 @@ test('a leaf closes the parent it belongs to, and no session closes itself', asy
   const saved = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = directory
   try {
-    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
+    const { asSessionId } = await import('../src/types/ids.ts')
     const {
-      getLeafViews, registerLeafViewForTesting, dispatchLeafRequestForTesting, forgetLeafFamilyRoot,
+      getLeafViews, registerLeafViewForTesting, registerLeafHostHandoff, dispatchLeafRequestForTesting, forgetLeafFamilyRoot,
     } = await import('../src/utils/leafWorkspace.ts')
     const root = getSessionId()
+    const projectDir = getSessionProjectDir()
+    const resumeDirectory = getSessionResumeDirectory()
     forgetLeafFamilyRoot()
     const familyPath = join(directory, 'leaf-families', `${root}.json`)
     const { leaf } = parkedLeaf()
@@ -67,6 +70,17 @@ test('a leaf closes the parent it belongs to, and no session closes itself', asy
       transcriptPath: join(directory, 'child.jsonl'), forkMessageId: randomUUID(),
     })
     const unregister = registerLeafViewForTesting({ rootSessionId: root, member, process: leaf as never, draft: '' })
+    // Closing the session parent hands this terminal to the successor, so the
+    // successor's conversation is resumed where the parent's was. That resume is
+    // the REPL's, and here it is a session switch plus a record of the call.
+    const resumed: string[] = []
+    const unregisterHandoff = registerLeafHostHandoff({
+      prepare: async () => {},
+      resume: async successor => {
+        resumed.push(successor.sessionId)
+        switchSession(asSessionId(successor.sessionId), null, directory)
+      },
+    })
     const status = async (sessionId: string) => (await readLeafFamily(familyPath, root)).members.find(item => item.sessionId === sessionId)?.status
     try {
       // The reported failure: from a leaf, `Close #8 Original` was refused with
@@ -75,22 +89,49 @@ test('a leaf closes the parent it belongs to, and no session closes itself', asy
       // usually the very parent it is asking to close, so the leaf was told it
       // was the parent. This is the real dispatch path a leaf's request takes.
       await dispatchLeafRequestForTesting(member.sessionId, root, 'change', [root, { status: 'closed' }])
+      // The handoff itself is deferred past the reply, so the leaf learns its
+      // request was accepted before the terminal it asked about changes hands.
+      // The deferral is a `setTimeout(…, 0)`, so wait for the outcome instead of
+      // guessing at its duration: a fixed sleep passes on a quiet machine and
+      // fails on a busy one, which is the flake this replaces.
+      const deadline = Date.now() + 5000
+      while (await status(root) !== 'closed' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10))
       assert.equal(await status(root), 'closed', 'a leaf must be able to close the parent it belongs to')
-      assert.deepEqual(getLeafViews().map(view => view.member.sessionId), [member.sessionId], 'closing the parent must not close the leaf that asked')
+      assert.equal(await status(member.sessionId), 'open', 'the leaf that asked takes the family over rather than closing with it')
+      assert.deepEqual(resumed, [member.sessionId], 'the successor conversation is resumed into the session terminal')
+      // Back to the parent's identity for the half that stays: this window is the
+      // creator again, so the two refusals below are read from its side.
+      switchSession(asSessionId(root), projectDir, resumeDirectory)
+      forgetLeafFamilyRoot()
 
-      // The half that stays: a leaf cannot close itself. The host holds a view
-      // for the asker, so "is there a process to close" cannot tell a leaf
-      // closing itself from a leaf closing a sibling - the asker can.
-      await dispatchLeafRequestForTesting(member.sessionId, root, 'change', [member.sessionId, { status: 'closed' }])
-      assert.equal(await status(member.sessionId), 'open', 'a leaf cannot close itself')
-      assert.deepEqual(getLeafViews().map(view => view.member.sessionId), [member.sessionId], 'a refused close leaves the leaf running')
+      // A fresh leaf stands in for the one that just became the session: the
+      // asker of the first half holds the terminal now, and a leaf is refused
+      // for itself and for nothing else.
+      const { leaf: second } = parkedLeaf()
+      const sibling = await addLeafMember(familyPath, root, {
+        sessionId: randomUUID(), parentSessionId: root, name: 'Second',
+        transcriptPath: join(directory, 'second.jsonl'), forkMessageId: randomUUID(),
+      })
+      const unregisterSibling = registerLeafViewForTesting({ rootSessionId: root, member: sibling, process: second as never, draft: '' })
+      try {
+        // A leaf cannot close itself. The host holds a view for the asker, so "is
+        // there a process to close" cannot tell a leaf closing itself from a leaf
+        // closing a sibling - the asker can.
+        await dispatchLeafRequestForTesting(sibling.sessionId, root, 'change', [sibling.sessionId, { status: 'closed' }])
+        assert.equal(await status(sibling.sessionId), 'open', 'a leaf cannot close itself')
 
-      // And the parent still closes its own leaves, which is what "either
-      // direction" means: the same rule, read from the other side.
-      await changeLeaf(member.sessionId, { status: 'closed' })
-      assert.equal(await status(member.sessionId), 'closed', 'the parent must still be able to close a leaf')
-      assert.deepEqual(getLeafViews(), [], 'a closed leaf is no longer an entry point')
-    } finally { unregister() }
+        // And the parent still closes its own leaves, which is what "either
+        // direction" means: the same rule, read from the other side.
+        await changeLeaf(sibling.sessionId, { status: 'closed' })
+        assert.equal(await status(sibling.sessionId), 'closed', 'the parent must still be able to close a leaf')
+        assert.deepEqual(getLeafViews(), [], 'a closed leaf is no longer an entry point')
+      } finally { unregisterSibling() }
+    } finally {
+      unregisterHandoff()
+      unregister()
+      switchSession(asSessionId(root), projectDir, resumeDirectory)
+      forgetLeafFamilyRoot()
+    }
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
@@ -632,12 +673,33 @@ test('reviving an archived leaf files it back in without starting it', async () 
 })
 
 test('worktree leaf rejects the current working tree before creating a fork', async () => {
-  const { getCwdState, setCwdState } = await import('../src/bootstrap/state.ts')
+  const { getCwdState, setCwdState, getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
   const { resolve } = await import('node:path')
   const previous = getCwdState()
+  const projectDir = getSessionProjectDir()
+  const resumeDirectory = getSessionResumeDirectory()
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-worktree-'))
+  const savedConfig = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  const workspace = await import('../src/utils/leafWorkspace.ts')
+  workspace.forgetLeafFamilyRoot()
+  workspace.clearFamilyHostClaimForTesting()
   setCwdState(resolve(import.meta.dir, '..'))
-  try { await assert.rejects(createLeaf('Must not create', undefined, getCwd()), /separate worktree/) }
-  finally { setCwdState(previous) }
+  switchSession(getSessionId(), projectDir, getCwd())
+  try {
+    await workspace.restoreLeafWorkspace()
+    await updateLeafMember(join(directory, 'leaf-families', `${getSessionId()}.json`), getSessionId(), getSessionId(), { cwd: getCwd() })
+    await assert.rejects(createLeaf('Must not create', getSessionId(), getCwd()), /separate worktree/)
+  }
+  finally {
+    switchSession(getSessionId(), projectDir, resumeDirectory)
+    setCwdState(previous)
+    if (savedConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = savedConfig
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearFamilyHostClaimForTesting()
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('nested fork copies the selected leaf transcript with immutable immediate ancestry', async () => {
@@ -788,9 +850,28 @@ test('a member resumed on its own finds its family, its siblings, and its parent
       assert.equal(parent?.transcriptPath, rootTranscript, 'the creator row carries the transcript to resume')
       assert.equal((await workspace.resolveLeafRef('parent'))?.sessionId, root, 'the parent is addressable by name')
       assert.equal((await workspace.resolveLeafRef('1'))?.name, 'Sibling', 'and a sibling by number')
+      // `cc --resume <leaf id>` is the address the menu hands out for a member,
+      // and the window it opens carries none of the launch environment a spawn
+      // does - so the member it is showing has to be named from the family's own
+      // records. The roster keeps leaving the asker out, because a row for the
+      // conversation you are in would offer to open or close it; the menu's
+      // roster carries it back so the rows can drop it knowingly and the wizard
+      // can offer it, and the id nothing was selected under is this window.
+      assert.equal(workspace.selectedLeafId(), member.sessionId, 'the window is the member it was resumed on')
+      assert.equal(await workspace.selfLeafMemberId(), member.sessionId, 'and the records say so')
+      assert.deepEqual(
+        (await workspace.listLeafMenuMembers()).map(item => item.sessionId),
+        [sibling.sessionId, root, member.sessionId],
+        'the menu roster names the session on screen as well',
+      )
+      assert.equal(
+        workspace.resolveLeafSource(undefined, { creator: root, parent: root, self: member.sessionId }, workspace.selectedLeafId()),
+        member.sessionId,
+        'a leaf created without a source named copies the conversation on screen, not the parent behind it',
+      )
       const roster = await workspace.familyRoster()
       assert.match(roster, new RegExp(`^family ${root}$`, 'm'))
-      assert.match(roster, new RegExp(`^#${creator.number} \\S.* \\[parent\\] ${root}$`, 'm'))
+      assert.match(roster, new RegExp(`^#${creator.number} \\S.* \\[family parent\\] ${root}$`, 'm'))
       // The creator is an ordinary member now: a member can close it, rename it
       // and archive it. Only the session doing the asking is still refused.
       await workspace.changeLeaf(root, { status: 'closed' })
@@ -852,7 +933,7 @@ test('the designated parent is the one parent and root name, and original never 
       const creatorNumber = (await readLeafFamily(family, root)).members.find(item => item.sessionId === root)!.number
       const roster = await workspace.familyRoster()
       assert.match(roster, new RegExp(`^family ${root}$`, 'm'), 'the family is still named by its id, which never moves')
-      assert.match(roster, new RegExp(`^#${sibling.number} Sibling \\[open\\] \\[parent\\] ${sibling.sessionId}$`, 'm'), 'the mark follows the designation')
+      assert.match(roster, new RegExp(`^#${sibling.number} Sibling \\[open\\] \\[family parent\\] ${sibling.sessionId}$`, 'm'), 'the mark follows the designation')
       assert.match(roster, new RegExp(`^#${creatorNumber} \\S.* \\[open\\] ${root}$`, 'm'), 'the creator is an ordinary row with no mark')
 
       // A pointer with no designation at all - the shape older code writes -
@@ -1054,6 +1135,54 @@ test('a displaced host refuses management but keeps the terminals it already att
       assert.equal(snapshots.at(-1)?.hostSessionId, second, 'the leaf is told which window manages its family now')
     } finally { unregister() }
   } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a lease whose window has exited is taken back', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-host-dead-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  const workspace = await import('../src/utils/leafWorkspace.ts')
+  const root = getSessionId()
+  const family = join(directory, 'leaf-families', `${root}.json`)
+  const claimPath = join(directory, 'leaf-families', 'index', `${root}.host.json`)
+  const holder = randomUUID()
+  // Any number no process holds: `isProcessRunning` answers false for a pid it
+  // cannot signal, which is the state a window that has exited leaves behind.
+  const writeClaim = (hostSessionId: string, pid: number) => writeFile(claimPath, JSON.stringify({
+    familyId: root, hostSessionId, pid,
+    processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    token: randomUUID(), generation: 1, openMemberIds: [],
+  }))
+  try {
+    const sibling = randomUUID()
+    await addLeafMember(family, root, { sessionId: sibling, parentSessionId: root, name: 'Sibling', transcriptPath: join(directory, 'sibling.jsonl'), forkMessageId: randomUUID() })
+    await mkdir(join(directory, 'leaf-families', 'index'), { recursive: true })
+    await writeClaim(holder, process.pid)
+    workspace.clearFamilyHostClaimForTesting()
+    await workspace.restoreLeafWorkspace()
+    // A live holder keeps the family, exactly as it does when the roster is
+    // re-read: what follows is about a lease nobody is behind any more.
+    await writeClaim(holder, process.pid)
+    await workspace.restoreLeafWorkspace()
+    assert.equal(workspace.isFamilyHost(), false, 'a window whose holder is still running is displaced')
+
+    // The holder's window exits. Its lease is the file it left, and the pid in it
+    // is dead - the reading is right and the session it names is not there, so a
+    // window that took it at face value refused every close, open and rename of a
+    // family nobody was managing, and only a restart cleared it.
+    await writeClaim(holder, 0x7ffffff0)
+    const promoted = await workspace.changeLeaf(sibling, { status: 'closed' })
+    assert.equal(workspace.isFamilyHost(), true, 'the window takes back a lease whose holder has exited')
+    assert.equal(promoted, undefined, 'the member closed was not the family parent')
+    assert.equal((JSON.parse(await readFile(claimPath, 'utf8')) as { hostSessionId: string }).hostSessionId, root, 'and the lease is rewritten to name it, so no other window reads the dead one')
+    assert.equal((JSON.parse(await readFile(family, 'utf8')) as { members: { sessionId: string; status: string }[] }).members.find(member => member.sessionId === sibling)?.status, 'closed', 'the family it took back is one it can manage')
+  } finally {
+    workspace.clearFamilyHostClaimForTesting()
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
     await rm(directory, { recursive: true, force: true })

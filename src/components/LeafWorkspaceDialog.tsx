@@ -4,11 +4,12 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafSelfName, getLeafViews, isFamilyHost, listLeafMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafSelfName, getLeafViews, isFamilyHost, listLeafMenuMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
 import { isGatewayMode } from '../utils/model/providers.js'
+import { getSessionId } from '../bootstrap/state.js'
 
 export function LeafSessionBar(): React.ReactNode {
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
@@ -82,7 +83,10 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
 
   // Refresh the family roster whenever the workspace publishes a change.
   useSyncExternalStore(subscribeLeafWorkspace, leafWorkspaceRevision, leafWorkspaceRevision)
-  const reload = () => { void listLeafMembers().then(setMembers).catch(() => setMembers([])) }
+  // The roster the rows are built from carries the session on screen as well:
+  // the rows drop it themselves, and the wizard needs it - the sessions a leaf
+  // can be forked from include the one the window is showing.
+  const reload = () => { void listLeafMenuMembers().then(setMembers).catch(() => setMembers([])) }
   useEffect(() => { reload() }, [screen])
   // One window manages a family at a time and another window may have opened it
   // since this one last looked. Read the lease on open so the rows are the ones
@@ -142,7 +146,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     // is the family file and a leaf has an entry in it. That one row is not
     // offered: closing or archiving it stops the process holding this menu. It
     // is named instead, which is also how a leaf finds itself.
-    const self = selectedLeafId()
+    const self = selectedLeafId() ?? getSessionId()
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
     const parentId = getLeafParentSessionId()
@@ -207,11 +211,17 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
           if (action === 'parent') return workspace.reparentLeaf(id)
-          await workspace.changeLeaf(id, { status: action === 'archive' ? 'archived' : 'closed' })
-          selectLeaf(undefined)
-          return action === 'archive'
+          // The pane is left where it is. A member leaving is not the window
+          // changing what it shows, and the workspace drops the selection itself
+          // when the member that goes is the one on screen - doing it here as
+          // well cleared the pane for every close, and inside a leaf that
+          // tears down the very terminal this dialog is drawn in, so the
+          // confirmation of what happened went with it.
+          const promoted = await workspace.changeLeaf(id, { status: action === 'archive' ? 'archived' : 'closed' })
+          const filed = action === 'archive'
             ? `${describeSession(member)} archived. It is detached from this family and no longer appears here; its transcript and session are untouched.`
             : `${describeSession(member)} closed. Its transcript is retained; open it again any time.`
+          return promoted ? `${filed} ${promoted}` : filed
         })
       }} />
       {busy && <Text dimColor>Working…</Text>}
@@ -266,9 +276,9 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'revive') return workspace.reviveLeaf(id)
           if (action === 'open-once') return workspace.openLeafOnce(id)
-          await workspace.changeLeaf(id, { status: 'archived' })
-          selectLeaf(undefined)
-          return `${describeSession(member)} closed. It stays archived.`
+          const promoted = await workspace.changeLeaf(id, { status: 'archived' })
+          const filed = `${describeSession(member)} closed. It stays archived.`
+          return promoted ? `${filed} ${promoted}` : filed
         })
       }} />
       {busy && <Text dimColor>Working…</Text>}
@@ -345,7 +355,7 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
   useRegisterOverlay('leaf-create', true)
   const [name, setName] = useState('')
   const [fresh, setFresh] = useState(false)
-  const [source, setSource] = useState(selectedId ?? 'root')
+  const [source, setSource] = useState(selectedId ?? getSessionId())
   const [model, setModel] = useState(defaultModel || MODEL_DEFAULT)
   const [effort, setEffort] = useState(defaultEffort || 'inherit')
   const [worktree, setWorktree] = useState('')
@@ -365,7 +375,8 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
       description: member.status,
     })),
   ]
-  const sourceName = sources.find(item => item.value === source)?.label ?? source
+  const sourceName = sources.find(item => item.value === source)?.label
+    ?? (source === parentId ? rootName : source === getSessionId() ? getLeafSelfName() : source)
 
   const create = async () => {
     if (creating.current) return

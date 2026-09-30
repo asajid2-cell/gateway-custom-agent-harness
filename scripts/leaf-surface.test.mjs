@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { resolveLeafMember } from '../src/utils/leafFamily.ts'
-import { parseForkRequest } from '../src/commands/leaf.tsx'
+import { parseForkRequest, parseMergeRequest, parseSeedlingRequest } from '../src/commands/leaf.tsx'
 import { leafFamilyReference, resolveLeafSource, rootReference } from '../src/utils/leafWorkspace.ts'
 
 const member = (number, name, sessionId) => ({
@@ -54,6 +54,25 @@ test('fork grammar treats a bare fork as the current session and rejects stray v
   assert.equal(parseForkRequest('new'), null)
   assert.equal(parseForkRequest('new scratch'), null)
   assert.equal(parseForkRequest('list'), null)
+})
+
+test('seed, seedling and merge parse a source and a bounded fidelity', () => {
+  assert.deepEqual(parseSeedlingRequest('seedling 2'), { seed: '2' })
+  assert.deepEqual(parseSeedlingRequest('seedling Scout bounded job'), { seed: 'Scout', name: 'bounded job' })
+  // `seedling` is its own verb; a bare `seed` must never answer to it.
+  assert.equal(parseSeedlingRequest('seed'), null)
+  assert.equal(parseSeedlingRequest('seed 2'), null)
+
+  assert.deepEqual(parseMergeRequest('merge 2'), { seedling: '2' })
+  assert.deepEqual(parseMergeRequest('merge Scout'), { seedling: 'Scout' })
+  assert.deepEqual(parseMergeRequest('merge Scout ledger'), { seedling: 'Scout', fidelity: 'ledger' })
+  assert.deepEqual(parseMergeRequest('merge Scout full'), { seedling: 'Scout', fidelity: 'full' })
+  // A fidelity is a closed set: a stray word is refused here rather than being
+  // passed on as a name and merged at the default fidelity without saying so.
+  assert.throws(() => parseMergeRequest('merge Scout sometimes'))
+  assert.throws(() => parseMergeRequest('merge'))
+  assert.throws(() => parseMergeRequest('merge Scout ledger extra'))
+  assert.equal(parseMergeRequest('merged 2'), null)
 })
 
 test('leaf command is an immediate, non-interrupting entrance surface', async () => {
@@ -316,10 +335,13 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent', 'read']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent', 'read', 'seed', 'seedling', 'merge', 'compact']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
+  // A merge carries its fidelity in `value`, so the merge action is exercisable
+  // without adding a field the strict schema would have to admit.
+  assert.equal(LeafTool.inputSchema.safeParse({ action: 'merge', leaf: 'Scout', value: 'ledger' }).success, true)
 })
 
 test('a leaf can reach its parent, not only its siblings', async () => {
@@ -586,9 +608,10 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   // A member's own pointer is what makes membership survive the parent process:
   // the family file is keyed by the root's id, which only the root can know.
   // The pointer is also where a branch of a checkpoint records which checkpoint
-  // it came from: the family file is strict, so this loose per-session record is
-  // the only place an extra field can go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string; fromCheckpointId?: string }'))
+  // it came from, and where a member records whether it is a seed or a seedling:
+  // the family file is strict, so this loose per-session record is the only place
+  // an extra field can go without an older reader having to know.
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)
@@ -608,7 +631,10 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   // family's creator is not necessarily the member designated as its parent.
   assert.match(workspace, /const direct = resolveLeafMember\(members, reference\)/)
   assert.match(workspace, /if \(ref === 'original'\) return leafCreatorMember\(\)/)
-  assert.match(workspace, /if \(ref === 'parent' \|\| ref === 'root'\) return leafParentMember\(\)/)
+  assert.match(workspace, /if \(ref === 'family-parent' \|\| ref === 'parent' \|\| ref === 'root'\) return leafParentMember\(\)/)
+  // The other role has a name of its own: `session-parent` is the session holding
+  // the family's terminal, which is not necessarily the designated member.
+  assert.match(workspace, /if \(ref === 'session-parent' \|\| ref === 'host'\)/)
   assert.match(workspace, /await ensureCreatorMember\(familyPath\(root\), root, \{/)
   assert.match(workspace, /const members = await ensureCreatorRow\(root, family\.members\)/)
   // A member with a fork point is always resumed; the creator is resumed when
@@ -624,7 +650,11 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   assert.doesNotMatch(workspace, /changeParent/)
   assert.match(workspace, /That is the session you are in; it ends when you leave it/)
   assert.match(workspace, /if \(sessionId === \(requestedBy \?\? self\)\)/)
-  assert.match(workspace, /case 'change': await changeLeaf\(id, value, sourceId\)/)
+  assert.match(workspace, /case 'change': result = await changeLeaf\(id, value, sourceId\)/)
+  // Closing or archiving the designated parent hands the family to the next
+  // member in line, so a family never keeps naming a parent that has left.
+  assert.match(workspace, /async function promoteNextParent\(root: string, leaving: string\)/)
+  assert.match(workspace, /await writeFamilyParentDesignation\(root, next\.sessionId\)/)
   // Reopening it from a member must not put two writers on one transcript.
   assert.match(workspace, /await claimHostOwnership\(\)/)
   assert.match(workspace, /is already open in another window; close it there before opening it here/)
@@ -709,6 +739,18 @@ test('the leaf menu treats the parent as an ordinary member', async () => {
   assert.match(dialog, /forks the session you are looking at: \{sourceName\}/)
   assert.match(dialog, /const sourceName = selected \? \(members\?\.find\(member => member\.sessionId === selected\)\?\.name \?\? selected\) : getLeafSelfName\(\)/)
   assert.match(dialog, /views=\{getLeafCarouselViews\(\)\}/)
+})
+
+test('the creator wizard defaults to the conversation on screen rather than the designated parent', async () => {
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /useState\(selectedId \?\? getSessionId\(\)\)/)
+  assert.doesNotMatch(dialog, /useState\(selectedId \?\? 'root'\)/)
+  assert.match(dialog, /const self = selectedLeafId\(\) \?\? getSessionId\(\)/)
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const roster = workspace.slice(workspace.indexOf('export async function listLeafMenuMembers'), workspace.indexOf('export async function resolveLeafRef'))
+  assert.doesNotMatch(roster, /!selfLeafMemberId\(\)/)
+  assert.match(workspace, /hostName: getLeafSelfName\(\)/)
+  assert.match(workspace, /return snapshot\.hostName/)
 })
 
 test('archive detaches a leaf without deleting anything', async () => {
