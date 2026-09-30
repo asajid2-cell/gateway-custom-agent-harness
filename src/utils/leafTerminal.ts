@@ -1,5 +1,6 @@
 import { PassThrough, Writable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
+import { connect } from 'node:net'
 import type { LeafMember } from './leafFamily.js'
 import type { LeafProcessState } from './leafProcess.js'
 import { serveLeafChannel, type LeafChannel } from './leafChannel.js'
@@ -117,6 +118,14 @@ type LeafLaunch = {
   columns: number
   rows: number
   colorDepth: number
+  /**
+   * Where the session that started this leaf answers, and the secret that says
+   * the answer is really from it. Absent when nothing owns this leaf - a leaf
+   * started from source or by a test - in which case there is no owner to
+   * outlive and no watchdog to run.
+   */
+  ownerEndpoint: string | undefined
+  ownerToken: string | undefined
 }
 let launch: LeafLaunch | undefined
 
@@ -142,6 +151,8 @@ export function leafSessionId(): string | undefined { return launch ? launch.ses
 export function leafLabel(): string | undefined { return launch ? launch.label : process.env.GATEWAY_LEAF_LABEL }
 export function leafTrusted(): boolean { return launch ? launch.trusted : process.env.GATEWAY_LEAF_TRUSTED === '1' }
 export function leafTranscript(): string | undefined { return launch ? launch.transcript : process.env.GATEWAY_LEAF_TRANSCRIPT }
+function leafOwnerEndpoint(): string | undefined { return launch ? launch.ownerEndpoint : process.env.GATEWAY_LEAF_OWNER_ENDPOINT }
+function leafOwnerToken(): string | undefined { return launch ? launch.ownerToken : process.env.GATEWAY_LEAF_OWNER_TOKEN }
 export function leafViewport(): { columns: number; rows: number; colorDepth: number } {
   const reading = launch ?? { columns: Number(process.env.GATEWAY_LEAF_COLUMNS) || 80, rows: Number(process.env.GATEWAY_LEAF_ROWS) || 24, colorDepth: Math.min(Number(process.env.GATEWAY_LEAF_COLOR_DEPTH) || 0, 3) }
   return { columns: reading.columns, rows: reading.rows, colorDepth: reading.colorDepth }
@@ -164,6 +175,8 @@ export function consumeLeafLaunchEnv(): void {
     label: process.env.GATEWAY_LEAF_LABEL,
     trusted: process.env.GATEWAY_LEAF_TRUSTED === '1',
     transcript: process.env.GATEWAY_LEAF_TRANSCRIPT,
+    ownerEndpoint: process.env.GATEWAY_LEAF_OWNER_ENDPOINT,
+    ownerToken: process.env.GATEWAY_LEAF_OWNER_TOKEN,
     ...leafViewport(),
   }
   delete process.env.GATEWAY_INTERACTIVE_LEAF
@@ -174,6 +187,71 @@ export function consumeLeafLaunchEnv(): void {
   delete process.env.GATEWAY_LEAF_COLUMNS
   delete process.env.GATEWAY_LEAF_ROWS
   delete process.env.GATEWAY_LEAF_COLOR_DEPTH
+  delete process.env.GATEWAY_LEAF_OWNER_ENDPOINT
+  delete process.env.GATEWAY_LEAF_OWNER_TOKEN
+}
+
+const OWNER_PROBE_INTERVAL_MS = 5000
+const OWNER_PROBE_TIMEOUT_MS = 3000
+
+/**
+ * Whether the session that started this leaf is still there.
+ *
+ * The owner answers on a private endpoint with a secret only the two of them
+ * hold. A PID would be cheaper and wrong: the system hands a dead process's
+ * number to the next one it starts, so a recycled PID reads as an owner that
+ * never died, and the leaf would outlive the very thing it is tied to. A pipe
+ * has no such gap - when the owner's process ends, its pipe goes with it.
+ *
+ * Only failing to reach the endpoint at all counts as gone. A busy owner still
+ * holds the endpoint open, so a timeout, a reset, or a pipe whose instances are
+ * all busy is a live owner that could not answer in time; reading those as death
+ * would let a busy session take its own leaves down.
+ */
+function leafOwnerAlive(): Promise<boolean> {
+  const endpoint = leafOwnerEndpoint()
+  const token = leafOwnerToken()
+  if (!endpoint || !token) return Promise.resolve(true)
+  return new Promise(resolve => {
+    const socket = connect(endpoint)
+    let settled = false
+    let answer = ''
+    const done = (alive: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(alive)
+    }
+    socket.setTimeout(OWNER_PROBE_TIMEOUT_MS, () => done(true))
+    socket.on('data', chunk => { answer += chunk.toString() })
+    socket.on('close', () => done(answer.trim() === token))
+    socket.on('error', error => {
+      const code = (error as NodeJS.ErrnoException).code
+      done(code !== 'ENOENT' && code !== 'ECONNREFUSED')
+    })
+  })
+}
+
+/**
+ * End this leaf when the session that owns it ends.
+ *
+ * A leaf outliving its launcher is the ordinary case for the transport - the
+ * launcher exiting is only "nobody is watching", and the leaf is picked up again
+ * by whoever opens it next. That is the right answer for a leaf that owns
+ * itself, and the wrong one for the session parent: the leaves belong to that
+ * session, so when it crashes, is Ctrl-C'd, or its terminal closes, they go with
+ * it rather than sitting detached with no family left to belong to.
+ */
+function watchLeafOwner(): void {
+  if (!leafOwnerEndpoint()) return
+  const timer = setInterval(() => {
+    void leafOwnerAlive().then(alive => {
+      if (alive) return
+      clearInterval(timer)
+      void import('./gracefulShutdown.js').then(({ gracefulShutdown }) => gracefulShutdown(0))
+    })
+  }, OWNER_PROBE_INTERVAL_MS)
+  timer.unref()
 }
 export function getLeafSnapshot(): LeafSnapshot | undefined { return snapshot }
 export function subscribeLeafSnapshot(listener: () => void): () => void { snapshotListeners.add(listener); return () => { snapshotListeners.delete(listener) } }
@@ -260,6 +338,7 @@ export async function installLeafTerminal(): Promise<void> {
   process.env.CLAUDE_CODE_NO_FLICKER = '1'
   initialDraft = process.env.GATEWAY_LEAF_DRAFT ?? ''
   delete process.env.GATEWAY_LEAF_DRAFT
+  watchLeafOwner()
   const resize = (columns: number, rows: number) => {
     if (columns === output.columns && rows === output.rows) return
     output.columns = Math.max(20, columns)

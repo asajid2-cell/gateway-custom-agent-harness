@@ -236,11 +236,18 @@ test('a session waits for a member it started, however long the start takes', { 
   }
 })
 
-test('a session leaving detaches what it was watching instead of closing it', async () => {
+test('a session that leaves takes the leaves it owns with it', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  const cleanup = workspace.slice(workspace.indexOf('registerCleanup(async () => {'), workspace.indexOf('await hostRelease?.()'))
-  assert.match(cleanup, /view\.process\.detach\(\)/, 'leaving a session must detach the family, not end it')
-  assert.doesNotMatch(cleanup, /view\.process\.close\(\)/, 'only a person closes a leaf')
+  // The release marker now appears earlier as well, because closing the session
+  // parent releases the same lease, so the slice is measured from the cleanup.
+  const cleanupStart = workspace.indexOf('registerCleanup(async () => {')
+  const cleanup = workspace.slice(cleanupStart, workspace.indexOf('await hostRelease?.()', cleanupStart))
+  // The leaves belong to the session holding the family's terminal, so a session
+  // that ends without handing the family on ends them too. Detaching is what
+  // happens when only the watching session goes away, and it lives on the leaf's
+  // own channel - not here.
+  assert.match(cleanup, /await view\.process\.close\(\)/, 'the leaves a session owns end with it')
+  assert.doesNotMatch(cleanup, /view\.process\.detach\(\)/, 'a session ending is not a detach')
   // The explicit close still exists, on the path a person takes.
   const change = workspace.slice(workspace.indexOf('export async function changeLeaf'), workspace.indexOf('export async function fileLeaf'))
   assert.match(change, /await view\.process\.close\(\)/)
@@ -290,7 +297,14 @@ test('a leaf is one by environment, not by having a parent', async () => {
   assert.match(terminal, /serveLeafChannel\(\{/)
   assert.match(terminal, /registerCleanup\(async \(\) => \{ sendLeafTerminal\(\{ type: 'leaf-exit', code: 0 \}\) \}\)/)
   assert.doesNotMatch(terminal, /process\.once\('disconnect'/)
-  assert.doesNotMatch(terminal, /gracefulShutdown\(0\)/)
+  // A leaf ends itself for one reason only: the session that owns it is gone.
+  // Losing the watching session is still not termination - the watchdog asks the
+  // owner's own private endpoint, and only an endpoint that cannot be reached at
+  // all is death - so the shutdown lives inside the watchdog and nowhere else.
+  const watchdog = terminal.slice(terminal.indexOf('function watchLeafOwner'), terminal.indexOf('export function getLeafSnapshot'))
+  assert.match(watchdog, /gracefulShutdown\(0\)/)
+  assert.doesNotMatch(terminal.slice(0, terminal.indexOf('function watchLeafOwner')), /gracefulShutdown\(0\)/)
+  assert.doesNotMatch(terminal.slice(terminal.indexOf('export function getLeafSnapshot')), /gracefulShutdown\(0\)/)
 })
 
 test('the leaf keeps its identity and its children inherit none of it', { timeout: 60_000 }, async () => {
