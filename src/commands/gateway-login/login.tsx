@@ -11,6 +11,7 @@ import { Box, Text } from '../../ink.js'
 import TextInput from '../../components/TextInput.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
+import { getSessionId } from '../../bootstrap/state.js'
 
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
 
@@ -67,6 +68,37 @@ export const call: LocalJSXCommandCall = async (
 ) => {
   const keyName = boundKeyName ?? (args.trim().startsWith('deepseek') ? 'ds' : 'opencode-go')
   const action = args.trim().toLowerCase()
+
+  if (keyName === 'opencode-go' && action) {
+    const match = /^(?:switch\s+)?(?:opencode-go)?([1-9][0-9]*)(?:\s+(session|global))?$/.exec(action)
+    if (match || action === 'status') {
+      const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
+      if (!base) { onDone('OpenCode account selection requires gateway mode.'); return null }
+      try {
+        const url = new URL('/gateway/opencode-account', base)
+        url.searchParams.set('sessionId', getSessionId())
+        const response = await fetch(url, {
+          ...(match ? {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ number: Number(match[1]), scope: match[2] ?? 'session', sessionId: getSessionId() }),
+          } : {}),
+          signal: AbortSignal.timeout(5_000),
+        })
+        const result = await response.json()
+        onDone(response.ok
+          ? match
+            ? `OpenCode account ${result.number} selected ${result.scope === 'global' ? 'globally' : 'for this session'}. Automatic fallback remains enabled.`
+            : `OpenCode active account: ${result.number}; global default: ${result.global}; loaded accounts: ${result.available.join(', ')}.`
+          : result.error ?? 'Could not select the OpenCode account.')
+      } catch { onDone('Could not reach the gateway account selector. Restart cc with the updated gateway.') }
+      return null
+    }
+    if (action !== 'remove') {
+      onDone('Use /opencodelogin switch 2 [session|global], /opencodelogin status, or /opencodelogin remove.')
+      return null
+    }
+  }
 
   if (action === 'status') {
     const stored = await access(keyPath(keyName)).then(() => true).catch(() => false)

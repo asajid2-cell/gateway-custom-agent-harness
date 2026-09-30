@@ -11,6 +11,16 @@ import {
   isAnthropicGatewayModel,
 } from '../src/utils/bottomBarUsage.ts'
 
+import { getOpenCodeRemainingPercent } from '../src/utils/opencodeUsage.ts'
+
+test('OpenCode remaining uses the most constrained subscription window', () => {
+  assert.equal(getOpenCodeRemainingPercent({ usage: { rolling: { percent: 38 }, weekly: { percent: 16 }, monthly: { percent: 100 } } }), 0)
+  assert.equal(getOpenCodeRemainingPercent({ usage: { rolling: { percent: 15 }, weekly: { percent: 42 }, monthly: { percent: 12 } } }), 58)
+  assert.equal(getOpenCodeRemainingPercent({}), null)
+  assert.equal(getOpenCodeRemainingPercent({ usage: { monthly: { percent: '100' } } }), null)
+  assert.match(formatBottomBarUsage('gateway-opencode-deepseek-v4.1-flash', null, 200_000, undefined, { remainingPercent: 58 }), /OpenCode remaining 58%/)
+})
+
 test('context usage exposes used and remaining tokens and percentages', () => {
   assert.deepEqual(
     getContextUsageValues(

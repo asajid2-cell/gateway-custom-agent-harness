@@ -132,15 +132,20 @@ test(`actual footer ${control} responds to terminal mouse input`, async () => {
 })
 }
 
-test('the resume row names the resume directory, never the live cwd', async () => {
+test('the resume row: cd follows the live cwd, the resume command does not', async () => {
   const footer = await readFile(new URL('../src/components/PromptInput/PromptInputFooter.tsx', import.meta.url), 'utf8')
-  // The live cwd moves with the worktree you are working in, so a row reading
-  // it could name a directory this session cannot be resumed from. Both the
-  // bare path and the command the control renders come from the resume
-  // directory, which is why the two cannot disagree.
+  // The row carries two different facts. The `cd:` half is where you are now, so
+  // it follows the shell and any worktree entered. The command the control
+  // renders is the one that brings this conversation back, so its directory is
+  // the resume directory - a chat is resumable from where it lives, not from
+  // wherever the person happens to be standing. A live cwd on the command could
+  // name a directory this session cannot be resumed from; that was the failure.
+  assert.match(footer, /const liveCwd = useSyncExternalStore\(onCwdChange, getCwdState, getCwdState\)/)
+  assert.match(footer, /const sessionResumeDirectory = getSessionResumeDirectory\(\)/)
+  assert.match(footer, /cd: \{liveCwd\}/)
   assert.match(footer, /<SessionResumeControl directory=\{sessionResumeDirectory\}/)
-  assert.match(footer, /cd: \{sessionResumeDirectory\}/)
   assert.doesNotMatch(footer, /getCwd\(\)/)
+  assert.doesNotMatch(footer, /SessionResumeControl directory=\{liveCwd\}/)
 })
 
 /** Mount the footer's resume control on its own, at the cell a click lands on. */

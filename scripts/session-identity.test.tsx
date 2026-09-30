@@ -59,6 +59,66 @@ test('a title carries the label and a short id that can be addressed', () => {
   expect(short).toMatch(/^[0-9a-f]{8}$/)
 })
 
+test('the LED this session was given leads the title, however long the name', async () => {
+  // The LED is the whole reason the title is composed in one place, and it is
+  // invisible to every unit test of the composition: what matters is that the
+  // hook's one write carries it, and where in the string it sits. A tab clips
+  // from the right, so a mark anywhere behind the name is a mark no tab shows -
+  // the name here is a leaf's, which is the longest one there is.
+  const configDir = mkdtempSync(join(tmpdir(), 'session-led-'))
+  dirs.push(configDir)
+  process.env.CLAUDE_CONFIG_DIR = configDir
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.DISABLE_AUTOUPDATER = '1'
+  process.env.GATEWAY_LEAF_LABEL = 'Leaf 2: tokens (of session 00000000-0000-4000-8000-000000000000)'
+
+  const { setLedAssignment } = await import('../src/utils/ledStore.ts')
+  await setLedAssignment(getSessionId(), getSessionId(), 'crimson')
+
+  const stdout = Object.assign(new PassThrough(), { columns: 100, rows: 30, isTTY: true })
+  let output = ''
+  stdout.on('data', chunk => { output += chunk.toString() })
+  const stdin = Object.assign(new PassThrough(), {
+    isTTY: true, setRawMode() {}, ref() {}, unref() {},
+  })
+
+  const app = await render(
+    <AppStateProvider>
+      <REPL
+        commands={[]}
+        debug={false}
+        initialTools={[]}
+        initialMessages={[]}
+        disableSlashCommands={false}
+        thinkingConfig={{ type: 'disabled' }}
+      />
+    </AppStateProvider>,
+    { stdout: stdout as any, stderr: stdout as any, stdin: stdin as any, patchConsole: false, exitOnCtrlC: false },
+  )
+
+  try {
+    const short = getSessionId().slice(0, 8)
+    let title: string | undefined
+    for (let i = 0; i < 30 && !(title ?? '').includes('❤️'); i++) {
+      await new Promise(r => setTimeout(r, 100))
+      title = observedTitle(output)
+    }
+    expect(title).toContain('❤️')
+    expect(title!.indexOf('❤️')).toBe(0)
+    // The clip case, on the real title the hook set: whatever width the tab is,
+    // the LED is still in what it shows.
+    expect(title!.slice(0, 8)).toContain('❤️')
+    expect(title!.length).toBeGreaterThan(60)
+    expect(title!.indexOf('❤️')).toBeLessThan(title!.indexOf(short))
+  } finally {
+    app.unmount()
+    app.cleanup()
+    for (const key of ['CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_USE_GATEWAY', 'DISABLE_AUTOUPDATER', 'GATEWAY_LEAF_LABEL']) {
+      delete process.env[key]
+    }
+  }
+}, 30_000)
+
 test('a leaf is titled by its own label, not the conversation it copied', () => {
   // A forked leaf carries the parent's transcript, so the session title it would
   // otherwise show describes work that belongs to somebody else. Naming it after

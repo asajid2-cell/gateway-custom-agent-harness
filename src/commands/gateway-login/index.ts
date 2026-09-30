@@ -5,7 +5,7 @@ const command = (name: string, description: string, keyName: string) =>
     type: 'local-jsx',
     name,
     description,
-    argumentHint: '[status|remove]',
+    argumentHint: keyName === 'opencode-go' ? '[switch <number> [session|global]|status|remove]' : '[status|remove]',
     load: async () => {
       const module = await import('./login.js')
       return {

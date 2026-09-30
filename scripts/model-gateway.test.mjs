@@ -24,6 +24,9 @@ import {
   stripUnsupportedOpenCodeToolChoice,
   safeUpstreamResponseError,
   gatewayRequestShape,
+  openCodeCredentialPool,
+  readOpenCodeSubscriptionUsage,
+  fetchWithRetry,
 } from './model-gateway.mjs'
 import {
   anthropicToOpenCodeChat,
@@ -55,6 +58,67 @@ import {
   sanitizeLegacyCompactionText,
   sanitizeStaleToolCapabilityContent,
 } from './gateway-contract.mjs'
+
+test('OpenCode retries cycle numbered credentials and wrap to the original', async () => {
+  const credentials = openCodeCredentialPool({
+    OPENCODE_API_KEY3: 'fixture-third',
+    OPENCODE_API_KEY: 'fixture-original',
+    OPENCODE_API_KEY2: 'fixture-second',
+    OPENCODE_API_KEY_OTHER: 'ignored',
+  })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead([429, 401, 503, 200][seen.length - 1], { 'retry-after': '0' })
+    res.end('{}')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'OpenCode Go',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: credentials.key } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 200)
+    await response.text()
+    assert.deepEqual(seen, ['fixture-original', 'fixture-second', 'fixture-third', 'fixture-original'])
+    assert.equal(credentials.redact(seen.join(' ')), '[REDACTED] [REDACTED] [REDACTED] [REDACTED]')
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('OpenCode usage follows credential rotation and caches each workspace separately', async () => {
+  const original = randomUUID()
+  const second = randomUUID()
+  const credentials = openCodeCredentialPool({ OPENCODE_API_KEY: original, OPENCODE_API_KEY2: second })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ usage: { monthly: { percent: req.headers.authorization === `Bearer ${original}` ? 100 : 12, resetsAt: '2026-10-30T00:00:00Z' } }, secret: 'must not relay' }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const url = `http://127.0.0.1:${server.address().port}`
+    assert.equal((await readOpenCodeSubscriptionUsage(credentials, url)).usage.monthly.percent, 100)
+    credentials.advance()
+    const reads = await Promise.all([readOpenCodeSubscriptionUsage(credentials, url), readOpenCodeSubscriptionUsage(credentials, url)])
+    assert.deepEqual(reads[0], { usage: { monthly: { percent: 12, resetsAt: '2026-10-30T00:00:00Z' } } })
+    credentials.advance()
+    assert.equal((await readOpenCodeSubscriptionUsage(credentials, url)).usage.monthly.percent, 100)
+    assert.deepEqual(seen, [`Bearer ${original}`, `Bearer ${second}`])
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
 
 class CaptureResponse {
   chunks = []
@@ -248,6 +312,36 @@ async function startGatewayForTest(env) {
   }
   await fail(`Gateway did not start: ${stderr}`)
 }
+
+test('OpenCode account selection isolates sessions and persists the global default', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'opencode-selection-'))
+  const env = { CLAUDE_CONFIG_DIR: dir, OPENCODE_API_KEY: 'fixture-first', OPENCODE_API_KEY2: 'fixture-second' }
+  let gateway = await startGatewayForTest(env)
+  const status = async session => {
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/gateway/opencode-account?sessionId=${session}`)
+    assert.equal(response.status, 200, 'account status route must exist')
+    return response.json()
+  }
+  const select = async (sessionId, number, scope) => fetch(`http://127.0.0.1:${gateway.port}/gateway/opencode-account`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, number, scope }),
+  })
+  try {
+    assert.equal((await select('a', 2, 'session')).status, 200)
+    assert.equal((await status('a')).number, 2)
+    assert.equal((await status('b')).number, 1)
+    assert.equal((await select('b', 2, 'global')).status, 200)
+    assert.equal((await status('c')).number, 2)
+    assert.equal((await select('a', 1, 'session')).status, 200)
+    assert.equal((await status('a')).number, 1)
+    assert.equal((await select('b', 99, 'global')).status, 400)
+    await stopChild(gateway.child)
+    gateway = await startGatewayForTest(env)
+    assert.equal((await status('new')).number, 2)
+  } finally {
+    await stopChild(gateway.child)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
 
 async function stopChild(child) {
   if (child.exitCode !== null) return

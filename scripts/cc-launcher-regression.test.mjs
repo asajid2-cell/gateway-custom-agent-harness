@@ -170,9 +170,17 @@ test('interactive cc avoids the Defender-blocked nested encoded launcher', async
   // so adding a provider cannot silently skip its key injection.
   assert.match(
     script,
-    /\$OptionalKeyProviders\s*=\s*@\([\s\S]*Credential\s*=\s*'opencode-go'[\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
+    /\$OptionalKeyProviders\s*=\s*\$OpenCodeProviders\s*\+\s*@\([\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
     'optional providers should be declared in one table',
   )
+})
+
+test('launcher injects every numbered OpenCode workspace credential', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.match(script, /Get-ChildItem[^\n]*-Filter 'opencode-go\*\.cred'/)
+  assert.match(script, /Sort-Object/)
+  assert.match(script, /Credential = \$_.BaseName; EnvVar = \('OPENCODE_API_KEY' \+ \$suffix\)/)
+  assert.doesNotMatch(script, /\$OpenCodeCredential = if/)
 })
 
 test('launcher honors the picker-written default model below explicit overrides', async () => {

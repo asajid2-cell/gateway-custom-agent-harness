@@ -906,8 +906,14 @@ try {
   # than passing multiple secrets to one invocation. Do not convert this into a
   # nested powershell.exe -EncodedCommand chain: Defender blocks that shape.
   $KeysafeCommand = $GatewayCommand
-  $OptionalKeyProviders = @(
-    @{ Credential = 'opencode-go'; EnvVar = 'OPENCODE_API_KEY' }
+  $OpenCodeProviders = @(Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.keysafe') -Filter 'opencode-go*.cred' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match '^opencode-go([2-9]|[1-9][0-9]+)?$' } |
+    Sort-Object { if ($_.BaseName -eq 'opencode-go') { 1 } else { [int]$_.BaseName.Substring('opencode-go'.Length) } } |
+    ForEach-Object {
+      $suffix = $_.BaseName.Substring('opencode-go'.Length)
+      @{ Credential = $_.BaseName; EnvVar = ('OPENCODE_API_KEY' + $suffix) }
+    })
+  $OptionalKeyProviders = $OpenCodeProviders + @(
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
     @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )

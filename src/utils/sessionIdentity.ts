@@ -18,9 +18,20 @@ import { leafLabel } from './leafTerminal.js'
  * its parent's conversation, so the session title it would otherwise show
  * describes the parent's work, and labelling a leaf with it is worse than
  * labelling it with nothing.
+ *
+ * A suffix leads the title rather than trailing it, because a tab clips its
+ * title from the right and the name is the long part: a leaf's label names the
+ * conversation it was forked from and runs to sixty-odd characters, and a session
+ * titled after its own work is no shorter. A mark placed after the name is a mark
+ * no tab ever shows - which is how the LED disappeared from the strip. Leading,
+ * it is the last thing a clip can reach, and the name is what gives way: the name
+ * is also on screen in the banner and in the window above, while the LED exists
+ * to be read at a glance from outside the session. It is a parameter rather than
+ * something the caller appends so that both the label and the id keep one writer.
  */
-export function sessionProcessTitle(title: string): string {
+export function sessionProcessTitle(title: string, suffix?: string): string {
   const label = (leafLabel() ?? title).replace(/\s+/g, ' ').trim()
   const short = getSessionId().slice(0, 8)
-  return label ? `${label} · ${short}` : short
+  if (!label) return suffix ? `${suffix} ${short}` : short
+  return suffix ? `${suffix} ${label} · ${short}` : `${label} · ${short}`
 }

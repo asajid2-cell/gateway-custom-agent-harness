@@ -76,8 +76,8 @@ test('statusline names the session directory rather than the live shell cwd', ()
   // The status line's directory token is the one place the live cwd used to
   // reach the footer: `cd` into a git checkout and it grew a branch and changed
   // its name. The session directory is the chat's own, so it is what the row
-  // prints - and it is also the value the resume row's `cd: ...` names, so the
-  // two rows cannot disagree about where the conversation lives.
+  // prints - and it is the directory the resume command names, so the row tells
+  // you where the conversation can be resumed from rather than where you stand.
   setSessionResumeDirectory('C:\\Users\\Ahmed')
   setCwdState('Z:\\328\\CMPUT328-A2\\codexworks\\301\\WorkRepo\\gateway')
   const input = statuslineInput('gateway-gpt-luna', 'high')

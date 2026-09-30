@@ -2237,24 +2237,83 @@ async function waitForRetry(delayMs, signal) {
   })
 }
 
-async function fetchWithRetry({
+export function openCodeCredentialPool(env = process.env) {
+  const names = Object.keys(env)
+    .filter(name => /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) && env[name])
+    .sort((a, b) => Number(a.slice('OPENCODE_API_KEY'.length) || 1) - Number(b.slice('OPENCODE_API_KEY'.length) || 1))
+  let index = 0
+  return {
+    get key() { return env[names[index]] },
+    get size() { return names.length },
+    get number() { return Number(names[index]?.slice('OPENCODE_API_KEY'.length) || 1) },
+    get numbers() { return names.map(name => Number(name.slice('OPENCODE_API_KEY'.length) || 1)) },
+    select(number) {
+      const next = names.findIndex(name => Number(name.slice('OPENCODE_API_KEY'.length) || 1) === number)
+      if (next < 0) return false
+      index = next
+      return true
+    },
+    advance() { index = (index + 1) % Math.max(1, names.length) },
+    redact(message) { return names.reduce((text, name) => redactSecret(text, env[name]), message) },
+  }
+}
+
+const openCodeCredentials = openCodeCredentialPool()
+const openCodeSessionCredentials = new Map()
+const openCodePreferencePath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'opencode-account.json')
+let openCodeGlobalNumber = 1
+
+async function sessionOpenCodeCredentials(sessionId) {
+  let number = 1
+  try {
+    const saved = JSON.parse(await fs.readFile(openCodePreferencePath, 'utf8'))
+    if (Number.isSafeInteger(saved.number) && saved.number > 0) number = saved.number
+  } catch {}
+  if (number !== openCodeGlobalNumber) {
+    openCodeGlobalNumber = number
+    openCodeCredentials.select(number)
+    for (const entry of openCodeSessionCredentials.values()) {
+      if (!entry.explicit) entry.pool.select(number)
+    }
+  }
+  if (!sessionId) return openCodeCredentials
+  let entry = openCodeSessionCredentials.get(sessionId)
+  if (!entry) {
+    entry = { pool: openCodeCredentialPool(), explicit: false }
+    entry.pool.select(openCodeGlobalNumber)
+    openCodeSessionCredentials.set(sessionId, entry)
+  }
+  return entry.pool
+}
+
+export async function fetchWithRetry({
   provider,
   url,
   options,
   control,
   trace,
+  credentials,
 }) {
   let lastError = null
-  for (let attempt = 1; attempt <= UPSTREAM_RETRIES + 1; attempt += 1) {
+  const retries = Math.max(UPSTREAM_RETRIES, credentials?.size > 1 ? credentials.size : 0)
+  for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
     if (attempt > 1) control.retryUpstream?.()
     try {
-      const response = await fetch(url, options)
+      const response = await fetch(url, typeof options === 'function' ? options() : options)
       trace.markUpstreamConnect()
       control.upstreamConnected()
-      if (response.ok || !(await retryableResponse(provider, response, control)) || attempt > UPSTREAM_RETRIES) {
+      const credentialFailure = credentials?.size > 1 && (
+        response.status === 401 || response.status === 403 ||
+        (response.status === 400 && (await readResponseCloneText(response, {
+          signal: control.signal,
+          timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+        })).toLowerCase().includes('privacy settings'))
+      )
+      if (response.ok || !(credentialFailure || await retryableResponse(provider, response, control)) || attempt > retries) {
         return response
       }
 
+      credentials?.advance()
       const delay = retryDelayMs(attempt, response)
       await response.body?.cancel().catch(() => {})
       process.stderr.write(
@@ -2263,9 +2322,10 @@ async function fetchWithRetry({
       await waitForRetry(delay, control.signal)
     } catch (error) {
       lastError = error
-      if (!retryableConnectionError(error, control.signal) || attempt > UPSTREAM_RETRIES) {
+      if (!retryableConnectionError(error, control.signal) || attempt > retries) {
         throw error
       }
+      credentials?.advance()
       const delay = retryDelayMs(attempt, null)
       process.stderr.write(
         `model-gateway retry provider=${safeLogValue(provider)} error=${safeLogValue(error?.code || classifyGatewayError(error))} attempt=${attempt} delay_ms=${delay}\n`,
@@ -3094,7 +3154,8 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-go', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const apiKey = process.env.OPENCODE_API_KEY
+  const credentials = await sessionOpenCodeCredentials(sessionId)
+  let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'OpenCode Go API key is not configured')
     trace.finish('auth-error', null, 401)
@@ -3142,14 +3203,18 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
         upstream = await fetchWithRetry({
           provider: 'OpenCode Go',
           url: openCodeGoEndpoint(route.protocol),
-          options: {
-            method: 'POST',
-            headers: openCodeGoHeaders(route.protocol, apiKey, wantsStream, sessionId),
-            body: JSON.stringify(request),
-            signal: control.signal,
+          options: () => {
+            apiKey = credentials.key
+            return {
+              method: 'POST',
+              headers: openCodeGoHeaders(route.protocol, apiKey, wantsStream, sessionId),
+              body: JSON.stringify(request),
+              signal: control.signal,
+            }
           },
           control,
           trace,
+          credentials,
         })
       } catch (error) {
         trace.markError(error)
@@ -3206,6 +3271,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
           relayAttempt < UPSTREAM_RETRIES
         ) {
           relayAttempt += 1
+          credentials.advance()
           const delay = retryDelayMs(relayAttempt, null)
           trace.clearError?.()
           process.stderr.write(
@@ -3216,7 +3282,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
         }
         if (!res.headersSent) {
           if (isContextWindowFailure(error)) finishAnthropicPromptTooLongError(res, error)
-          else anthropicError(res, 502, redactSecret(errorMessage(error), apiKey))
+          else anthropicError(res, 502, credentials.redact(errorMessage(error)))
         } else if (wantsStream) {
           finishAnthropicStreamWithError(res, error)
         }
@@ -3227,7 +3293,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
   } catch (error) {
     trace.markError(error)
     if (!res.headersSent) {
-      anthropicError(res, 502, error instanceof Error ? error.message : 'OpenCode Go request failed')
+      anthropicError(res, 502, credentials.redact(error instanceof Error ? error.message : 'OpenCode Go request failed'))
     } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
     }
@@ -3328,7 +3394,8 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'opencode-zen', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const apiKey = process.env.OPENCODE_API_KEY
+  const credentials = await sessionOpenCodeCredentials(sessionId)
+  let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'OpenCode Zen API key is not configured')
     trace.finish('auth-error', null, 401)
@@ -3364,14 +3431,18 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
     const upstream = await fetchWithRetry({
       provider: 'OpenCode Zen',
       url: openCodeZenEndpoint(route.protocol),
-      options: {
-        method: 'POST',
-        headers: openCodeZenHeaders(apiKey, wantsStream, sessionId),
-        body: JSON.stringify(request),
-        signal: control.signal,
+      options: () => {
+        apiKey = credentials.key
+        return {
+          method: 'POST',
+          headers: openCodeZenHeaders(apiKey, wantsStream, sessionId),
+          body: JSON.stringify(request),
+          signal: control.signal,
+        }
       },
       control,
       trace,
+      credentials,
     })
     if (!upstream.ok) {
       const detail = await safeUpstreamResponseError(
@@ -3398,7 +3469,7 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
     trace.markError(error)
     if (!res.headersSent) {
       const status = control.signal.aborted ? control.statusFor(error) : 502
-      anthropicError(res, status, control.signal.aborted ? 'OpenCode Zen upstream request timed out' : redactSecret(errorMessage(error), apiKey))
+      anthropicError(res, status, control.signal.aborted ? 'OpenCode Zen upstream request timed out' : credentials.redact(errorMessage(error)))
     } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
     }
@@ -3682,6 +3753,41 @@ const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
     backend: 'anthropic',
     headers: (req, context) => anthropicHeaders(req, context),
   },
+}
+
+const openCodeUsageCache = new Map()
+
+export async function readOpenCodeSubscriptionUsage(credentials = openCodeCredentials, endpoint = 'https://opencode.ai/zen/go/v1/usage') {
+  const key = credentials.key
+  if (!key) return {}
+  const cached = openCodeUsageCache.get(key)
+  if (cached && Date.now() - cached.at < 30_000) return cached.value
+  if (cached?.pending) return cached.pending
+  const pending = (async () => {
+    try {
+      const response = await fetch(endpoint, {
+        headers: { authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(5_000),
+      })
+      if (!response.ok) return {}
+      const payload = await response.json()
+      const usage = {}
+      for (const name of ['rolling', 'weekly', 'monthly']) {
+        const window = payload?.usage?.[name]
+        if (typeof window?.percent !== 'number' || !Number.isFinite(window.percent)) continue
+        usage[name] = { percent: window.percent, resetsAt: window.resetsAt ?? null }
+      }
+      const value = { usage }
+      openCodeUsageCache.set(key, { at: Date.now(), value })
+      return value
+    } catch {
+      return {}
+    } finally {
+      if (openCodeUsageCache.get(key)?.pending) openCodeUsageCache.delete(key)
+    }
+  })()
+  openCodeUsageCache.set(key, { pending })
+  return pending
 }
 
 /**
@@ -4104,6 +4210,59 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/v1/models') {
     process.stderr.write('model-gateway route path=/v1/models backend=models\n')
     json(res, 200, modelsResponse())
+    return
+  }
+
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/opencode-account') {
+    let selection
+    try { selection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid account selection' })
+      return
+    }
+    const { number, sessionId, scope } = selection ?? {}
+    if (!Number.isSafeInteger(number) || number < 1 || !['session', 'global'].includes(scope) || typeof sessionId !== 'string' || !sessionId.trim()) {
+      json(res, 400, { error: 'Use a positive account number and session or global scope' })
+      return
+    }
+    const pool = await sessionOpenCodeCredentials(sessionId)
+    if (!pool.numbers.includes(number)) {
+      json(res, 400, { error: `Account ${number} is not loaded. Available: ${pool.numbers.join(', ')}. Restart cc after adding a key.` })
+      return
+    }
+    if (scope === 'global') {
+      const temp = `${openCodePreferencePath}.${randomUUID()}.tmp`
+      try {
+        await fs.mkdir(path.dirname(openCodePreferencePath), { recursive: true })
+        await fs.writeFile(temp, JSON.stringify({ number }))
+        await fs.rename(temp, openCodePreferencePath)
+      } catch {
+        await fs.unlink(temp).catch(() => {})
+        json(res, 500, { error: 'Could not save the global OpenCode account' })
+        return
+      }
+      await sessionOpenCodeCredentials(sessionId)
+      openCodeCredentials.select(number)
+      for (const entry of openCodeSessionCredentials.values()) {
+        if (!entry.explicit) entry.pool.select(number)
+      }
+      openCodeSessionCredentials.get(sessionId).explicit = false
+    } else {
+      openCodeSessionCredentials.get(sessionId).explicit = true
+    }
+    pool.select(number)
+    json(res, 200, { number, scope })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/opencode-account') {
+    const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, { number: pool.number, global: openCodeGlobalNumber, available: pool.numbers })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/opencode-usage') {
+    const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, await readOpenCodeSubscriptionUsage(pool))
     return
   }
 
