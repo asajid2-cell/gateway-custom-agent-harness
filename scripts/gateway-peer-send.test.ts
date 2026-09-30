@@ -197,6 +197,32 @@ test('a registry that cannot be validated is not reported as an empty one', { ti
   }
 })
 
+test('a trusted registry replaced by a link is immediately refused', { timeout: 60000 }, async () => {
+  const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
+  const { rename, symlink } = await import('node:fs/promises')
+  // Cached ACL checks must not let a replacement link inherit the old directory's trust.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-trusted-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const real = join(registry, 'real-sessions')
+  const seed = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Seed', cwd: registry })
+  try {
+    await seed.start()
+    assert.equal((await listGatewayPeers(sessions)).length, 1)
+    await rename(sessions, real)
+    await symlink(real, sessions, 'junction')
+    await assert.rejects(listGatewayPeers(sessions), /Invalid session directory/)
+    await rm(sessions)
+    await rename(real, sessions)
+  } finally {
+    await seed.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
 test('a listing is bounded by one probe, not by the sum of them', { timeout: 60000 }, async () => {
   const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
   const { createServer } = await import('node:net')
