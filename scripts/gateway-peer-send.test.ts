@@ -109,6 +109,152 @@ test('a session ID that is not live is refused, not routed onward', async () => 
   }
 })
 
+test('a peer that is connected but does not answer a ping is not declared exited', { timeout: 60000 }, async () => {
+  const { resolveGatewayPeer } = await import('../src/utils/gatewayPeerSend.ts')
+  const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
+  const { createServer } = await import('node:net')
+  // The reported symptom: a reply the sender had composed was refused with
+  // "Session X is not live; it has exited or crashed without deregistering",
+  // for a session that was alive the whole time. The cause is in the listing,
+  // not the ping: a ping is answered through the transport's own serial chain,
+  // so a peer that is mid-request answers late or not at all, and the listing
+  // drops it. Resolution then reads the drop as proof of death - even though
+  // this file's own rule, written for the deletion path, is that a silent
+  // endpoint is not proof of anything.
+  //
+  // A post-connect failure is the boundary being fixed: the client cannot tell
+  // a ping that timed out from a socket that was torn down, and both mean the
+  // registration's endpoint exists and accepted the connection. A failure to
+  // connect (ENOENT) is the conclusive case, and that stays a refusal - it is
+  // pinned by the neighbouring test.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-busy-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const live = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Live peer', cwd: registry })
+  const busyRuntime = randomUUID()
+  const busyId = randomUUID()
+  const busyEndpoint = endpointFor(sessions, busyRuntime)
+  // Accepts the connection and answers nothing: a stand-in for any peer that is
+  // too busy to answer a ping within the client's window.
+  const busyServer = createServer(socket => { socket.on('error', () => {}); setTimeout(() => socket.destroy(), 50) })
+  try {
+    await live.start()
+    await new Promise<void>((resolve, reject) => { busyServer.once('error', reject); busyServer.listen(busyEndpoint, resolve) })
+    await writeFile(join(sessions, `${busyId}.json`), JSON.stringify({
+      peer: { ...live.peer, sessionId: busyId, runtimeId: busyRuntime, name: 'Busy peer', pid: process.pid, endpoint: busyEndpoint },
+      token: 'b'.repeat(64),
+    }))
+    const listed = await listGatewayPeers(sessions)
+    assert.ok(listed.some(peer => peer.sessionId === busyId), 'a peer that accepted the connection is still on the bus')
+    // Both addresses must keep working, because the model addresses peers by
+    // name as readily as by ID and a false refusal is what it acts on.
+    assert.deepEqual(await resolveGatewayPeer(busyId), { sessionId: busyId, label: busyId })
+    assert.deepEqual(await resolveGatewayPeer('Busy peer'), { sessionId: busyId, label: `Busy peer (${busyId})` })
+  } finally {
+    await new Promise<void>(resolve => busyServer.close(() => resolve()))
+    await live.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a registry that cannot be validated is not reported as an empty one', { timeout: 60000 }, async () => {
+  const { resolveGatewayPeer } = await import('../src/utils/gatewayPeerSend.ts')
+  const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
+  const { mkdir, symlink } = await import('node:fs/promises')
+  // An empty live set and an unreadable registry are different answers, and the
+  // difference is what a sender acts on. The listing used to swallow a failed
+  // directory check into [], which resolution reads as "nothing is live" - so a
+  // peer that was running was reported as "No live session named X". The check
+  // is a PowerShell spawn on Windows, so this is the shape of a transient
+  // failure under load, not only of a tampered directory.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-untrusted-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const live = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Live peer', cwd: registry })
+  try {
+    await live.start()
+    // A junction is a directory link an unprivileged user can create, and it is
+    // what the check refuses: readdir follows it, so the registry looks readable
+    // while nothing about it can be trusted.
+    const home = join(registry, 'linked-home')
+    await mkdir(home)
+    await symlink(sessions, join(home, 'gateway-sessions'), 'junction')
+    process.env.CLAUDE_CONFIG_DIR = home
+    await assert.rejects(listGatewayPeers(join(home, 'gateway-sessions')), /Invalid session directory/)
+    const byName = await resolveGatewayPeer('Live peer')
+    assert.ok('error' in byName, 'an unreadable registry must not resolve a name')
+    assert.match(byName.error, /Could not read the live session registry/)
+    assert.doesNotMatch(byName.error, /No live session named/)
+  } finally {
+    await live.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a listing is bounded by one probe, not by the sum of them', { timeout: 60000 }, async () => {
+  const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
+  const { createServer } = await import('node:net')
+  // A listing is on the path of every send and every panel refresh, so its cost
+  // is a cost the user pays constantly. Probing one registration at a time made
+  // that cost the sum of every probe, so a single hung endpoint - a frozen
+  // process, a foreign pipe - stalled the whole registry for its whole timeout
+  // before anyone else could be discovered. Waiting on the probes together
+  // bounds the listing by the slowest one.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-listing-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const seed = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Seed', cwd: registry })
+  const hung: Array<{ close: () => Promise<void> }> = []
+  try {
+    // Creates the directory with the private ACL the listing validates.
+    await seed.start()
+    const ids: string[] = []
+    for (let index = 0; index < 3; index++) {
+      const runtimeId = randomUUID()
+      const sessionId = randomUUID()
+      const endpoint = endpointFor(sessions, runtimeId)
+      // Accepts and never answers, so each probe runs to its own timeout. The
+      // accepted sockets are held so cleanup can end them: a server does not
+      // close while a connection to it is open, and a server that never writes
+      // never ends one, so closing without this waits forever on the very
+      // silence the test is built from.
+      const sockets = new Set<{ destroy: () => void }>()
+      const server = createServer(socket => {
+        socket.on('error', () => {})
+        sockets.add(socket)
+        socket.on('close', () => sockets.delete(socket))
+      })
+      await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve) })
+      hung.push({ close: () => new Promise<void>(resolve => { for (const socket of sockets) socket.destroy(); server.close(() => resolve()) }) })
+      await writeFile(join(sessions, `${sessionId}.json`), JSON.stringify({
+        peer: { ...seed.peer, sessionId, runtimeId, name: `Hung ${index}`, pid: process.pid, endpoint },
+        token: 'd'.repeat(64),
+      }))
+      ids.push(sessionId)
+    }
+    const started = Date.now()
+    const listed = await listGatewayPeers(sessions)
+    const elapsed = Date.now() - started
+    for (const id of ids) assert.ok(listed.some(peer => peer.sessionId === id), 'a peer that accepted the connection is still on the bus')
+    // One probe timeout is 5s; three probed in turn would be 15s. The bound is
+    // loose enough for a loaded machine and still well inside the sum.
+    assert.ok(elapsed < 10_000, `three hung endpoints cost one probe, not three: ${elapsed}ms`)
+  } finally {
+    for (const server of hung) await server.close()
+    await seed.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
 test('a peer send is not refused for carrying model or effort', async () => {
   const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
   const { getDefaultAppState } = await import('../src/state/AppState.tsx')

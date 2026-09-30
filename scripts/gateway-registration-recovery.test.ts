@@ -4,6 +4,8 @@ import { mkdir, mkdtemp, readFile, rm, unlink, utimes, writeFile } from 'node:fs
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { PassThrough } from 'node:stream'
+import { gatewayRegistrationRetryDelay, useGatewaySession } from '../src/hooks/useGatewaySession.ts'
 import {
   GatewaySessionRuntime,
   gatewaySessionCommsProblem,
@@ -168,6 +170,73 @@ test('a session blocked by a lock left behind by a gone process recovers, and re
   }
 })
 
+test('a session whose fast retries are spent keeps trying and comes back on its own', { timeout: 180000 }, async () => {
+  const { directory, restore } = await configHome()
+  const sessionId = randomUUID()
+  const sessions = join(directory, 'gateway-sessions')
+  const writers = join(directory, 'gateway-writers')
+  await mkdir(writers, { recursive: true })
+  // A real lock, held by a holder that is alive and refreshing it. A hand-made
+  // lock would not do: with nobody refreshing it, proper-lockfile reads it as
+  // stale 30 seconds in and the fast schedule's last attempt simply steals it,
+  // which is the ladder working rather than the recovery under test. A live
+  // holder keeps the lock looking held for as long as it is held, so the fast
+  // schedule is spent with the blocker still there - the state that used to be
+  // permanent.
+  const { lock } = await import('../src/utils/lockfile.ts')
+  let held: (() => Promise<void>) | undefined = await lock(join(writers, sessionId), { realpath: false, retries: 0 })
+  const { getSessionId, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
+  const previousSessionId = getSessionId()
+  const previousResumeDirectory = getSessionResumeDirectory()
+  switchSession(sessionId as any, null, directory)
+  const React = await import('react')
+  const { render } = await import('../src/ink.ts')
+  const { AppStateProvider } = await import('../src/state/AppState.tsx')
+  const stdout = Object.assign(new PassThrough(), { columns: 100, rows: 30, isTTY: true })
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} })
+  // The real hook, mounted the way the REPL mounts it. Nothing here stands in
+  // for the bus: the lock, the named pipe and the registration are all real, so
+  // a session that reappears has genuinely recovered rather than been staged.
+  const app = await render(
+    React.createElement(AppStateProvider, null, React.createElement(function Harness() {
+      useGatewaySession('Blocked session', 'idle', [])
+      return null
+    })),
+    { stdout: stdout as any, stderr: stdout as any, stdin: stdin as any, patchConsole: false, exitOnCtrlC: false },
+  )
+  try {
+    // The fast schedule is spent 42 seconds in, so a moment after that the
+    // session is still off the bus - and it stays off the bus forever in the
+    // version this test is written against, because the loop gave up there.
+    await new Promise(resolve => setTimeout(resolve, 46_000))
+    assert.equal(gatewaySessionCommsState(sessionId).state, 'failed', 'the blocked attempt kept its reason')
+    assert.ok(!(await listGatewayPeers(sessions)).some(peer => peer.sessionId === sessionId), 'nothing registered it while it was blocked')
+    // The blocker clears. A session that is still trying finds the bus on its
+    // own; one that gave up never will, and no new process appears to rescue it.
+    await held()
+    held = undefined
+    const deadline = Date.now() + 45_000
+    let registered = false
+    while (!registered && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      registered = (await listGatewayPeers(sessions)).some(peer => peer.sessionId === sessionId)
+    }
+    assert.ok(registered, 'the session registered itself after the blocker cleared, without a restart')
+    assert.equal(gatewaySessionCommsProblem(sessionId), undefined, 'and it reads as live once it is')
+  } finally {
+    app.unmount()
+    // A runtime's writer claim is a lease for its whole life, given back when the
+    // process cleans up, so the test has to release it before removing the
+    // directory it points into - for the same reason as the held lock above: a
+    // lease whose path disappeared reports the loss wherever it lands.
+    await held?.().catch(() => {})
+    await releaseGatewaySessionWriter(sessionId).catch(() => {})
+    switchSession(previousSessionId, null, previousResumeDirectory)
+    restore()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('a session that was never asked to register says so, instead of reading as a broken bus', () => {
   const previous = process.env.CLAUDE_CODE_USE_GATEWAY
   const sessionId = randomUUID()
@@ -199,11 +268,33 @@ test('registration is retried for longer than a lock can look held', async () =>
   // lock is at its freshest when the first attempt sees it.
   const waits = delays.reduce((total, delay) => total + delay, 0)
   assert.ok(waits > stale, `the retries must keep trying past the ${stale}ms a dead holder's lock still looks held (they wait ${waits}ms)`)
+  // Clearing the window is only half the promise. The loop used to give up when
+  // the schedule ran out, so a blocker that outlived the window left the session
+  // off the bus for as long as it lived. Every failure has to schedule another
+  // attempt instead of returning.
+  const failure = hook.slice(hook.indexOf('} catch (error) {'), hook.indexOf('if (disposed || getSessionId()'))
+  assert.match(failure, /gatewayRegistrationRetryDelay\(attempt\)/, 'a failed attempt schedules the next one')
+  assert.doesNotMatch(failure.replace(/if \(disposed\) return/g, ''), /\breturn\b/, 'the failure branch no longer gives up')
   // The retry has to build a fresh runtime: a failed start leaves its transport
   // closed, so reusing it can only fail again.
   assert.match(hook, /for \(let attempt = 0; !disposed; attempt\+\+\)/)
   assert.match(hook, /const runtime = new GatewaySessionRuntime\(sessionId, getSessionResumeDirectory\(\), name\)/)
   assert.equal((hook.match(/new GatewaySessionRuntime\(/g) ?? []).length, 1, 'one construction site, inside the retry loop')
+})
+
+test('the retry schedule has no end, so a session that cannot register keeps trying', () => {
+  // The loop reads this schedule to decide whether to try again, so the property
+  // that has to hold is that it never runs out. Stopping when it ran out is the
+  // defect: the session was alive and writing its transcript while absent from
+  // the bus, and only a new process ever put it back.
+  for (const attempt of [0, 1, 2, 3, 4, 10, 100, 100_000]) {
+    const delay = gatewayRegistrationRetryDelay(attempt)
+    assert.ok(Number.isFinite(delay) && delay > 0, `attempt ${attempt} still has a wait`)
+  }
+  // The fast attempts are unchanged, so the failure the schedule was written for
+  // - a lock that heals the moment its staleness window passes - is still met the
+  // same way it was.
+  assert.deepEqual([0, 1, 2].map(gatewayRegistrationRetryDelay), [2_000, 10_000, 30_000])
 })
 
 test('a request from a session with no registration of its own is refused for that reason', { timeout: 30000 }, async () => {

@@ -42,11 +42,13 @@ export async function resolveGatewayPeer(
   // fail later as an ambiguous transport error. Discovery has already pinged
   // every candidate, so checking membership costs nothing extra.
   //
-  // Only a conclusive live set can prove an ID dead. An empty set means the
-  // registry could not be consulted (no directory, failed directory check), and
-  // refusing on that would make addressing by ID as unreliable as addressing by
-  // name - so an empty set defers to the transport, which reports the missing
-  // session in its own words.
+  // Only a conclusive live set can prove an ID dead. An empty set is not one: it
+  // says this machine has no registrations, not that the address is wrong, and a
+  // session in another config home would be refused by it. Refusing on that would
+  // make addressing by ID as unreliable as addressing by name, so an empty set
+  // defers to the transport, which reports the missing session in its own words.
+  // A registry that could not be read at all is a different case and never
+  // reaches here: the listing throws, and the caller above reports that.
   if (SESSION_ID_PATTERN.test(address)) {
     if (peers.length === 0 || peers.some(peer => peer.sessionId === address)) return { sessionId: address, label: address }
     const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)

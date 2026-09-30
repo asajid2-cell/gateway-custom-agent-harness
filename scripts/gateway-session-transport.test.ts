@@ -1,12 +1,96 @@
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { spawnSync } from 'node:child_process'
+import { createConnection } from 'node:net'
 import { mkdtemp, rm, mkdir, rename, readFile, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setCommandLifecycleListener, subscribeCommandLifecycle, notifyCommandLifecycle } from '../src/utils/commandLifecycle.ts'
 import { GatewaySessionTransport, callGatewayPeer, listGatewayPeers } from '../src/utils/gatewaySessionTransport.ts'
+
+test('a ping is answered without waiting for the transport chain', { timeout: 30000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-ping-'))
+  const directory = join(root, 'private')
+  const peer = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Probed peer', cwd: root })
+  // Every listing probes every registration, so the ping is on the path of
+  // every send and every panel refresh. It used to be served from inside the
+  // transport's serial chain, so a peer that was mid-request answered late or
+  // not at all - and a listing that gets no answer drops the peer and then
+  // reports it as exited. The probe reads no mutable state, so it must not
+  // queue behind work that does.
+  const order: string[] = []
+  const exchange = (tag: string, request: unknown) => new Promise<void>((resolve, reject) => {
+    const socket = createConnection(peer.peer.endpoint)
+    let buffer = Buffer.alloc(0)
+    socket.setTimeout(15000, () => { socket.destroy(); reject(new Error(`${tag} timed out`)) })
+    socket.on('error', reject)
+    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`))
+    socket.on('data', chunk => {
+      buffer = Buffer.concat([buffer, chunk])
+      if (buffer.indexOf(10) < 0) return
+      socket.destroy()
+      order.push(tag)
+      resolve()
+    })
+  })
+  try {
+    await peer.start()
+    const token = peer.hookEnvironment().GATEWAY_PEER_TOKEN!
+    // Occupies the chain: an unregistered sender still has to have its own
+    // registration read (a directory validation) before the request can be
+    // refused, and that read is what the chain is waiting on.
+    const blocker = exchange('message', {
+      type: 'message', token, senderToken: token,
+      message: {
+        id: randomUUID(), fromSessionId: randomUUID(), fromRuntimeId: randomUUID(),
+        toSessionId: peer.peer.sessionId, text: 'busy', summary: 'busy', createdAt: new Date().toISOString(),
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const ping = exchange('ping', { type: 'ping', token })
+    await Promise.all([blocker, ping])
+    assert.deepEqual(order, ['ping', 'message'], 'the probe is answered before the request that holds the chain')
+  } finally {
+    await peer.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a rejected request names the fault instead of one blanket reason', { timeout: 30000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-reason-'))
+  const directory = join(root, 'private')
+  const a = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Sender', cwd: root })
+  const b = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Receiver', cwd: root })
+  try {
+    await a.start()
+    await b.start()
+    const token = b.hookEnvironment().GATEWAY_PEER_TOKEN!
+    // The sender is registered, so this is not an unattributable caller: the
+    // receiver can name it and still refuses it, because the token in the
+    // request is not the one its registration carries. That is a sender that has
+    // been re-registered under a stale copy of itself - the one rejection the
+    // sender can act on - and it used to arrive as the same blanket string as a
+    // malformed request or a wrong token, so the sender retried it unchanged.
+    const response = await callGatewayPeer(b.peer.endpoint, {
+      type: 'message', token, senderToken: 'c'.repeat(64),
+      message: {
+        id: randomUUID(), fromSessionId: a.peer.sessionId, fromRuntimeId: a.peer.runtimeId,
+        toSessionId: b.peer.sessionId, text: 'stale', summary: 'stale', createdAt: new Date().toISOString(),
+      },
+    }) as { ok?: boolean; reason?: string }
+    assert.equal(response.ok, false)
+    assert.match(String(response.reason), /Invalid sender/)
+    assert.doesNotMatch(String(response.reason), /Invalid or unauthorized peer request/)
+    // A session addressing itself is told that, rather than being handed the
+    // receiver's refusal of a request it cannot attribute.
+    await assert.rejects(a.send(a.peer.sessionId, 'self note', 'self note'), /cannot send a message to itself/)
+  } finally {
+    await a.close()
+    await b.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('closed transport cannot recreate registration or mutate inbox', { timeout: 30000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'gateway-peer-closed-'))

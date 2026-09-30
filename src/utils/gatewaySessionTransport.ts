@@ -83,6 +83,19 @@ export async function sendGatewayHookMessage(env: NodeJS.ProcessEnv, toSessionId
 
 // JSON can expand one control character to six ASCII bytes (\\u0000).
 const RESPONSE_TIMEOUT_MS = 15000
+/**
+ * How long a listing waits for one peer's liveness probe.
+ *
+ * A probe is not a request the peer has to work on: a healthy transport answers
+ * it off its own loop in single-digit milliseconds. The wait only has to cover a
+ * peer whose event loop is busy, so it is far shorter than a request's timeout -
+ * and a listing is on the path of every send and every panel refresh, so the
+ * short wait is what keeps a peer that is hung, frozen or foreign from holding
+ * the whole registry open. Timing out is safe in that direction: a peer that
+ * connected but did not answer stays listed as busy rather than being declared
+ * gone.
+ */
+const PROBE_TIMEOUT_MS = 5000
 const MAX_FRAME = MAX_PEER_MESSAGE_BYTES * 6 + 8192
 /**
  * How much of a transcript one peer read may carry.
@@ -107,7 +120,7 @@ async function atomicJson(path: string, value: unknown): Promise<void> {
   } finally { await unlink(temporary).catch(() => {}) }
 }
 
-export async function callGatewayPeer(endpoint: string, request: unknown): Promise<unknown> {
+export async function callGatewayPeer(endpoint: string, request: unknown, timeoutMs = RESPONSE_TIMEOUT_MS): Promise<unknown> {
   const frame = Buffer.from(`${JSON.stringify(request)}\n`)
   if (frame.length > MAX_FRAME) throw new Error('Peer message exceeds the transport size limit')
   return new Promise((resolve, reject) => {
@@ -126,7 +139,7 @@ export async function callGatewayPeer(endpoint: string, request: unknown): Promi
       error.peerConnected = connected
       reject(error)
     }
-    socket.setTimeout(RESPONSE_TIMEOUT_MS, fail)
+    socket.setTimeout(timeoutMs, fail)
     socket.on('error', fail)
     socket.on('connect', () => { connected = true; socket.write(frame) })
     socket.on('data', chunk => {
@@ -190,9 +203,21 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
   // Validate the directory once for the whole listing. A stale registration is
   // the common case here, and the check is a PowerShell spawn on Windows: doing
   // it per file made discovery cost ~350ms per registration on disk.
-  try { await validatePrivateDirectory(directory) } catch { return [] }
-  const peers: GatewayPeer[] = []
-  for (const entry of candidates) {
+  //
+  // A failed check propagates rather than reading as an empty registry. The two
+  // are not the same answer: an empty list is a claim that nothing is live, and
+  // resolution turns that claim into "no live session named X" - a false
+  // statement about a peer that is running, produced by a check that could not
+  // be run. Only a missing directory means an empty registry.
+  await validatePrivateDirectory(directory)
+  // Probes run together, and the answer keeps the directory's order. One at a
+  // time made the listing cost the sum of every probe, so a single hung, frozen
+  // or foreign endpoint stalled the whole registry for its timeout - on the path
+  // of every send and every panel refresh. Waiting on them together bounds the
+  // listing by the slowest one instead. The result is collected by position
+  // rather than by completion, so a listing is still a stable answer and the
+  // callers that index into it see the same order on every call.
+  const probes = candidates.map(async entry => {
     const sessionId = entry.slice(0, -5)
     // Kept outside the try so the sweep can run after a failure. A peer that is
     // gone usually fails the ping by rejecting rather than by answering
@@ -201,15 +226,28 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
     // registration leaves this unset, and nothing is deleted on a guess.
     let peer: GatewayPeer | undefined
     let answered = false
+    // A peer whose endpoint accepted the connection and then produced no answer
+    // is busy, not gone. The registration's endpoint exists and something behind
+    // it is listening; only a failure to connect proves the session that wrote
+    // the registration has exited. The sweep below already refuses to delete on a
+    // silent endpoint because "a silent endpoint is not proof of anything" - but
+    // the listing still dropped it, and resolution reads a drop as proof of
+    // death. That is what made a peer vanish from the bus while it was mid-turn
+    // and be refused as "exited or crashed without deregistering".
+    let connected = false
     try {
       const registration = await readRegistrationUnchecked(directory, sessionId)
       peer = registration.peer
-      const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token: registration.token }) as { runtimeId?: string }
+      const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token: registration.token }, PROBE_TIMEOUT_MS) as { runtimeId?: string }
       answered = response.runtimeId === peer.runtimeId
-      if (answered) peers.push(peer)
-    } catch { /* Stale or inaccessible registrations are not live sessions. */ }
-    if (peer && !answered) await unlinkIfDead(directory, sessionId, peer.pid)
-  }
+    } catch (error) {
+      connected = (error as { peerConnected?: boolean }).peerConnected === true
+    }
+    if (peer && !answered && !connected) await unlinkIfDead(directory, sessionId, peer.pid)
+    return answered || connected ? peer : undefined
+  })
+  const peers: GatewayPeer[] = []
+  for (const peer of await Promise.all(probes)) if (peer) peers.push(peer)
   return peers
 }
 
@@ -377,6 +415,20 @@ export class GatewaySessionTransport {
           let request: any
           try { request = JSON.parse(buffer.subarray(0, newline).toString('utf8')) }
           catch { socket.end(`${JSON.stringify({ ok: false, reason: 'Invalid request' })}\n`); return }
+          // The liveness probe is answered out of band, because it is on the path
+          // of every listing - and therefore of every send and every panel
+          // refresh - while the chain is on the path of every real request. A
+          // probe that waits for the chain answers late or not at all while the
+          // session is mid-request, and a listing that gets no answer drops the
+          // peer. It reads nothing mutable (the runtime id is fixed for the life
+          // of the transport), so it does not need the ordering the chain gives.
+          if (request.type === 'ping') {
+            void this.handle(request).then(
+              response => socket.end(`${JSON.stringify(response)}\n`),
+              () => socket.end(`${JSON.stringify({ ok: false, reason: 'Invalid or unauthorized peer request' })}\n`),
+            )
+            return
+          }
           // Start registration checks together, but reserve mutation order now.
           // Otherwise every queued message pays for a separate PowerShell ACL check.
           const sender = this.authenticateSender(request).then(value => ({ value, fault: undefined as Error | undefined }), (error: unknown) => ({ value: undefined, fault: error instanceof Error ? error : new Error('Invalid sender') }))
@@ -384,16 +436,22 @@ export class GatewaySessionTransport {
             let response: unknown
             try {
               const authenticated = await sender
-              if (request.type !== 'ping' && !authenticated.value) {
+              if (!authenticated.value) {
                 if (authenticated.fault instanceof UnregisteredSenderError) throw authenticated.fault
                 throw new Error('Invalid sender')
               }
               response = await this.handle(request, authenticated.value)
             }
             catch (error) {
+              // The specific reason reaches the sender. A blanket "invalid or
+              // unauthorized peer request" made every rejection look like the
+              // same transport fault, so a sender whose own registration had
+              // been replaced under it - the one case it could actually fix -
+              // could not tell that from addressing itself or holding a stale
+              // token, and retried the same message unchanged.
               response = error instanceof UnregisteredSenderError
                 ? { ok: false, reason: `The sender is not registered on this bus, so its message cannot be attributed: ${error.message}` }
-                : { ok: false, reason: 'Invalid or unauthorized peer request' }
+                : { ok: false, reason: `Rejected by the receiving session: ${error instanceof Error ? error.message : 'invalid request'}` }
             }
             socket.end(`${JSON.stringify(response)}\n`)
           }).catch(() => socket.destroy())
@@ -532,6 +590,11 @@ export class GatewaySessionTransport {
   }
 
   async send(toSessionId: string, text: string, summary: string, replyTo?: string, kind?: PeerMessageKind): Promise<unknown> {
+    // A session addressing itself is a real mistake - an ID read off a listing
+    // and mistaken for the peer's - and the receiver rejects it anyway, as a
+    // request it cannot attribute. Saying so here keeps the sender from reading
+    // its own address as a transport fault and retrying it unchanged.
+    if (toSessionId === this.peer.sessionId) throw new Error('That is this session; a session cannot send a message to itself')
     const target = await readRegistration(this.options.directory, toSessionId)
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
