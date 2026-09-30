@@ -55,6 +55,8 @@ test('gateway display labels preserve Gateway identities and normalize provider 
   assert.equal(getGatewayModelDisplayName('claude-gpt-sol'), 'GPT-5.6-Sol')
   assert.equal(getGatewayModelDisplayName('gateway-gpt-6-sol'), 'GPT-6-Sol')
   assert.equal(getGatewayModelDisplayName('gpt-6-sol'), 'GPT-6-Sol')
+  assert.equal(getGatewayModelDisplayName('gateway-gpt-6.1-sol'), 'GPT-6.1-Sol')
+  assert.equal(getGatewayModelDisplayName('gpt-6.1-sol'), 'GPT-6.1-Sol')
   assert.equal(getGatewayModelDisplayName('gateway-gpt-luna'), 'GPT-5.6-Luna')
   assert.equal(getGatewayModelDisplayName('gpt-5.6-luna'), 'GPT-5.6-Luna')
   assert.equal(getGatewayModelDisplayName('claude-gpt-luna'), 'GPT-5.6-Luna')

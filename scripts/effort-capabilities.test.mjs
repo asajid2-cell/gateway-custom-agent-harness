@@ -5,6 +5,7 @@ import test from 'node:test'
 import {
   ASTRA_EFFORT_LEVELS,
   GPT56_EFFORT_LEVELS,
+  GPT61_SOL_EFFORT_LEVELS,
   GPT_LUNA_EFFORT_LEVELS,
   GPT_SOL_EFFORT_LEVELS,
   GPT_TERRA_EFFORT_LEVELS,
@@ -36,6 +37,16 @@ test('shared effort catalog preserves model-specific GPT ladders', () => {
   assert.equal(GPT_SOL_EFFORT_LEVELS.includes('ultra'), false)
   assert.equal(GPT_TERRA_EFFORT_LEVELS.includes('ultra'), false)
   assert.equal(ASTRA_EFFORT_LEVELS.includes('ultra'), false)
+  // The point release is the one Sol that cannot take `none`, so it shares
+  // astra's ladder rather than the 5.6/6-sol one.
+  assert.deepEqual(GPT61_SOL_EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max'])
+  assert.deepEqual(
+    GPT61_SOL_EFFORT_LEVELS,
+    catalog.gatewayAliases['gateway-gpt-6.1-sol'],
+  )
+  assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('none'), false)
+  assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('minimal'), false)
+  assert.equal(GPT61_SOL_EFFORT_LEVELS.includes('ultra'), false)
 })
 
 test('every OpenCode Go route has explicit capability metadata', () => {

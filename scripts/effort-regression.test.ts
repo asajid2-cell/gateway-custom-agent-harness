@@ -612,6 +612,8 @@ test('every GPT route spelling reports the same client accounting window', () =>
     'gateway-gpt-terra',
     'gpt-5.6-terra',
     'claude-gpt-terra',
+    'gateway-gpt-6.1-sol',
+    'gpt-6.1-sol',
   ]) {
     assert.equal(
       getContextWindowForModel(spelling),
@@ -638,6 +640,14 @@ test('gateway preserves native effort levels on GPT aliases', () => {
   assert.equal(resolveProviderEffort('gpt-6-luna', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('gpt-6-sol', 'ultracode'), 'max')
   assert.equal(resolveProviderEffort('gpt-6-astra', 'ultracode'), 'max')
+  // The Sol point release dropped `none`; the provider answers 400 for it
+  // there while 5.6-sol and 6-sol still accept it. A name that looks like the
+  // older ladder must not silently inherit it.
+  assert.equal(resolveProviderEffort('gateway-gpt-6.1-sol', 'ultracode'), 'max')
+  assert.equal(resolveProviderEffort('gateway-gpt-6.1-sol', 'ultra'), undefined)
+  assert.equal(resolveProviderEffort('gateway-gpt-6.1-sol', 'none'), undefined)
+  assert.equal(resolveProviderEffort('gpt-6.1-sol', 'none'), undefined)
+  assert.equal(resolveProviderEffort('gateway-gpt-6-sol', 'none'), 'none')
 })
 
 test('DeepSeek exposes only its real effort levels', () => {

@@ -1103,6 +1103,7 @@ test('HTTP boundary routes Astra to gpt-6-astra and normalizes ultracode to max'
 
 test('HTTP boundary sends each GPT route to the upstream its name promises', async () => {
   const expected = {
+    'gateway-gpt-6.1-sol': 'gpt-6.1-sol',
     'gateway-gpt-6-luna': 'gpt-6-luna',
     'gateway-gpt-luna': 'gpt-5.6-luna',
     'gateway-gpt-6-sol': 'gpt-6-sol',

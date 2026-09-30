@@ -18,6 +18,16 @@ test('shared catalog exports the exact visible Gateway picker metadata', () => {
   assert.deepEqual(GATEWAY_MODEL_OPTIONS, catalog.gatewayModelOptions)
   assert.equal(new Set(optionIds).size, optionIds.length)
   assert.ok(optionIds.every(id => id.startsWith('gateway-')))
+  // The newest Sol point release leads the picker; the rest keep their order.
+  assert.equal(optionIds[0], 'gateway-gpt-6.1-sol')
+  assert.deepEqual(
+    catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-6.1-sol'),
+    {
+      value: 'gateway-gpt-6.1-sol',
+      label: 'GPT-6.1-Sol',
+      description: 'Latest workhorse model for coding and everyday work.',
+    },
+  )
   assert.deepEqual(
     catalog.gatewayModelOptions.find(option => option.value === 'gateway-gpt-astra'),
     {
@@ -92,6 +102,10 @@ test('catalog aliases resolve only to visible Gateway routes', () => {
     'claude-gpt-sol',
   ])
   assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-6-sol'], ['gpt-6-sol'])
+  // A point release, not a generation: the versioned id alone, no `claude-`
+  // legacy spelling (that convention stopped at the 5.6 line) and no
+  // versionless Gateway name that could float onto another generation.
+  assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-6.1-sol'], ['gpt-6.1-sol'])
   assert.deepEqual(catalog.gatewayModelAliases['gateway-gpt-terra'], [
     'gpt-5.6-terra',
     'claude-gpt-terra',
@@ -118,6 +132,7 @@ test('each GPT route names its own generation upstream and offers only accepted 
     'gateway-gpt-sol': 'gpt-5.6-sol',
     'gateway-gpt-6-sol': 'gpt-6-sol',
     'gateway-gpt-terra': 'gpt-5.6-terra',
+    'gateway-gpt-6.1-sol': 'gpt-6.1-sol',
   }
   for (const [id, upstream] of Object.entries(upstreamByGatewayId)) {
     const entry = data.find(model => model.id === id)
@@ -125,6 +140,11 @@ test('each GPT route names its own generation upstream and offers only accepted 
     assert.equal(entry.owned_by, 'codex')
     assert.equal(entry.display_name, upstream)
   }
+  // The point release dropped `none` along with `ultra`: the provider answers
+  // "'none' is not supported with the 'gpt-6.1-sol' model" while 5.6-sol and
+  // 6-sol accept it, so the older ladder cannot be copied onto it.
+  const pointRelease = data.find(model => model.id === 'gateway-gpt-6.1-sol')
+  assert.deepEqual(pointRelease.effort_levels, ['low', 'medium', 'high', 'xhigh', 'max'])
   // The provider enumerates none/minimal/low/medium/high/xhigh/max for the
   // whole generation and rejects `ultra` by name, so no GPT-6 route may offer
   // it - a level the endpoint 400s is a failed turn, not a capability.

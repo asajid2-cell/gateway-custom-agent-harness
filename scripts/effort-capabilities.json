@@ -8,6 +8,21 @@
     "max"
   ],
   "gatewayModelMetadata": {
+    "gateway-gpt-6.1-sol": {
+      "defaultReasoning": "low",
+      "nativeEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+      "contextWindow": 272000,
+      "maximumContext": 872000,
+      "effectiveContextPercentage": 95,
+      "modalities": ["text", "image"],
+      "apiSupported": true,
+      "tier": "fast",
+      "codeModeOnly": true,
+      "execution": "unified",
+      "webSearch": true,
+      "imageDetail": "original",
+      "defaultVerbosity": "low"
+    },
     "gateway-gpt-6-luna": {
       "defaultReasoning": "medium",
       "nativeEffortLevels": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -109,7 +124,8 @@
       "gateway-gpt-6-sol",
       "gateway-gpt-sol",
       "gateway-gpt-astra",
-      "gateway-gpt-terra"
+      "gateway-gpt-terra",
+      "gateway-gpt-6.1-sol"
     ]
   },
   "opencodeGo": {
@@ -152,6 +168,7 @@
     "inclusionai/ling-3.0-flash-sante:free": ["low", "medium", "high", "xhigh", "max"]
   },
   "gatewayAliases": {
+    "gateway-gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -238,6 +255,11 @@
     "claude-opencode-muse-spark-1.2-contributor-free": ["opencode-zen/muse-spark-1.2-contributor-free"]
   },
   "gatewayModelOptions": [
+    {
+      "value": "gateway-gpt-6.1-sol",
+      "label": "GPT-6.1-Sol",
+      "description": "Latest workhorse model for coding and everyday work."
+    },
     {
       "value": "gateway-gpt-6-luna",
       "label": "GPT-6-Luna",
@@ -496,6 +518,7 @@
     "gateway-gpt-6-luna": ["gpt-6-luna"],
     "gateway-gpt-sol": ["gpt-5.6-sol", "claude-gpt-sol"],
     "gateway-gpt-6-sol": ["gpt-6-sol"],
+    "gateway-gpt-6.1-sol": ["gpt-6.1-sol"],
     "gateway-gpt-terra": ["gpt-5.6-terra", "claude-gpt-terra"],
     "gateway-gpt-astra": ["gpt-6-astra", "claude-gpt-astra"],
     "gateway-ds-flash": ["deepseek-v4-flash", "claude-ds-flash"],

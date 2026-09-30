@@ -61,6 +61,7 @@ const GATEWAY_MODEL_FOR_NATIVE = {
   'gpt-6-luna': 'gateway-gpt-6-luna',
   'gpt-5.6-luna': 'gateway-gpt-luna',
   'gpt-6-sol': 'gateway-gpt-6-sol',
+  'gpt-6.1-sol': 'gateway-gpt-6.1-sol',
   'gpt-5.6-sol': 'gateway-gpt-sol',
   'gpt-6-astra': 'gateway-gpt-astra',
   'gpt-5.6-terra': 'gateway-gpt-terra',

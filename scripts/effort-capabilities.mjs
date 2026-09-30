@@ -20,6 +20,7 @@ export const GPT_LUNA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-lu
 export const GPT_SOL_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-sol']]
 export const GPT_TERRA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-terra']]
 export const ASTRA_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-astra']]
+export const GPT61_SOL_EFFORT_LEVELS = [...CATALOG.gatewayAliases['gateway-gpt-6.1-sol']]
 
 export const GATEWAY_MODEL_OPTIONS = Object.freeze(
   (Array.isArray(CATALOG.gatewayModelOptions)

@@ -37,6 +37,7 @@ import {
 import {
   gatewayCatalogDrift,
   ASTRA_EFFORT_LEVELS,
+  GPT61_SOL_EFFORT_LEVELS,
   GPT_LUNA_EFFORT_LEVELS,
   GPT_SOL_EFFORT_LEVELS,
   GPT_TERRA_EFFORT_LEVELS,
@@ -158,11 +159,14 @@ const DEFAULT_MODELS = {
   'gpt-5.6-sol': { backend: 'codex', upstream: 'gpt-5.6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
   'gpt-5.6-terra': { backend: 'codex', upstream: 'gpt-5.6-terra', effortLevels: GPT_TERRA_EFFORT_LEVELS, hidden: true },
   'gpt-6-astra': { backend: 'codex', upstream: 'gpt-6-astra', effortLevels: ASTRA_EFFORT_LEVELS, hidden: true },
-  // The GPT-6 generation of the Luna and Sol line. Both generations are served
+  // The GPT-6 generation of the Luna and Sol line. All generations are served
   // by the provider at once, so each one keeps its own visible route below
-  // rather than one id floating onto whichever generation is current.
+  // rather than one id floating onto whichever generation is current. Sol now
+  // has a point release as well; it has no Luna or Terra counterpart, and the
+  // provider answers 400 for those names.
   'gpt-6-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS, hidden: true },
   'gpt-6-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS, hidden: true },
+  'gpt-6.1-sol': { backend: 'codex', upstream: 'gpt-6.1-sol', effortLevels: GPT61_SOL_EFFORT_LEVELS, hidden: true },
   'deepseek-flash': { backend: 'deepseek', upstream: 'deepseek-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
   'deepseek-v4-flash': { backend: 'deepseek', upstream: 'deepseek-v4-flash', effortLevels: ['low', 'high', 'max'], hidden: true },
   'deepseek-v4-pro': { backend: 'deepseek', upstream: 'deepseek-v4-pro', effortLevels: ['low', 'high', 'max'], hidden: true },
@@ -229,6 +233,7 @@ const DEFAULT_MODELS = {
       },
     ]),
   ),
+  'gateway-gpt-6.1-sol': { backend: 'codex', upstream: 'gpt-6.1-sol', effortLevels: GPT61_SOL_EFFORT_LEVELS },
   'gateway-gpt-6-luna': { backend: 'codex', upstream: 'gpt-6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
   'gateway-gpt-luna': { backend: 'codex', upstream: 'gpt-5.6-luna', effortLevels: GPT_LUNA_EFFORT_LEVELS },
   'gateway-gpt-6-sol': { backend: 'codex', upstream: 'gpt-6-sol', effortLevels: GPT_SOL_EFFORT_LEVELS },
