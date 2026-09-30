@@ -160,8 +160,14 @@ export class LeafProcess {
   }) {}
 
   private setState(state: LeafProcessState): void {
+    // Only a change is a transition. A member reports its state again with every
+    // keystroke it takes - the draft it is holding travels alongside - so
+    // announcing a repeat made one keystroke in one leaf publish the whole
+    // family: a snapshot written to every other open leaf, and a repaint in
+    // each. The state itself is still recorded either way.
+    const changed = state !== this.state
     this.state = state
-    this.options.onState(state)
+    if (changed) this.options.onState(state)
     // A closed or failed leaf will never run a held message, so its senders are
     // told now rather than left waiting on a promise that cannot settle.
     if (state === 'closed' || state === 'failed') this.drainInbox()
@@ -579,6 +585,10 @@ export class LeafProcess {
 
   syncDraft(): Promise<void> { return this.control({ subtype: 'leaf_draft' }) }
   checkpoint(name?: string): Promise<void> { return this.control({ subtype: 'leaf_checkpoint', name }) }
+  // Asks the member to compact its own conversation. The member owns the
+  // messages being summarized, so the work happens there and this is only the
+  // request - see the `leaf_compact` control in useLeafTerminalSession.
+  compact(): Promise<void> { return this.control({ subtype: 'leaf_compact' }) }
   setModel(model: string): Promise<void> { return this.control({ subtype: 'set_model', model }) }
   setEffort(effort: string): Promise<void> { return this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: effort } }) }
   interrupt(): Promise<void> { return this.control({ subtype: 'interrupt' }) }

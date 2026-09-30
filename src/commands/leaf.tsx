@@ -3,7 +3,7 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|reparent <leaf>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|reparent <leaf>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -57,6 +57,31 @@ export function parseReadRequest(input: string): { reference?: string; options: 
   return request
 }
 
+/**
+ * The `merge` grammar: a seedling, plus an optional fidelity. Only `full` and
+ * `ledger` are accepted, and a rejected word is refused here rather than being
+ * passed on as a name. Kept pure so the grammar is testable without a live
+ * workspace.
+ */
+export function parseMergeRequest(input: string): { seedling: string; fidelity?: 'full' | 'ledger' } | null {
+  if (input !== 'merge' && !input.startsWith('merge ')) return null
+  const [seedling, fidelity, ...rest] = input.slice(6).trim().split(/\s+/).filter(Boolean)
+  if (!seedling || rest.length) throw new Error(`Usage: /leaf ${USAGE}`)
+  if (fidelity && fidelity !== 'full' && fidelity !== 'ledger') throw new Error('Merge fidelity must be full or ledger')
+  return { seedling, ...(fidelity ? { fidelity: fidelity as 'full' | 'ledger' } : {}) }
+}
+
+/**
+ * The `seedling` grammar: the seed to fork, plus its name. Kept pure so the
+ * grammar is testable without a live workspace.
+ */
+export function parseSeedlingRequest(input: string): { seed: string; name?: string } | null {
+  if (!input.startsWith('seedling ')) return null
+  const [seed, ...tail] = input.slice(9).trim().split(/\s+/)
+  if (!seed) throw new Error(`Usage: /leaf ${USAGE}`)
+  return { seed, ...(tail.length ? { name: tail.join(' ') } : {}) }
+}
+
 export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContext & LocalJSXCommandContext, args: string): Promise<React.ReactNode> {
   if (context.agentId) { onDone('Leaf workspace is available only in the main terminal.', { display: 'system' }); return null }
   try {
@@ -68,8 +93,8 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     if (filing) {
       const member = await workspace.resolveLeafRef(filing[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      await workspace.fileLeaf(member.sessionId, filing[2]!)
-      onDone('Leaf filed by tag in session history and closed in this workspace; transcript and identity retained.', { display: 'system' })
+      const promoted = await workspace.fileLeaf(member.sessionId, filing[2]!)
+      onDone(`Leaf filed by tag in session history and closed in this workspace; transcript and identity retained.${promoted ? ` ${promoted}` : ''}`, { display: 'system' })
       return null
     }
 
@@ -86,6 +111,36 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
 
     const interrupt = input.match(/^interrupt\s+(\S+)$/)
     if (interrupt) { onDone(await workspace.interruptLeaf(interrupt[1]!), { display: 'system' }); return null }
+
+    // A seed is a fork that is also a merge target, and a seedling is a bounded
+    // fork of one. Both are ordinary leaves once made, so the grammar only has to
+    // name the source; the role travels with the member and is what a merge reads.
+    // As with `fork`, a token that answers to no leaf or session is the name, not
+    // the source, so `seed my-seed` names a fork of the current conversation.
+    const seedling = parseSeedlingRequest(input)
+    if (seedling) {
+      const view = await workspace.createSeedling(seedling.seed, seedling.name)
+      onDone(`Leaf #${view.member.number} ${view.member.name} is a seedling of its seed; merge it back with /leaf merge ${view.member.number}.`, { display: 'system' })
+      return null
+    }
+
+    if (input === 'seed' || input.startsWith('seed ')) {
+      const rest = input.slice(4).trim()
+      const [first, ...tail] = rest ? rest.split(/\s+/) : []
+      const source = first && await isLeafReference(first, workspace.resolveLeafRef) ? first : undefined
+      const view = await workspace.createSeed(source, source ? tail.join(' ').trim() || undefined : rest || undefined)
+      onDone(`Leaf #${view.member.number} ${view.member.name} is a seed; /leaf seedling ${view.member.number} forks a bounded job off it.`, { display: 'system' })
+      return null
+    }
+
+    const merge = parseMergeRequest(input)
+    if (merge) {
+      onDone(await workspace.mergeSeedling(merge.seedling, merge.fidelity ? { fidelity: merge.fidelity } : {}), { display: 'system' })
+      return null
+    }
+
+    const compacting = input.match(/^compact\s+(\S+)$/)
+    if (compacting) { onDone(await workspace.compactLeaf(compacting[1]!), { display: 'system' }); return null }
 
     const checkpoint = input.match(/^checkpoint\s+(\S+)(?:\s+([\s\S]+))?$/)
     if (checkpoint) { onDone(await workspace.checkpointLeaf(checkpoint[1]!, checkpoint[2]?.trim() || undefined), { display: 'system' }); return null }
@@ -169,8 +224,8 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       if (action === 'rename' && !change[3]?.trim()) throw new Error('Name required')
       const member = await workspace.resolveLeafRef(change[2]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      await workspace.changeLeaf(member.sessionId, action === 'rename' ? { name: change[3]!.trim() } : { status: action === 'close' ? 'closed' : action === 'archive' ? 'archived' : action === 'reopen' ? 'open' : 'promoted', ...(change[3]?.trim() ? { name: change[3].trim() } : {}) })
-      onDone(`Leaf ${action} recorded; transcript and ancestry retained.`, { display: 'system' })
+      const promoted = await workspace.changeLeaf(member.sessionId, action === 'rename' ? { name: change[3]!.trim() } : { status: action === 'close' ? 'closed' : action === 'archive' ? 'archived' : action === 'reopen' ? 'open' : 'promoted', ...(change[3]?.trim() ? { name: change[3].trim() } : {}) })
+      onDone(`Leaf ${action} recorded; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`, { display: 'system' })
       return null
     }
 

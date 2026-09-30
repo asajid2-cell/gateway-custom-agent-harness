@@ -27,6 +27,10 @@ const inputSchema = lazySchema(() =>
         'checkpoints',
         'checkpoint-drop',
         'checkpoint-purge',
+        'seed',
+        'seedling',
+        'merge',
+        'compact',
       ])
       .describe('Operation to perform on the leaf family'),
     leaf: z
@@ -35,7 +39,7 @@ const inputSchema = lazySchema(() =>
       .describe('Leaf reference: session ID, number, N:name, or name. A checkpoint reference is #number, or a label'),
     name: z.string().optional().describe('Name for a new leaf, or a label for a checkpoint'),
     message: z.string().optional().describe('Text for send or for a context return'),
-    value: z.string().optional().describe('Model name or effort level'),
+    value: z.string().optional().describe('Model name, effort level, or merge fidelity (full or ledger)'),
     tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
     since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
   }),
@@ -92,8 +96,8 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'reopen': {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      await workspace.changeLeaf(member.sessionId, { status: input.action === 'close' ? 'closed' : 'open' })
-      return `Leaf #${member.number} ${member.name} ${input.action === 'close' ? 'closed' : 'reopened'}; transcript and ancestry retained.`
+      const promoted = await workspace.changeLeaf(member.sessionId, { status: input.action === 'close' ? 'closed' : 'open' })
+      return `Leaf #${member.number} ${member.name} ${input.action === 'close' ? 'closed' : 'reopened'}; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`
     }
     case 'model':
     case 'effort': {
@@ -124,6 +128,24 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       return workspace.dropLeafCheckpoint(requireLeaf())
     case 'checkpoint-purge':
       return workspace.purgeLeafCheckpoint(requireLeaf())
+    // A seed's source is optional: with no reference it forks this conversation,
+    // which is what makes `seed` on its own a way to keep the durable line
+    // separate from the forks that do bounded jobs against it.
+    case 'seed': {
+      const view = await workspace.createSeed(input.leaf?.trim() || undefined, input.name?.trim() || undefined)
+      return `Leaf #${view.member.number} ${view.member.name} is a seed (${view.member.sessionId}); fork a bounded job off it with action seedling.`
+    }
+    case 'seedling': {
+      const view = await workspace.createSeedling(requireLeaf(), input.name?.trim() || undefined)
+      return `Leaf #${view.member.number} ${view.member.name} is a seedling of ${requireLeaf()}; merge it back with action merge.`
+    }
+    case 'merge': {
+      const fidelity = input.value?.trim().toLowerCase()
+      if (fidelity && fidelity !== 'full' && fidelity !== 'ledger') throw new Error('Merge fidelity must be full or ledger')
+      return workspace.mergeSeedling(requireLeaf(), fidelity ? { fidelity: fidelity as 'full' | 'ledger' } : {})
+    }
+    case 'compact':
+      return workspace.compactLeaf(requireLeaf())
   }
 }
 

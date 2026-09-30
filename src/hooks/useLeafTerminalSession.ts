@@ -144,6 +144,19 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
           wakeLeafInput()
           return
         }
+        // Compaction is this member's own `/compact`, run by its own REPL. The
+        // host cannot summarize a conversation it is not holding - the messages
+        // are this process's, and the summary is installed with this process's
+        // setMessages - so the request is answered here, through the command the
+        // person would type rather than a second implementation of it. The queue
+        // takes it and the processor runs it between turns, so it waits for an
+        // idle REPL the same way the human's own /compact does.
+        case 'leaf_compact': {
+          if (latest.current.status !== 'idle' || !latest.current.canCheckpoint()) throw new Error('Wait for this leaf to be idle before compacting it')
+          enqueue({ value: '/compact', mode: 'prompt', priority: 'next' })
+          wakeLeafInput()
+          return
+        }
         case 'interrupt': latest.current.interrupt(); return
         case 'shutdown': {
           latest.current.interrupt()

@@ -178,7 +178,10 @@ test('a leaf registers on the shared bus as a leaf, not as the session it forked
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   assert.match(workspace, /GATEWAY_LEAF_LABEL: leafSelfLabel\(member, rootSessionId\)/)
   assert.match(workspace, /function leafSelfLabel\(member: LeafMember, rootSessionId: string\): string/)
-  assert.match(workspace, /`Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{rootSessionId\}\)`/)
+  // "Of" names the member it was forked from, not the family root: a leaf forked
+  // from a leaf belongs to that leaf, and saying otherwise had it fork the top
+  // level and answer to a name belonging to the conversation behind it.
+  assert.match(workspace, /`Leaf \$\{member\.number\}: \$\{member\.name\} \(of session \$\{member\.parentSessionId\}\)`/)
   // The parent session is hosted as a member now, and naming it "Leaf 0" would
   // have it derive its intent from being one of its own leaves.
   assert.match(workspace, /`The original session \$\{member\.name\} \(family root \$\{rootSessionId\}\)`/)

@@ -1,14 +1,21 @@
 import React, { useState } from 'react'
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
+import { randomUUID } from 'node:crypto'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { render, Box, Text, useInput } from '../src/ink.ts'
 import instances from '../src/ink/instances.ts'
 import { nodeCache } from '../src/ink/node-cache.ts'
 import { LeafCarousel } from '../src/components/LeafWorkspaceDialog.tsx'
-import { SessionEditControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
+import { LedMenu } from '../src/components/LedMenu.tsx'
+import { SessionEditControl, SessionLedControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
 import { AppStateProvider } from '../src/state/AppState.tsx'
+import { KeybindingSetup } from '../src/keybindings/KeybindingProviderSetup.tsx'
 import { requestLeafMenu, subscribeLeafMenuRequest, type LeafView } from '../src/utils/leafWorkspace.ts'
+import { readLedStore, setLedAssignment, subscribeLedMenuRequest } from '../src/utils/ledStore.ts'
 
 const settle = () => new Promise(resolve => setTimeout(resolve, 80))
 async function waitForScreen(predicate: () => boolean): Promise<void> {
@@ -24,12 +31,18 @@ function labelNode(node: any, label: string): any {
   }
   return textOf(node) === label && nodeCache.has(node) ? node : undefined
 }
-async function terminal(content: React.ReactNode, columns = 100) {
+async function terminal(content: React.ReactNode, columns = 100, options: { keybindings?: boolean } = {}) {
   const stdout = Object.assign(new PassThrough(), { columns, rows: 30, isTTY: true })
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} })
   stdout.resume()
   function InputOwner() { useInput(() => {}); return null }
-  const app = await render(<AppStateProvider><InputOwner /><Box width={columns}>{content}</Box></AppStateProvider>, { stdout: stdout as any, stderr: stdout as any, stdin: stdin as any, patchConsole: false, exitOnCtrlC: false })
+  const frame = <><InputOwner /><Box width={columns}>{content}</Box></>
+  // A Select takes Enter through the keybinding context, not through its own
+  // useInput, so anything that must be accepted with Enter needs the provider
+  // the REPL always installs. Without it Enter resolves to nothing and the
+  // component looks inert.
+  const body = options.keybindings ? <KeybindingSetup>{frame}</KeybindingSetup> : frame
+  const app = await render(<AppStateProvider>{body}</AppStateProvider>, { stdout: stdout as any, stderr: stdout as any, stdin: stdin as any, patchConsole: false, exitOnCtrlC: false })
   await settle()
   const ink = instances.get(stdout as any) as any
   // The real terminal supplies origin via CPR. Set only that measurement here;
@@ -328,6 +341,62 @@ test('terminal handoff suspends and restores both input listener modes exactly o
     t.stdin.off('data', data)
     t.stdin.off('readable', readable)
     t.close()
+  }
+})
+
+test('the LED control reaches the picker by click, with nothing typed', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'led-control-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  let opened = 0
+  const unsubscribe = subscribeLedMenuRequest(() => { opened++ })
+  const t = await terminal(<SessionLedControl />)
+  try {
+    // No colour yet, so the control shows an empty circle rather than a glyph.
+    await t.click('◌ Led')
+    assert.equal(opened, 1)
+    t.stdin.write(' \r'); await settle()
+    assert.equal(opened, 1, 'the control is a pointer target, never a focus stop that Space re-fires')
+  } finally {
+    unsubscribe(); t.close()
+    process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the picker writes the colour it was given, and reports a worn one as taken', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'led-picker-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { familyRootSync } = await import('../src/utils/leafWorkspace.ts')
+    const family = familyRootSync()
+    const sibling = randomUUID()
+    await setLedAssignment(family, sibling, 'yellow')
+
+    let done = 0
+    const t = await terminal(<LedMenu onDone={() => { done++ }} />, 100, { keybindings: true })
+    try {
+      const screen = textOf(t.ink.rootNode)
+      assert.match(screen, /🔴 Red/, 'every colour but the worn one is offered')
+      assert.match(screen, /worn by/, 'a colour another session wears says so rather than just vanishing')
+      // The first row is the first colour, so Enter takes it. Yellow is out of
+      // reach because the session already wearing it is not this one.
+      t.stdin.write('\r'); await settle()
+      const deadline = Date.now() + 2000
+      let store = await readLedStore(family)
+      while (store.assignments[getSessionId()] === undefined && Date.now() < deadline) {
+        await settle()
+        store = await readLedStore(family)
+      }
+
+      assert.equal(store.assignments[getSessionId()]?.color, 'red', 'the picker writes what it offered')
+      assert.equal(store.assignments[sibling]?.color, 'yellow', 'and leaves the other session alone')
+    } finally { t.close() }
+  } finally {
+    process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
   }
 })
 

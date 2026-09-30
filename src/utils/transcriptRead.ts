@@ -20,6 +20,16 @@ export type TranscriptTurn = {
   tools?: TranscriptToolUse[]
   /** A turn the session was handed by another session rather than by a person. */
   meta?: boolean
+  /**
+   * The compaction summary that stands in for the turns it replaced.
+   *
+   * It arrives as a user turn and is not marked meta, so a reader looking for
+   * the session's own conclusion would either take it for something a person
+   * typed or miss it entirely. Naming it is what lets a ledger merge carry it:
+   * after a session compacts itself there is no closing prose turn left, and the
+   * summary is the last thing it actually said.
+   */
+  summary?: boolean
 }
 export type TranscriptSlice = {
   sessionId: string
@@ -34,9 +44,20 @@ export type TranscriptSlice = {
   chainLength?: number
 }
 
-export type TranscriptReadOptions = { tail?: number; since?: string; maxChars?: number }
+export type TranscriptReadOptions = { tail?: number; since?: string; maxChars?: number; turnChars?: number }
 
 const TURN_TEXT_CAP = 1200
+/**
+ * How far the per-turn cap can be raised.
+ *
+ * The cap is what keeps a read a digest rather than a dump, and it is right for
+ * a window of turns. It is wrong for a read whose whole subject is one turn -
+ * a ledger merge carries the seedling's closing report and nothing else, so a
+ * report longer than the cap would arrive cut off in the middle of its own
+ * conclusion, with the seed continuing from a sentence that stops. `maxChars`
+ * still bounds the total, so raising this only moves where the cut falls.
+ */
+const MAX_TURN_TEXT_CAP = 20_000
 const DEFAULT_TAIL = 12
 const MAX_TAIL = 200
 const DEFAULT_MAX_CHARS = 20_000
@@ -52,6 +73,7 @@ type Entry = {
   parentUuid?: string | null
   timestamp?: string
   isMeta?: boolean
+  isCompactSummary?: boolean
   isSidechain?: boolean
   message?: { content?: unknown }
 }
@@ -160,7 +182,7 @@ function summarizeTool(name: string, input: unknown): string {
 }
 
 /** One chain entry as a turn, or undefined when it holds nothing worth showing. */
-function turnOf(entry: Entry): TranscriptTurn | undefined {
+function turnOf(entry: Entry, cap: number): TranscriptTurn | undefined {
   const uuid = entry.uuid ?? ''
   if (!uuid) return undefined
   const role = entry.type === 'system' ? 'system' : entry.type === 'assistant' ? 'assistant' : 'user'
@@ -183,9 +205,10 @@ function turnOf(entry: Entry): TranscriptTurn | undefined {
     uuid,
     role,
     ...(entry.timestamp ? { at: entry.timestamp } : {}),
-    text: text.length > TURN_TEXT_CAP ? `${text.slice(0, TURN_TEXT_CAP)}…` : text,
+    text: text.length > cap ? `${text.slice(0, cap)}…` : text,
     ...(tools.length ? { tools } : {}),
     ...(entry.isMeta ? { meta: true } : {}),
+    ...(entry.isCompactSummary ? { summary: true } : {}),
   }
 }
 
@@ -206,6 +229,7 @@ export async function readTranscriptSlice(
   options: TranscriptReadOptions = {},
 ): Promise<TranscriptSlice> {
   const tail = clamp(Math.floor(options.tail ?? DEFAULT_TAIL), 1, MAX_TAIL)
+  const turnCap = clamp(Math.floor(options.turnChars ?? TURN_TEXT_CAP), 200, MAX_TURN_TEXT_CAP)
   const maxChars = Math.max(0, options.maxChars ?? DEFAULT_MAX_CHARS)
   const size = await open(path, 'r').then(handle => handle.stat().then(stat => { void handle.close(); return stat.size }), () => 0)
 
@@ -221,7 +245,7 @@ export async function readTranscriptSlice(
   }
 
   const chronological = [...chain.ordered].reverse()
-  const allTurns = chronological.map(turnOf).filter((turn): turn is TranscriptTurn => turn !== undefined)
+  const allTurns = chronological.map(entry => turnOf(entry, turnCap)).filter((turn): turn is TranscriptTurn => turn !== undefined)
 
   let turns = allTurns
   let behind = false
