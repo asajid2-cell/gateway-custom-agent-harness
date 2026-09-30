@@ -183,6 +183,18 @@ export class LeafProcess {
   getPendingCount(): number { return this.inbox.length }
   getPending(): string[] { return this.inbox.map(item => item.text) }
   getState(): LeafProcessState { return this.state }
+  /**
+   * Whether the member can be talked to right now.
+   *
+   * A member's row exists before the member is listening, so a handle can be
+   * held while there is no channel yet. `starting` is a real state a member is
+   * in for as long as its CLI takes to boot, and every control needs the
+   * channel - so anything that only wants to *ask* the member something has to
+   * check this rather than the state, or it reaches for a channel that is not
+   * there and reports a member that is starting perfectly well as one that is
+   * not running.
+   */
+  canReceive(): boolean { return Boolean(this.channel) }
   getPermissions(): LeafPermission[] { return structuredClone([...this.permissions.values()]) }
 
   private needsStreamJsonBootstrap(): boolean {

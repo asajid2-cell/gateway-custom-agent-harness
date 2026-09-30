@@ -2254,6 +2254,15 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
     return
   }
   if (patch.status && patch.status !== 'open' && view) {
+    // A member's row exists before the member is listening, so the close a
+    // person types straight after making a leaf arrives while its CLI is still
+    // booting. Waiting for the launch here is what makes that close land on the
+    // member it names: without it the close has no channel to ask, and a member
+    // that cannot be asked is left running while the roster calls it closed -
+    // the one outcome a close must never produce. A launch that failed has
+    // nothing to wait for and nothing to stop, which is the same shape a reopen
+    // takes.
+    await launches.get(sessionId)?.started.catch(() => {})
     await saveLeafDraft(view)
     await view.process.close()
     await ownerReleases.get(sessionId)?.()
@@ -2555,7 +2564,12 @@ export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<Le
 
 export async function saveLeafDraft(view: LeafView): Promise<void> {
   const owned = views.get(view.member.sessionId)
-  if (owned && !['closed', 'failed'].includes(owned.process.getState())) await owned.process.syncDraft()
+  // A member that has not connected yet has nothing to ask, and reaching for its
+  // channel anyway is what failed a close with "Leaf terminal is not running"
+  // while the leaf was still booting: `starting` passes a state check, but every
+  // control needs a channel that does not exist yet. The draft in the roster is
+  // already this member's draft, so skipping the sync loses nothing.
+  if (owned && owned.process.canReceive()) await owned.process.syncDraft()
   view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, view.member.sessionId, { draft: view.draft })
 }
 

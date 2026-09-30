@@ -783,6 +783,34 @@ test('archive detaches a leaf without deleting anything', async () => {
   assert.match(command, /\|archive\|promote/)
 })
 
+test('a close waits for a member that is still on its way up', async () => {
+  // A member's row exists before the member is listening: `/leaf new` writes the
+  // row and returns while the leaf's CLI is still booting. Closing it in that
+  // window reached for a channel that was not there yet, and the draft save -
+  // which gated on the process state, and `starting` passes that - threw "Leaf
+  // terminal is not running" at a leaf that was starting perfectly well. The
+  // close then aborted with the leaf still open. Measured, not guessed: the
+  // owner-cascade probe reproduces it under load, and the throw it caught was
+  // `channel=false state=starting`.
+  //
+  // So the close waits for the launch, and the draft save asks whether there is
+  // a channel instead of reading the state. Both halves are needed: the wait is
+  // what makes a close land on the member it names, and the predicate is what
+  // keeps every other caller of the draft save - the cleanup a session runs on
+  // its way out, most of all - from throwing at a member that is merely booting.
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const change = workspace.slice(workspace.indexOf('export async function changeLeaf'), workspace.indexOf('export async function fileLeaf'))
+  assert.match(change, /await launches\.get\(sessionId\)\?\.started\.catch\(\(\) => \{\}\)/)
+  assert.match(change, /await saveLeafDraft\(view\)/)
+  const draft = workspace.slice(workspace.indexOf('export async function saveLeafDraft'), workspace.indexOf('registerCleanup(async () => {'))
+  assert.match(draft, /owned\.process\.canReceive\(\)/)
+  assert.doesNotMatch(draft, /\['closed', 'failed'\]\.includes\(owned\.process\.getState\(\)\)/)
+  // The predicate is the channel, not the state: every control needs a channel,
+  // and `starting` is exactly a state a member is in with none yet.
+  const process = await readFile(new URL('../src/utils/leafProcess.ts', import.meta.url), 'utf8')
+  assert.match(process, /canReceive\(\): boolean \{ return Boolean\(this\.channel\) \}/)
+})
+
 test('a leaf may start over its own transcript when nothing conversational is in it', async () => {
   // The launcher decides between starting and resuming a member by asking
   // whether its transcript holds a turn, and the CLI refuses to start an id that
