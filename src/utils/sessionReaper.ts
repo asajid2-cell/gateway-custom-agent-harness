@@ -1,5 +1,6 @@
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { isEnvTruthy } from './envUtils.js'
+import { isProcessRunning } from './genericProcessUtils.js'
 import { gracefulShutdown } from './gracefulShutdown.js'
 import { isInteractiveLeaf, isLeafClientAttached, leafIdleMs, leafLabel, leafSessionId } from './leafTerminal.js'
 import { getSessionIdleMs, isSessionBusy } from './sessionActivity.js'
@@ -91,18 +92,13 @@ export function decideReap(input: ReapInput): ReapDecision {
  *
  * A root session runs in the foreground of its launcher for its whole life, so a
  * live launcher means a live terminal, and a dead one means nobody can reach
- * this session any more. EPERM is reported as alive: it means the process exists
- * but is not ours to signal, and the unsafe direction here is calling a live
- * launcher dead. A probe that cannot see the parent at all (pid 0 or 1) is dead.
+ * this session any more. The shared probe answers it: a process that exists but
+ * is not ours to signal (EPERM, EACCES) is alive, and the unsafe direction here
+ * is calling a live launcher dead. A probe that cannot see the parent at all
+ * (pid 0 or 1) is dead.
  */
 export function isLauncherAlive(pid: number = process.ppid): boolean {
-  if (!pid || pid <= 1) return false
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM'
-  }
+  return isProcessRunning(pid)
 }
 
 function envMs(name: string, fallback: number): number {
