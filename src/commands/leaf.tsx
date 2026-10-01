@@ -3,7 +3,7 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|patriarch <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|patriarch <leaf>|heir <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -164,6 +164,14 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       const member = await workspace.resolveLeafRef(patriarch[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       onDone(await workspace.conferPatriarch(member.sessionId), { display: 'system' })
+      return null
+    }
+
+    const heir = input.match(/^heir\s+(\S+)$/)
+    if (heir) {
+      const member = await workspace.resolveLeafRef(heir[1]!)
+      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      onDone(await workspace.conferHeir(member.sessionId), { display: 'system' })
       return null
     }
 

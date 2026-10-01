@@ -721,6 +721,73 @@ test('a member that held the patriarch role is filed as an elder, and a merely p
   }
 })
 
+test('naming an heir records a designation the family reads, and ascending clears it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-heir-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    await workspace.restoreLeafWorkspace()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const pointerPath = join(directory, 'leaf-families', 'index', `${root}.json`)
+    const heir = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Heir', transcriptPath: join(directory, 'heir.jsonl'), forkMessageId: randomUUID() })
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+    const pointer = async () => JSON.parse(await readFile(pointerPath, 'utf8')) as { patriarchSessionId?: string; heirSessionId?: string }
+
+    // Naming an heir is a designation, not a mode: the member keeps its name and
+    // its row, and the family reads it back from the same pointer the patriarch
+    // designation lives in - the field an older reader simply ignores.
+    assert.match(await workspace.conferHeir(heir.sessionId), /^Leaf #\d+ Heir is now the family heir\.$/)
+    assert.equal(workspace.getLeafHeirSessionId(), heir.sessionId, 'the heir is readable as a designation')
+    assert.equal((await pointer()).heirSessionId, heir.sessionId, 'the designation is written where the patriarch’s is')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${heir.number} Heir \\[open\\] \\[heir\\] ${heir.sessionId}$`, 'm'), 'the family view files the heir')
+
+    // Refusals: a reference outside the family, the member that is the patriarch
+    // (it cannot succeed itself), the member that is already the heir, and a
+    // target whose turn is in flight.
+    await assert.rejects(workspace.conferHeir(randomUUID()), /Unknown leaf/)
+    await assert.rejects(workspace.conferHeir(root), /already the family patriarch/)
+    await assert.rejects(workspace.conferHeir(heir.sessionId), /already the family heir/)
+    const { leaf } = parkedLeaf()
+    leaf.setState('running')
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: other as never, process: leaf as never, draft: '' })
+    try {
+      await assert.rejects(workspace.conferHeir(other.sessionId), /Wait for the leaf turn/)
+    } finally { unregister() }
+
+    // The designation is singular: naming a new heir replaces the old one, and
+    // the member that was the heir keeps every other fact about itself.
+    assert.match(await workspace.conferHeir(other.sessionId), /now the family heir/)
+    assert.equal(workspace.getLeafHeirSessionId(), other.sessionId, 'one heir at a time')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[heir\\] ${other.sessionId}$`, 'm'), 'the new heir is the one filed')
+
+    // Ascension is the one thing that clears the designation: the member being
+    // raised takes the role, so it stops being the heir in the same write - and
+    // the patriarch it displaces is filed as an elder by that same write.
+    await workspace.conferPatriarch(other.sessionId)
+    assert.equal(workspace.getLeafHeirSessionId(), undefined, 'the heir that ascends stops being the heir')
+    assert.equal((await pointer()).heirSessionId, undefined, 'the cleared designation is gone from the pointer too')
+    assert.doesNotMatch(await workspace.familyRoster(), /\[heir\]/, 'no row is marked the heir after ascension')
+    assert.equal((await readLeafFamily(family, root)).members.find(item => item.sessionId === root)!.eldership, true, 'the displaced patriarch is an elder')
+  } finally {
+    // The resolved root and the matriarch lease are module state this case took;
+    // give them back so the cases after it read their own family, not this one.
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('worktree leaf rejects the current working tree before creating a fork', async () => {
   const { getCwdState, setCwdState, getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
   const { resolve } = await import('node:path')

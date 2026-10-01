@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafHeirSessionId, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -152,6 +152,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
     const patriarchId = getLeafPatriarchSessionId()
+    const heirId = getLeafHeirSessionId()
     const canCloseSelf = isFamilyMatriarch() || isInteractiveLeaf()
     // Displaced, this is a roster and nothing else: the rows that manage leaves
     // belong to the window holding the lease, and offering them here only
@@ -189,6 +190,11 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           label: `Make patriarch #${member.number} ${member.name}`,
           description: 'The family takes this member’s name; the member that is the patriarch now becomes an ordinary leaf',
         })),
+        ...open.filter(member => member.sessionId !== patriarchId && member.sessionId !== heirId).map(member => ({
+          value: `heir:${member.sessionId}`,
+          label: `Raise heir #${member.number} ${member.name}`,
+          description: 'Name the member being trained to succeed the patriarch; it stays an ordinary leaf',
+        })),
       ]),
       // Every member is an entry point, so every member gets the command that
       // opens it from anywhere. It is a read, not management: a window that was
@@ -221,6 +227,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
           if (action === 'patriarch') return workspace.conferPatriarch(id)
+          if (action === 'heir') return workspace.conferHeir(id)
           // Closing the session you are in is the same call as closing any other
           // member; what it does is decided by which session is asking, not by
           // the row. It hands the family on when it can and leaves when it

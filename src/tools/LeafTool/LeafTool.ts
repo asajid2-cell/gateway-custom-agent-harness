@@ -23,6 +23,7 @@ const inputSchema = lazySchema(() =>
         'notify',
         'roster',
         'patriarch',
+        'heir',
         'read',
         'checkpoints',
         'checkpoint-drop',
@@ -128,6 +129,11 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       return workspace.conferPatriarch(member.sessionId)
+    }
+    case 'heir': {
+      const member = await workspace.resolveLeafRef(requireLeaf())
+      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      return workspace.conferHeir(member.sessionId)
     }
     case 'checkpoints':
       return workspace.listLeafCheckpoints(input.leaf?.trim() || undefined)

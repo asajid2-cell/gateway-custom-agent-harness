@@ -608,10 +608,11 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // A member's own pointer is what makes membership survive the patriarch process:
   // the family file is keyed by the root's id, which only the root can know.
   // The pointer is also where a branch of a checkpoint records which checkpoint
-  // it came from, and where a member records whether it is a seed or a seedling:
-  // the family file is strict, so this loose per-session record is the only place
-  // an extra field can go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  // it came from, where a member records whether it is a seed or a seedling, and
+  // where the heir designation lives beside the patriarch's: the family file is
+  // strict, so this loose per-session record is the only place an extra field can
+  // go without an older reader having to know.
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)

@@ -11,6 +11,8 @@ export type LeafSnapshot = {
   patriarchName: string
   /** Which member is the family's patriarch now; the family id until one is designated. */
   patriarchSessionId: string
+  /** The member being raised as the family's next patriarch, if any. */
+  heirSessionId?: string
   /** The session managing this family, so a leaf can tell when the family moved. */
   matriarchSessionId: string
   matriarchName: string

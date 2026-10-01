@@ -40,6 +40,7 @@ parser.add_argument('--probe-merge-stress', action='store_true')
 parser.add_argument('--probe-merge-roles', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--probe-elder', action='store_true')
+parser.add_argument('--probe-arc', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -97,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
         view = view_tag(messages[-1].get('content', '') if messages else '')
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -1704,6 +1705,152 @@ def probe_elder():
                           readableWhileParked=True, reopened=True, recalled=True)), flush=True)
 
 
+def probe_arc():
+    """The succession arc, end to end, in one family.
+
+    Succession is the point of a family - one conversation raises another, hands
+    the role over, and steps back into a place the rest of the family can still
+    reach - and nothing has witnessed that as ONE sequence. The pieces exist (a
+    designation, an elder mark, a read that reaches a parked member), but a piece
+    is not an arc. This drives the whole thing in a live window and answers three
+    questions at once:
+
+      1. Before the handover the successor is WORKING. It holds something the
+         patriarch told it, told in a real turn - not merely a pointer that names
+         it - so the raise is a relationship and not a label.
+      2. The handover is ATOMIC. One command makes the successor the patriarch,
+         clears the heir designation, and files the member it displaced as an
+         elder; one read of the family afterwards shows all three together, so
+         they cannot have happened as separate steps that drifted apart.
+      3. After the former patriarch is parked it is reachable by a THIRD PARTY.
+         A different member - not the one that parked it - reads it and finds the
+         memory it kept, so an elder is the family's to consult rather than the
+         parker's private record.
+
+    The family: the window is the creator and the matriarch. A is a leaf made the
+    patriarch, B is raised as its heir, C is a bystander that does the reading.
+    A is parked from the window and read from C, so the parker and the reader are
+    different sessions - which is the whole of question 3.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+
+    # Three leaves. A will hold the role; B will be raised; C only reads. Each is
+    # started by opening it, which is also what gives it a live process to talk
+    # to later.
+    t.submit('/leaf new Elder')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'the patriarch-to-be', 75)
+    t.assert_view(t.leaves()[0]['sessionId'], 'the patriarch-to-be', 75)
+    t.original()
+    t.submit('/leaf new Heir')
+    t.wait(lambda: len(t.leaves()) == 2 and 'All 3' in t.text(), 'the successor', 75)
+    t.assert_view(t.leaves()[1]['sessionId'], 'the successor', 75)
+    t.original()
+    t.submit('/leaf new Witness')
+    t.wait(lambda: len(t.leaves()) == 3 and 'All 4' in t.text(), 'the bystander', 75)
+    t.assert_view(t.leaves()[2]['sessionId'], 'the bystander', 75)
+    t.original()
+
+    elder, heir, witness = t.leaves()[0], t.leaves()[1], t.leaves()[2]
+
+    # A holds the role. It is a leaf, not the window, so the window can park it
+    # the way it parks any member - and so the member that reads it afterwards is
+    # a different session again.
+    t.submit('/leaf patriarch ' + elder['sessionId'])
+    t.wait(lambda: 'is now the family patriarch' in t.after('/leaf patriarch ' + elder['sessionId']),
+           'the patriarch holds the role', 45)
+    t.check(lambda: t.pointer(t.id).get('patriarchSessionId') == elder['sessionId'],
+            'the designation did not move to the member the family was renamed after')
+
+    # The memory only the patriarch has. The fixture answers the marker, so the
+    # turn is real and the bytes it leaves are this member's own.
+    t.leaf(0)
+    t.submit('PATRIARCH_SECRET_')
+    t.wait(lambda: 'FIXTURE_REPLY_PATRIARCH_SECRET_' in t.text(), 'the patriarch learns something only it has', 45)
+    t.original()
+
+    # Raise the heir: a designation, written where the patriarch's is, so the
+    # family reads it and files it. This is the label half - question 1 is what
+    # makes it more than a label, and that is the training below.
+    t.submit('/leaf heir ' + heir['sessionId'])
+    t.wait(lambda: 'is now the family heir' in t.after('/leaf heir ' + heir['sessionId']),
+           'the heir is designated', 45)
+    t.check(lambda: t.pointer(t.id).get('heirSessionId') == heir['sessionId'],
+            'the heir designation is not written where the patriarch’s is')
+    # The designation is a filing, not a mode: the member keeps its row and its
+    # standing, so nothing about it becomes a patriarch before the handover.
+    raised = {member['sessionId']: member for member in t.family().get('members', [])}
+    t.check(lambda: raised.get(heir['sessionId'], {}).get('status') == 'open' and
+            raised.get(heir['sessionId'], {}).get('eldership') is None,
+            'naming the heir changed the member’s own standing, not just its filing')
+
+    # THE TRAINING. The patriarch tells the heir what it knows, in a real turn,
+    # and the heir answers. Before the send the heir has never heard it; after,
+    # it holds the patriarch's secret on its own screen. That is question 1: the
+    # successor is working, and the raise is a conversation, not a pointer move.
+    t.submit('/leaf read ' + heir['sessionId'])
+    t.wait(lambda: 'Leaf #' in t.after('/leaf read ' + heir['sessionId']), 'the heir can be read', 45)
+    t.check(lambda: 'PATRIARCH_SECRET_' not in t.after('/leaf read ' + heir['sessionId']),
+            'the heir already held the patriarch’s secret before it was told')
+    t.leaf(0)
+    t.submit('/leaf send ' + heir['sessionId'] + ' PATRIARCH_SECRET_')
+    t.wait(lambda: 'PATRIARCH_SECRET_' in t.after('/leaf send'), 'the patriarch tells the heir', 30)
+    t.leaf(1)
+    t.wait(lambda: 'FIXTURE_REPLY_PATRIARCH_SECRET_' in t.text(), 'the heir answers with what it was told', 60)
+    t.original()
+
+    # THE HANDOVER. One command. The successor takes the role, the heir
+    # designation it just realized is cleared, and the member it displaced is
+    # filed as an elder - and one read of the family shows all three together,
+    # which is question 2: atomic, not three steps that could drift apart.
+    t.submit('/leaf patriarch ' + heir['sessionId'])
+    t.wait(lambda: 'is now the family patriarch' in t.after('/leaf patriarch ' + heir['sessionId']),
+           'the heir ascends', 45)
+    pointer = t.pointer(t.id)
+    members = {member['sessionId']: member for member in t.family().get('members', [])}
+    ascended = pointer.get('patriarchSessionId') == heir['sessionId']
+    cleared = pointer.get('heirSessionId') is None
+    filed = members.get(elder['sessionId'], {}).get('eldership') is True
+    t.check(lambda: ascended, 'the ascension did not make the heir the patriarch')
+    t.check(lambda: cleared, 'the heir designation was not cleared in the same write as the ascension')
+    t.check(lambda: filed, 'the displaced patriarch was not filed as an elder in the same write as the ascension')
+    # The heir that ascended is an ordinary member again, and the elder that was
+    # displaced keeps its place - the mark it gained is the only change.
+    t.check(lambda: members.get(heir['sessionId'], {}).get('eldership') is None,
+            'the heir that ascended was filed as an elder too, not as the patriarch')
+
+    # Park the former patriarch. The window parks it; the reading below is done
+    # from another member, so an elder is not the parker's private record. The
+    # wait is for "no longer open", not the word `archived`: the member is a live
+    # process, and archiving it ends that process, whose exit handler files it
+    # back as `closed` (leafWorkspace.ts onExit) - which of the two words the row
+    # ends on is a race this probe must not depend on.
+    t.submit('/leaf archive ' + elder['sessionId'])
+    t.wait(lambda: 'Leaf archive recorded' in t.text(), 'the archive is recorded', 30)
+    t.wait(lambda: any(member['sessionId'] == elder['sessionId'] and member['status'] != 'open'
+                       for member in t.leaves()), 'the former patriarch is parked', 60)
+    parked = next(member['status'] for member in t.family().get('members', [])
+                  if member['sessionId'] == elder['sessionId'])
+
+    # QUESTION 3. A third party - the bystander, which neither held the role nor
+    # parked the member - reads the parked elder and finds the memory it kept. If
+    # only the parker could reach it, the elder would be a personal resource; this
+    # is what makes it the family's.
+    t.leaf(2)
+    t.submit('/leaf read ' + elder['sessionId'])
+    t.wait(lambda: 'PATRIARCH_SECRET_' in t.after('/leaf read ' + elder['sessionId']),
+           'a third party reaches the parked elder', 45)
+    t.check(lambda: '[peer session transcript' in t.after('/leaf read ' + elder['sessionId']),
+            'the third-party read was not labelled as peer-authored text')
+
+    t.original()
+    t.close_leaves(60)
+    t.exit()
+    print(json.dumps(dict(elder=elder['sessionId'], heir=heir['sessionId'], witness=witness['sessionId'],
+                          heirDesignated=True, trained=True, ascended=ascended, clearedInSameWrite=cleared,
+                          elderFiledInSameWrite=filed, parkedAs=parked, thirdPartyRead=True)), flush=True)
+
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -2756,6 +2903,7 @@ try:
         (args.probe_compact, probe_compact), (args.probe_merge_stress, probe_merge_stress),
         (args.probe_merge_roles, probe_merge_roles),
         (args.probe_elder, probe_elder),
+        (args.probe_arc, probe_arc),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
     if chosen:
