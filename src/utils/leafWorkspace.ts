@@ -2734,9 +2734,11 @@ export async function conferPatriarch(sessionId: string): Promise<string> {
  * a member mid-turn is left to finish first. A member that is merely running is
  * not a refusal - being up is the ordinary state of a member you would raise.
  *
- * The write is gated by `requireMatriarch`, so a member naming itself the heir is
- * unreachable by construction rather than by a check: a leaf's request relays to
- * the process hosting the family, and this function runs there.
+ * A member cannot name itself: the write runs on the matriarch, and a member
+ * that asks is always mid-turn - it is running this very command - so the
+ * turn check above refuses it. The lease gate (`requireMatriarch`) is about
+ * which window manages the family; the turn check is what a self-naming member
+ * actually hits, and it is what makes self-naming unreachable in practice.
  */
 export async function conferHeir(sessionId: string): Promise<string> {
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('heir', [sessionId])

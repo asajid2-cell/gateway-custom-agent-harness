@@ -41,6 +41,7 @@ parser.add_argument('--probe-merge-roles', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--probe-elder', action='store_true')
 parser.add_argument('--probe-arc', action='store_true')
+parser.add_argument('--probe-stress', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -1851,6 +1852,112 @@ def probe_arc():
                           elderFiledInSameWrite=filed, parkedAs=parked, thirdPartyRead=True)), flush=True)
 
 
+def probe_stress():
+    """What the family model does when it is pushed.
+
+    Two claims a live surface can falsify, asked of the surface rather than the
+    code: that a member cannot raise ITSELF (the write is gated on the matriarch),
+    and that a raised successor is the family's answer to losing its patriarch.
+    It also looks for the state a discarded successor leaves behind. Nothing is
+    asserted away - the surface is asked, and what it does is the result, so a
+    refusal is an answer and so is a success the design did not intend.
+
+    Run it against a fresh config tree; it reads and writes only its own family.
+    """
+    results = {}
+
+    def answered(command, needles, timeout=90):
+        t.submit(command)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            t.pump()
+            shown = t.after(command)
+            if any(needle in shown for needle in needles):
+                return shown
+            time.sleep(.05)
+        return t.after(command)
+
+    def refusal_line(shown):
+        for line in shown.splitlines():
+            if 'Leaf operation failed' in line:
+                return ' '.join(line.split())[-200:]
+        return ''
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+
+    # Two leaves: Alpha is raised and then tries to take the role itself; Bravo is
+    # the rival it is later replaced by.
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'Alpha', 75)
+    t.assert_view(t.leaves()[0]['sessionId'], 'Alpha', 75)
+    t.original()
+    t.submit('/leaf new Bravo')
+    t.wait(lambda: len(t.leaves()) == 2 and 'All 3' in t.text(), 'Bravo', 75)
+    t.assert_view(t.leaves()[1]['sessionId'], 'Bravo', 75)
+    t.original()
+    alpha, bravo = t.leaves()[0], t.leaves()[1]
+
+    # The window raises Alpha. The ordinary path, expected to work, and the thing
+    # everything after it is measured against.
+    shown = answered('/leaf heir ' + alpha['sessionId'], ('is now the family heir', 'Leaf operation failed'))
+    results['raiseAlpha'] = 'heir' if 'is now the family heir' in shown else (refusal_line(shown) or 'no output')
+
+    # CLAIM 1: the heir cannot name ITSELF the patriarch, by construction. The
+    # heir is a member; entering it and asking is exactly what a successor would
+    # do, and a relay the matriarch runs on the member's behalf is a relay the
+    # member asked for - so if this succeeds, the claim is false.
+    t.leaf(0)
+    shown = answered('/leaf patriarch ' + alpha['sessionId'], ('is now the family patriarch', 'Leaf operation failed'))
+    t.original()
+    results['heirSelfPromoted'] = t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId']
+    results['heirSelfPromotionSaid'] = 'patriarch' if 'is now the family patriarch' in shown else (refusal_line(shown) or 'no output')
+
+    # A discarded successor. Raise Alpha, replace it with Bravo - the successor
+    # that failed - then park Bravo. What does the designation say now? If it
+    # still names a parked member, the family points at a successor that cannot
+    # succeed.
+    answered('/leaf heir ' + alpha['sessionId'], ('is now the family heir', 'Leaf operation failed'))
+    answered('/leaf heir ' + bravo['sessionId'], ('is now the family heir', 'Leaf operation failed'))
+    answered('/leaf close ' + bravo['sessionId'], ('closed', 'Leaf operation failed'))
+    t.wait(lambda: any(item['sessionId'] == bravo['sessionId'] and item['status'] != 'open' for item in t.leaves()),
+           'the discarded successor is parked', 60)
+    heir_now = t.pointer(t.id).get('heirSessionId')
+    parked = {item['sessionId']: item['status'] for item in t.family().get('members', [])}
+    results['staleHeirAfterDiscard'] = heir_now == bravo['sessionId'] and parked.get(bravo['sessionId']) != 'open'
+    results['heirAfterDiscard'] = None if heir_now is None else (heir_now[:8] + ' (' + str(parked.get(heir_now)) + ')')
+
+    # CLAIM 2: when the patriarch is lost, the raised successor takes over. Reopen
+    # Bravo and raise it again, make Alpha the patriarch, then close Alpha. The
+    # lowest-numbered open member wins the promotion - the question is whether the
+    # heir does, or is passed over.
+    answered('/leaf reopen ' + bravo['sessionId'], ('reopened', 'Leaf operation failed'))
+    t.wait(lambda: any(item['sessionId'] == bravo['sessionId'] and item['status'] == 'open' for item in t.leaves()),
+           'the rival is back', 90)
+    answered('/leaf heir ' + bravo['sessionId'], ('is now the family heir', 'Leaf operation failed'))
+    answered('/leaf patriarch ' + alpha['sessionId'], ('is now the family patriarch', 'Leaf operation failed'))
+    answered('/leaf close ' + alpha['sessionId'], ('closed', 'Leaf operation failed'))
+    t.wait(lambda: t.pointer(t.id).get('patriarchSessionId') != alpha['sessionId'], 'the role moved off the closed patriarch', 60)
+    new_patriarch = t.pointer(t.id).get('patriarchSessionId')
+    results['heirPassedOverOnDeath'] = new_patriarch == t.id
+    results['newPatriarchAfterDeath'] = new_patriarch[:8] if isinstance(new_patriarch, str) else new_patriarch
+    results['heirWas'] = bravo['sessionId'][:8]
+    heir_after_death = t.pointer(t.id).get('heirSessionId')
+    results['heirAfterDeath'] = None if heir_after_death is None else heir_after_death[:8]
+
+    # Invariants: whatever happened, the family is coherent - one patriarch, the
+    # file parses, and no number repeats.
+    members = t.family().get('members', [])
+    numbers = [item['number'] for item in members]
+    results['onePatriarch'] = new_patriarch in {item['sessionId'] for item in members}
+    results['numbersUnique'] = len(numbers) == len(set(numbers))
+
+    t.original()
+    t.close_leaves(90)
+    t.exit()
+    print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -2904,6 +3011,7 @@ try:
         (args.probe_merge_roles, probe_merge_roles),
         (args.probe_elder, probe_elder),
         (args.probe_arc, probe_arc),
+        (args.probe_stress, probe_stress),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
     if chosen:
