@@ -47,6 +47,83 @@ function validatePrivateDirectory(directory: string): Promise<void> {
   return check
 }
 
+/** How one PowerShell ACL probe can fail, as `execFile` reports it. */
+type AclProbeFault = Error & {
+  code?: number | string | null
+  killed?: boolean
+  signal?: NodeJS.Signals | null
+  syscall?: string
+  stderr?: string
+}
+
+const ACL_PROBE_TIMEOUT_MS = 10_000
+/**
+ * How many times a probe that ran out of time is tried again.
+ *
+ * A spawn that did not finish inside the timeout says nothing about the
+ * directory: the machine was busy, which is the ordinary way this happens and
+ * is exactly the case that must not be read as a verdict. One retry covers it.
+ */
+const ACL_PROBE_ATTEMPTS = 2
+
+/**
+ * Say what went wrong with a PowerShell probe in its own terms.
+ *
+ * The ACL check is a spawn, and everything that can go wrong with one - no
+ * `powershell.exe` on PATH, a machine too busy to start one inside the timeout,
+ * output too large for the buffer, a probe that died of its own error - has to
+ * be told apart from the verdict the probe exists to produce. The check used to
+ * read all of them as its own answer, so a session whose peers were perfectly
+ * well protected was told "Session directory must have a private Windows ACL":
+ * a statement about the directory made by a process that never read it.
+ */
+function describePowerShellFault(fault: AclProbeFault): string {
+  if (fault.killed === true || fault.signal) return `it did not finish within ${ACL_PROBE_TIMEOUT_MS / 1000}s (${fault.signal ?? 'timed out'})`
+  const stderr = (fault.stderr ?? '').trim().split('\n')[0]?.slice(0, 300)
+  const code = fault.code === undefined || fault.code === null ? 'no exit code' : String(fault.code)
+  return `it failed with ${code}${fault.syscall ? ` (${fault.syscall})` : ''}${stderr ? `: ${stderr}` : ''}`
+}
+
+/**
+ * Run one PowerShell ACL step, retrying a run that only ran out of time.
+ *
+ * Shared by the check and by the creation of a new directory, because both are
+ * the same spawn and both used to answer for its failures with a claim about the
+ * directory. A retry is safe for either: reading an ACL and setting one are both
+ * idempotent.
+ */
+async function runAclPowerShell(script: string, directory: string): Promise<{ kind: 'ok' } | { kind: 'fault'; fault: AclProbeFault }> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        env: { ...process.env, GATEWAY_DIRECTORY_CHECK: directory }, timeout: ACL_PROBE_TIMEOUT_MS, maxBuffer: 4096, windowsHide: true,
+      })
+      return { kind: 'ok' }
+    } catch (error) {
+      const fault = error as AclProbeFault
+      if (attempt < ACL_PROBE_ATTEMPTS && (fault.killed === true || fault.signal != null)) continue
+      return { kind: 'fault', fault }
+    }
+  }
+}
+
+/**
+ * Run one ACL probe and say which of three things happened.
+ *
+ * Only the probe's own exit codes are a verdict about the directory: 2 is
+ * another account owning it, 3 an allow rule for an account that is not this
+ * user, SYSTEM or Administrators. Everything else is the check failing to run,
+ * and a check that cannot run must still fail closed - an unverified directory
+ * is not a trusted one - but it fails saying so, not with the verdict it never
+ * reached.
+ */
+async function probeDirectoryAcl(script: string, directory: string): Promise<{ kind: 'ok' } | { kind: 'verdict' } | { kind: 'unavailable'; detail: string }> {
+  const run = await runAclPowerShell(script, directory)
+  if (run.kind === 'ok') return { kind: 'ok' }
+  if (run.fault.code === 2 || run.fault.code === 3) return { kind: 'verdict' }
+  return { kind: 'unavailable', detail: describePowerShellFault(run.fault) }
+}
+
 async function checkPrivateDirectory(directory: string): Promise<void> {
   const stat = await lstat(directory)
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Invalid session directory')
@@ -55,11 +132,9 @@ async function checkPrivateDirectory(directory: string): Promise<void> {
     return
   }
   const script = `$ErrorActionPreference='Stop'; $acl=Get-Acl -LiteralPath $env:GATEWAY_DIRECTORY_CHECK; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if($owner -ne $sid){exit 2}; foreach($rule in $acl.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])) { if($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($sid,'S-1-5-18','S-1-5-32-544')) {exit 3} }`
-  try {
-    await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-      env: { ...process.env, GATEWAY_DIRECTORY_CHECK: directory }, timeout: 10000, maxBuffer: 4096, windowsHide: true,
-    })
-  } catch { throw new Error('Session directory must have a private Windows ACL') }
+  const probe = await probeDirectoryAcl(script, directory)
+  if (probe.kind === 'verdict') throw new Error('Session directory must have a private Windows ACL')
+  if (probe.kind === 'unavailable') throw new Error(`Could not check the session directory's permissions: ${probe.detail}`)
 }
 
 export async function sendGatewayHookMessage(env: NodeJS.ProcessEnv, toSessionId: string, text: string): Promise<unknown> {
@@ -391,11 +466,8 @@ export class GatewaySessionTransport {
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
     if (created && process.platform === 'win32') {
       const script = `$ErrorActionPreference='Stop'; $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false); $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule); Set-Acl -LiteralPath $env:GATEWAY_DIRECTORY_CHECK -AclObject $acl`
-      try {
-        await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-          env: { ...process.env, GATEWAY_DIRECTORY_CHECK: this.options.directory }, timeout: 10000, maxBuffer: 4096, windowsHide: true,
-        })
-      } catch { throw new Error('Could not create private session directory') }
+      const run = await runAclPowerShell(script, this.options.directory)
+      if (run.kind === 'fault') throw new Error(`Could not make the session directory private: ${describePowerShellFault(run.fault)}`)
     }
     await validatePrivateDirectory(this.options.directory)
     // A live registration is never overwritten. The exclusive claim also

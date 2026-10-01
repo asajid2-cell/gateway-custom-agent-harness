@@ -102,6 +102,29 @@ test('since returns what is new, and says so when the cursor has scrolled away',
   assert.deepEqual(behind.turns.map(item => item.text), ['two', 'three', 'four'])
 })
 
+test('a cursor that names an entry no reader is shown still follows exactly', async () => {
+  // A session writes records that are not turns - a system note, a user entry
+  // that is only tool results - and the tip a read walks to is often one of
+  // them. A cursor naming it used to be a cursor `since` could not find, so the
+  // read reported it as scrolled away and answered with the newest window: the
+  // turns the caller had already been given, handed to it a second time.
+  const path = await transcript([
+    turn('user', 'u1', null, text('one'), 0),
+    turn('assistant', 'a2', 'u1', text('two'), 1),
+    turn('system', 's3', 'a2', undefined, 2),
+  ])
+  const first = await readTranscriptSlice(path, 'session', { tail: 1 })
+  assert.deepEqual(first.turns.map(item => item.text), ['two'])
+  assert.equal(first.cursor, 's3')
+  const next = await readTranscriptSlice(path, 'session', { tail: 1, since: first.cursor })
+  assert.deepEqual(next.turns, [])
+  assert.equal(next.behind, false)
+  // And a cursor from before it still returns strictly what came after it.
+  const after = await readTranscriptSlice(path, 'session', { tail: 1, since: 'u1' })
+  assert.deepEqual(after.turns.map(item => item.text), ['two'])
+  assert.equal(after.behind, false)
+})
+
 test('a cursor older than the window is reported rather than answered wrongly', async () => {
   const path = await transcript([
     turn('user', 'u1', null, text('one'), 0),

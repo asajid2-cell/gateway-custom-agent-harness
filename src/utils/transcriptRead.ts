@@ -34,7 +34,13 @@ export type TranscriptTurn = {
 export type TranscriptSlice = {
   sessionId: string
   turns: TranscriptTurn[]
-  /** The last returned turn's id, to be passed back as `since` next time. */
+  /**
+   * The newest entry the read walked to, to be passed back as `since` next time.
+   *
+   * It is an entry id rather than a turn id: the tip of the chain can be a
+   * record no reader is shown, and `since` resolves against the chain so that
+   * a cursor naming one of those still follows exactly.
+   */
   cursor: string
   /** The requested `since` was not in the read window, so older turns are missing. */
   behind: boolean
@@ -219,9 +225,9 @@ function clamp(value: number, min: number, max: number): number {
 /**
  * Read the last turns of a transcript, chain-correct and bounded.
  *
- * `since` returns only what came after a turn id the caller already saw; if that
- * turn is not in the window the answer says so (`behind`) rather than quietly
- * returning the wrong slice.
+ * `since` returns only what came after an entry id the caller already saw; if
+ * that entry is not in the window the answer says so (`behind`) rather than
+ * quietly returning the wrong slice.
  */
 export async function readTranscriptSlice(
   path: string,
@@ -250,12 +256,20 @@ export async function readTranscriptSlice(
   let turns = allTurns
   let behind = false
   if (options.since) {
-    const at = allTurns.findIndex(turn => turn.uuid === options.since)
+    // Resolved against the chain rather than against the turns, because the
+    // cursor a read hands back is the newest entry it walked to and a session
+    // writes entries no reader is shown - a system note, a user entry that is
+    // only tool results. A cursor naming one of those was a cursor this could
+    // not find, which read as "scrolled away" and answered with the newest
+    // window: turns the caller had already been given, handed to it again.
+    // Against the chain, "what came after it" is exact whichever it names.
+    const at = chain.ordered.findIndex(entry => entry.uuid === options.since)
     if (at < 0) {
       behind = true
       turns = allTurns.slice(-tail)
     } else {
-      turns = allTurns.slice(at + 1)
+      const newer = new Set(chain.ordered.slice(0, at).map(entry => entry.uuid))
+      turns = allTurns.filter(turn => newer.has(turn.uuid))
     }
   } else {
     turns = allTurns.slice(-tail)

@@ -99,7 +99,7 @@ test('forks work for any session with a transcript, not only an open leaf', asyn
   const source = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   assert.match(source, /getTranscriptPathForSession/)
   assert.match(source, /No session or open leaf matches/)
-  assert.match(source, /createFork\(undefined, parent \? \{ sessionId: parent\.member\.sessionId, transcriptPath: parent\.member\.transcriptPath \} : source\)/)
+  assert.match(source, /createFork\(undefined, sourceView \? \{ sessionId: sourceView\.member\.sessionId, transcriptPath: sourceView\.member\.transcriptPath \} : source\)/)
 })
 
 test('leaves skip setup modals that would wedge startup, inheriting trust instead', async () => {
@@ -335,7 +335,7 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'reparent', 'read', 'seed', 'seedling', 'merge', 'compact']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'patriarch', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-close']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
@@ -344,18 +344,18 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'merge', leaf: 'Scout', value: 'ledger' }).success, true)
 })
 
-test('a leaf can reach its parent, not only its siblings', async () => {
+test('a leaf can reach its matriarch, not only its siblings', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   // The root is a nameable target inside a leaf, so `send original ...` reports
   // up instead of failing to resolve a member that is not in the family list.
   assert.match(workspace, /export function rootReference\(reference: string\)/)
-  assert.match(workspace, /ref === 'parent'/)
-  assert.match(workspace, /if \(isInteractiveLeaf\(\) && rootReference\(reference\)\) return notifyLeafParent\(message\)/)
-  assert.match(workspace, /export async function notifyLeafParent/)
+  assert.match(workspace, /ref === 'patriarch'/)
+  assert.match(workspace, /if \(isInteractiveLeaf\(\) && rootReference\(reference\)\) return notifyLeafMatriarch\(message\)/)
+  assert.match(workspace, /export async function notifyLeafMatriarch/)
   assert.match(workspace, /case 'notify': \{/)
 
   const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
-  assert.match(tool, /return workspace\.notifyLeafParent\(input\.message\)/)
+  assert.match(tool, /return workspace\.notifyLeafMatriarch\(input\.message\)/)
   // The prompt must state the symmetry, or a leaf never tries it.
   const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
   assert.match(prompt, /notify: available inside a leaf only/)
@@ -365,7 +365,7 @@ test('a leaf can reach its parent, not only its siblings', async () => {
   assert.match(hook, /registerLeafContextNotify/)
 })
 
-test('roster is the verb that names the parent, and the prompt says so', async () => {
+test('roster is the verb that names the patriarch, and the prompt says so', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-roster-'))
   const saved = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = directory
@@ -388,8 +388,8 @@ test('roster is the verb that names the parent, and the prompt says so', async (
     // verb is documented as the family view, that it is named as the way to
     // reach the parent, and that it is told apart from `list`.
     assert.match(prompt, /roster: the family view/)
-    assert.match(prompt, /\[parent\]/)
-    assert.match(prompt, /roster.*shows it its parent|\\`roster\\` shows it its parent/)
+    assert.match(prompt, /\[patriarch\]/)
+    assert.match(prompt, /roster.*shows it the matriarch|\\`roster\\` shows it the matriarch/)
     assert.match(prompt, /\\`list\\` shows the same members/)
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
@@ -448,12 +448,12 @@ test('an archived leaf can be read, revived, and run without unfiling it', async
 
 test('a leaf can fork itself, which it cannot checkpoint while it asks', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  const create = workspace.slice(workspace.indexOf('export async function createLeaf'), workspace.indexOf('let hostRelease'))
+  const create = workspace.slice(workspace.indexOf('export async function createLeaf'), workspace.indexOf('let matriarchRelease'))
   // A mid-turn member refuses a checkpoint of its own turn, so a self-fork asked
   // for one and came back as an opaque failure. Only the asking leaf is skipped:
   // any other busy source is still a legible refusal.
-  assert.match(create, /const selfFork = parent\?\.member\.sessionId === options\.requestedBy/)
-  assert.match(create, /if \(parent && !options\.fresh && !selfFork\) await parent\.process\.checkpoint\(\)/)
+  assert.match(create, /const selfFork = sourceView\?\.member\.sessionId === options\.requestedBy/)
+  assert.match(create, /if \(sourceView && !options\.fresh && !selfFork\) await sourceView\.process\.checkpoint\(\)/)
   // The host knows which leaf asked from the request itself, not from a guess.
   assert.match(workspace, /requestedBy: sourceId/)
   // A fork copies a transcript FILE, and the host cannot flush another process's
@@ -496,7 +496,7 @@ test('a leaf menu acts on the family, never on the session holding it', async ()
   assert.match(dialog, /member\.status !== 'archived' && member\.sessionId !== self/)
   // A missing row is confusing on its own, so which session is on screen is
   // said out loud instead.
-  assert.ok(dialog.includes('These rows act on the rest of the family'), 'the self row is named, not just dropped')
+  assert.match(dialog, /is the session you are in; the rows below act on the rest of the family/, 'the self row is named, not just dropped')
 })
 
 test('a refusal a leaf cannot read is a refusal it cannot act on', async () => {
@@ -513,10 +513,10 @@ test('a refusal a leaf cannot read is a refusal it cannot act on', async () => {
 
 test('the fork source rule picks the session on screen, and only names a member when told to', () => {
   const CREATOR = 'creator-session'
-  const PARENT = 'parent-session'
+  const PATRIARCH = 'patriarch-session'
   const SELF = 'self-session'
   const LEAF = 'leaf-session'
-  const family = { creator: CREATOR, parent: PARENT, self: SELF }
+  const family = { creator: CREATOR, patriarch: PATRIARCH, self: SELF }
   // The reported bug: with a leaf on screen, a bare fork copied the conversation
   // behind it and silently discarded the leaf's context.
   assert.equal(resolveLeafSource(undefined, family, LEAF), LEAF)
@@ -524,10 +524,10 @@ test('the fork source rule picks the session on screen, and only names a member 
   // is the member itself, not the family's creator.
   assert.equal(resolveLeafSource(undefined, family, undefined), SELF)
   // Naming a family member forces that one, even with a leaf selected - and the
-  // family's creator and its designated parent are different members.
+  // family's creator and its designated patriarch are different members.
   assert.equal(resolveLeafSource('original', family, LEAF), CREATOR)
-  assert.equal(resolveLeafSource('root', family, LEAF), PARENT)
-  assert.equal(resolveLeafSource('parent', family, LEAF), PARENT)
+  assert.equal(resolveLeafSource('root', family, LEAF), PATRIARCH)
+  assert.equal(resolveLeafSource('patriarch', family, LEAF), PATRIARCH)
   assert.equal(resolveLeafSource('  original  ', family, LEAF), CREATOR)
   // An explicit session ID wins over the selection.
   assert.equal(resolveLeafSource('other-session', family, LEAF), 'other-session')
@@ -536,25 +536,25 @@ test('the fork source rule picks the session on screen, and only names a member 
 test('creating a leaf forks what you are looking at, not the root behind it', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   const create = workspace.slice(workspace.indexOf('export async function createLeaf'), workspace.indexOf('/**\n * Rebuild the in-memory view'))
-  assert.match(create, /const resolvedParentId = resolveLeafSource\(parentSessionId, \{ creator: root, parent: getLeafParentSessionId\(\), self \}, selectedLeafId\(\)\)/)
+  assert.match(create, /const resolvedSourceId = resolveLeafSource\(parentSessionId, \{ creator: root, patriarch: getLeafPatriarchSessionId\(\), self \}, selectedLeafId\(\)\)/)
   // The session asking is the source when nothing else is named, so a member
   // opens new leaves from itself rather than from the conversation behind it.
-  assert.match(create, /const fromSelf = resolvedParentId === self/)
+  assert.match(create, /const fromSelf = resolvedSourceId === self/)
   // A branch of a checkpoint records the member the checkpoint came from as its
   // parent: the checkpoint is a point in that member's conversation, so that
   // member - not the checkpoint id - is the ancestry the family file holds.
-  assert.match(create, /parentSessionId: parent\?\.member\.sessionId \?\? checkpointBranch\?\.sourceSessionId \?\? resolvedParentId/)
+  assert.match(create, /parentSessionId: sourceView\?\.member\.sessionId \?\? checkpointBranch\?\.sourceSessionId \?\? resolvedSourceId/)
   // The resolved id, not the raw argument, seeds the fork and the fallback.
-  assert.match(create, /getTranscriptPathForSession\(resolvedParentId\)/)
-  assert.match(create, /source = \{ sessionId: resolvedParentId, transcriptPath \}/)
+  assert.match(create, /getTranscriptPathForSession\(resolvedSourceId\)/)
+  assert.match(create, /source = \{ sessionId: resolvedSourceId, transcriptPath \}/)
 })
 
 test('every member can name the conversation the family was forked from', () => {
   assert.equal(rootReference('original'), true)
   assert.equal(rootReference('root'), true)
-  assert.equal(rootReference('parent'), true)
+  assert.equal(rootReference('patriarch'), true)
   assert.equal(rootReference('ROOT'), true)
-  assert.equal(rootReference('  parent  '), true)
+  assert.equal(rootReference('  patriarch  '), true)
   // A leaf name must not be swallowed by the root aliases.
   assert.equal(rootReference('2'), false)
   assert.equal(rootReference('api'), false)
@@ -603,15 +603,15 @@ test('the bottom nav reaches the leaf menu, and the prompt overlay is what shows
   assert.match(prompt, /if \(showLeafMenu && !isFullscreenEnvEnabled\(\)\) return leafMenuDialog/)
 })
 
-test('the family outlives its parent: any member can find and reopen the rest', async () => {
+test('the family outlives its patriarch: any member can find and reopen the rest', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  // A member's own pointer is what makes membership survive the parent process:
+  // A member's own pointer is what makes membership survive the patriarch process:
   // the family file is keyed by the root's id, which only the root can know.
   // The pointer is also where a branch of a checkpoint records which checkpoint
   // it came from, and where a member records whether it is a seed or a seedling:
   // the family file is strict, so this loose per-session record is the only place
   // an extra field can go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; parentSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)
@@ -626,15 +626,15 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   // family, and found rather than synthesized.
   assert.match(workspace, /export async function leafCreatorMember\(\): Promise<LeafMember \| undefined>/)
   assert.match(workspace, /if \(root === getSessionId\(\)\) return undefined/)
-  assert.match(workspace, /export async function leafParentMember\(\): Promise<LeafMember \| undefined>/)
+  assert.match(workspace, /export async function leafPatriarchMember\(\): Promise<LeafMember \| undefined>/)
   // Real members answer before the aliases do, and the aliases split: the
-  // family's creator is not necessarily the member designated as its parent.
+  // family's creator is not necessarily the member designated as its patriarch.
   assert.match(workspace, /const direct = resolveLeafMember\(members, reference\)/)
   assert.match(workspace, /if \(ref === 'original'\) return leafCreatorMember\(\)/)
-  assert.match(workspace, /if \(ref === 'family-parent' \|\| ref === 'parent' \|\| ref === 'root'\) return leafParentMember\(\)/)
-  // The other role has a name of its own: `session-parent` is the session holding
+  assert.match(workspace, /if \(ref === 'patriarch' \|\| ref === 'root'\) return leafPatriarchMember\(\)/)
+  // The other role has a name of its own: `matriarch` is the session holding
   // the family's terminal, which is not necessarily the designated member.
-  assert.match(workspace, /if \(ref === 'session-parent' \|\| ref === 'host'\)/)
+  assert.match(workspace, /if \(ref === 'matriarch'\)/)
   assert.match(workspace, /await ensureCreatorMember\(familyPath\(root\), root, \{/)
   assert.match(workspace, /const members = await ensureCreatorRow\(root, family\.members\)/)
   // A member with a fork point is always resumed; the creator is resumed when
@@ -647,22 +647,22 @@ test('the family outlives its parent: any member can find and reopen the rest', 
   // session doing the asking is refused - and asking means the leaf behind a
   // request, not the session that executes it, or a leaf could never close the
   // parent hosting its family.
-  assert.doesNotMatch(workspace, /changeParent/)
+  assert.doesNotMatch(workspace, /reparentLeaf/)
   assert.match(workspace, /That is the session you are in; it ends when you leave it/)
   assert.match(workspace, /if \(sessionId === \(requestedBy \?\? self\)\)/)
   assert.match(workspace, /case 'change': result = await changeLeaf\(id, value, sourceId\)/)
   // Closing or archiving the designated parent hands the family to the next
   // member in line, so a family never keeps naming a parent that has left.
-  assert.match(workspace, /async function promoteNextParent\(root: string, leaving: string\)/)
-  assert.match(workspace, /await writeFamilyParentDesignation\(root, next\.sessionId\)/)
+  assert.match(workspace, /async function promoteNextPatriarch\(root: string, leaving: string\)/)
+  assert.match(workspace, /await writePatriarchDesignation\(root, next\.sessionId\)/)
   // Reopening it from a member must not put two writers on one transcript.
-  assert.match(workspace, /await claimHostOwnership\(\)/)
+  assert.match(workspace, /await claimMatriarchOwnership\(\)/)
   assert.match(workspace, /is already open in another window; close it there before opening it here/)
   // Every member is a leaf, the creator included, so the bar and the roster are
   // the same list.
   assert.match(workspace, /export function getLeafCarouselViews\(\): LeafView\[\]/)
   assert.match(workspace, /return \[\.\.\.views\.values\(\)\]\.filter\(view => view\.rootSessionId === root\)/)
-  assert.match(workspace, /export function getLeafHostName\(\): string/)
+  assert.match(workspace, /export function getLeafMatriarchName\(\): string/)
   assert.match(workspace, /export function getLeafSelfName\(\): string/)
   assert.match(workspace, /return \(await currentFamily\(\)\)\.members\.filter\(member => member\.sessionId !== self\)/)
 })
@@ -695,10 +695,10 @@ test('every member is an entry point, and the doctrine says so', async () => {
   // is a designation that can move, and any member opens on its own.
   assert.doesNotMatch(prompt, /forked from this one/)
   assert.match(prompt, /cc --resume <session id>/)
-  assert.match(prompt, /reparent: make another member the family's parent/)
+  assert.match(prompt, /patriarch: confer the title of patriarch on another member/)
   assert.match(prompt, /The family id is the session the family was created from/)
   assert.match(prompt, /\\`original\\` names the member the family was created from/)
-  assert.match(prompt, /\\`parent\\` and \\`root\\` name the member designated as its parent/)
+  assert.match(prompt, /\\`patriarch\\` and \\`root\\` name the member designated as its head/)
   assert.match(prompt, /DESCRIPTION = 'See, talk to, and drive the leaf sessions in this family\.'/)
 
   // The menu hands out the command that opens each member from anywhere. It is
@@ -715,16 +715,16 @@ test('every member is an entry point, and the doctrine says so', async () => {
   // The peer skill carries the same model: a member is addressable by its own
   // session id, and the parent is a designation rather than an address.
   const peers = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
-  assert.match(peers, /which member is the parent is a designation that can move/)
+  assert.match(peers, /which member is the patriarch is a designation that can move/)
   assert.match(peers, /never assume the session a family was created from is the one that owns the rest/)
 })
 
-test('the leaf menu treats the parent as an ordinary member', async () => {
+test('the leaf menu treats the patriarch as an ordinary member', async () => {
   const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
   // The creator has a row like every other member, so there is no second path
   // for it: one set of open/close/archive rows covers the whole family.
-  assert.doesNotMatch(dialog, /leafParentMember/)
-  assert.doesNotMatch(dialog, /leafParentIsOpen/)
+  assert.doesNotMatch(dialog, /leafPatriarchMember/)
+  assert.doesNotMatch(dialog, /leafPatriarchIsOpen/)
   assert.match(dialog, /const open = members\?\.filter\(member => member\.status !== 'archived' && member\.sessionId !== self\) \?\? \[\]/)
   assert.match(dialog, /label: `Open  #\$\{member\.number\} \$\{member\.name\}`/)
   assert.match(dialog, /label: `Archive #\$\{member\.number\} \$\{member\.name\}`/)
@@ -735,13 +735,13 @@ test('the leaf menu treats the parent as an ordinary member', async () => {
   // the leaf in the slot twice and left the parent unnamed - so the wizard's
   // "forks the session you are looking at" line names the session asking
   // instead, which is the other question.
-  assert.match(dialog, /label: getLeafHostName\(\)/)
+  assert.match(dialog, /label: getLeafMatriarchName\(\)/)
   assert.match(dialog, /forks the session you are looking at: \{sourceName\}/)
   assert.match(dialog, /const sourceName = selected \? \(members\?\.find\(member => member\.sessionId === selected\)\?\.name \?\? selected\) : getLeafSelfName\(\)/)
   assert.match(dialog, /views=\{getLeafCarouselViews\(\)\}/)
 })
 
-test('the creator wizard defaults to the conversation on screen rather than the designated parent', async () => {
+test('the creator wizard defaults to the conversation on screen rather than the designated patriarch', async () => {
   const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
   assert.match(dialog, /useState\(selectedId \?\? getSessionId\(\)\)/)
   assert.doesNotMatch(dialog, /useState\(selectedId \?\? 'root'\)/)
@@ -749,8 +749,8 @@ test('the creator wizard defaults to the conversation on screen rather than the 
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   const roster = workspace.slice(workspace.indexOf('export async function listLeafMenuMembers'), workspace.indexOf('export async function resolveLeafRef'))
   assert.doesNotMatch(roster, /!selfLeafMemberId\(\)/)
-  assert.match(workspace, /hostName: getLeafSelfName\(\)/)
-  assert.match(workspace, /return snapshot\.hostName/)
+  assert.match(workspace, /matriarchName: getLeafSelfName\(\)/)
+  assert.match(workspace, /return snapshot\.matriarchName/)
 })
 
 test('archive detaches a leaf without deleting anything', async () => {
@@ -762,10 +762,10 @@ test('archive detaches a leaf without deleting anything', async () => {
   // Detach must not become delete: no file removal anywhere in the menu.
   assert.doesNotMatch(dialog, /\bunlink\b|\brmSync\b|\brm\(/)
   // An archived leaf leaves the menu, which is what "detached" means here. The
-  // wizard's fork-source list also drops the designated parent, which has the
+  // wizard's fork-source list also drops the designated patriarch, which has the
   // first row to itself and would otherwise appear twice.
   assert.match(dialog, /members\?\.filter\(member => member\.status !== 'archived' && member\.sessionId !== self\)/)
-  assert.match(dialog, /\(members \?\? \[\]\)\.filter\(member => member\.status !== 'archived' && member\.sessionId !== parentId\)/)
+  assert.match(dialog, /\(members \?\? \[\]\)\.filter\(member => member\.status !== 'archived' && member\.sessionId !== patriarchId\)/)
 
   // The engine path already releases the process and the owner claim, keeps the
   // family file entry, and drops it from the live views the carousel reads.

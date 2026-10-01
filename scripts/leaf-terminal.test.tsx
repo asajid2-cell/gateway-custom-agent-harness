@@ -81,8 +81,8 @@ for (const columns of [40, 100]) test(`carousel pointer and wheel select full se
     t.mouse(64, t.point('2 Chat 2')); await settle()
     assert.equal(selected, 'leaf-0')
     await t.click('All 6')
-    const { getLeafRootName } = await import('../src/utils/leafWorkspace.ts')
-    await t.click(getLeafRootName())
+    const { getLeafPatriarchName } = await import('../src/utils/leafWorkspace.ts')
+    await t.click(getLeafPatriarchName())
     assert.equal(selected, undefined)
   } finally { t.close() }
 })

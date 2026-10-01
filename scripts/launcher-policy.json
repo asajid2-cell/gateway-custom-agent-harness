@@ -1,0 +1,4 @@
+{
+  "prewarmTimeoutMs": 180000,
+  "partnerStartupTimeoutMs": 60000
+}

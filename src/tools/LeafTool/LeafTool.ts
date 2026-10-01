@@ -22,7 +22,7 @@ const inputSchema = lazySchema(() =>
         'return',
         'notify',
         'roster',
-        'reparent',
+        'patriarch',
         'read',
         'checkpoints',
         'checkpoint-drop',
@@ -31,6 +31,9 @@ const inputSchema = lazySchema(() =>
         'seedling',
         'merge',
         'compact',
+        'partner',
+        'partners',
+        'partner-close',
       ])
       .describe('Operation to perform on the leaf family'),
     leaf: z
@@ -94,7 +97,11 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       return workspace.checkpointLeaf(requireLeaf(), input.name?.trim() || undefined)
     case 'close':
     case 'reopen': {
-      const member = await workspace.resolveLeafRef(requireLeaf())
+      // Closing may name the session you are in; reopening may not, because the
+      // session on screen is already running.
+      const member = input.action === 'close'
+        ? await workspace.resolveCloseTarget(requireLeaf())
+        : await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       const promoted = await workspace.changeLeaf(member.sessionId, { status: input.action === 'close' ? 'closed' : 'open' })
       return `Leaf #${member.number} ${member.name} ${input.action === 'close' ? 'closed' : 'reopened'}; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`
@@ -108,8 +115,8 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       if (!input.message) throw new Error('Selected context is required to return')
       return workspace.returnLeafContext(requireLeaf(), input.message)
     case 'notify':
-      if (!input.message) throw new Error('A message is required to notify the parent')
-      return workspace.notifyLeafParent(input.message)
+      if (!input.message) throw new Error('A message is required to notify the matriarch')
+      return workspace.notifyLeafMatriarch(input.message)
     case 'roster':
       return workspace.familyRoster()
     case 'read':
@@ -117,10 +124,10 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
         ...(input.tail !== undefined ? { tail: input.tail } : {}),
         ...(input.since?.trim() ? { since: input.since.trim() } : {}),
       })
-    case 'reparent': {
+    case 'patriarch': {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      return workspace.reparentLeaf(member.sessionId)
+      return workspace.conferPatriarch(member.sessionId)
     }
     case 'checkpoints':
       return workspace.listLeafCheckpoints(input.leaf?.trim() || undefined)
@@ -146,6 +153,17 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     }
     case 'compact':
       return workspace.compactLeaf(requireLeaf())
+    // A partner is a session, not a family member: it is launched, listed and
+    // closed by its own address on the peer bus rather than by a leaf number.
+    case 'partner':
+      return workspace.createPartner({
+        ...(input.name?.trim() ? { purpose: input.name.trim() } : {}),
+        ...(input.value?.trim() ? { model: input.value.trim() } : {}),
+      })
+    case 'partners':
+      return workspace.partnerRoster()
+    case 'partner-close':
+      return workspace.closePartner(requireLeaf())
   }
 }
 

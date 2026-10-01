@@ -238,10 +238,10 @@ test('a session waits for a member it started, however long the start takes', { 
 
 test('a session that leaves takes the leaves it owns with it', async () => {
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
-  // The release marker now appears earlier as well, because closing the session
-  // parent releases the same lease, so the slice is measured from the cleanup.
+  // The release marker now appears earlier as well, because closing the matriarch
+  // releases the same lease, so the slice is measured from the cleanup.
   const cleanupStart = workspace.indexOf('registerCleanup(async () => {')
-  const cleanup = workspace.slice(cleanupStart, workspace.indexOf('await hostRelease?.()', cleanupStart))
+  const cleanup = workspace.slice(cleanupStart, workspace.indexOf('await matriarchRelease?.()', cleanupStart))
   // The leaves belong to the session holding the family's terminal, so a session
   // that ends without handing the family on ends them too. Detaching is what
   // happens when only the watching session goes away, and it lives on the leaf's
@@ -279,7 +279,7 @@ test('a leaf is one by environment, not by having a parent', async () => {
   // IPC channel, which made being a leaf the same thing as being somebody's
   // child. Read once, then consumed, because the environment a leaf runs in is
   // the one its children inherit.
-  assert.match(cli, /const \{ consumeLeafLaunchEnv, installLeafTerminal, isInteractiveLeaf \} = await import\('\.\.\/utils\/leafTerminal\.js'\)/)
+  assert.match(cli, /const \{ consumeLeafLaunchEnv, installLeafTerminal, isInteractiveLeaf, adoptHeadlessLeafOwner \} = await import\('\.\.\/utils\/leafTerminal\.js'\)/)
   assert.match(cli, /const leaf = isInteractiveLeaf\(\)/)
   assert.match(cli, /if \(leaf\) \{\r?\n    consumeLeafLaunchEnv\(\)/)
   assert.doesNotMatch(cli, /GATEWAY_INTERACTIVE_LEAF === '1' && typeof process\.send/)
@@ -305,6 +305,23 @@ test('a leaf is one by environment, not by having a parent', async () => {
   assert.match(watchdog, /gracefulShutdown\(0\)/)
   assert.doesNotMatch(terminal.slice(0, terminal.indexOf('function watchLeafOwner')), /gracefulShutdown\(0\)/)
   assert.doesNotMatch(terminal.slice(terminal.indexOf('export function getLeafSnapshot')), /gracefulShutdown\(0\)/)
+})
+
+test('a headless leaf takes the launch environment and watches its owner, like any leaf', async () => {
+  const cli = await readFile(new URL('../src/entrypoints/cli.tsx', import.meta.url), 'utf8')
+  // A partner installs no terminal - it has no REPL to draw into - but it is
+  // still a leaf, and owning is a property of the launch rather than of having a
+  // terminal. It takes the same two steps an interactive leaf takes on the way
+  // up: consume the launch environment, or every tool it runs inherits leaf
+  // identity, and watch the owner, or it outlives the leaf that started it.
+  assert.match(cli, /else if \(process\.env\.GATEWAY_LEAF_OWNER_ENDPOINT\)/)
+  assert.match(cli, /adoptHeadlessLeafOwner\(\)/)
+  const terminal = await readFile(new URL('../src/utils/leafTerminal.ts', import.meta.url), 'utf8')
+  const adoption = terminal.slice(terminal.indexOf('export function adoptHeadlessLeafOwner'))
+  // Order matters: the watchdog reads the endpoint the consume call caches, so
+  // watching first would have it ask an environment that is already gone.
+  assert.ok(adoption.indexOf('consumeLeafLaunchEnv()') < adoption.indexOf('watchLeafOwner()'))
+  assert.ok(adoption.indexOf('consumeLeafLaunchEnv()') >= 0)
 })
 
 test('the leaf keeps its identity and its children inherit none of it', { timeout: 60_000 }, async () => {

@@ -78,7 +78,6 @@ function Resolve-SelectedCodexHome {
 # pin an explicit account through TANDEM_GATEWAY_CODEX_HOME; ordinary launches
 # still resolve the current account at launch time instead of trusting stale
 # inherited CODEX_HOME.
-$env:CODEX_HOME = Resolve-SelectedCodexHome
 $Keysafe = Join-Path $env:USERPROFILE '.claude\skills\keysafe\scripts\keysafe.ps1'
 # The model picker's `f` shortcut writes the last model the user chose to make
 # the default; MODEL_GATEWAY_DEFAULT (set by the cc-* launcher wrappers) and an
@@ -243,6 +242,71 @@ namespace CcCommandLine {
 if (Test-Path Env:CC_RAW_ARGS) {
   $ClaudeArgs = @(ConvertFrom-WindowsCommandLine -CommandLine $env:CC_RAW_ARGS)
 }
+
+function Test-ClaudeArtifactFresh {
+  if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) { return $false }
+  $buildInputs = @(
+    (Join-Path $Root 'src'),
+    (Join-Path $Root 'scripts\build.ts'),
+    (Join-Path $Root 'scripts\effort-capabilities.json'),
+    (Join-Path $Root 'scripts\effort-capabilities.mjs'),
+    (Join-Path $Root 'package.json'),
+    (Join-Path $Root 'bun.lock'),
+    (Join-Path $Root 'bun.lockb'),
+    (Join-Path $Root 'tsconfig.json')
+  )
+  $inputFiles = @(
+    foreach ($inputPath in $buildInputs) {
+      if (Test-Path -LiteralPath $inputPath -PathType Container) {
+        Get-ChildItem -LiteralPath $inputPath -File -Recurse -Force
+      } elseif (Test-Path -LiteralPath $inputPath -PathType Leaf) {
+        Get-Item -LiteralPath $inputPath
+      }
+    }
+  )
+  if ($inputFiles.Count -eq 0) { return $false }
+  $latestInput = ($inputFiles | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+  return (Get-Item -LiteralPath $ClaudeScript).LastWriteTimeUtc -ge $latestInput
+}
+
+function Initialize-ClaudeArtifact {
+  if (-not (Test-ClaudeArtifactFresh)) {
+    if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
+      throw 'Selected candidate is missing or stale; build it explicitly before launch.'
+    }
+    Write-LaunchDiagnostic 'build-start'
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ClaudeRunner
+    $startInfo.Arguments = 'run build'
+    $startInfo.WorkingDirectory = $Root
+    $startInfo.UseShellExecute = $false
+    # A build must not inherit and consume a print-mode caller's prompt stream.
+    $startInfo.RedirectStandardInput = $true
+    $buildProcess = [Diagnostics.Process]::new()
+    $buildProcess.StartInfo = $startInfo
+    try {
+      [void]$buildProcess.Start()
+      $buildProcess.StandardInput.BaseStream.Close()
+      $buildProcess.WaitForExit()
+      $buildExitCode = $buildProcess.ExitCode
+    } finally {
+      $buildProcess.Dispose()
+    }
+    Write-LaunchDiagnostic 'build-exit' @{ exitCode = $buildExitCode }
+    if ($buildExitCode -ne 0) {
+      throw "Claude harness build failed with exit code $buildExitCode."
+    }
+  }
+}
+
+# Prewarm exits before account selection, credentials, services, or the harness.
+if ($ClaudeArgs -contains '--prewarm') {
+  if ($ClaudeArgs.Count -ne 1) { throw '--prewarm must be used alone.' }
+  Initialize-ClaudeArtifact
+  Write-LaunchDiagnostic 'prewarm-exit' @{ exitCode = 0 }
+  exit 0
+}
+$env:CODEX_HOME = Resolve-SelectedCodexHome
 
 function ConvertTo-Hashtable {
   param($Value)
@@ -643,58 +707,10 @@ if (-not (Test-Path -LiteralPath $Keysafe)) {
   throw "Keysafe is missing: $Keysafe"
 }
 
-function Test-ClaudeArtifactFresh {
-  if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
-    return $false
-  }
-
-  $buildInputs = @(
-    (Join-Path $Root 'src'),
-    (Join-Path $Root 'scripts\build.ts'),
-    (Join-Path $Root 'scripts\effort-capabilities.json'),
-    (Join-Path $Root 'scripts\effort-capabilities.mjs'),
-    (Join-Path $Root 'package.json'),
-    (Join-Path $Root 'bun.lock'),
-    (Join-Path $Root 'bun.lockb'),
-    (Join-Path $Root 'tsconfig.json')
-  )
-  $inputFiles = @(
-    foreach ($inputPath in $buildInputs) {
-      if (Test-Path -LiteralPath $inputPath -PathType Container) {
-        Get-ChildItem -LiteralPath $inputPath -File -Recurse -Force
-      } elseif (Test-Path -LiteralPath $inputPath -PathType Leaf) {
-        Get-Item -LiteralPath $inputPath
-      }
-    }
-  )
-  if ($inputFiles.Count -eq 0) {
-    return $false
-  }
-
-  $latestInput = ($inputFiles | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
-  $artifact = Get-Item -LiteralPath $ClaudeScript
-  return $artifact.LastWriteTimeUtc -ge $latestInput
-}
-
 # The global cc launcher intentionally points at this worktree. Rebuild only
-# when the compiled harness is older than its source or build inputs; this keeps
-# fresh terminals current without paying the full Bun build cost on every launch.
-if (-not (Test-ClaudeArtifactFresh)) {
-  if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
-    throw 'Selected candidate is missing or stale; build it explicitly before launch.'
-  }
-  Push-Location $Root
-  try {
-    Write-LaunchDiagnostic 'build-start'
-    & $ClaudeRunner 'run' 'build'
-    Write-LaunchDiagnostic 'build-exit' @{ exitCode = $LASTEXITCODE }
-    if ($LASTEXITCODE -ne 0) {
-      throw "Claude harness build failed with exit code $LASTEXITCODE."
-    }
-  } finally {
-    Pop-Location
-  }
-}
+# when its source or build inputs are newer than the published bundle.
+Initialize-ClaudeArtifact
+
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
 # loopback port so an unrelated or stale listener is never adopted.

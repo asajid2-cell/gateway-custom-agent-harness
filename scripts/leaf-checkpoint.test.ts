@@ -43,9 +43,9 @@ async function fixture(): Promise<Fixture> {
   const saved = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = directory
   const { getSessionId } = await import('../src/bootstrap/state.ts')
-  const { forgetLeafFamilyRoot, clearFamilyHostClaimForTesting } = await import('../src/utils/leafWorkspace.ts')
+  const { forgetLeafFamilyRoot, clearMatriarchClaimForTesting } = await import('../src/utils/leafWorkspace.ts')
   forgetLeafFamilyRoot()
-  clearFamilyHostClaimForTesting()
+  clearMatriarchClaimForTesting()
   return {
     directory,
     root: getSessionId(),

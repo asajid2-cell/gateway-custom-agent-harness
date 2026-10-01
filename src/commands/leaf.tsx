@@ -3,19 +3,19 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|reparent <leaf>|close|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|patriarch <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
- * Names for the root conversation, which createLeaf already accepts as a
- * parent. They must be resolved as references before the family lookup: a
+ * Names for the family's head conversation, which createLeaf already accepts as
+ * a source. They must be resolved as references before the family lookup: a
  * bare word that matches no leaf is otherwise treated as the new leaf's NAME,
- * and createLeaf then fills the absent parent with the CURRENT session - so
- * `fork original` run from inside a leaf forked the leaf instead of the root.
- * `parent` is the same reference the workspace accepts, so the grammar and the
- * workspace agree on every name for it.
+ * and createLeaf then fills the absent source with the CURRENT session - so
+ * `fork original` run from inside a leaf forked the leaf instead of the family's
+ * head. `patriarch` is the same reference the workspace accepts, so the grammar
+ * and the workspace agree on every name for it.
  */
-const ROOT_REFS = new Set(['original', 'root', 'parent'])
+const ROOT_REFS = new Set(['original', 'root', 'patriarch'])
 
 /** A leaf reference resolves inside the family; a UUID is also a session ref. */
 async function isLeafReference(token: string, resolveLeafRef: (ref: string) => Promise<unknown>): Promise<boolean> {
@@ -159,11 +159,11 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       return null
     }
 
-    const reparent = input.match(/^reparent\s+(\S+)$/)
-    if (reparent) {
-      const member = await workspace.resolveLeafRef(reparent[1]!)
+    const patriarch = input.match(/^patriarch\s+(\S+)$/)
+    if (patriarch) {
+      const member = await workspace.resolveLeafRef(patriarch[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      onDone(await workspace.reparentLeaf(member.sessionId), { display: 'system' })
+      onDone(await workspace.conferPatriarch(member.sessionId), { display: 'system' })
       return null
     }
 
@@ -218,11 +218,24 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       return null
     }
 
+    // Closing the session you are in, which is the one close a leaf reference
+    // cannot address: `me` names this session, and a bare `close` is the same
+    // request. What it does is decided by the session asking rather than by the
+    // grammar - the family moves to the next leaf, or the session just leaves.
+    if (input === 'close' || input === 'close me' || input === 'close self') {
+      const { getSessionId } = await import('../bootstrap/state.js')
+      onDone(await workspace.changeLeaf(getSessionId(), { status: 'closed' }) ?? '', { display: 'system' })
+      return null
+    }
+
     const change = input.match(/^(rename|close|archive|promote|reopen)\s+(\S+)(?:\s+([\s\S]+))?$/)
     if (change) {
       const action = change[1]!
       if (action === 'rename' && !change[3]?.trim()) throw new Error('Name required')
-      const member = await workspace.resolveLeafRef(change[2]!)
+      // Closing may name the session you are in, which no other verb here may.
+      const member = action === 'close'
+        ? await workspace.resolveCloseTarget(change[2]!)
+        : await workspace.resolveLeafRef(change[2]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       const promoted = await workspace.changeLeaf(member.sessionId, action === 'rename' ? { name: change[3]!.trim() } : { status: action === 'close' ? 'closed' : action === 'archive' ? 'archived' : action === 'reopen' ? 'open' : 'promoted', ...(change[3]?.trim() ? { name: change[3].trim() } : {}) })
       onDone(`Leaf ${action} recorded; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`, { display: 'system' })

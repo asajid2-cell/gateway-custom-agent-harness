@@ -152,7 +152,13 @@ test('a registration advertises the directory the conversation resumes from', as
   assert.doesNotMatch(hook, /getCwd\(\)/)
 
   const headless = await readFile(new URL('../src/cli/print.ts', import.meta.url), 'utf8')
-  assert.match(headless, /new GatewaySessionRuntime\(getSessionId\(\), getSessionResumeDirectory\(\), 'Gateway headless session'\)/)
+  assert.match(headless, /new GatewaySessionRuntime\(getSessionId\(\), getSessionResumeDirectory\(\), gatewaySessionName\)/)
+  // A partner advertises the leaf label that names its owner and its purpose
+  // rather than registering anonymously; a plain print session has no such label
+  // and keeps the generic name. It is read through `leafLabel()`, not the
+  // environment: the launch env is consumed on the way up, so the raw variable
+  // is already gone here and the name would silently fall back to the generic one.
+  assert.match(headless, /const gatewaySessionName = leafLabel\(\)\?\.trim\(\) \|\| 'Gateway headless session'/)
 })
 
 test('a leaf registers on the shared bus as a leaf, not as the session it forked', async () => {

@@ -8,12 +8,12 @@ import { registerCleanup } from './cleanupRegistry.js'
 
 export type LeafSnapshot = {
   rootSessionId: string
-  rootName: string
-  /** Which member is the family's parent now; the family id until one is designated. */
-  parentSessionId: string
+  patriarchName: string
+  /** Which member is the family's patriarch now; the family id until one is designated. */
+  patriarchSessionId: string
   /** The session managing this family, so a leaf can tell when the family moved. */
-  hostSessionId: string
-  hostName: string
+  matriarchSessionId: string
+  matriarchName: string
   members: { member: LeafMember; state: LeafProcessState }[]
 }
 export type LeafTerminalControl = { subtype: string; [key: string]: unknown }
@@ -27,7 +27,7 @@ export type LeafTerminalMessage =
        * for the leaf to finish everything it was already doing, which is the
        * "no proper awareness" complaint.
        *
-       * `question` is the peer text being answered, so the parent can match the
+       * `question` is the peer text being answered, so the asker can match the
        * answer to the right ask. Several questions can be in flight at once now
        * that a running leaf takes them immediately, and "oldest still owed"
        * would answer the wrong asker when the leaf replies out of order.
@@ -239,7 +239,7 @@ function leafOwnerAlive(): Promise<boolean> {
  * A leaf outliving its launcher is the ordinary case for the transport - the
  * launcher exiting is only "nobody is watching", and the leaf is picked up again
  * by whoever opens it next. That is the right answer for a leaf that owns
- * itself, and the wrong one for the session parent: the leaves belong to that
+ * itself, and the wrong one for the matriarch: the leaves belong to that
  * session, so when it crashes, is Ctrl-C'd, or its terminal closes, they go with
  * it rather than sitting detached with no family left to belong to.
  */
@@ -253,6 +253,23 @@ function watchLeafOwner(): void {
     })
   }, OWNER_PROBE_INTERVAL_MS)
   timer.unref()
+}
+
+/**
+ * Bind a leaf that has no terminal to the session that owns it.
+ *
+ * An interactive leaf gets both halves of this on the way up: installLeafTerminal
+ * consumes the launch environment and calls watchLeafOwner. A headless partner
+ * installs no terminal, so it took neither - it kept GATEWAY_LEAF_* in the
+ * environment every tool it ran inherited, and it held an owner endpoint it
+ * never watched, so it outlived the leaf that started it. Owning is a property
+ * of the launch, not of having a terminal: a headless leaf takes the same two
+ * steps here, in the same order, so leafOwnerEndpoint() reads the value the
+ * consume call has just cached rather than the environment it just deleted.
+ */
+export function adoptHeadlessLeafOwner(): void {
+  consumeLeafLaunchEnv()
+  watchLeafOwner()
 }
 export function getLeafSnapshot(): LeafSnapshot | undefined { return snapshot }
 export function subscribeLeafSnapshot(listener: () => void): () => void { snapshotListeners.add(listener); return () => { snapshotListeners.delete(listener) } }
@@ -282,6 +299,20 @@ export function registerLeafTerminalControls(handler: (request: LeafTerminalCont
   controls = handler
   for (const message of pendingControls.splice(0)) void handleControl(message)
   return () => { if (controls === handler) controls = undefined }
+}
+
+/**
+ * Have this leaf leave, on its own word rather than a session's.
+ *
+ * Closing the session you are in is the one close a leaf performs rather than
+ * asks for: the process that would be stopped is the one typing, so there is
+ * nobody to ask. It runs the same leaving a session-issued close does - the
+ * transcript is recorded, the queues are drained and the process exits - so the
+ * two doors cannot drift apart.
+ */
+export function requestLeafSelfClose(): Promise<void> {
+  if (!controls) return Promise.reject(new Error('Leaf shutdown is unavailable'))
+  return controls({ subtype: 'shutdown' })
 }
 
 /** Installed before CLI imports: the normal REPL owns these streams, not a second chat renderer. */
@@ -379,7 +410,7 @@ export async function installLeafTerminal(): Promise<void> {
       requests.delete(message.id)
       if (message.ok) pending.resolve(message.value)
       // One opaque string covered four unrelated causes - an unavailable
-      // parent, a busy target, a bad reference - so a refusal could not be told
+      // matriarch, a busy target, a bad reference - so a refusal could not be told
       // apart from a broken workspace. The session that owns the family reports
       // what actually failed; the generic line is only the fallback for a
       // refusal that carried no reason.

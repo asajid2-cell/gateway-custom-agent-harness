@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFile, mkdtemp, rm } from 'node:fs/promises'
+import { readFile, mkdtemp, rm, mkdir, writeFile, copyFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
 import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import test from 'node:test'
@@ -143,7 +144,7 @@ test('interactive cc skips the full build when the compiled harness is fresh', a
   assert.match(script, /function Test-ClaudeArtifactFresh\s*\{[\s\S]*Get-ChildItem[\s\S]*LastWriteTimeUtc/)
   assert.match(
     script,
-    /if \(-not \(Test-ClaudeArtifactFresh\)\) \{[\s\S]*& \$ClaudeRunner 'run' 'build'/,
+    /if \(-not \(Test-ClaudeArtifactFresh\)\) \{[\s\S]*\$startInfo\.Arguments = 'run build'/,
     'the build must be conditional on artifact freshness',
   )
   assert.equal(
@@ -151,6 +152,64 @@ test('interactive cc skips the full build when the compiled harness is fresh', a
     false,
     'the launcher must not rebuild unconditionally',
   )
+})
+
+test('partner prewarm has one finite launch-path budget', async () => {
+  const policy = JSON.parse(await readFile(new URL('./launcher-policy.json', import.meta.url), 'utf8'))
+  assert.ok(Number.isSafeInteger(policy.prewarmTimeoutMs))
+  assert.ok(policy.prewarmTimeoutMs > 0 && policy.prewarmTimeoutMs <= 300000)
+})
+
+test('prewarm builds without a session and does not consume caller stdin', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'gateway-prewarm-'))
+  try {
+    await mkdir(path.join(root, 'scripts'))
+    await mkdir(path.join(root, 'src'))
+    const launcher = await readFile(scriptPath, 'utf8')
+    await writeFile(path.join(root, 'scripts', 'cc.ps1'), launcher.replace(
+      "  Write-LaunchDiagnostic 'prewarm-exit'",
+      "  [IO.File]::WriteAllText((Join-Path $Root 'remaining-input'), [Console]::In.ReadToEnd())\n  Write-LaunchDiagnostic 'prewarm-exit'",
+    ))
+    await copyFile(new URL('./effort-capabilities.json', import.meta.url), path.join(root, 'scripts', 'effort-capabilities.json'))
+    await writeFile(path.join(root, 'src', 'input.ts'), 'export {}')
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'bun scripts/build.ts' } }))
+    await writeFile(path.join(root, 'scripts', 'build.ts'), `
+      import { mkdirSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+      const input = readFileSync(0, 'utf8');
+      if (input !== '' && input !== '\\uFEFF') throw new Error('Build stdin: ' + JSON.stringify(input));
+      mkdirSync('dist', { recursive: true });
+      writeFileSync('dist/cli.js', 'throw new Error("Harness must not launch")');
+      appendFileSync('build-count', '1');
+    `)
+    const env = { ...process.env, CC_RAW_ARGS: '--prewarm', CC_CLAUDE_RUNNER_OVERRIDE: process.execPath,
+      LOCALAPPDATA: root, USERPROFILE: path.join(root, 'missing-home') }
+    delete env.CC_CLAUDE_SCRIPT_OVERRIDE
+    delete env.TANDEM_GATEWAY_CODEX_HOME
+    const fixturePath = path.join(root, 'scripts', 'cc.ps1')
+    const fixture = await readFile(fixturePath, 'utf8')
+    await writeFile(fixturePath, fixture
+      .replace('$startInfo.RedirectStandardInput = $true', '$startInfo.RedirectStandardInput = $false')
+      .replace('$buildProcess.StandardInput.BaseStream.Close()', ''))
+    const red = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', fixturePath], {
+      env, input: 'caller prompt must survive', encoding: 'utf8', timeout: 30000,
+    })
+    assert.equal(red.status, 1)
+    assert.match(red.stderr, /Build stdin:.*caller prompt must survive/)
+    await writeFile(fixturePath, fixture)
+    for (let i = 0; i < 2; i++) {
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'scripts', 'cc.ps1')], {
+        env, input: 'caller prompt must survive', encoding: 'utf8', timeout: 30000,
+      })
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+      assert.equal(await readFile(path.join(root, 'remaining-input'), 'utf8'), 'caller prompt must survive')
+    }
+    assert.equal(await readFile(path.join(root, 'build-count'), 'utf8'), '1')
+    const events = (await readFile(path.join(root, 'Gateway', 'launcher.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.equal(events.filter(event => event.event === 'prewarm-exit').length, 2)
+    assert.equal(events.some(event => event.event === 'harness-exit'), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('interactive cc avoids the Defender-blocked nested encoded launcher', async () => {

@@ -87,7 +87,7 @@ async function mutateFamily<T>(path: string, rootSessionId: string, mutate: (fam
 export function addLeafMember(path: string, rootSessionId: string, input: Omit<LeafMember, 'number' | 'createdAt' | 'status'>): Promise<LeafMember> {
   return mutateFamily(path, rootSessionId, family => {
     if (family.members.some(m => m.sessionId === input.sessionId) || input.sessionId === rootSessionId) throw new Error('Leaf session already belongs to this family')
-    if (input.parentSessionId !== rootSessionId && !family.members.some(m => m.sessionId === input.parentSessionId)) throw new Error('Unknown leaf parent')
+    if (input.parentSessionId !== rootSessionId && !family.members.some(m => m.sessionId === input.parentSessionId)) throw new Error('Unknown leaf ancestry')
     if (!Number.isSafeInteger(family.nextNumber + 1)) throw new Error('Leaf sequence exhausted')
     const member = memberSchema.parse({ ...input, number: family.nextNumber++, createdAt: new Date().toISOString(), status: 'open' })
     family.members.push(member)
@@ -99,9 +99,9 @@ export function addLeafMember(path: string, rootSessionId: string, input: Omit<L
  * Record the session that created the family as one of its members.
  *
  * The creator used to exist only as the family's identity: it had no row, every
- * reader synthesized one for it, and that is what made "the parent" a
+ * reader synthesized one for it, and that is what made "the patriarch" a
  * structural role instead of a member - it could not be renamed, archived or
- * forked, and designating a different member as the parent had nowhere to be
+ * forked, and designating a different member as the patriarch had nowhere to be
  * recorded. It is an ordinary row now.
  *
  * This is the only path allowed to write it: `addLeafMember` still refuses the

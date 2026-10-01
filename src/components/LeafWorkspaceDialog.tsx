@@ -4,10 +4,11 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getFamilyHostSessionId, getLeafCarouselViews, getLeafHostName, getLeafParentSessionId, getLeafRootName, getLeafSelfName, getLeafViews, isFamilyHost, listLeafMenuMembers, refreshLeafFamilyHost, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
+import { isInteractiveLeaf } from '../utils/leafTerminal.js'
 import { isGatewayMode } from '../utils/model/providers.js'
 import { getSessionId } from '../bootstrap/state.js'
 
@@ -22,7 +23,7 @@ export function LeafSessionBar(): React.ReactNode {
   </Box>
 }
 
-/** Effort choices offered by the wizard; `inherit` keeps the parent's effort. */
+/** Effort choices offered by the wizard; `inherit` keeps the source's effort. */
 const EFFORT_CHOICES: readonly string[] = ['inherit', ...LEAF_EFFORT_LEVELS]
 
 const MODEL_INHERIT = 'inherit'
@@ -92,7 +93,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // since this one last looked. Read the lease on open so the rows are the ones
   // that will actually work, rather than refusing after the fact; the publish
   // this triggers re-renders the menu with the answer.
-  useEffect(() => { void refreshLeafFamilyHost() }, [])
+  useEffect(() => { void refreshLeafMatriarch() }, [])
 
   const run = async (label: string, action: () => Promise<string | void>) => {
     if (busy) return
@@ -133,7 +134,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     return <LeafCreateWizard
       members={members}
       selectedId={selectedLeafId()}
-      rootName={getLeafRootName()}
+      patriarchName={getLeafPatriarchName()}
       defaultModel={model}
       defaultEffort={effort}
       onDone={result => { if (result) void run(result, async () => result); setScreen('home') }}
@@ -142,19 +143,28 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   }
 
   if (screen === 'list') {
-    // Inside a leaf the roster includes the session asking, because the roster
-    // is the family file and a leaf has an entry in it. That one row is not
-    // offered: closing or archiving it stops the process holding this menu. It
-    // is named instead, which is also how a leaf finds itself.
+    // The session asking is a member like any other - inside a leaf the roster
+    // is the family file, and a window opened on a member's own address is in
+    // it too - so its row is named rather than dropped, which is also how a leaf
+    // finds itself. It is offered the one verb that means anything for it:
+    // closing it, which moves the family rather than stopping a process.
     const self = selectedLeafId() ?? getSessionId()
     const mine = members?.find(member => member.sessionId === self)
     const open = members?.filter(member => member.status !== 'archived' && member.sessionId !== self) ?? []
-    const parentId = getLeafParentSessionId()
+    const patriarchId = getLeafPatriarchSessionId()
+    const canCloseSelf = isFamilyMatriarch() || isInteractiveLeaf()
     // Displaced, this is a roster and nothing else: the rows that manage leaves
     // belong to the window holding the lease, and offering them here only
     // produced a refusal after the fact.
     const options = [
-      ...(!isFamilyHost() ? open.map(member => ({
+      ...(mine && canCloseSelf ? [{
+        value: `close-self:${self}`,
+        label: `Close this session — ${describeSession(mine)}`,
+        description: isFamilyMatriarch()
+          ? 'Hand the family to the next leaf and leave; with no leaf left it just leaves'
+          : 'Leave this leaf; its transcript and its place in the family are kept',
+      }] : []),
+      ...(!isFamilyMatriarch() ? open.map(member => ({
         value: `member:${member.sessionId}`,
         label: `#${member.number} ${member.name}`,
         description: `${member.status}${externallyHeldLeafIds().includes(member.sessionId) ? ' · open in the window that manages it' : ''}`,
@@ -174,10 +184,10 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           label: `Archive #${member.number} ${member.name}`,
           description: 'Detach it from this family and hide it from this menu; the transcript is kept',
         })),
-        ...open.filter(member => member.sessionId !== parentId).map(member => ({
-          value: `parent:${member.sessionId}`,
-          label: `Make parent #${member.number} ${member.name}`,
-          description: 'The family takes this member’s name; the member that is the parent now becomes a leaf',
+        ...open.filter(member => member.sessionId !== patriarchId).map(member => ({
+          value: `patriarch:${member.sessionId}`,
+          label: `Make patriarch #${member.number} ${member.name}`,
+          description: 'The family takes this member’s name; the member that is the patriarch now becomes an ordinary leaf',
         })),
       ]),
       // Every member is an entry point, so every member gets the command that
@@ -195,7 +205,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     return <Box flexDirection="column">
       <Text bold>Leaves in this family</Text>
       <Text dimColor>Opening a leaf is the only thing that starts its process. Closed leaves stay closed until you open them again.</Text>
-      {mine && <Text dimColor>These rows act on the rest of the family: {describeSession(mine)} is the session you are in.</Text>}
+      {mine && <Text dimColor>{describeSession(mine)} is the session you are in; the rows below act on the rest of the family.</Text>}
       <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
         if (value === 'back' || value === 'empty') { setScreen('home'); return }
         if (value === 'archives') { setScreen('archives'); return }
@@ -210,7 +220,12 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
-          if (action === 'parent') return workspace.reparentLeaf(id)
+          if (action === 'patriarch') return workspace.conferPatriarch(id)
+          // Closing the session you are in is the same call as closing any other
+          // member; what it does is decided by which session is asking, not by
+          // the row. It hands the family on when it can and leaves when it
+          // cannot, and the workspace says which happened.
+          if (action === 'close-self') return workspace.changeLeaf(id, { status: 'closed' })
           // The pane is left where it is. A member leaving is not the window
           // changing what it shows, and the workspace drops the selection itself
           // when the member that goes is the one on screen - doing it here as
@@ -239,12 +254,12 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     // Reading an archived conversation is not managing the family, so it stays
     // available to a displaced window; reviving and running one do not.
     const options = [
-      ...(isFamilyHost() ? archived.map(member => ({
+      ...(isFamilyMatriarch() ? archived.map(member => ({
         value: `revive:${member.sessionId}`,
         label: `Revive #${member.number} ${member.name}`,
         description: 'Put it back in the leaf list; it stays closed until you open it',
       })) : []),
-      ...(isFamilyHost() ? archived.map(member => ({
+      ...(isFamilyMatriarch() ? archived.map(member => ({
         value: `open-once:${member.sessionId}`,
         label: `Open once #${member.number} ${member.name}`,
         description: 'Run it now, then file it away again when you close it',
@@ -254,7 +269,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         label: `View #${member.number} ${member.name}`,
         description: 'Read the saved conversation; nothing is started',
       })),
-      ...(isFamilyHost() ? archived.filter(member => running.has(member.sessionId)).map(member => ({
+      ...(isFamilyMatriarch() ? archived.filter(member => running.has(member.sessionId)).map(member => ({
         value: `close:${member.sessionId}`,
         label: `Close #${member.number} ${member.name}`,
         description: 'Stop the process it is running now; it stays archived',
@@ -307,12 +322,12 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
 
   const selected = selectedLeafId()
   // With nothing selected the source is the session asking, which is not always
-  // the family's parent - a member hosting the family forks itself.
+  // the patriarch - a member hosting the family forks itself.
   const sourceName = selected ? (members?.find(member => member.sessionId === selected)?.name ?? selected) : getLeafSelfName()
   // One window manages a family at a time. This one is a window onto it: it can
   // still use the terminals it has attached, but starting or changing leaves
   // belongs to the session that took the lease.
-  const displaced = !isFamilyHost()
+  const displaced = !isFamilyMatriarch()
   const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
     ...(displaced ? [] : [{ value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' }]),
     { value: 'list', label: 'Leaves in this family', description: displaced ? 'Read-only: another window manages them now' : members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
@@ -323,7 +338,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     <Text bold>Leaves</Text>
     <Text dimColor>Each leaf is a full independent session. They share your files unless you point one at a separate worktree.</Text>
     {displaced
-      ? <Text dimColor>The family moved to the window opened most recently ({getFamilyHostSessionId()}), which manages its leaves now. The terminals you already have stay yours to use.</Text>
+      ? <Text dimColor>The family moved to the window opened most recently ({getLeafMatriarchSessionId()}), which manages its leaves now. The terminals you already have stay yours to use.</Text>
       : <Text dimColor>Nothing starts until you open it. Creating a leaf forks the session you are looking at: {sourceName}.</Text>}
     <Select options={options} visibleOptionCount={6} onCancel={() => onDone()} onChange={(value: string) => {
       if (value === 'exit') { onDone(); return }
@@ -343,10 +358,10 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
  * the fork source is shown as a choice rather than implied - forking the wrong
  * conversation was the failure mode when the source was invisible.
  */
-export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, defaultEffort, onDone, onCancel }: {
+export function LeafCreateWizard({ members, selectedId, patriarchName, defaultModel, defaultEffort, onDone, onCancel }: {
   members?: LeafMember[]
   selectedId?: string
-  rootName: string
+  patriarchName: string
   defaultModel?: string
   defaultEffort?: string
   onDone: (result?: string) => void
@@ -364,19 +379,19 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
   const [error, setError] = useState('')
   const creating = useRef(false)
 
-  // The designated parent gets the first row, so it is not listed twice: it is
-  // a member now, and its own row would otherwise sit beside this one.
-  const parentId = getLeafParentSessionId()
+  // The designated patriarch gets the first row, so it is not listed twice: it
+  // is a member now, and its own row would otherwise sit beside this one.
+  const patriarchId = getLeafPatriarchSessionId()
   const sources = [
-    { value: 'root', label: rootName, description: 'The member designated as this family’s parent' },
-    ...(members ?? []).filter(member => member.status !== 'archived' && member.sessionId !== parentId).map(member => ({
+    { value: 'root', label: patriarchName, description: 'The member designated as this family’s patriarch' },
+    ...(members ?? []).filter(member => member.status !== 'archived' && member.sessionId !== patriarchId).map(member => ({
       value: member.sessionId,
       label: `#${member.number} ${member.name}`,
       description: member.status,
     })),
   ]
   const sourceName = sources.find(item => item.value === source)?.label
-    ?? (source === parentId ? rootName : source === getSessionId() ? getLeafSelfName() : source)
+    ?? (source === patriarchId ? patriarchName : source === getSessionId() ? getLeafSelfName() : source)
 
   const create = async () => {
     if (creating.current) return
@@ -388,10 +403,10 @@ export function LeafCreateWizard({ members, selectedId, rootName, defaultModel, 
       // "Root" is named rather than left empty: an empty source means "the
       // session on screen", which is not the same conversation once a leaf is
       // selected - the row said root and forked the leaf.
-      const parent = source
+      const forkSource = source
       const view = await createLeaf(
         name.trim() || undefined,
-        parent,
+        forkSource,
         worktree.trim() || undefined,
         { fresh, model: model === MODEL_DEFAULT || model === MODEL_INHERIT ? undefined : model, effort: (effort === 'inherit' ? undefined : effort) as LeafMember['effort'] },
       )
@@ -467,7 +482,7 @@ export function LeafCarousel({ views, activeId, onSelect, onExpand, onManage }: 
   // process has ended is not an entry point - entering one muted this session
   // and left a black screen - and it stays in the menu, where it can be
   // reopened, rather than in the bar, where a click is the only gesture.
-  const items = [{ id: undefined, label: getLeafHostName(), state: '' }, ...views.filter(view => isLeafProcessAlive(view.process.getState())).map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
+  const items = [{ id: undefined, label: getLeafMatriarchName(), state: '' }, ...views.filter(view => isLeafProcessAlive(view.process.getState())).map(view => ({ id: view.member.sessionId, label: `${view.member.number} ${view.member.name}`, state: view.process.getState() }))]
   const active = Math.max(0, items.findIndex(item => item.id === activeId))
   const capacity = Math.max(1, Math.floor((columns - 14) / 20))
   const first = Math.max(0, Math.min(active - Math.floor(capacity / 2), items.length - capacity))
