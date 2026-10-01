@@ -2,7 +2,7 @@ import React from 'react'
 import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { PassThrough } from 'node:stream'
-import { render, Box, Text } from '../src/ink.ts'
+import { render, Box, Text, useInput } from '../src/ink.ts'
 import { BoundedMainScreen } from '../src/ink/components/BoundedMainScreen.tsx'
 import instances from '../src/ink/instances.ts'
 import { cellAt, type Screen } from '../src/ink/screen.ts'
@@ -141,6 +141,13 @@ function Body({ lines }: { lines: number }) {
       </Box>
     </BoundedMainScreen>
   )
+}
+
+// The inline mouse probe only arms once a component has taken raw mode
+// (`App.rawModeEnabledCount > 0`), which `useInput` is what a real REPL does.
+function InteractiveBody() {
+  useInput(() => {})
+  return <Body lines={3} />
 }
 
 test('the inline bounded block owns its rows on the first frame', async () => {
@@ -519,6 +526,66 @@ test('the prompt survives a block above it taller than the terminal', async () =
       rootNode: { yogaNode: { getComputedHeight(): number } }
     }).rootNode.yogaNode.getComputedHeight()
     assert.ok(yogaHeight <= 24, `the frame is ${yogaHeight} rows tall in a 24-row terminal`)
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
+
+test('a timed-out inline mouse probe re-probes after the backoff, so a late attach self-heals', async () => {
+  // A relay/mux client sends no host resize on a same-size attach, so the
+  // alt-screen exit and the size-changing frame that used to be the only
+  // clears for a failed probe may never arrive. The probe must therefore
+  // retry on its own: the first reply after a client attaches then arms the
+  // wheel with no resize. Nothing answers here, so the retry is the only
+  // signal, and any second probe on the wire is proof it fired.
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin, take } = harness()
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  // The private DECXCPR the probe writes; the harness never replies, so each
+  // occurrence is one probe that will time out.
+  const PROBE = '\x1b[?6n'
+  const countProbes = (s: string) => s.split(PROBE).length - 1
+  let seen = 0
+  try {
+    assert.ok(isBoundedLayoutEnabled(), 'the test must exercise the bounded lane')
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as any, stderr: stdout as any, stdin: stdin as any,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    // Let useInput's effect take raw mode, then force one frame so the probe
+    // is sent now rather than whenever the next render happens to land.
+    await sleep(200)
+    ;(instances.get(stdout as any) as unknown as { resume(): void }).resume()
+    // Past the first 1s timeout: one probe has gone out and the latch is set.
+    await sleep(1200)
+    seen += countProbes(take())
+    assert.ok(seen >= 1, 'the first probe never went out, so the test proves nothing')
+    // Past the backoff (1s timeout + 2s retry) with no resize and no
+    // alt-screen exit: a second probe must have sent itself.
+    await sleep(2600)
+    seen += countProbes(take())
+    assert.ok(
+      seen >= 2,
+      `the probe did not retry after the backoff (saw ${seen}), so a late attach would stay latched`,
+    )
   } finally {
     app?.unmount()
     stdin.destroy()
