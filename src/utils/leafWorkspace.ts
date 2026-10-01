@@ -786,6 +786,15 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
  * Nothing happens unless the member leaving IS the patriarch, and that is settled
  * from the designation alone before the family file is opened - so this is safe
  * to call on every departure, which is where it runs.
+ *
+ * KNOWN LIMITATION, and deliberate: the heir designation does NOT influence this
+ * choice. A family that raised a successor and then lost the patriarch it was
+ * raising it under does not hand the role to that successor - the member the
+ * person listed first takes it, and the heir must be promoted deliberately. An
+ * automatic hand-to-the-heir is the mechanism the family model exists without:
+ * ascension is a decision someone makes, not a fallback a lost session triggers.
+ * The raise is over the moment the patriarch moves, so what is passed over here
+ * is a member that is no longer being raised at all.
  */
 async function promoteNextPatriarch(root: string, leaving: string): Promise<LeafMember | undefined> {
   if ((await familyPatriarchSessionId(root)) !== leaving) return undefined
