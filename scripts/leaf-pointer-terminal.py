@@ -2605,6 +2605,19 @@ def probe_goal_reopen():
     results['g_reopenedInFamilyFile'] = status() == 'open'
     flush_results()
 
+    # The family file is rewritten by the teardown below, so the state
+    # as-of-assertion is captured to its own file first: a residue's family file
+    # is POST-teardown and cannot be read back as this probe's reading. Without
+    # this, a reader of the residue directory sees the last write on disk rather
+    # than what the probe asserted - which nearly produced a false contradiction
+    # against this commit, read from the file instead of from the bar.
+    (root / 'goal-reopen-reading.json').write_text(json.dumps(dict(
+        reachedPostCloseRefusal=saw_post_close,
+        familyFileStatusAfter=status(),
+        familyFileMembers=[(m['number'], m['name'], m['status']) for m in t.family()['members']],
+        alphaSessionId=alpha['sessionId'],
+    ), indent=1, sort_keys=True), encoding='utf-8')
+
     t.check(lambda: saw_post_close,
             'never reached the post-close refusal, so the close-modify-reopen branch was not exercised')
     t.check(lambda: status() == 'open',
