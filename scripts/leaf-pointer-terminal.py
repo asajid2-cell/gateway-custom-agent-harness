@@ -46,6 +46,7 @@ parser.add_argument('--probe-crash-window', action='store_true')
 parser.add_argument('--probe-designation-residue', action='store_true')
 parser.add_argument('--probe-dormant-residue', action='store_true')
 parser.add_argument('--probe-close-promotion', action='store_true')
+parser.add_argument('--probe-goal-reopen', action='store_true')
 parser.add_argument('--probe-boot', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -2515,6 +2516,104 @@ def probe_close_promotion():
     t.exit(family_survives=True)
 
 
+def probe_goal_reopen():
+    """The close-modify-reopen failure branch: a goal that throws still reopens.
+
+    `setLeafGoal` closes the leaf, claims the writer, writes the goal, and reopens
+    in a nested `finally`. The branch that matters is the failure: if the write
+    throws AFTER the close, that reopen is the only thing standing between a
+    failed command and a leaf left stopped by it. Nothing in leaf-family.test.ts
+    reaches it - every refusal there fires before the close (the `Unknown leaf`
+    check and the `Leaf must be open and idle` guard both precede
+    `changeLeaf(status:'closed')`), so the `finally` never runs its failing branch.
+
+    The failure is produced by the app's own logic rather than a mutation: a
+    `pause` on a leaf that has never been given a goal reads no record and throws
+    'No saved leaf goal' after the close. What is asserted is that the member
+    reads OPEN again - and it is read from the family FILE, named as the file,
+    not from a return value, so the answer is held to the thing that has to carry
+    it.
+
+    The leaf has to be idle for the command to reach the close at all: the idle
+    guard precedes it, and an attempt that trips the guard never closed anything.
+    So the ask is repeated until the refusal seen is the post-close one, and the
+    guard's own message is recorded separately, so a pre-close refusal is never
+    mistaken for the branch under test. With the reopen deleted from the `finally`
+    the family file keeps the member `closed` and this probe fails - that is the
+    mutation this exists to catch.
+    """
+    results = {}
+
+    def flush_results():
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('ALPHA_FIRST_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_FIRST_TURN' in t.text(), 'the creator has a conversation', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'Alpha created', 90)
+    alpha = t.leaves()[0]
+
+    # Enter Alpha, so it leaves 'starting' and reaches 'idle'. `setLeafGoal`
+    # refuses anything but idle (unlike confer/heir, which accept closed and
+    # failed too), and a leaf that was only created and never read is still
+    # starting - a plain `/leaf new` never reaches its input loop on its own.
+    # Entering is the switch that proves it is reading, and `assert_view` is what
+    # makes it idle: its marker is answered, and the reply is the idle claim, so
+    # no separate turn is needed. The switch is repeated because the bar is still
+    # repainting the leaf it just made, and a press that lands between frames
+    # toggles nothing.
+    for attempt in range(6):
+        try:
+            t.leaf(0)
+            break
+        except AssertionError:
+            t.pause(2)
+    t.assert_view(alpha['sessionId'], 'Alpha on screen and idle', 90)
+    t.original()
+
+    def status():
+        return next((m['status'] for m in t.family()['members'] if m['sessionId'] == alpha['sessionId']), None)
+
+    results['g_statusBefore'] = status()
+    flush_results()
+
+    # Repeat until the refusal is the one thrown AFTER the close. A leaf that is
+    # still booting trips the idle guard first, and that attempt closed nothing -
+    # so the guard's message is tracked apart from the post-close one.
+    saw_post_close = False
+    for attempt in range(12):
+        t.proc.write('\x15'); t.pause(.4)
+        t.submit('/leaf goal ' + alpha['sessionId'] + ' pause')
+        t.pause(5)
+        screen = t.text()
+        post_close = 'No saved leaf goal' in screen
+        results['g_attempt' + str(attempt) + '_postClose'] = post_close
+        results['g_attempt' + str(attempt) + '_idleGuard'] = 'Leaf must be open and idle' in screen
+        if post_close:
+            saw_post_close = True
+            results['g_refusalScreen'] = screen[-1200:]
+            break
+
+    results['g_reachedPostCloseRefusal'] = saw_post_close
+    # The answer is held to the family file, named here, not to a return value.
+    results['g_familyFileMembers'] = [(m['number'], m['name'], m['status']) for m in t.family()['members']]
+    results['g_familyFileStatusAfter'] = status()
+    results['g_reopenedInFamilyFile'] = status() == 'open'
+    flush_results()
+
+    t.check(lambda: saw_post_close,
+            'never reached the post-close refusal, so the close-modify-reopen branch was not exercised')
+    t.check(lambda: status() == 'open',
+            'the family file leaves the leaf stopped after a goal that threw: ' + json.dumps(t.family()['members']))
+
+    t.close_leaves(90)
+    t.exit(family_survives=True)
+
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -3589,6 +3688,7 @@ try:
         (args.probe_designation_residue, probe_designation_residue),
         (args.probe_dormant_residue, probe_dormant_residue),
         (args.probe_close_promotion, probe_close_promotion),
+        (args.probe_goal_reopen, probe_goal_reopen),
         (args.probe_boot, probe_boot),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
