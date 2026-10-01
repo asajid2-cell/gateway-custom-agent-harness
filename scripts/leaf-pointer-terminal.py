@@ -1927,19 +1927,23 @@ def probe_stress():
     results['staleHeirAfterDiscard'] = heir_now == bravo['sessionId'] and parked.get(bravo['sessionId']) != 'open'
     results['heirAfterDiscard'] = None if heir_now is None else (heir_now[:8] + ' (' + str(parked.get(heir_now)) + ')')
 
-    # CLAIM 2: when the patriarch is lost, the raised successor takes over. Reopen
-    # Bravo and raise it again, make Alpha the patriarch, then close Alpha. The
-    # lowest-numbered open member wins the promotion - the question is whether the
-    # heir does, or is passed over.
+    # CLAIM 2: when the patriarch is lost, the raised successor takes over. Bring
+    # the rival back, hand Alpha the role, and only THEN raise Bravo - a raise
+    # belongs to the patriarch that is training it, so a raise made before the
+    # hand-off is ended by the hand-off itself, and measuring the loss against a
+    # designation that is already gone would measure nothing. Close Alpha: the
+    # lowest-numbered open member wins the promotion, and the question is whether
+    # the heir does, or is passed over.
     answered('/leaf reopen ' + bravo['sessionId'], ('reopened', 'Leaf operation failed'))
     t.wait(lambda: any(item['sessionId'] == bravo['sessionId'] and item['status'] == 'open' for item in t.leaves()),
            'the rival is back', 90)
-    answered('/leaf heir ' + bravo['sessionId'], ('is now the family heir', 'Leaf operation failed'))
     answered('/leaf patriarch ' + alpha['sessionId'], ('is now the family patriarch', 'Leaf operation failed'))
+    answered('/leaf heir ' + bravo['sessionId'], ('is now the family heir', 'Leaf operation failed'))
+    results['heirBeforeDeath'] = t.pointer(t.id).get('heirSessionId') == bravo['sessionId']
     answered('/leaf close ' + alpha['sessionId'], ('closed', 'Leaf operation failed'))
     t.wait(lambda: t.pointer(t.id).get('patriarchSessionId') != alpha['sessionId'], 'the role moved off the closed patriarch', 60)
     new_patriarch = t.pointer(t.id).get('patriarchSessionId')
-    results['heirPassedOverOnDeath'] = new_patriarch == t.id
+    results['heirPassedOverOnDeath'] = new_patriarch != bravo['sessionId']
     results['newPatriarchAfterDeath'] = new_patriarch[:8] if isinstance(new_patriarch, str) else new_patriarch
     results['heirWas'] = bravo['sessionId'][:8]
     heir_after_death = t.pointer(t.id).get('heirSessionId')

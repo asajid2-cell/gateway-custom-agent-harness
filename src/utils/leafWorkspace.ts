@@ -743,12 +743,15 @@ export async function writePatriarchDesignation(familyId: string, patriarchSessi
   const current = await readLeafFamilyPointer(familyId)
   const previous = current?.patriarchSessionId ?? familyId
   const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
-  // An heir is raised to succeed one particular patriarch, so when the member
-  // being raised is the member taking the role, the designation has been
-  // realized and is cleared in the same write. That is the whole rule: an heir
-  // that ascends stops being the heir. A patriarch that moves to anyone else
-  // leaves the heir in place - the raise is still about the member it names.
-  const heirSessionId = current?.heirSessionId === patriarchSessionId ? undefined : current?.heirSessionId
+  // The heir designation describes a raise that is in progress UNDER THE CURRENT
+  // patriarch: the member was being trained by whoever holds the role. When the
+  // role moves - to the heir itself, to a third member, or nowhere but away - the
+  // raise is over, because the member that was training it has left the chair. So
+  // the designation is cleared in the same write that moves the role, which is
+  // the same rule as the elder: it belongs to the patriarch moving, and ascension
+  // is one instance of it rather than a special case. A write that does not move
+  // the role leaves the raise in place.
+  const heirSessionId = previous === patriarchSessionId ? current?.heirSessionId : undefined
   await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId, heirSessionId })
   if (previous !== patriarchSessionId) await markLeafElder(familyPath(familyId), familyId, previous)
 }

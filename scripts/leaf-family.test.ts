@@ -766,9 +766,14 @@ test('naming an heir records a designation the family reads, and ascending clear
     assert.equal(workspace.getLeafHeirSessionId(), other.sessionId, 'one heir at a time')
     assert.match(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[heir\\] ${other.sessionId}$`, 'm'), 'the new heir is the one filed')
 
-    // Ascension is the one thing that clears the designation: the member being
-    // raised takes the role, so it stops being the heir in the same write - and
-    // the patriarch it displaces is filed as an elder by that same write.
+    // A write that does not move the role leaves the raise in place: the heir
+    // was raised under the patriarch that is still there.
+    await workspace.writePatriarchDesignation(root, root)
+    assert.equal(workspace.getLeafHeirSessionId(), other.sessionId, 'a raise survives a write that does not move the role')
+
+    // Ascension clears the designation: the member being raised takes the role,
+    // so it stops being the heir in the same write - and the patriarch it
+    // displaces is filed as an elder by that same write.
     await workspace.conferPatriarch(other.sessionId)
     assert.equal(workspace.getLeafHeirSessionId(), undefined, 'the heir that ascends stops being the heir')
     assert.equal((await pointer()).heirSessionId, undefined, 'the cleared designation is gone from the pointer too')
