@@ -247,7 +247,7 @@ function isHandshakeAnswer(event: { type?: string; response?: { request_id?: str
  * takes the parent turns a failed launch into an orphan that holds the port and
  * the transcript. `taskkill /T` on Windows, `tree-kill` elsewhere.
  */
-async function killTree(pid: number | undefined): Promise<void> {
+export async function killTree(pid: number | undefined): Promise<void> {
   if (!pid) return
   await new Promise<void>(resolve => {
     if (process.platform === 'win32') {

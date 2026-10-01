@@ -20,7 +20,8 @@ import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
 import { withResolvers } from './withResolvers.js'
 import { isProcessRunning } from './genericProcessUtils.js'
-import { launchPartner, partnerStartupTimeoutMs, type PartnerHandle } from './partnerLeaf.js'
+import { killTree, launchPartner, partnerStartupTimeoutMs, type PartnerHandle } from './partnerLeaf.js'
+import { launchSessionInTerminal } from './deepLink/terminalLauncher.js'
 import { getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafSelfClose, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
@@ -29,6 +30,8 @@ import {
   checkpointTranscriptPath, defaultCheckpointLabel, dropCheckpoint, findCheckpoint, listCheckpoints,
   purgeCheckpoint, recordCheckpoint, renderCheckpoints, sizeLabel, slugLabel, type LeafCheckpoint,
 } from './leafCheckpoints.js'
+
+const execFileAsync = promisify(execFile)
 
 export type LeafView = { rootSessionId: string; member: LeafMember; process: Pick<LeafProcess, 'getState' | 'checkpoint' | 'compact' | 'setModel' | 'setEffort'>; draft: string }
 type OwnedLeafView = LeafView & { process: LeafProcess }
@@ -206,7 +209,48 @@ function ensureLeafOwnerEndpoint(): Promise<void> {
  * so the roster can say which ones this session holds - not because the partner
  * needs a parent, which is what it deliberately does not have.
  */
-const partners = new Map<string, { handle: PartnerHandle; label: string }>()
+/**
+ * One tandem this session holds, and everything a row needs to describe it.
+ *
+ * The handle is the lifetime; the rest is what makes a row readable and what
+ * lets a watched tandem be found again. `watchedPid` is the terminal process
+ * Watch opened, where the platform handed one back - an aid to closing that
+ * window, never the authority for it (see `closeTandem`).
+ */
+type TandemEntry = {
+  handle: PartnerHandle
+  label: string
+  ownerSessionId: string
+  cwd: string
+  startedAt: string
+  purpose?: string
+  model?: string
+  effort?: string
+  watchedPid?: number
+}
+
+const partners = new Map<string, TandemEntry>()
+
+/**
+ * A tandem as a row: a throwaway session this one owns, never a family member.
+ *
+ * It is separate from `LeafView` on purpose. A tandem has no leaf number, no
+ * place in `leaf-families/`, and no row in the durable leaf list, the roster or
+ * the carousel - which is the whole point of the section it appears in. The
+ * shared shape is `state`, because that is the one thing a person acts on.
+ */
+export type TandemView = {
+  sessionId: string
+  label: string
+  ownerSessionId: string
+  cwd: string
+  startedAt: string
+  purpose?: string
+  model?: string
+  effort?: string
+  state: 'starting' | 'ready' | 'closed' | 'failed'
+  watched: boolean
+}
 
 /**
  * The endpoint and token a partner is launched with.
@@ -264,7 +308,16 @@ export async function createPartner(options: { purpose?: string; model?: string;
     ...(options.model ? { model: options.model } : {}),
     ...(options.effort ? { effort: options.effort } : {}),
   }, credentials)
-  partners.set(sessionId, { handle, label })
+  partners.set(sessionId, {
+    handle,
+    label,
+    ownerSessionId: owner,
+    cwd: getCwd(),
+    startedAt: new Date().toISOString(),
+    ...(purpose ? { purpose } : {}),
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.effort ? { effort: options.effort } : {}),
+  })
   // Wait for the handshake the launch sent, bounded by the launcher's own startup
   // budget. Convening is only useful if the partner can then be talked to, so the
   // result is written from an answer rather than from an assumption: a caller
@@ -287,12 +340,121 @@ export function partnerRoster(): string {
   if (!partners.size) return 'No partners convened. Use action partner to start one.'
   const lines = ['partners']
   for (const [sessionId, entry] of partners) {
-    // A partner that ended, or never came up, is shown as it is rather than
-    // hidden: the row is the record that this session held it, and `closed` and
-    // `failed` are both the truth about it.
-    lines.push(`${entry.label} [${entry.handle.getState()}] ${sessionId}`)
+    const bits: string[] = [entry.handle.getState()]
+    if (entry.model) bits.push(entry.model)
+    if (entry.effort) bits.push(entry.effort)
+    if (entry.watchedPid !== undefined) bits.push('in a terminal')
+    lines.push(`${entry.label} [${bits.join(' · ')}] ${sessionId}`)
   }
   return lines.join('\n')
+}
+
+/** The tandems this session holds, as rows rather than as a report. */
+export function getTandemViews(): TandemView[] {
+  return [...partners].map(([sessionId, entry]) => ({
+    sessionId,
+    label: entry.label,
+    ownerSessionId: entry.ownerSessionId,
+    cwd: entry.cwd,
+    startedAt: entry.startedAt,
+    ...(entry.purpose ? { purpose: entry.purpose } : {}),
+    ...(entry.model ? { model: entry.model } : {}),
+    ...(entry.effort ? { effort: entry.effort } : {}),
+    state: entry.handle.getState(),
+    watched: entry.watchedPid !== undefined,
+  }))
+}
+
+/**
+ * Stop the headless tandem and hand its session to a terminal, so it can be
+ * seen and typed into.
+ *
+ * The headless process is stopped first, and awaited: one process owns a
+ * session at a time, and a terminal that came up while the print session was
+ * still holding the transcript would be the second writer this exists to avoid.
+ * `close()` is graceful - stdin ends, the turn finishes, the transcript is
+ * flushed - so what the terminal resumes is the whole conversation.
+ *
+ * A tandem that is already stopped is opened directly: watching it is then just
+ * the terminal half, and refusing would strand a row whose only remaining use is
+ * to be looked at. A tandem that is still `starting` is refused, because there
+ * is nothing to resume yet and stopping it would end a launch that never ran.
+ */
+export async function watchTandem(reference: string): Promise<string> {
+  const id = reference.trim()
+  const entry = partners.get(id)
+  if (!entry) throw new Error(`This session holds no tandem ${id}; list them in the tandem section or with action partners`)
+  if (entry.watchedPid !== undefined) throw new Error(`${entry.label} is already open in a terminal (pid ${entry.watchedPid}); close it there, or close the row here and watch again`)
+  const state = entry.handle.getState()
+  if (state === 'starting') throw new Error(`${entry.label} has not finished starting; watch it once it is ready`)
+  if (state === 'ready') await entry.handle.close()
+  const launched = await launchSessionInTerminal(id, entry.cwd)
+  if (!launched.ok) {
+    return `Stopped the headless tandem ${entry.label} but could not open a terminal for it (${id}). It is not running now; resume it with cc --resume ${id}, or close the row.`
+  }
+  if (launched.pid !== undefined) entry.watchedPid = launched.pid
+  return `Watching ${entry.label} (${id}) in a new terminal${launched.pid !== undefined ? ` (pid ${launched.pid})` : ''}. The headless session is stopped, so that terminal is the only writer.`
+}
+
+/**
+ * Close a tandem: end its headless process, or the terminal it was handed to.
+ *
+ * A watched tandem is closed by killing the window Watch opened, and the window
+ * is found by the session id on its command line rather than by the pid it was
+ * given - a pid is not an identity, and one that died and was reused would make
+ * a bare-pid kill reach a stranger's process. A window that cannot be found is
+ * not killed at all: the row is dropped and the answer says the window was not
+ * found, because a row that outlives its management is worse than one that is
+ * gone with an explanation.
+ */
+export async function closeTandem(reference: string): Promise<string> {
+  const id = reference.trim()
+  const entry = partners.get(id)
+  if (!entry) throw new Error(`This session holds no tandem ${id}; list them in the tandem section or with action partners`)
+  if (entry.watchedPid === undefined) return closePartner(id)
+  const pids = await resumeTerminalPids(id)
+  partners.delete(id)
+  if (!pids.length) {
+    return `Dropped the tandem row for ${entry.label} (${id}). Its terminal could not be found by session id, so nothing was killed - close that window yourself if it is still open.`
+  }
+  for (const pid of pids) await killTree(pid)
+  return `Closed ${entry.label} (${id}): the terminal watching it${pids.length > 1 ? ` and ${pids.length - 1} other process(es) resuming it` : ''} (pid ${pids.join(', ')}) is gone.`
+}
+
+/**
+ * The processes resuming `sessionId` in a terminal, by the id on their command
+ * line.
+ *
+ * The id travels to the child as an environment variable rather than being
+ * pasted into the query, so a reference that reached this function is never
+ * interpreted as script. The caller has already resolved the id against the
+ * tandems this session holds, and it is checked to be a plain UUID here anyway,
+ * because this is the one place a string becomes a shell program.
+ */
+async function resumeTerminalPids(sessionId: string): Promise<number[]> {
+  if (!/^[0-9a-fA-F-]{36}$/.test(sessionId)) return []
+  const env = { ...process.env, GATEWAY_TANDEM_SESSION: sessionId }
+  const mine = process.pid
+  if (process.platform === 'win32') {
+    const script = [
+      '$id = $env:GATEWAY_TANDEM_SESSION;',
+      'Get-CimInstance Win32_Process',
+      "| Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--resume') -and $_.CommandLine.Contains($id) }",
+      '| Select-Object -ExpandProperty ProcessId',
+    ].join(' ')
+    const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env, windowsHide: true }).catch(() => ({ stdout: '' }))
+    return stdout.split(/\s+/).map(Number).filter(pid => Number.isInteger(pid) && pid > 0 && pid !== mine)
+  }
+  const { stdout } = await execFileAsync('ps', ['-eo', 'pid=,args='], { env }).catch(() => ({ stdout: '' }))
+  const pids: number[] = []
+  for (const line of stdout.split('\n')) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line)
+    if (!match) continue
+    const pid = Number(match[1])
+    const args = match[2] ?? ''
+    if (pid !== mine && args.includes('--resume') && args.includes(sessionId)) pids.push(pid)
+  }
+  return pids
 }
 
 /** Close one partner by a reference to it. The rest are untouched. */
