@@ -232,6 +232,40 @@ exit 0
   expect(Date.now() - started).toBeLessThan(8_000)
 })
 
+test.skipIf(!isWindows)('an overrunning warm build is killed, not left to finish behind the refusal', async () => {
+  // The refusal is only half of what the deadline promises. The build it
+  // declined to trust has to stop too, or a declined launch leaves a
+  // minute-long build running behind it - and the kill that ends it is the one
+  // on the timeout path, the branch that still has a live child to kill.
+  //
+  // The budget is deliberately generous enough for a cold powershell to record
+  // its own pid first. Measured with a budget short enough to beat that write,
+  // this would kill a spawn that never got anywhere and prove nothing about a
+  // running build.
+  const dir = stubLauncher(`
+$prewarm = $false
+foreach ($a in $args) { if ($a -eq '--prewarm') { $prewarm = $true } }
+if ($prewarm) {
+  if ($env:PARTNER_PID_FILE) { Set-Content -Path $env:PARTNER_PID_FILE -Value $PID -Encoding utf8 }
+  Start-Sleep -Seconds 60
+  exit 0
+}
+exit 0
+`)
+  const pidFile = join(dir, 'prewarm-pid.txt')
+  process.env.PARTNER_PID_FILE = pidFile
+
+  await expect(prewarm({ cwd: tmpdir(), timeoutMs: 3_000 })).rejects.toThrow(/prewarm exceeded 3000ms/)
+
+  let pid = 0
+  for (let attempt = 0; attempt < 400 && !pid; attempt++) {
+    try { pid = Number(readFileSync(pidFile, 'utf8').replace(/^\uFEFF/, '').trim()) } catch { await new Promise(resolve => setTimeout(resolve, 10)) }
+  }
+  expect(pid, 'the warm build must have recorded its pid, or this says nothing about a running one').toBeGreaterThan(0)
+  await waitForGone(pid)
+  expect(isRunning(pid), 'an overrunning warm build must be killed, not left to finish').toBe(false)
+}, { timeout: 60_000 })
+
 test.skipIf(!isWindows)('a nonzero warm build refuses the launch', async () => {
   stubLauncher(`
 foreach ($a in $args) { if ($a -eq '--prewarm') { exit 3 } }
