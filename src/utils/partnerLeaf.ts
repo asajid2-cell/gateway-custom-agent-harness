@@ -289,7 +289,13 @@ export async function prewarm(options: { cwd: string; timeoutMs?: number; env?: 
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (error) await killTree(child.pid)
+      // Only a child still running has a tree to kill. On the exit path the
+      // process is already gone, and `taskkill /T` on a dead pid cannot reach the
+      // tree it left anyway - Windows does not keep a dead parent to walk from -
+      // while a pid the OS has since reused would make that same call kill
+      // someone else's tree. The timeout path is the one that needs this.
+      const running = child.exitCode === null && child.signalCode === null
+      if (error && running) await killTree(child.pid)
       error ? reject(error) : resolve()
     }
     const timer = setTimeout(() => { void finish(new Error(`prewarm exceeded ${timeoutMs}ms; the build tree was killed and no partner was started`)) }, timeoutMs)
