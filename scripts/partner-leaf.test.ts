@@ -516,3 +516,58 @@ test.skipIf(!isWindows)('a leaf convenes a partner through the Leaf tool, named 
   expect(await call({ action: 'partner-close', leaf: spawned.session })).toMatch(/^Closed partner of /)
   expect(await call({ action: 'partners' })).toBe('No partners convened. Use action partner to start one.')
 }, { timeout: 60_000 })
+
+// A leaf is itself a leaf: it holds `GATEWAY_LEAF_*` in its environment because
+// its own owner launched it that way. The partner it convenes must not carry that
+// inherited identity - it is a leaf of *this* process, so it is handed the
+// endpoint and token this process opened, and interactive-ness is cleared rather
+// than passed through. This is the property that made a live probe's idle
+// self-exit a probe bug rather than a product one, and it was uncovered: the
+// convene test above runs with no ambient identity, so an inherited endpoint and
+// the owner's own are indistinguishable there.
+test.skipIf(!isWindows)('a partner of a leaf is bound to that leaf, not to the identity it inherited', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'partner-inherit-'))
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
+  const dump = join(dir, 'spawn.json')
+  process.env.PARTNER_ENV_DUMP = dump
+  process.env.GATEWAY_PARTNER_LIMIT = '1'
+  stubLauncher(RECORDING_STUB)
+  // The session id and the family both come from config, and a test that left the
+  // real config home in place would convene a partner against a real family.
+  const config = mkdtempSync(join(tmpdir(), 'partner-config-'))
+  cleanups.push(() => rmSync(config, { recursive: true, force: true }))
+  const savedConfig = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = config
+  cleanups.push(() => { savedConfig === undefined ? delete process.env.CLAUDE_CONFIG_DIR : process.env.CLAUDE_CONFIG_DIR = savedConfig })
+
+  // What a leaf inherits from the owner above it. The token is deliberately not a
+  // uuid, so a dropped override cannot pass by looking like a fresh one.
+  const inherited: Record<string, string> = {
+    GATEWAY_LEAF_SESSION: 'inherited-session-id',
+    GATEWAY_LEAF_LABEL: 'inherited label',
+    GATEWAY_LEAF_OWNER_ENDPOINT: '\\\\.\\pipe\\gateway-leaf-owner-INHERITED',
+    GATEWAY_LEAF_OWNER_TOKEN: 'inherited-token-not-a-uuid',
+    GATEWAY_INTERACTIVE_LEAF: '1',
+  }
+  const saved: Record<string, string | undefined> = {}
+  for (const [key, value] of Object.entries(inherited)) { saved[key] = process.env[key]; process.env[key] = value }
+  cleanups.push(() => { for (const [key, value] of Object.entries(saved)) { value === undefined ? delete process.env[key] : process.env[key] = value } })
+
+  const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
+  const call = async (input: Record<string, unknown>): Promise<string> =>
+    (await LeafTool.call(input as never, {} as never)).data.result
+
+  expect(await call({ action: 'partner', name: 'inherit probe' })).toContain('[ready]')
+
+  const spawned = await waitForSpawnRecord(dump)
+  // The endpoint is this process's own - a fresh pipe, not the one it inherited.
+  expect(spawned.endpoint).toContain('gateway-leaf-owner-')
+  expect(spawned.endpoint).not.toBe(inherited.GATEWAY_LEAF_OWNER_ENDPOINT)
+  // The token is this process's own too, and a fresh one is a uuid.
+  expect(spawned.token).not.toBe(inherited.GATEWAY_LEAF_OWNER_TOKEN)
+  expect(spawned.token).toMatch(/^[0-9a-f-]{36}$/)
+  // It is a leaf of this leaf, not of the session above it.
+  expect(spawned.session).not.toBe(inherited.GATEWAY_LEAF_SESSION)
+  // And it does not inherit interactive-ness: it has no terminal to draw into.
+  expect(spawned.interactive ?? '').toBe('')
+}, { timeout: 60_000 })
