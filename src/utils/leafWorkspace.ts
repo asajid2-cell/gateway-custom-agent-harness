@@ -95,6 +95,12 @@ export function getLeafPatriarchSessionId(): string {
  * same one and is cached here for the sync render paths. A member reads it from
  * the snapshot the matriarch publishes; the matriarch resolves it from the
  * designation it last read. Absent means the family is raising no one.
+ *
+ * The `designatedHeir` fallback is seeded only by `refreshDesignatedPatriarch`,
+ * which every roster read runs first (`listLeafMembers`), so this sync getter is
+ * correct only downstream of one. A reader that calls it before any
+ * `listLeafMembers`/refresh in the same turn reads undefined on a fresh mount,
+ * whatever the pointer on disk holds.
  */
 let designatedHeir: string | undefined
 
