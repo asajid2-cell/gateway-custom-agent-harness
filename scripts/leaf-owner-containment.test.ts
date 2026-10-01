@@ -23,7 +23,10 @@ import { join } from 'node:path'
  * be observed in less than one interval, and a test bound tighter than that would
  * be testing the bound rather than the watchdog. Each test waits for the probe it
  * is reasoning about - a connection counted by the endpoint, or a connection the
- * owner answered - rather than sleeping for a guessed duration.
+ * owner answered - rather than sleeping for a guessed duration. The one thing
+ * taken off the measured path is the harness's own startup: a leaf runs from a
+ * bundle, where the shutdown module is already loaded, and `adoptingLeaf`
+ * preloads it for that reason.
  *
  * Two things this does NOT prove, both deliberate and both stated rather than
  * implied. It does not prove that a *descendant the leaf never registered* goes
@@ -42,6 +45,18 @@ const isWindows = process.platform === 'win32'
 /** The product's probe interval. Every bound below is measured in these. */
 const PROBE = 5_000
 const PROBE_TIMEOUT = 3_000
+
+/**
+ * How long the leaf is given, after the probe that should end it, to be gone.
+ *
+ * Far above the two probes plus the shutdown itself, on purpose: what is
+ * asserted is that the leaf exits and that what it owned goes with it, not how
+ * quickly a loaded machine gets there. A tighter bound buys no safety - a leaf
+ * that was going to hang is still hanging at any of these numbers - and it
+ * turns machine load into a red. Measured here: a run that takes 12s alone can
+ * take 43s when several suites are competing for the machine.
+ */
+const EXIT_WINDOW = PROBE * 2 + 20_000
 
 const cleanups: (() => void)[] = []
 afterEach(() => { for (const cleanup of cleanups.splice(0)) { try { cleanup() } catch { /* a cleanup that fails must not fail the test it follows */ } } })
@@ -105,16 +120,20 @@ async function serveOwner(token: string) {
   const state: { answering: string | undefined } = { answering: token }
   const sockets: Socket[] = []
   let connections = 0
+  const sent: string[] = []
   const server = createServer(socket => {
     connections++
     sockets.push(socket)
     socket.on('error', () => {})
-    if (state.answering !== undefined) socket.end(`${state.answering}\n`)
+    if (state.answering !== undefined) {
+      sent.push(state.answering)
+      socket.end(`${state.answering}\n`)
+    } else sent.push('(silent)')
   })
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve) })
   const stop = () => { for (const socket of sockets.splice(0)) socket.destroy(); server.close() }
   cleanups.push(stop)
-  return { endpoint, token, connections: () => connections, answer: (text: string | undefined) => { state.answering = text }, stop }
+  return { endpoint, token, connections: () => connections, sent: () => sent, answer: (text: string | undefined) => { state.answering = text }, stop }
 }
 
 /**
@@ -128,12 +147,20 @@ async function serveOwner(token: string) {
  * It also spawns a descendant and registers it the way a leaf registers what it
  * owns, so the shutdown the watchdog triggers is the one under test rather than
  * a bare `exit`.
+ *
+ * It preloads the shutdown module before it starts watching, which is what a
+ * bundled harness has and what the watchdog's own dynamic import finds there. In
+ * source mode that import is a transpile of the whole harness graph, and when
+ * several suites are running at once it measured 31s in this window - real work
+ * on the machine, but not work this fixture is about. Preloading keeps the
+ * fixture measuring the watchdog and the exit, not the build the exit waits on.
  */
 function adoptingLeaf(owner: { endpoint: string; token: string }) {
   const dir = mkdtempSync(join(tmpdir(), 'leaf-owner-'))
   cleanups.push(() => rmSync(dir, { recursive: true, force: true }))
   const startedFile = join(dir, 'started.txt')
   const exitFile = join(dir, 'exit.txt')
+  const cleanupFile = join(dir, 'cleanup.txt')
   const grandchildPidFile = join(dir, 'grandchild.txt')
 
   const grandchildScript = join(dir, 'grandchild.mjs')
@@ -144,23 +171,43 @@ function adoptingLeaf(owner: { endpoint: string; token: string }) {
     '',
   ].join('\n'), 'utf8')
 
+  // The child narrates its own progress to stderr, one line per step, with the
+  // milliseconds since it started. A watchdog that fires and a shutdown that
+  // never finishes look identical from the parent - the child is simply still
+  // there - so the failing case has to say which step it reached. The last
+  // mark printed is where it stopped, rather than a duration to be guessed at.
   const childScript = join(dir, 'child.mjs')
   writeFileSync(childScript, [
     "import { writeFileSync } from 'node:fs'",
     "import { spawn, execFile } from 'node:child_process'",
+    'const began = Date.now()',
+    'const mark = name => console.error(`LEAF ${name} +${Date.now() - began}ms`)',
     'const stamp = (file, text) => { try { writeFileSync(file, String(text)) } catch {} }',
     'stamp(process.env.CHILD_STARTED_FILE, process.pid)',
-    "process.on('exit', code => stamp(process.env.CHILD_EXIT_FILE, code))",
+    "process.on('exit', code => { mark('exit'); stamp(process.env.CHILD_EXIT_FILE, code) })",
     "process.on('unhandledRejection', reason => console.error('UNHANDLED REJECTION', (reason && reason.stack) || reason))",
     "process.on('uncaughtException', error => console.error('UNCAUGHT', (error && error.stack) || error))",
     'setInterval(() => {}, 1000)',
     `const { registerCleanup } = await import(${JSON.stringify(new URL('../src/utils/cleanupRegistry.ts', import.meta.url).href)})`,
+    "mark('registry')",
+    // See the fixture note: this is the module the watchdog loads when it decides
+    // the owner is gone, and loading it here is what a bundle has already done.
+    `await import(${JSON.stringify(new URL('../src/utils/gracefulShutdown.ts', import.meta.url).href)})`,
+    "mark('shutdown-loaded')",
     `const grandchild = spawn(process.execPath, [${JSON.stringify(grandchildScript)}], { env: process.env, stdio: 'ignore' })`,
     'registerCleanup(async () => {',
+    '  stamp(process.env.CHILD_CLEANUP_FILE, "reached")',
     "  await new Promise(resolve => execFile('taskkill.exe', ['/PID', String(grandchild.pid), '/T', '/F'], { windowsHide: true }, () => resolve()))",
+    "  mark('descendant-killed')",
     '})',
     `const leaf = await import(${JSON.stringify(new URL('../src/utils/leafTerminal.ts', import.meta.url).href)})`,
+    "mark('leaf-imported')",
     'leaf.adoptHeadlessLeafOwner()',
+    "mark('owner-watched')",
+    // gracefulShutdown sets process.exitCode only after it arms its failsafe, so
+    // this line is the boundary between "the shutdown got through its imports"
+    // and "it never got that far".
+    'const poll = setInterval(() => { if (process.exitCode !== undefined) { clearInterval(poll); mark(`exitCode=${process.exitCode}`) } }, 200)',
     '',
   ].join('\n'), 'utf8')
 
@@ -172,6 +219,7 @@ function adoptingLeaf(owner: { endpoint: string; token: string }) {
       GATEWAY_LEAF_LABEL: 'partner of a containment test',
       CHILD_STARTED_FILE: startedFile,
       CHILD_EXIT_FILE: exitFile,
+      CHILD_CLEANUP_FILE: cleanupFile,
       GRANDCHILD_PID_FILE: grandchildPidFile,
     }),
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -189,8 +237,30 @@ function adoptingLeaf(owner: { endpoint: string; token: string }) {
     stderr: () => stderr,
     started: () => published(startedFile),
     grandchild: () => published(grandchildPidFile),
+    /** Whether the shutdown the watchdog asked for reached the cleanup registry. */
+    reachedCleanup: () => published(cleanupFile) !== undefined,
+    /** The exit code the leaf recorded about itself, or undefined while it has not ended. */
+    exitCode: () => published(exitFile),
+    /**
+     * Resolves when the leaf is gone, and says how it ended.
+     *
+     * The `exit` event is the obvious channel and not the only one: with several
+     * suites competing for the machine, a leaf that has demonstrably ended - its
+     * own exit record written, its process no longer running - has been seen
+     * while the event had not arrived, which made a leaf that died on schedule
+     * read as one that never died. The child's own record plus asking the OS is
+     * stronger evidence about a process that has already ended than a
+     * convenience event, so whichever of them arrives first settles it.
+     */
     exit: new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
       child.on('exit', (code, signal) => resolve({ code, signal }))
+      const observed = setInterval(() => {
+        const recorded = published(exitFile)
+        if (recorded === undefined || (child.pid !== undefined && isRunning(child.pid))) return
+        clearInterval(observed)
+        resolve({ code: recorded, signal: null })
+      }, 200)
+      observed.unref?.()
     }),
   }
 }
@@ -212,7 +282,10 @@ test.skipIf(!isWindows)('a leaf lives while its owner answers the token, and a w
   // A live endpoint that answers something else is not the owner. The secret is
   // the identity, so a stranger holding the address cannot keep a leaf alive.
   owner.answer('not-the-owner-token')
-  const outcome = await within(leaf.exit, PROBE * 2 + 8_000, 'the leaf to end when its owner stops answering the token')
+  const outcome = await within(leaf.exit, EXIT_WINDOW, 'the leaf to end when its owner stops answering the token')
+    .catch((error: Error) => {
+      throw new Error(`${error.message} | probes=${owner.connections()} answers=${JSON.stringify(owner.sent())} recordedExit=${leaf.exitCode()} running=${leaf.child.pid !== undefined && isRunning(leaf.child.pid)} reachedCleanup=${leaf.reachedCleanup()} stderr=${JSON.stringify(leaf.stderr())}`)
+    })
   // Graceful, not killed: the watchdog asks for a shutdown, and a leaf that died
   // by another route would leave everything it owns behind.
   expect(outcome.code, `the leaf must shut down gracefully, not be killed: ${leaf.stderr()}`).toBe(0)
@@ -286,6 +359,9 @@ test.skipIf(!isWindows)('an owner that is killed rather than closed still ends i
   })
   expect(isRunning(hostPid), 'the owner must really be gone, or nothing below is about a dead owner').toBe(false)
 
-  const outcome = await within(leaf.exit, PROBE * 2 + 8_000, 'the leaf to end once its owner process is gone')
+  const outcome = await within(leaf.exit, EXIT_WINDOW, 'the leaf to end once its owner process is gone')
+    .catch((error: Error) => {
+      throw new Error(`${error.message} | answers=${JSON.stringify(published(answersFile))} recordedExit=${leaf.exitCode()} running=${leaf.child.pid !== undefined && isRunning(leaf.child.pid)} reachedCleanup=${leaf.reachedCleanup()} stderr=${JSON.stringify(leaf.stderr())}`)
+    })
   expect(outcome.code, `the leaf must shut down gracefully: ${leaf.stderr()}`).toBe(0)
 }, { timeout: 120_000 })
