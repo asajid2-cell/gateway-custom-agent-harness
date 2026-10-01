@@ -612,7 +612,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // where the heir designation lives beside the patriarch's: the family file is
   // strict, so this loose per-session record is the only place an extra field can
   // go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)
@@ -655,7 +655,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // Closing or archiving the designated parent hands the family to the next
   // member in line, so a family never keeps naming a parent that has left.
   assert.match(workspace, /async function promoteNextPatriarch\(root: string, leaving: string\)/)
-  assert.match(workspace, /await writePatriarchDesignation\(root, next\.sessionId\)/)
+  assert.match(workspace, /await writePatriarchDesignation\(root, next\.sessionId, leaving\)/)
   // Reopening it from a member must not put two writers on one transcript.
   assert.match(workspace, /await claimMatriarchOwnership\(\)/)
   assert.match(workspace, /is already open in another window; close it there before opening it here/)

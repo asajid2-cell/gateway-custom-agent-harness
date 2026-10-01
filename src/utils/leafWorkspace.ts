@@ -71,6 +71,17 @@ export function selectedLeafId(): string | undefined {
  */
 let designatedPatriarch: { sessionId: string; name: string } | undefined
 
+/**
+ * Members that have held the patriarch role and given it up, as last read.
+ *
+ * The designation names the holder; this names the ones who gave it up, so that
+ * the elder fact is durable at the moment the role moves rather than at a second
+ * write an interruption can skip. Cached and published for the same reason the
+ * designation is: a roster is a render path and cannot await the disk, so a
+ * member reads it from the snapshot the host publishes.
+ */
+let formerPatriarchIds: readonly string[] = []
+
 /** Which member the family's patriarch is right now: the designated one, else the creator. */
 export function getLeafPatriarchSessionId(): string {
   return getLeafSnapshot()?.patriarchSessionId ?? designatedPatriarch?.sessionId ?? familyRootSync()
@@ -90,6 +101,11 @@ let designatedHeir: string | undefined
 /** Which member the family is raising as its next patriarch, if any. */
 export function getLeafHeirSessionId(): string | undefined {
   return getLeafSnapshot()?.heirSessionId ?? designatedHeir
+}
+
+/** Members that have held the patriarch role and given it up, in the order they held it. */
+export function getLeafFormerPatriarchIds(): readonly string[] {
+  return getLeafSnapshot()?.formerPatriarchIds ?? formerPatriarchIds
 }
 
 /**
@@ -398,7 +414,7 @@ function publish(): void {
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
   const root = familyRootSync()
-  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
     if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
@@ -452,7 +468,7 @@ export function getLeafCarouselViews(): LeafView[] {
  * one that knows its transcript path and directory), so any member can find the
  * family and reopen the rest of it - including the patriarch.
  */
-type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
 let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
 
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
@@ -674,6 +690,85 @@ export function getLeafMatriarchSessionId(): string { return getLeafSnapshot()?.
 export function externallyHeldLeafIds(): readonly string[] { return matriarchState?.forSession === getSessionId() ? matriarchState.external : [] }
 
 /**
+ * Whether a member can still hold a designation.
+ *
+ * The question is the filing, not liveness. `open` is what the succession paths
+ * already mean by a member that can take the role - `promoteNextPatriarch` and
+ * `closeMatriarch` both pick the next patriarch with `status === 'open'` and
+ * nothing else - and the other three filings are ways of having left: `closed`
+ * and `archived` are put away, `promoted` stands on its own. A member whose
+ * process merely is not running is still `open` and still acts, which is what
+ * "records what a leaf was doing when we last saw it, not an instruction to
+ * boot" means. Liveness is deliberately not consulted: it is not durable, and a
+ * designation is a fact about the family that outlives any one process.
+ */
+function memberCanHoldRole(member: LeafMember): boolean {
+  return member.status === 'open'
+}
+
+/** The family's members if its file can be read, undefined otherwise: a read is never a new failure here. */
+async function familyMembersForRead(familyId: string): Promise<readonly LeafMember[] | undefined> {
+  try { return (await readLeafFamily(familyPath(familyId), familyId)).members } catch { return undefined }
+}
+
+/**
+ * The acting patriarch: the designated member while it can hold the role, else
+ * the member the person listed first that can.
+ *
+ * A designation is a fact about a member, and a member that cannot hold the role
+ * is not one every reader can resolve to. Without this a family whose patriarch
+ * was filed away - which `onExit` does the moment its process dies, and a
+ * deliberate close does on purpose - keeps naming a conversation that is not
+ * there, and every reader decides from it: the roster marks it,
+ * `promoteNextPatriarch`'s guard never promotes, `closeMatriarch`'s guard never
+ * moves the matriarch, and `indexLeafMembers` republishes it into every member
+ * pointer. Reading the designation as a preference rather than as the answer is
+ * what makes an interrupted succession heal by being read instead of by being
+ * repaired - and repairing on read is what would race the writer it is trying to
+ * fix.
+ *
+ * Nothing is written here, deliberately: no pointer write, no elder mark, no
+ * designation move. The designation is left exactly where the writer put it, so
+ * this stays idempotent and side-effect free, and the family pointer stays the
+ * authority. `indexLeafMembers` publishes THIS answer into the member copies,
+ * which is safe only because no read path treats a member copy's
+ * `patriarchSessionId` as authority - the family pointer keyed by the family id
+ * is what every reader here goes through.
+ *
+ * The terminal answer is the designation the pointer already holds: when no
+ * member can act, the last member the family designated is still what the family
+ * says it is - a family with nothing open is dormant, not nameless. Only a family
+ * that never designated anyone falls back to the family id, which is who the
+ * patriarch was before anyone could designate one. That terminus is a name rather
+ * than an acting member, and it is only reached when no member can act - which a
+ * session that is itself reading cannot observe, because the reading session's
+ * own row is open.
+ */
+async function actingPatriarch(familyId: string, designated: string): Promise<string> {
+  const members = await familyMembersForRead(familyId)
+  if (!members) return designated
+  if (members.some(member => member.sessionId === designated && memberCanHoldRole(member))) return designated
+  return members.filter(memberCanHoldRole).sort((a, b) => a.number - b.number)[0]?.sessionId ?? designated
+}
+
+/**
+ * The designation exactly as the pointer holds it.
+ *
+ * For the write paths that decide whether to MOVE the designation. They ask
+ * whether the member leaving is the one the family designated, which is a
+ * question about the pointer rather than about who can act, so they read it
+ * directly. `familyPatriarchSessionId` answers the other question, for readers.
+ * The two cannot be conflated, and the reason is ordering rather than taste: a
+ * deliberate close files the member `closed` (see `changeLeaf` and
+ * `pendingMatriarchClose`) BEFORE asking whether the designation should move, so
+ * a moving question asked of the derived answer would see the successor already
+ * acting and never move the designation or its titles at all.
+ */
+async function designatedPatriarchSessionId(familyId: string): Promise<string> {
+  return (await readLeafFamilyPointer(familyId))?.patriarchSessionId ?? familyId
+}
+
+/**
  * Which member is the family's patriarch.
  *
  * The family file never moves - it is named after the creator's session id and
@@ -682,19 +777,32 @@ export function externallyHeldLeafIds(): readonly string[] { return matriarchSta
  * lives in the creator's own pointer instead, which is read loosely and whose
  * extra field an older reader ignores. Absent, the family id is the patriarch,
  * which is exactly what the patriarch was before anyone could designate one.
+ *
+ * The pointer names the member the family DESIGNATED. The answer here is the
+ * member that can actually act as it; see `actingPatriarch` for why the two come
+ * apart and why nothing is written to put them back together.
  */
 async function familyPatriarchSessionId(familyId: string): Promise<string> {
-  return (await readLeafFamilyPointer(familyId))?.patriarchSessionId ?? familyId
+  return actingPatriarch(familyId, await designatedPatriarchSessionId(familyId))
 }
 
 /**
  * Which member the family is raising as its next patriarch, if any.
  *
  * Read from the same loose pointer the patriarch designation lives in, so a
- * reader that does not know about heirs simply ignores the extra field.
+ * reader that does not know about heirs simply ignores the extra field. A raise
+ * is a fact about a member the family is training, and only a member that can
+ * still act can be trained: an heir that was filed away is no heir and resolves
+ * to none rather than to a session that is not there. Singular by construction -
+ * there is no next in line to fall to, because ascension is a decision and not a
+ * fallback - so this is the same rule as the patriarch's, not a second one.
  */
 async function familyHeirSessionId(familyId: string): Promise<string | undefined> {
-  return (await readLeafFamilyPointer(familyId))?.heirSessionId
+  const designated = (await readLeafFamilyPointer(familyId))?.heirSessionId
+  if (!designated) return undefined
+  const members = await familyMembersForRead(familyId)
+  if (!members) return designated
+  return members.some(member => member.sessionId === designated && memberCanHoldRole(member)) ? designated : undefined
 }
 
 /**
@@ -734,14 +842,26 @@ async function familyPatriarchMember(members: readonly LeafMember[], familyId: s
  *
  * This is the one place the patriarch moves, so it is also the one place a member
  * becomes an elder: whoever the designation is moving away from has held the role
- * and does not hold it now. Reading the outgoing member from the pointer that is
- * about to be overwritten - and falling back to the family id, which is the
- * patriarch a family has before any designation is written - catches every move,
- * whether the member stepped down, was displaced, or left.
+ * and does not hold it now.
+ *
+ * Who that is comes from the caller when the caller knows, because the caller is
+ * the one that decided the move and the raw pointer can disagree with it. A
+ * reader resolves a designation to a member that can act
+ * (`familyPatriarchSessionId`), so with a stale designation the member being
+ * displaced - the one whose title this write demotes - is not the member the
+ * pointer still names. The caller passes the member its own decision is about
+ * (`current` in `conferPatriarch`, `leaving` in `promoteNextPatriarch`, `self` in
+ * `pendingMatriarchClose`), so the demotion and the record name one member rather
+ * than two.
+ *
+ * The raw read stays as the fallback, and the family id after it: a path that
+ * bootstraps a family which never had a designation writes none of its own and
+ * must still record that the creator held the role, which is the patriarch a
+ * family has before anyone could designate one.
  */
-export async function writePatriarchDesignation(familyId: string, patriarchSessionId: string): Promise<void> {
+export async function writePatriarchDesignation(familyId: string, patriarchSessionId: string, displacedSessionId?: string): Promise<void> {
   const current = await readLeafFamilyPointer(familyId)
-  const previous = current?.patriarchSessionId ?? familyId
+  const previous = displacedSessionId ?? current?.patriarchSessionId ?? familyId
   const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
   // The heir designation describes a raise that is in progress UNDER THE CURRENT
   // patriarch: the member was being trained by whoever holds the role. When the
@@ -752,7 +872,18 @@ export async function writePatriarchDesignation(familyId: string, patriarchSessi
   // is one instance of it rather than a special case. A write that does not move
   // the role leaves the raise in place.
   const heirSessionId = previous === patriarchSessionId ? current?.heirSessionId : undefined
-  await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId, heirSessionId })
+  // The elder fact is recorded in THIS write rather than in the mark that
+  // follows it. The mark is a second write, and an interruption between the two
+  // loses the fact for good: nothing on disk would name the member that held the
+  // role, and no read can invent a fact that was never written. The pointer is
+  // the write that cannot be skipped, because it is the one that moves the role,
+  // so the outgoing holder is named here. Whoever the role moved away from has
+  // held it, which is the whole of the elder concept - the mark still runs, and
+  // is what a reader that only knows the row field goes on reading.
+  const formerPatriarchIds = previous === patriarchSessionId
+    ? current?.formerPatriarchIds ?? []
+    : [...new Set([...(current?.formerPatriarchIds ?? []), previous])]
+  await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId, heirSessionId, formerPatriarchIds })
   if (previous !== patriarchSessionId) await markLeafElder(familyPath(familyId), familyId, previous)
 }
 
@@ -763,6 +894,7 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   const member = await familyPatriarchMember(members, root)
   designatedPatriarch = member ? { sessionId: member.sessionId, name: member.name } : undefined
   designatedHeir = await familyHeirSessionId(root)
+  formerPatriarchIds = (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? []
   return member
 }
 
@@ -797,10 +929,13 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
  * is a member that is no longer being raised at all.
  */
 async function promoteNextPatriarch(root: string, leaving: string): Promise<LeafMember | undefined> {
-  if ((await familyPatriarchSessionId(root)) !== leaving) return undefined
+  // The designation is read as the pointer holds it, not as `actingPatriarch`
+  // resolves it: the member leaving is filed away before this runs, so asking
+  // who can act would already answer with its successor and nothing would move.
+  if ((await designatedPatriarchSessionId(root)) !== leaving) return undefined
   const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
-  const current = await familyPatriarchMember(members, root)
-  if (!current || current.sessionId !== leaving) return undefined
+  const current = members.find(member => member.sessionId === leaving)
+  if (!current) return undefined
   const next = members
     .filter(member => member.sessionId !== leaving && member.status === 'open' &&
       (member.sessionId === getSessionId() || isLeafProcessAlive(views.get(member.sessionId)?.process.getState() ?? 'closed')))
@@ -813,7 +948,7 @@ async function promoteNextPatriarch(root: string, leaving: string): Promise<Leaf
   const successor = views.get(next.sessionId)
   if (!successor || ['idle', 'closed', 'failed'].includes(successor.process.getState())) saveSessionName(asSessionId(next.sessionId), next.name, next.transcriptPath)
   if (leaving !== getSessionId()) saveSessionName(asSessionId(leaving), `Leaf ${current.number}: ${current.name}`, current.transcriptPath)
-  await writePatriarchDesignation(root, next.sessionId)
+  await writePatriarchDesignation(root, next.sessionId, leaving)
   // Every pointer is rewritten with the patriarch the family has now, so a leaf
   // resumed on its own later reads the family it actually belongs to.
   await indexLeafMembers(root, members)
@@ -843,8 +978,25 @@ function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: 
   return (async () => {
     // The designation is read before it is written: the family-id pointer is
     // the authority, and re-indexing must republish it rather than drop it.
-    const pointer = { ...rootPointerInfo(root), patriarchSessionId: await familyPatriarchSessionId(root), heirSessionId: await familyHeirSessionId(root), ...extra }
-    await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, pointer).catch(() => {})))
+    //
+    // A member copy is republished with the ACTING patriarch, so it can disagree
+    // with the family pointer, which holds the designation as written. That is
+    // safe only because no read path treats a member copy's `patriarchSessionId`
+    // as authority - `familyPatriarchSessionId` always reads the family pointer
+    // keyed by the family id - so the next reader to add a lookup here must read
+    // the family pointer, not the copy.
+    //
+    // The root is a member, so its own entry IS the family pointer: it is the one
+    // that must keep the designation as written. Writing the acting answer there
+    // would heal the pointer on every ordinary mount, and the raw designation is
+    // the only record of who was displaced - so a mount would silently undo the
+    // succession record that the designation exists to keep. Only the copies get
+    // the acting answer, which is the whole reason they exist: a member resumed on
+    // its own must not be told to resolve to a session that cannot act.
+    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], ...extra }
+    const acting = await familyPatriarchSessionId(root)
+    const designated = await designatedPatriarchSessionId(root)
+    await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: member.sessionId === root ? designated : acting }).catch(() => {})))
   })()
 }
 
@@ -1134,12 +1286,17 @@ export async function familyRoster(): Promise<string> {
   // patriarch does move, so the mark follows the designation rather than the id.
   const patriarchId = getLeafPatriarchSessionId()
   const heirId = getLeafHeirSessionId()
+  // The elder is read from the row AND from the pointer's record of who held the
+  // role. The row mark is a second write that an interruption can skip, so the
+  // record is what makes the fact survive one; a member is an elder if either
+  // says so, and neither is ever cleared.
+  const elderIds = new Set(getLeafFormerPatriarchIds())
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
   const lines = [`family ${root}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
     const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
-    const role = `${member.sessionId === patriarchId ? ' [patriarch]' : ''}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
+    const role = `${member.sessionId === patriarchId ? ' [patriarch]' : ''}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
     lines.push(`#${member.number} ${member.name} [${state}]${role} ${member.sessionId}${settings ? ` ${settings}` : ''}`)
   }
   return lines.join('\n')
@@ -2565,7 +2722,9 @@ async function closeMatriarch(requestedBy?: string): Promise<string | undefined>
         await handler.resume({ ...next, draft: successor.draft })
         if (getSessionId() !== next.sessionId) throw new Error('Successor did not take the session terminal')
         await updateLeafMember(familyPath(root), root, self, { status: 'closed' })
-        if (await familyPatriarchSessionId(root) === self) await writePatriarchDesignation(root, next.sessionId)
+        // As in promoteNextPatriarch: `self` was filed `closed` on the line above,
+        // so the moving question is asked of the pointer, not of who can act.
+        if (await designatedPatriarchSessionId(root) === self) await writePatriarchDesignation(root, next.sessionId, self)
         matriarchState = undefined
         forgetLeafFamilyRoot()
         await restoreLeafWorkspace()
@@ -2722,7 +2881,7 @@ export async function conferPatriarch(sessionId: string): Promise<string> {
   // renaming is mid-turn, and that is the check above.
   saveSessionName(asSessionId(target.sessionId), target.name, target.transcriptPath)
   saveSessionName(asSessionId(current.sessionId), `Leaf ${current.number}: ${current.name}`, current.transcriptPath)
-  await writePatriarchDesignation(root, target.sessionId)
+  await writePatriarchDesignation(root, target.sessionId, current.sessionId)
   // Every pointer is rewritten with the patriarch the family has now, so a leaf
   // resumed on its own later reads the family it actually belongs to.
   await indexLeafMembers(root, members)

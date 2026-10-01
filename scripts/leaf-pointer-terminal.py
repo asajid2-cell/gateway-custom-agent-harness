@@ -43,6 +43,9 @@ parser.add_argument('--probe-elder', action='store_true')
 parser.add_argument('--probe-arc', action='store_true')
 parser.add_argument('--probe-stress', action='store_true')
 parser.add_argument('--probe-crash-window', action='store_true')
+parser.add_argument('--probe-designation-residue', action='store_true')
+parser.add_argument('--probe-dormant-residue', action='store_true')
+parser.add_argument('--probe-close-promotion', action='store_true')
 parser.add_argument('--probe-boot', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -2210,12 +2213,30 @@ def probe_crash_window():
     confer_patriarch(u, a1['sessionId'], results, 'w1')
     u.check(lambda: u.pointer(u.id).get('patriarchSessionId') == a1['sessionId'], 'Alpha never took the role')
 
-    # The residue, written by hand: the pointer has moved to Bravo and the family
-    # file is untouched, because `markLeafElder` for Alpha never ran. This is the
-    # instant between the pointer rename and the elder write, frozen.
+    # (a) The writer half, read off the disk. A real conferral is the commit that
+    # an interruption cannot split, so what the pointer holds afterwards is what
+    # survives one. The holder the role moved away from must be named in the
+    # POINTER, in the same write that moved the role: while it lived only in the
+    # `markLeafElder` that follows, dying between the two lost it for good, and no
+    # read can invent a fact that was never written.
+    after_confer = u.pointer(u.id)
+    results['w1_pointerAfterConfer'] = after_confer
+    results['w1_writerRecordsOutgoingHolder'] = u.id in (after_confer.get('formerPatriarchIds') or [])
+    u.check(lambda: u.id in (after_confer.get('formerPatriarchIds') or []),
+            'the pointer does not name the holder the role moved away from: ' + json.dumps(after_confer))
+    creator_row = next((m for m in u.family()['members'] if m['sessionId'] == u.id), {})
+    results['w1_realConferMarksCreatorElder'] = bool(creator_row.get('eldership'))
+
+    # (b) The display half: the instant between the pointer write and the elder
+    # mark, frozen. The pointer has moved to Bravo carrying the record that Alpha
+    # held the role, and Alpha's row is unmarked - exactly what an interruption
+    # leaves now that the record rides in the same write. A resolver-only diff
+    # cannot make the resumed roster show this, because there would be nothing on
+    # disk for it to derive from.
     pointer_path = root / 'leaf-families' / 'index' / (u.id + '.json')
     pointer = json.loads(pointer_path.read_text(encoding='utf-8'))
     pointer['patriarchSessionId'] = b1['sessionId']
+    pointer['formerPatriarchIds'] = list(dict.fromkeys((pointer.get('formerPatriarchIds') or []) + [a1['sessionId']]))
     pointer_path.write_text(json.dumps(pointer), encoding='utf-8')
     alpha_member = next(m for m in u.family()['members'] if m['sessionId'] == a1['sessionId'])
     results['w1_residueElderOnAlpha'] = bool(alpha_member.get('eldership'))
@@ -2253,6 +2274,245 @@ def probe_crash_window():
     # which is a probe failing on its own housekeeping. What the probe owes is
     # the family left standing, and `exit` reads that back.
     v.exit(family_survives=True)
+
+
+def probe_designation_residue():
+    """The open-sibling residue: a stale designation with a member that can act.
+
+    The pointer names a member whose process was killed, so the family filed it
+    away; another member is still open, so the family is not dormant. What is
+    asserted is POSITIVE: the member that can act must carry [patriarch], read
+    from a session that is not it. The window-3 residue in `probe_crash_window`
+    could only show the mark coming OFF the closed member, and a resolver that
+    returned no patriarch at all satisfies that reading just as well - it is one
+    half of the fact.
+
+    The other residue a stale designation leaves - every member filed away, so
+    nothing can act - is `probe_dormant_residue`. It builds its family in a run
+    of its own on purpose: this residue kills a member's process, a killed
+    process cannot give its writer lock back, and a leaf spawned into that same
+    config root afterwards never leaves its boot and can never be given the
+    title. A residue is read in a root where nothing has been killed.
+    """
+    results = {}
+
+    def flush_results():
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    # --- The open-sibling residue ---------------------------------------------
+    #
+    # Kill the patriarch, then read from a sibling. A window reading its own
+    # family is filtered out of its own roster, so a session that enters as the
+    # creator can never be shown the creator's row - and the creator is the
+    # member the derivation falls back to here, being the lowest-numbered open
+    # one. Entering as a leaf puts the reading session behind a row of its own
+    # and leaves the acting patriarch a row this window has to show.
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
+    # The session that reads a member back afterwards enters its own conversation,
+    # and a leaf that never had one has none to resume: a fresh leaf's transcript
+    # is metadata only, and `--resume` refuses it. The creator is given a turn and
+    # the reading sibling is forked from it, which is what gives the sibling a
+    # conversation without having to open it on screen.
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('ALPHA_FIRST_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_FIRST_TURN' in t.text(), 'the creator has a conversation', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'Alpha created', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf fork original Bravo')
+    t.wait(lambda: len(t.leaves()) == 2, 'Bravo forked', 90)
+    alpha, bravo = t.leaves()[0], t.leaves()[1]
+
+    confer_patriarch(t, alpha['sessionId'], results, 'r1')
+    t.check(lambda: t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId'], 'Alpha never took the role')
+
+    # The interruption, produced by the app: kill the patriarch's process. Its
+    # exit handler files it back as closed and does not promote, so the pointer
+    # keeps naming a member the family has put away.
+    t.wait(lambda: member_process(t, alpha['sessionId']) is not None, 'the patriarch has a process', 90)
+    victim = member_process(t, alpha['sessionId'])
+    t.check(lambda: victim is not None, 'the patriarch has no process to lose')
+    victim.terminate()
+    t.wait(lambda: next((m for m in t.family()['members'] if m['sessionId'] == alpha['sessionId']), {}).get('status') != 'open',
+           'the dead patriarch is filed back as closed', 60)
+    closed_alpha = next(m for m in t.family()['members'] if m['sessionId'] == alpha['sessionId'])
+    results['r1_pointerNamesClosedAlpha'] = t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId']
+    results['r1_alphaStatus'] = closed_alpha.get('status')
+    t.check(lambda: closed_alpha.get('status') == 'closed',
+            'the family file does not say closed for the dead patriarch: ' + json.dumps(closed_alpha))
+    flush_results()
+
+    # Close the sibling on purpose, so the session that reads afterwards enters a
+    # closed member - the ordinary way a person comes back to one - rather than
+    # racing the process the window left behind.
+    t.submit('/leaf close ' + bravo['sessionId'])
+    t.wait(lambda: next(m for m in t.family()['members'] if m['sessionId'] == bravo['sessionId'])['status'] == 'closed',
+           'the sibling closed cleanly', 90)
+
+    # Enter as the sibling while the window that made the family is still up:
+    # that is the ordinary way a member is entered - `cc --resume <leaf id>`, the
+    # address the leaf menu prints for every member - and two windows on one
+    # family, a host and a member, is the shape the family model is built on. The
+    # session reading is not the acting patriarch, so the acting patriarch is a
+    # row this window has to show.
+    r = Terminal(bravo['sessionId'])
+    r.wait(lambda: 'All ' in r.text(), 'the sibling resumed', 180)
+    rows = ask_roster(r, results, 'r1_roster')
+    results['r1_rosterRows'] = rows
+    alpha_line = next((row for row in rows if alpha['sessionId'] in row), None)
+    acting_line = next((row for row in rows if t.id in row), None)
+    results['r1_closedPatriarchLine'] = alpha_line
+    results['r1_actingLine'] = acting_line
+    results['r1_closedPatriarchStillMarked'] = bool(alpha_line and '[patriarch]' in alpha_line)
+    results['r1_successorMarked'] = bool(acting_line and '[patriarch]' in acting_line)
+    flush_results()
+    r.pause(1)
+    r.exit(family_survives=True)
+    t.exit(family_survives=True)
+
+
+def probe_dormant_residue():
+    """The all-filed-away residue: a designation with no member that can act.
+
+    No member can act at all, which is the one case the derivation has nothing
+    to fall back to. It is put to the app rather than settled in prose, so the
+    answer recorded is whatever the app actually says.
+
+    Nothing in the app files every member away while a window is reading - a
+    window that is reading is a window whose own row is open - so the residue is
+    built by hand, exactly as window 1's is. It gets a run of its own because
+    the other residue, `probe_designation_residue`, kills a member's process,
+    and a killed process cannot give its writer lock back: a leaf spawned into
+    that same config root afterwards never leaves its boot.
+    """
+    results = {}
+
+    def flush_results():
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    # The pointer still names a member the family has put away, and no member
+    # can act: the pointer's member is what a fallback returns, and the family
+    # id is what a deliberate terminus would name.
+    u = Terminal()
+    u.wait(lambda: 'All 1' in u.text(), 'initial session', 240)
+    # The dormant family is read back through this same session, so it is given a
+    # conversation to resume for the same reason the sibling was.
+    u.proc.write('\x15'); u.pause(.4)
+    u.submit('ALPHA_LATER_TURN')
+    u.wait(lambda: 'FIXTURE_REPLY_ALPHA_LATER_TURN' in u.text(), 'the creator has a conversation', 90)
+    u.proc.write('\x15'); u.pause(.4)
+    u.submit('/leaf new Alpha')
+    u.wait(lambda: len(u.leaves()) == 1, 'Alpha created', 90)
+    a2 = u.leaves()[0]
+    results['r2_beforeResidue'] = [(m['number'], m['name'], m['status']) for m in u.family()['members']]
+    results['r2_pointerBeforeResidue'] = u.pointer(u.id)
+    flush_results()
+
+    # The window leaves before the file is reshaped: a running window is a window
+    # that can still rewrite the file it is reading, and the residue has to be
+    # what the session that reads it finds on disk.
+    u.exit(family_survives=True)
+
+    # The residue, built by hand - the designation moved and every member filed
+    # away, so the pointer names a role nobody can hold and nobody is left to
+    # fall back to.
+    #
+    # Hand-built for the same reason window 1's is, and not for want of a real
+    # route: `/leaf patriarch` does move the designation. It is that the title is
+    # refused while the leaf is not `idle`, and a member that never reaches its
+    # own endpoint is refused for good - three runs of this probe were spent on
+    # exactly that refusal, with the leaf's process up the whole time and the app
+    # never letting the title through. The residue is the input either way; what
+    # the family does with it is the answer, and that is what is read below.
+    family_file = root / 'leaf-families' / (u.id + '.json')
+    pointer_file = root / 'leaf-families' / 'index' / (u.id + '.json')
+    dormant = json.loads(family_file.read_text(encoding='utf-8'))
+    for member in dormant['members']:
+        member['status'] = 'closed'
+    family_file.write_text(json.dumps(dormant), encoding='utf-8')
+    pointer = json.loads(pointer_file.read_text(encoding='utf-8'))
+    pointer['patriarchSessionId'] = a2['sessionId']
+    pointer_file.write_text(json.dumps(pointer), encoding='utf-8')
+    results['r2_membersAllClosed'] = [(m['number'], m['name'], m['status']) for m in dormant['members']]
+    results['r2_pointerNames'] = a2['sessionId']
+    results['r2_residuePointer'] = u.pointer(u.id)
+    flush_results()
+
+    w = Terminal(session_id=u.id)
+    w.wait(lambda: 'All ' in w.text(), 'the dormant family resumed', 180)
+    rows = ask_roster(w, results, 'r2_roster')
+    results['r2_rosterRows'] = rows
+    results['r2_rowsMarkingPatriarch'] = [row for row in rows if '[patriarch]' in row]
+    results['r2_familyId'] = u.id
+    # The reading session's own row is filtered out of its roster, so the file is
+    # read too: it says whether entering the family put the reader back among the
+    # members that can act, which is the claim about why the terminus is never
+    # observed from inside.
+    results['r2_familyAfterResume'] = [(m['number'], m['name'], m['status']) for m in w.family()['members']]
+    flush_results()
+    w.pause(1)
+    w.exit(family_survives=True)
+
+
+def probe_close_promotion():
+    """The deliberate close still moves the designation, and records the elder.
+
+    Window 1's fix puts the name of the holder the role moved away from into the
+    SAME write that moves the role. The risk that carries is the other direction:
+    a move that now also records history could stop moving the designation when
+    it should. So the ordinary path is put to the app - confer the title on a
+    leaf, then close that leaf on purpose - and the pointer that follows is read.
+    It has to name the member that took over, that member has to be one that can
+    act, and the member the role moved off has to be in the record the same write
+    left behind.
+    """
+    results = {}
+
+    def flush_results():
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('ALPHA_FIRST_TURN')
+    t.wait(lambda: 'FIXTURE_REPLY_ALPHA_FIRST_TURN' in t.text(), 'the creator has a conversation', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'Alpha created', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf fork original Bravo')
+    t.wait(lambda: len(t.leaves()) == 2, 'Bravo forked', 90)
+    alpha = t.leaves()[0]
+
+    confer_patriarch(t, alpha['sessionId'], results, 'p')
+    results['p_pointerAfterConfer'] = t.pointer(t.id)
+    flush_results()
+    t.check(lambda: t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId'], 'Alpha never took the role')
+
+    # The deliberate close: the designated patriarch is filed away by command
+    # rather than by a dying process. This is the path that promotes, and it is
+    # the path the residue runs never take.
+    t.submit('/leaf close ' + alpha['sessionId'])
+    t.wait(lambda: next(m for m in t.family()['members'] if m['sessionId'] == alpha['sessionId'])['status'] == 'closed',
+           'the patriarch closed cleanly', 90)
+    t.pause(4)
+    after = t.pointer(t.id)
+    results['p_pointerAfterDeliberateClose'] = after
+    results['p_designationMoved'] = after.get('patriarchSessionId') != alpha['sessionId']
+    results['p_newPatriarchStatus'] = next(
+        (m['status'] for m in t.family()['members'] if m['sessionId'] == after.get('patriarchSessionId')), None)
+    results['p_outgoingHeldInHistory'] = alpha['sessionId'] in (after.get('formerPatriarchIds') or [])
+    rows = ask_roster(t, results, 'p_roster')
+    results['p_rosterRows'] = rows
+    results['p_rosterMarksOutgoingElder'] = any(alpha['sessionId'] in row and '[elder]' in row for row in rows)
+    flush_results()
+    t.check(lambda: after.get('patriarchSessionId') != alpha['sessionId'],
+            'the designation did not move on a deliberate close: ' + json.dumps(after))
+
+    t.close_leaves(90)
+    t.exit(family_survives=True)
 
 
 def probe_queue():
@@ -3326,6 +3586,9 @@ try:
         (args.probe_arc, probe_arc),
         (args.probe_stress, probe_stress),
         (args.probe_crash_window, probe_crash_window),
+        (args.probe_designation_residue, probe_designation_residue),
+        (args.probe_dormant_residue, probe_dormant_residue),
+        (args.probe_close_promotion, probe_close_promotion),
         (args.probe_boot, probe_boot),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)

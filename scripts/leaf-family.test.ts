@@ -793,6 +793,120 @@ test('naming an heir records a designation the family reads, and ascending clear
   }
 })
 
+test('the patriarch is read from the family pointer, never from a member copy', async () => {
+  // A member's own loose pointer carries the designation too, so a leaf resumed
+  // on its own reads the family it belongs to. That copy is a republication of
+  // what one reader resolved - written by whoever indexed the family last - and
+  // it can disagree with the family-id pointer it came from. The family-id
+  // pointer is the authority; a copy is never one. So a copy is made to name a
+  // different member and every reading is held to what the family pointer says.
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-designation-copy-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    await workspace.restoreLeafWorkspace()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const designated = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Designated', transcriptPath: join(directory, 'designated.jsonl'), forkMessageId: randomUUID() })
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+    // Conferring is what writes the member copies, so it is also what makes the
+    // disagreement real rather than hypothetical: one copy is then made to lie.
+    assert.match(await workspace.conferPatriarch(designated.sessionId), /now the family patriarch/)
+    const copyPath = join(directory, 'leaf-families', 'index', `${other.sessionId}.json`)
+    const copy = JSON.parse(await readFile(copyPath, 'utf8')) as { patriarchSessionId?: string; formerPatriarchIds?: string[] }
+    assert.equal(copy.patriarchSessionId, designated.sessionId, 'the copy is published from the designation')
+    copy.patriarchSessionId = other.sessionId
+    // The elder record is republished into the same copy, so it is held to the
+    // same rule: a copy that names an extra elder cannot put that mark on the
+    // roster. Without this a republication bug in the elder field would hide
+    // behind the patriarch assertions above.
+    copy.formerPatriarchIds = [other.sessionId]
+    await writeFile(copyPath, JSON.stringify(copy))
+    assert.equal(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${root}.json`), 'utf8')).patriarchSessionId, designated.sessionId, 'the family pointer is untouched by the copy')
+
+    // The copy is now wrong; the pointers on disk disagree. Every reading must
+    // still answer with the family pointer's member, which is only visible if
+    // the read goes back to that pointer rather than trusting a copy.
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${designated.number} Designated \\[open\\] \\[patriarch\\] ${designated.sessionId}$`, 'm'), 'the roster marks the family pointer’s member')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[patriarch\\]`, 'm'), 'the roster must not follow a member copy')
+    assert.equal(workspace.getLeafPatriarchSessionId(), designated.sessionId, 'the session-wide answer follows the family pointer')
+    assert.equal((await workspace.resolveLeafRef('patriarch'))?.sessionId, designated.sessionId, 'the patriarch reference follows the family pointer')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[elder\\]`, 'm'), 'the roster must not follow a member copy’s elder record')
+  } finally {
+    // The resolved root and the matriarch lease are module state this case took;
+    // give them back so the cases after it read their own family, not this one.
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a stale designation records the member the move displaced, not the one the pointer still names', async () => {
+  // A designated member that dies is filed away without the designation moving,
+  // so the pointer keeps naming it while every reader resolves the role to the
+  // member that can act. A conferral then displaces the acting member, and the
+  // elder record must name that member - the one whose title this write demotes -
+  // rather than the stale name the pointer still carries. Otherwise the history
+  // gains a member the family never displaced and disagrees with the demotion.
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-stale-designation-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    await workspace.restoreLeafWorkspace()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const gone = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Gone', transcriptPath: join(directory, 'gone.jsonl'), forkMessageId: randomUUID() })
+    const target = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Target', transcriptPath: join(directory, 'target.jsonl'), forkMessageId: randomUUID() })
+    // Designate Gone, then file it away exactly as its process dying does: the
+    // pointer still names it, which is the stale designation this case is about.
+    await workspace.writePatriarchDesignation(root, gone.sessionId)
+    await updateLeafMember(family, root, gone.sessionId, { status: 'closed' })
+    const pointerPath = join(directory, 'leaf-families', 'index', `${root}.json`)
+    assert.equal(JSON.parse(await readFile(pointerPath, 'utf8')).patriarchSessionId, gone.sessionId, 'the pointer still names the filed-away member')
+    assert.equal(workspace.getLeafPatriarchSessionId(), root, 'every reader resolves the role to the member that can act')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${gone.number} Gone \\[closed\\] \\[patriarch\\]`, 'm'), 'the stale name is not marked as the patriarch')
+
+    // An ordinary mount re-indexes the family. The family pointer is the root's
+    // own entry, so it must keep the designation as written - the filed-away
+    // member - while the member copies get the acting answer. Writing the acting
+    // answer to the family pointer would heal away the record of who was
+    // displaced on every mount, which is the ordinary path rather than a crash.
+    await workspace.restoreLeafWorkspace()
+    assert.equal(JSON.parse(await readFile(pointerPath, 'utf8')).patriarchSessionId, gone.sessionId, 'the mount leaves the family pointer’s designation as written')
+    assert.equal(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${target.sessionId}.json`), 'utf8')).patriarchSessionId, root, 'the member copy names the member that can act')
+
+    // The acting patriarch is the creator, so conferring displaces the creator.
+    assert.match(await workspace.conferPatriarch(target.sessionId), /now the family patriarch/)
+    const after = JSON.parse(await readFile(pointerPath, 'utf8')) as { formerPatriarchIds?: string[] }
+    assert.deepEqual(after.formerPatriarchIds, [root], 'the elder record names the member the move displaced')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${gone.number} Gone \\[closed\\] \\[elder\\]`, 'm'), 'the stale name is not recorded as an elder')
+  } finally {
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('worktree leaf rejects the current working tree before creating a fork', async () => {
   const { getCwdState, setCwdState, getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
   const { resolve } = await import('node:path')
