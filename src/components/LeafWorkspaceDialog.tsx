@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafHeirSessionId, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafHeirSessionId, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, getTandemViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView, type TandemView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -73,8 +73,11 @@ function nextIn(values: readonly string[], current: string): string {
  */
 export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) => void; model?: string; effort?: string }): React.ReactNode {
   useRegisterOverlay('leaf-menu', true)
-  const [screen, setScreen] = useState<'home' | 'list' | 'create' | 'archives' | 'view'>('home')
+  const [screen, setScreen] = useState<'home' | 'list' | 'create' | 'archives' | 'view' | 'tandems' | 'tandem-create'>('home')
   const [members, setMembers] = useState<LeafMember[] | undefined>(undefined)
+  // Tandems are this session's own, so there is nothing to load from disk: the
+  // rows are read straight from the workspace whenever the roster refreshes.
+  const [tandems, setTandems] = useState<TandemView[]>(() => getTandemViews())
   // The transcript an archive row asked to read, with the member it belongs to:
   // the viewer is read-only, and Enter in it resumes that member once.
   const [viewing, setViewing] = useState<{ member: LeafMember; log: LogOption } | undefined>(undefined)
@@ -87,7 +90,10 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   // The roster the rows are built from carries the session on screen as well:
   // the rows drop it themselves, and the wizard needs it - the sessions a leaf
   // can be forked from include the one the window is showing.
-  const reload = () => { void listLeafMenuMembers().then(setMembers).catch(() => setMembers([])) }
+  const reload = () => {
+    void listLeafMenuMembers().then(setMembers).catch(() => setMembers([]))
+    setTandems(getTandemViews())
+  }
   useEffect(() => { reload() }, [screen])
   // One window manages a family at a time and another window may have opened it
   // since this one last looked. Read the lease on open so the rows are the ones
@@ -139,6 +145,15 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
       defaultEffort={effort}
       onDone={result => { if (result) void run(result, async () => result); setScreen('home') }}
       onCancel={() => setScreen('home')}
+    />
+  }
+
+  if (screen === 'tandem-create') {
+    return <TandemCreateWizard
+      defaultModel={model}
+      defaultEffort={effort}
+      onDone={result => { if (result) void run(result, async () => result); setScreen('tandems') }}
+      onCancel={() => setScreen('tandems')}
     />
   }
 
@@ -309,6 +324,51 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     </Box>
   }
 
+  // Tandems are this session's own throwaway partners, so nothing here can
+  // displace a window or touch the durable family: the rows are per-tandem verbs
+  // plus the one that starts a fresh one. A tandem is never a family member and
+  // is deliberately kept out of the leaf list, the roster and the session bar.
+  if (screen === 'tandems') {
+    const options = [
+      ...tandems.flatMap(tandem => [
+        {
+          value: `watch:${tandem.sessionId}`,
+          label: `Watch ${tandem.label}`,
+          description: tandem.watched
+            ? 'Already open in a terminal'
+            : 'Stop the headless tandem and open its session in a new terminal',
+        },
+        {
+          value: `close:${tandem.sessionId}`,
+          label: `Close ${tandem.label}`,
+          description: 'End it for good; a tandem is throwaway and is not kept',
+        },
+      ]),
+      ...(tandems.length === 0 ? [{ value: 'empty', label: 'No tandems right now', description: 'Start one below' }] : []),
+      { value: 'create', label: 'Start a fresh tandem', description: 'A throwaway session to review or check something with' },
+      { value: 'back', label: 'Back', description: 'Return to the leaf menu' },
+    ]
+    return <Box flexDirection="column">
+      <Text bold>Tandem leaves</Text>
+      <Text dimColor>A tandem is a throwaway session this one owns: an independent model working the same problem, whose disagreement is the signal. It is not a family member, so it never appears in the leaf list, the roster or the session bar.</Text>
+      <Text dimColor>It ends when this session ends, or when you close it here. Watching it stops the headless tandem and opens its session in a new terminal so you can see and type into it.</Text>
+      <Select options={options} visibleOptionCount={12} onCancel={() => setScreen('home')} onChange={(value: string) => {
+        if (value === 'back' || value === 'empty') { setScreen('home'); return }
+        if (value === 'create') { setScreen('tandem-create'); return }
+        const id = value.slice(value.indexOf(':') + 1)
+        const action = value.slice(0, value.indexOf(':'))
+        void run('', async () => {
+          const workspace = await import('../utils/leafWorkspace.js')
+          if (action === 'watch') return workspace.watchTandem(id)
+          return workspace.closeTandem(id)
+        })
+      }} />
+      {busy && <Text dimColor>Working…</Text>}
+      {notice && <Text>{notice}</Text>}
+      {error && <Text color="error">{error}</Text>}
+    </Box>
+  }
+
   // The read-only viewer. Enter is the one gesture it inherits from resume, so
   // Enter means the same thing here as it does there: run it once, archived.
   if (screen === 'view' && viewing) {
@@ -338,6 +398,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
   const options: Array<{ value: string; label: string; description?: string; type?: 'text' }> = [
     ...(displaced ? [] : [{ value: 'create', label: 'Create a leaf', description: 'Name it, choose its model and effort, then create it' }]),
     { value: 'list', label: 'Leaves in this family', description: displaced ? 'Read-only: another window manages them now' : members ? `${members.length} saved — open, close, or reopen one` : 'Loading…' },
+    { value: 'tandems', label: 'Tandem leaves', description: tandems.length ? `${tandems.length} held — throwaway partners this session owns` : 'Throwaway partners this session owns; kept out of the family' },
     { value: 'archives', label: 'Archived leaves', description: describeArchives(members, displaced ? 'filed away' : 'leaves you archive are filed here') },
     { value: 'exit', label: 'Cancel', description: 'Leave the leaf workspace' },
   ]
@@ -350,6 +411,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
     <Select options={options} visibleOptionCount={6} onCancel={() => onDone()} onChange={(value: string) => {
       if (value === 'exit') { onDone(); return }
       if (value === 'list') { setScreen('list'); return }
+      if (value === 'tandems') { setScreen('tandems'); return }
       if (value === 'archives') { setScreen('archives'); return }
       setError('')
       setNotice('')
@@ -467,6 +529,85 @@ export function LeafCreateWizard({ members, selectedId, patriarchName, defaultMo
         if (value === 'create') { void create(); return }
         if (value === 'mode') { setFresh(current => !current); return }
         if (value === 'source') { setSource(current => nextIn(sources.map(item => item.value), current)); return }
+        if (value === 'model') { setModel(current => nextIn([MODEL_INHERIT, MODEL_DEFAULT], current)); return }
+        if (value === 'effort') { setEffort(current => nextIn(EFFORT_CHOICES, current)); return }
+      }} />
+    {error && <Text color="error">{error}</Text>}
+  </Box>
+}
+
+/**
+ * Create-tandem wizard. A tandem is always fresh - there is no source to choose
+ * - so the fields are what it is for, its model and its effort. It goes through
+ * the same `createPartner` path the `partner` tool action uses, so the menu and
+ * the assistant cannot drift apart.
+ */
+export function TandemCreateWizard({ defaultModel, defaultEffort, onDone, onCancel }: {
+  defaultModel?: string
+  defaultEffort?: string
+  onDone: (result?: string) => void
+  onCancel: () => void
+}): React.ReactNode {
+  useRegisterOverlay('tandem-create', true)
+  const [purpose, setPurpose] = useState('')
+  const [model, setModel] = useState(defaultModel ? MODEL_INHERIT : MODEL_DEFAULT)
+  const [effort, setEffort] = useState(defaultEffort || 'inherit')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const creating = useRef(false)
+
+  const create = async () => {
+    if (creating.current) return
+    creating.current = true
+    setBusy(true)
+    setError('')
+    try {
+      const { createPartner } = await import('../utils/leafWorkspace.js')
+      const result = await createPartner({
+        ...(purpose.trim() ? { purpose: purpose.trim() } : {}),
+        ...(model === MODEL_DEFAULT ? {} : model === MODEL_INHERIT ? (defaultModel ? { model: defaultModel } : {}) : { model }),
+        ...(effort === 'inherit' ? {} : { effort }),
+      })
+      onDone(result)
+    } catch (failure) {
+      const reason = failure instanceof Error ? failure.message.replace(/\s+/g, ' ').trim() : ''
+      setError(reason || 'Could not start a tandem. Nothing was changed.')
+      creating.current = false
+      setBusy(false)
+    }
+  }
+
+  useInput((_input, key) => { if (key.escape && !busy) onCancel() })
+
+  const summary = `${modelLabel(model)} · ${effortLabel(effort)}`
+  const options: Array<{
+    value: string
+    label: string
+    description?: string
+    type?: 'text' | 'input'
+    onChange?: (value: string) => void
+    placeholder?: string
+  }> = [
+    { value: 'purpose', type: 'input', label: 'Purpose', description: 'What it is for — e.g. "review the diff"', placeholder: 'review X', onChange: setPurpose },
+    { value: 'model', label: `Model: ${modelLabel(model)}`, description: 'Which model the tandem runs' },
+    { value: 'effort', label: `Effort: ${effortLabel(effort)}`, description: 'How hard the tandem thinks' },
+    { value: 'create', label: busy ? 'Starting…' : `Start tandem — ${summary}`, description: 'Convenes a headless session this one owns' },
+    { value: 'cancel', label: 'Cancel', description: 'Back to the tandem leaves' },
+  ]
+  return <Box flexDirection="column">
+    <Text bold>Start a tandem</Text>
+    <Text dimColor>A tandem is a throwaway headless session this one owns. It is not a family member and never joins the leaf list.</Text>
+    <Text dimColor>Pick a row and press Enter. The purpose is typed in place.</Text>
+    <Select
+      options={options}
+      visibleOptionCount={5}
+      layout="expanded"
+      isDisabled={busy}
+      onCancel={() => onCancel()}
+      onChange={(value: string) => {
+        if (busy) return
+        if (value === 'cancel') { onCancel(); return }
+        if (value === 'create') { void create(); return }
         if (value === 'model') { setModel(current => nextIn([MODEL_INHERIT, MODEL_DEFAULT], current)); return }
         if (value === 'effort') { setEffort(current => nextIn(EFFORT_CHOICES, current)); return }
       }} />

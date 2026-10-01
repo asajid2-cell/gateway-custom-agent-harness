@@ -1,5 +1,6 @@
 import { z } from 'zod/v4'
 import { buildTool, type ToolDef } from '../../Tool.js'
+import { EFFORT_LEVELS, HARNESS_EFFORT_LEVELS } from '../../utils/effort.js'
 import { lazySchema } from '../../utils/lazySchema.js'
 import { LEAF_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
@@ -34,6 +35,7 @@ const inputSchema = lazySchema(() =>
         'compact',
         'partner',
         'partners',
+        'partner-watch',
         'partner-close',
       ])
       .describe('Operation to perform on the leaf family'),
@@ -58,6 +60,26 @@ const outputSchema = lazySchema(() =>
 type OutputSchema = ReturnType<typeof outputSchema>
 
 export type Output = z.infer<OutputSchema>
+
+/**
+ * What a `partner` request's `value` names: the model the partner runs, or the
+ * effort level it runs at.
+ *
+ * `value` carries one of several things depending on the action - a model, an
+ * effort level, a merge fidelity - and for a partner both the model and the
+ * effort are meaningful, so the word is what decides. The effort levels are a
+ * closed set, so a level is recognised rather than guessed at, and anything
+ * else is the model it names. Before this, `value` was read unconditionally as
+ * the model, so a partner could not be given an effort at all - and a level
+ * passed here silently became the model it was launched with - though both the
+ * prompt and the design doc promise a partner runs with its own effort.
+ */
+export function partnerValueSpec(value: string | undefined): { model?: string; effort?: string } {
+  const word = value?.trim()
+  if (!word) return {}
+  const levels: readonly string[] = [...EFFORT_LEVELS, ...HARNESS_EFFORT_LEVELS]
+  return levels.includes(word) ? { effort: word } : { model: word }
+}
 
 async function run(input: z.infer<InputSchema>, context: { getAppState?: () => { mainLoopModel?: string | null; effortValue?: unknown } }): Promise<string> {
   const workspace = await import('../../utils/leafWorkspace.js')
@@ -164,12 +186,16 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'partner':
       return workspace.createPartner({
         ...(input.name?.trim() ? { purpose: input.name.trim() } : {}),
-        ...(input.value?.trim() ? { model: input.value.trim() } : {}),
+        ...partnerValueSpec(input.value),
       })
     case 'partners':
       return workspace.partnerRoster()
+    // Watching stops the headless partner and opens its session in a terminal,
+    // so it is the same reference as closing one: the partner's session id.
+    case 'partner-watch':
+      return workspace.watchTandem(requireLeaf())
     case 'partner-close':
-      return workspace.closePartner(requireLeaf())
+      return workspace.closeTandem(requireLeaf())
   }
 }
 
