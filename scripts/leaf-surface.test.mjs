@@ -335,13 +335,86 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'patriarch', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-close']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'patriarch', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
   // A merge carries its fidelity in `value`, so the merge action is exercisable
   // without adding a field the strict schema would have to admit.
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'merge', leaf: 'Scout', value: 'ledger' }).success, true)
+})
+
+test('a partner can be given an effort level, not only a model', async () => {
+  const { partnerValueSpec } = await import('../src/tools/LeafTool/LeafTool.ts')
+  // The gap this closes: `value` was read unconditionally as the partner's
+  // model, so a level passed there silently became the model it launched with,
+  // and a partner could not be given an effort at all - though the prompt and
+  // the design doc both promise a partner runs with its own. A level is told
+  // apart from a model by the closed set rather than guessed at.
+  assert.deepEqual(partnerValueSpec('low'), { effort: 'low' })
+  assert.deepEqual(partnerValueSpec('ultracode'), { effort: 'ultracode' })
+  assert.deepEqual(partnerValueSpec('  xhigh  '), { effort: 'xhigh' })
+  assert.deepEqual(partnerValueSpec('gateway-opencode-deepseek-v4-flash'), { model: 'gateway-opencode-deepseek-v4-flash' })
+  assert.deepEqual(partnerValueSpec(undefined), {})
+  assert.deepEqual(partnerValueSpec('   '), {})
+
+  // The dispatch is wired, and the prompt states what `value` may be.
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  assert.match(tool, /\.\.\.partnerValueSpec\(input\.value\)/)
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+  assert.match(prompt, /\\`value\\` is its model, or one of the effort levels it can run at/)
+})
+
+test('a tandem can be watched and closed, and is a section of its own', async () => {
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  // Watching and closing take the same reference - the tandem's session id -
+  // so both read the one `leaf` field rather than inventing a second one.
+  assert.match(tool, /case 'partner-watch':\s*\n\s*return workspace\.watchTandem\(requireLeaf\(\)\)/)
+  assert.match(tool, /case 'partner-close':\s*\n\s*return workspace\.closeTandem\(requireLeaf\(\)\)/)
+
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  assert.match(workspace, /export function getTandemViews\(\): TandemView\[\]/)
+  assert.match(workspace, /export async function watchTandem\(reference: string\): Promise<string>/)
+  assert.match(workspace, /export async function closeTandem\(reference: string\): Promise<string>/)
+  // Closing a watched tandem asks PowerShell which processes resume it, so that
+  // query is a PowerShell program and its assignment statement must be
+  // terminated. Unterminated, PowerShell reads the next token as part of the
+  // assignment and fails to parse; the swallowed error then makes every watched
+  // terminal invisible, so Close silently drops the row without killing anything.
+  assert.match(workspace, /\$id = \$env:GATEWAY_TANDEM_SESSION;/)
+
+  // The menu calls a partner a tandem and gives it a section of its own, kept
+  // out of the durable family rather than mixed into the leaf list.
+  const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
+  assert.match(dialog, /screen === 'tandems'/)
+  assert.match(dialog, /screen === 'tandem-create'/)
+  assert.match(dialog, /value: 'tandems', label: 'Tandem leaves'/)
+  assert.match(dialog, /workspace\.watchTandem\(id\)/)
+  assert.match(dialog, /workspace\.closeTandem\(id\)/)
+
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+  assert.match(prompt, /tandem/)
+  assert.match(prompt, /partner-watch/)
+})
+
+test('watching a tandem resumes its session with the harness that owns the transcript', async () => {
+  const { resumeSessionArgs } = await import('../src/utils/deepLink/terminalLauncher.ts')
+  // The whole interface between Watch and the session it hands over. A `cc` from
+  // PATH would be a different install than the build that owns the transcript,
+  // so the argv is the harness's own entry and nothing else - no deep-link
+  // origin, which belongs to the OS hand-off.
+  assert.deepEqual(
+    resumeSessionArgs('/build/cli.js', '11111111-1111-4111-8111-111111111111'),
+    ['/build/cli.js', '--resume', '11111111-1111-4111-8111-111111111111'],
+  )
+
+  const launcher = await readFile(new URL('../src/utils/deepLink/terminalLauncher.ts', import.meta.url), 'utf8')
+  assert.match(launcher, /resumeSessionArgs\(cliEntry, sessionId\)/)
+  // The executable is this process's own, matching how a leaf resumes a session.
+  assert.match(launcher, /process\.execPath,\s*\n\s*resumeSessionArgs\(cliEntry, sessionId\)/)
+  // And the leaf-owner identity this process inherited is cleared, or the
+  // resumed session arms a watchdog against a pipe it does not have.
+  assert.match(launcher, /cleanLeafOwnerEnv\(\)/)
 })
 
 test('a leaf can reach its matriarch, not only its siblings', async () => {

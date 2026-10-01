@@ -647,4 +647,86 @@ test.skipIf(!isWindows)('a partner of a leaf is bound to that leaf, not to the i
   expect(spawned.session).not.toBe(inherited.GATEWAY_LEAF_SESSION)
   // And it does not inherit interactive-ness: it has no terminal to draw into.
   expect(spawned.interactive ?? '').toBe('')
+
+  // The row this convened is this session's, and it outlives the test unless it
+  // is given back: the partner map is module state, so a leak here is a phantom
+  // tandem in every later test and a slot still counted against the cap.
+  const { getTandemViews, closeTandem } = await import('../src/utils/leafWorkspace.js')
+  for (const view of getTandemViews()) await closeTandem(view.sessionId)
+  expect(getTandemViews()).toHaveLength(0)
+}, { timeout: 60_000 })
+
+/**
+ * A tandem is the row the menu manages: a throwaway session this one owns, with
+ * the purpose, model and effort it was convened with. These exercise the
+ * bookkeeping the menu reads - the row, the refusal of a reference that is not
+ * one of ours, and the row going away when it is closed - without opening a
+ * terminal, which is the one part that needs a live desktop and is covered by
+ * the isolated-build driver instead.
+ */
+test.skipIf(!isWindows)('a tandem is a row this session holds, and closing it drops the row', async () => {
+  stubLauncher(LIVE_STUB)
+  const config = mkdtempSync(join(tmpdir(), 'tandem-config-'))
+  cleanups.push(() => rmSync(config, { recursive: true, force: true }))
+  const savedConfig = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = config
+  cleanups.push(() => { savedConfig === undefined ? delete process.env.CLAUDE_CONFIG_DIR : process.env.CLAUDE_CONFIG_DIR = savedConfig })
+
+  const { createPartner, getTandemViews, closeTandem, watchTandem } = await import('../src/utils/leafWorkspace.js')
+
+  const convened = await createPartner({ purpose: 'review the diff', model: 'gateway-opencode-deepseek-v4-flash', effort: 'low' })
+  expect(convened).toContain('[ready]')
+  // Found by the id it was convened as, so a row some earlier test left behind
+  // cannot stand in for this one or make the length say the wrong thing.
+  const id = /as ([0-9a-f-]{36}) \[/.exec(convened)?.[1] ?? ''
+  expect(id).not.toBe('')
+
+  const tandem = getTandemViews().find(view => view.sessionId === id)
+  expect(tandem).toBeDefined()
+  expect(tandem!.purpose).toBe('review the diff')
+  expect(tandem!.model).toBe('gateway-opencode-deepseek-v4-flash')
+  expect(tandem!.effort).toBe('low')
+  expect(tandem!.state).toBe('ready')
+  expect(tandem!.watched).toBe(false)
+  // The row is named for what it is for, which is how it reads in the section.
+  expect(tandem!.label).toContain('review the diff')
+
+  // A reference this session does not hold is refused rather than guessed at,
+  // for both verbs - the alternative is a kill aimed at a stranger's process.
+  await expect(watchTandem('not-a-tandem')).rejects.toThrow(/holds no tandem/)
+  await expect(closeTandem('not-a-tandem')).rejects.toThrow(/holds no tandem/)
+
+  // Closing a headless tandem ends its process and drops the row.
+  expect(await closeTandem(id)).toMatch(/^Closed partner of /)
+  expect(getTandemViews().find(view => view.sessionId === id)).toBeUndefined()
+}, { timeout: 60_000 })
+
+test.skipIf(!isWindows)('watching a tandem that has not finished starting is refused, not raced', async () => {
+  stubLauncher(SILENT_STUB, { partnerStartupTimeoutMs: 5_000 })
+  process.env.GATEWAY_PARTNER_LIMIT = '1'
+  const config = mkdtempSync(join(tmpdir(), 'tandem-config-'))
+  cleanups.push(() => rmSync(config, { recursive: true, force: true }))
+  const savedConfig = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = config
+  cleanups.push(() => { savedConfig === undefined ? delete process.env.CLAUDE_CONFIG_DIR : process.env.CLAUDE_CONFIG_DIR = savedConfig })
+
+  const { createPartner, getTandemViews, watchTandem, closeTandem } = await import('../src/utils/leafWorkspace.js')
+
+  // `createPartner` records the row before it waits for the handshake, so the
+  // tandem is observable while it is still starting - which is exactly the
+  // window in which watching it must refuse: there is nothing to resume yet,
+  // and stopping it would end a launch that never ran.
+  const pending = createPartner({ purpose: 'slow to start' })
+  let id = ''
+  for (let attempt = 0; attempt < 400 && !id; attempt++) {
+    id = getTandemViews().find(view => view.state === 'starting')?.sessionId ?? ''
+    if (!id) await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  expect(id).not.toBe('')
+  await expect(watchTandem(id)).rejects.toThrow(/has not finished starting/)
+
+  // Let the launch reach its own deadline, then give the row back.
+  await pending
+  await closeTandem(id)
+  expect(getTandemViews().find(view => view.sessionId === id)).toBeUndefined()
 }, { timeout: 60_000 })
