@@ -1,5 +1,6 @@
 import { test, expect, afterEach } from 'bun:test'
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -59,6 +60,36 @@ afterEach(() => {
 /** Whether a process this test started is still running. */
 function isRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch { return false }
+}
+
+/**
+ * Wait for a killed process to stop reading as running.
+ *
+ * `taskkill` returning means the process was terminated; it does not mean the OS
+ * has finished with it. A just-killed pid can still answer `kill(pid, 0)` until
+ * it is reaped, and under load that lag is long enough to read as a survivor -
+ * so liveness is observed with a bound rather than on the instant, and a kill
+ * that never took effect still fails here.
+ */
+async function waitForGone(pid: number, timeoutMs = 8_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (isRunning(pid) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20))
+}
+
+/**
+ * When the process holding a pid started, or undefined if the OS has no such pid.
+ *
+ * Liveness alone cannot answer "is this the process we killed": pid numbers are
+ * reused, and a reused one answers `kill(pid, 0)` exactly as the original did.
+ * The creation time is what makes the two tellable apart.
+ */
+async function processStartedAt(pid: number): Promise<string | undefined> {
+  return new Promise(resolve => {
+    const command = `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($p) { ([datetime]$p.CreationDate).ToString('o') }`
+    execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { windowsHide: true }, (error, stdout) => {
+      resolve(error || !stdout.trim() ? undefined : stdout.trim())
+    })
+  })
 }
 
 // A launcher that warms instantly, then behaves like a print-mode session: it
@@ -362,6 +393,9 @@ test.skipIf(!isWindows)('a partner that never answers is failed, killed and rele
   }
   expect(pid).toBeGreaterThan(0)
   expect(isRunning(pid)).toBe(true)
+  // Read while the process is known to be up, so "the partner is gone" can be
+  // told from "the number was handed to something else" below.
+  const startedAt = await processStartedAt(pid)
 
   // Nobody calls waitUntilReady to make this happen. The deadline is what ends
   // it, and the wait answers false the moment the failure is known rather than
@@ -377,8 +411,17 @@ test.skipIf(!isWindows)('a partner that never answers is failed, killed and rele
 
   // The tree went with it, not just the parent - and the answer above is not
   // given until it has: the deadline is a kill, and the process the stub
-  // recorded is gone by the time anyone is told the launch failed.
-  expect(isRunning(pid)).toBe(false)
+  // recorded is terminated by the time anyone is told the launch failed.
+  //
+  // Observed by identity, not by liveness alone. `taskkill` returning means the
+  // process was terminated, and a number the OS has since handed to another
+  // process answers `kill(pid, 0)` just as the partner did - under this
+  // machine's load that reuse happens inside this window and reads as a
+  // survivor. The partner is gone when the number is either unused or used by a
+  // process that started at a different time.
+  await waitForGone(pid)
+  const survivorStartedAt = isRunning(pid) ? await processStartedAt(pid) : undefined
+  expect(survivorStartedAt, `pid ${pid} is still the partner that was killed`).not.toBe(startedAt)
 
   // And cleaning up a failed partner does not rewrite why it ended.
   await partner.close()

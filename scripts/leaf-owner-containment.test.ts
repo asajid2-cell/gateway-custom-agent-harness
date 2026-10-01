@@ -357,6 +357,11 @@ test.skipIf(!isWindows)('an owner that is killed rather than closed still ends i
   await new Promise<void>(resolve => {
     execFile('taskkill.exe', ['/PID', String(hostPid), '/T', '/F'], { windowsHide: true }, () => resolve())
   })
+  // Bounded, not instant: `taskkill` returning means the process was terminated,
+  // and a just-killed pid can still read as alive until it is reaped. Asserting on
+  // the instant check made this fail under load while the kill had in fact
+  // happened, which is the one thing this line must not be wrong about.
+  await waitFor(() => !isRunning(hostPid) || undefined, 'the killed owner process to be gone', 8_000)
   expect(isRunning(hostPid), 'the owner must really be gone, or nothing below is about a dead owner').toBe(false)
 
   const outcome = await within(leaf.exit, EXIT_WINDOW, 'the leaf to end once its owner process is gone')
