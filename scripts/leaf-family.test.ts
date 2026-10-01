@@ -3,7 +3,7 @@ import { strict as assert } from 'node:assert'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { addLeafMember, ensureCreatorMember, readLeafFamily, updateLeafMember, recordLeafContextReturn } from '../src/utils/leafFamily.ts'
 import { createFork } from '../src/commands/branch/branch.ts'
 import { createLeaf, changeLeaf, fileLeaf } from '../src/utils/leafWorkspace.ts'
@@ -1495,6 +1495,128 @@ test('reopening the family leaves the lease with the window that is holding it',
     workspace.clearMatriarchClaimForTesting()
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a goal refuses before it stops the leaf, and reads back without stopping one', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-goal-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    await workspace.restoreLeafWorkspace()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const member = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Goal', transcriptPath: join(directory, 'goal.jsonl'), forkMessageId: randomUUID() })
+    const status = async () => (await readLeafFamily(family, root)).members.find(item => item.sessionId === member.sessionId)!.status
+
+    // A goal is written with the leaf stopped, because the record it writes is
+    // the one its next turn reads. The refusals come first, so a leaf that cannot
+    // take a goal is never stopped for one.
+    await assert.rejects(workspace.setLeafGoal(randomUUID(), 'status'), /Unknown leaf/, 'an unknown leaf is named, not stopped')
+
+    // Every verb but `status` needs the leaf stopped and idle to be given a goal:
+    // it has no turn to resume into while it is not running, and writing the
+    // record under a live turn would be read by the turn already in flight.
+    assert.equal(await status(), 'open', 'the row exists before anything is asked of it')
+    await assert.rejects(workspace.setLeafGoal(member.sessionId, 'resume'), /Leaf must be open and idle/, 'the refusal precedes the write')
+    assert.equal(await status(), 'open', 'a refusal that never closed the leaf leaves it open')
+
+    // Reading the goal is a read: it answers while the leaf is stopped and it
+    // must not stop one to answer. This is the half of the command reachable
+    // without a launch, and it is pinned so the read stays a read.
+    const { parsePersistArgs } = await import('../src/skills/bundled/persist.ts')
+    const storage = await import('../src/utils/sessionStorage.ts')
+    const parsed = parsePersistArgs('task: already done')
+    if (parsed.kind !== 'task') throw new Error('the parser did not read a task')
+    await storage.writePersistSessionRecord({ version: 1, task: parsed.options.task, mode: parsed.options.mode, keep: parsed.options.keep, taskMode: parsed.options.taskMode, nudgesRemaining: parsed.options.nudges, nudgesSent: 0, status: 'completed', initialPlanningResponseAllowed: parsed.options.mode === 'plan' }, member.transcriptPath)
+    assert.match(await workspace.setLeafGoal(member.sessionId, 'status'), /completed/, 'the goal that is on disk is the one that reads back')
+    assert.equal(await status(), 'open', 'reading the goal never stopped the leaf')
+
+    // NOT COVERED HERE, and deliberately not claimed: the close-modify-reopen
+    // itself. Writing a goal stops the leaf and starting it again is a real
+    // spawn, so the path that matters - the `finally` that reopens a leaf whose
+    // write failed - cannot be reached without a launch. Confirmed by mutation:
+    // deleting the reopen from that `finally` leaves this case green, so the
+    // contract is NOT pinned by this test and is not asserted by it. It belongs
+    // to the terminal harness, which can drive a real process.
+  } finally {
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the host reads an heir that was named before it opened the family', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-heir-reopen-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const pointerPath = join(directory, 'leaf-families', 'index', `${root}.json`)
+    await ensureCreatorMember(family, root, { name: 'Original', transcriptPath: join(directory, 'root.jsonl') })
+    const heir = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Heir', transcriptPath: join(directory, 'heir.jsonl'), forkMessageId: randomUUID() })
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+
+    // The heir designation is written by whichever window held the family when a
+    // person named one. It lives in the pointer keyed by the family id, which is
+    // the only place the fact exists - so it is already on disk, and nothing in
+    // it says which process put it there. This is a HAND-SHAPED pointer: the
+    // module's own writer is not exported, so it cannot be called here, and the
+    // fields below are written to match what a reader expects rather than
+    // produced by the code under test. If the pointer's shape ever changes, this
+    // literal must change with it and nothing will say so - which is the cost of
+    // injecting at this layer rather than driving a real conferral.
+    await mkdir(dirname(pointerPath), { recursive: true })
+    await writeFile(pointerPath, JSON.stringify({ rootSessionId: root, rootName: 'Original', rootTranscriptPath: join(directory, 'root.jsonl'), heirSessionId: heir.sessionId }), 'utf8')
+    assert.equal((JSON.parse(await readFile(pointerPath, 'utf8')) as { heirSessionId?: string }).heirSessionId, heir.sessionId, 'the raise is on disk before any window opens the family')
+
+    // A window that opens the family now - the host after a restart, or any
+    // session resuming it - reads the raise it never named. `refreshDesignated-
+    // Patriarch` is the whole of what opening a family reads, and it is what
+    // seeds every later sync read of the designation.
+    await workspace.clearMatriarchClaimForTesting()
+    await workspace.restoreLeafWorkspace()
+
+    assert.equal(workspace.getLeafHeirSessionId(), heir.sessionId, 'the host reads the heir a previous window named')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${heir.number} Heir \\[open\\] \\[heir\\] ${heir.sessionId}$`, 'm'), 'the family view files the heir named before this window opened')
+
+    // The control: the patriarch is read on the same path and does survive a
+    // reopen, so a missing heir is the heir's own read and not a stale file.
+    assert.equal(workspace.getLeafPatriarchSessionId(), root, 'the patriarch reads correctly on the same path')
+
+    // A raise that was cleared stays cleared: the read must not revive one.
+    await writeFile(pointerPath, JSON.stringify({ rootSessionId: root, rootName: 'Original', rootTranscriptPath: join(directory, 'root.jsonl') }), 'utf8')
+    workspace.forgetLeafFamilyRoot()
+    await workspace.clearMatriarchClaimForTesting()
+    await workspace.restoreLeafWorkspace()
+    assert.equal(workspace.getLeafHeirSessionId(), undefined, 'a window that opens after the raise ended reads no heir')
+    assert.doesNotMatch(await workspace.familyRoster(), /\[heir\]/, 'and files nobody as one')
+    assert.ok(other.number > 0, 'the second member is real')
+  } finally {
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
     await rm(directory, { recursive: true, force: true })
   }
 })
