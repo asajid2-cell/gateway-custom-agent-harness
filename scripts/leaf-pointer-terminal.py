@@ -42,6 +42,8 @@ parser.add_argument('--probe-queue', action='store_true')
 parser.add_argument('--probe-elder', action='store_true')
 parser.add_argument('--probe-arc', action='store_true')
 parser.add_argument('--probe-stress', action='store_true')
+parser.add_argument('--probe-crash-window', action='store_true')
+parser.add_argument('--probe-boot', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -53,6 +55,29 @@ started_turns = set()
 finished_turns = set()
 # Where a view-tag keystroke landed, in arrival order. See Terminal.typed_in.
 arrivals = []
+# What the app computed for a tool it ran, in arrival order: the result is sent
+# back to the model, and for tools the transcript does not render - the Leaf
+# tool among them - that request is the only place the answer exists. See
+# tool_result_text.
+tool_results = []
+
+def tool_result_text(content):
+    """The text of a tool result the app is sending back to the model.
+
+    A tool the app runs has one observable that is not the screen: the result
+    it hands to the model in the next request. The Leaf tool's listing is the
+    case that matters here - the app runs it, sends the text back and renders
+    only the model's next words, so a probe that reads the screen concludes the
+    app said nothing. The result itself is right there on the wire.
+    """
+    blocks = content if isinstance(content, list) else [content]
+    for block in blocks:
+        if not isinstance(block, dict) or block.get('type') != 'tool_result': continue
+        inner = block.get('content')
+        if isinstance(inner, str): return inner
+        if isinstance(inner, list):
+            return '\n'.join(part.get('text', '') for part in inner if isinstance(part, dict))
+    return None
 
 def session_of(body):
     """The session a request belongs to, as the app itself stamps it.
@@ -99,7 +124,9 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
         view = view_tag(messages[-1].get('content', '') if messages else '')
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
+        answered = tool_result_text(messages[-1].get('content', '') if messages else '')
+        tool_results.append(answered)
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -109,7 +136,7 @@ class Handler(BaseHTTPRequestHandler):
             with open(root / 'requests.log', 'a', encoding='utf-8') as log:
                 log.write(json.dumps(dict(
                     view=(view.group(0) if view else None), marker=marker,
-                    session=session_of(body), tail=latest[-240:],
+                    session=session_of(body), tail=latest[-4000:],
                 ), ensure_ascii=False) + '\n')
         if view:
             # Recorded here and deliberately kept out of `requests`: a view tag
@@ -156,6 +183,27 @@ class Handler(BaseHTTPRequestHandler):
             if tool_name:
                 frames[1] = dict(type='content_block_start', index=0, content_block=dict(type='tool_use', id='tool_monitor_fixture', name=tool_name, input={}))
                 frames[2] = dict(type='content_block_delta', index=0, delta=dict(type='input_json_delta', partial_json=json.dumps(dict(command='sleep 90', description='Local fixture background task', run_in_background=True))))
+                frames[4]['delta']['stop_reason'] = 'tool_use'
+        if marker == 'ROSTER_TASK':
+            tools = {tool['name'] for tool in body.get('tools', [])}
+            print('FIXTURE_ROSTER_TASK leafTool=' + str('Leaf' in tools) + ' n=' + str(len(tools)) + ' names=' + ','.join(sorted(tools)), flush=True)
+            # The family roster is the app's own account of who holds the role,
+            # and it is only reachable through the model's Leaf tool - there is
+            # no slash command for it. So the fixture asks for it the way the
+            # model would, and the app computes the listing, which is the
+            # resolution a probe wants to read rather than a file it parsed.
+            #
+            # Only when the request is a real turn: an auxiliary request (a
+            # title, a quota probe) replays the same last user message with a
+            # reduced tool set, and answering that one with a tool call names a
+            # tool the request never had. `Write` is an ordinary tool that a
+            # real turn always carries and an auxiliary one never does - the
+            # same distinction the plan-mode branch draws, for the same reason.
+            # The Leaf tool itself is not the test: it is a deferred tool, so it
+            # is described in the prompt rather than listed in `tools`.
+            if 'Write' in tools or 'write' in tools:
+                frames[1] = dict(type='content_block_start', index=0, content_block=dict(type='tool_use', id='tool_roster_fixture', name='Leaf', input=dict(action='roster')))
+                frames[2] = dict(type='content_block_delta', index=0, delta=dict(type='input_json_delta', partial_json=json.dumps(dict(action='roster'))))
                 frames[4]['delta']['stop_reason'] = 'tool_use'
         if marker == 'BULK_TURN_':
             # One long turn, repeated, is how a seed's conversation is pushed
@@ -466,6 +514,11 @@ class Terminal:
             pending = [member for member in self.leaves() if member['status'] == 'open']
             if not pending: return
             for member in pending:
+                # A busy app can leave the previous ask sitting in the input box,
+                # and the next paste then joins it into one long command - which
+                # is a close that never runs, read as a member that would not
+                # close. Ctrl-U is the clear `typed_in` uses.
+                self.proc.write('\x15'); self.pause(.3)
                 self.submit('/leaf close ' + member['sessionId'])
             self.pause(1)
         self.dump()
@@ -1962,6 +2015,246 @@ def probe_stress():
     print(json.dumps(results, indent=1, sort_keys=True), flush=True)
 
 
+def member_process(terminal, session_id):
+    """The captured child that is running one member of this family.
+
+    A leaf is a process the window started, so the window holds it - the same
+    capture `owned_leaves` reads. This picks the one whose command line names the
+    member asked for, which is the process that has to die for the member's row
+    to be filed back as `closed`.
+    """
+    for process in terminal.running_owned():
+        try: line = process.cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied): continue
+        if any(session_id in part for part in line): return process
+    return None
+
+
+def roster_rows(terminal, marker):
+    """The family roster the app rendered after `marker`, one row per member.
+
+    The roster is the app's own account of who holds the role, and it is only
+    reachable through the model's Leaf tool - there is no slash command for it -
+    so a probe reads what the app computed rather than a file it parsed. Rows
+    are `#N name [state] [marks...] <session id>`; the box the transcript draws
+    them in is stripped so a row is compared whole.
+    """
+    rows = []
+    for line in terminal.after(marker).splitlines():
+        text = line.strip(' │|')
+        if text.startswith('#') and '[' in text: rows.append(text)
+    return rows
+
+
+def confer_patriarch(terminal, leaf_id, results, label):
+    """Put `leaf_id` in the patriarch seat, or leave the tries behind.
+
+    `/leaf patriarch` is refused while the leaf still holds a turn, and a leaf
+    that is booting is a leaf mid-turn - under load, which is to say whenever
+    the machine is also running everyone else's leaves, that is most of the
+    first minute. So the ask is repeated rather than sent once.
+
+    The line is cleared before each ask because a busy app can leave the
+    previous command sitting in the input box, and the next paste then joins
+    it: this probe once produced `/leaf patriarch <id>/leaf patriarch <id>`,
+    got a Usage error back, and read that as the app refusing the role. That
+    was a reading about the harness. Ctrl-U is the same clear `typed_in` does.
+    """
+    for attempt in range(10):
+        if terminal.pointer(terminal.id).get('patriarchSessionId') == leaf_id:
+            return
+        terminal.proc.write('\x15')
+        terminal.pause(.4)
+        terminal.submit('/leaf patriarch ' + leaf_id)
+        terminal.pause(4)
+        results[label + '_ask' + str(attempt)] = terminal.text()[-1200:]
+
+
+def ask_roster(terminal, results, label):
+    """Ask the app for the family roster and report what the app answered.
+
+    There is no slash command for the roster - it is only reachable through the
+    model's Leaf tool - so the fixture answers with that tool call and the app
+    computes the listing. The listing is then read from the request that carries
+    it back to the model, because that is where it exists: the app runs the
+    tool, sends the result and paints only the model's next words, so the
+    transcript shows the reply and nothing of the roster. The screen is kept
+    anyway, so a future reader can see that for themselves.
+
+    A row is `#N name [state] [marks...] <session id>`; the box the transcript
+    draws them in is stripped, so a row compares whole.
+    """
+    terminal.proc.write('\x15')
+    terminal.pause(.4)
+    before = len(tool_results)
+    terminal.submit('ROSTER_TASK')
+    terminal.pause(12)
+    results[label + '_screen'] = terminal.text()
+    # The first *result* after the ask, not the first request after it: the
+    # turns in between are auxiliary requests carrying no tool result at all.
+    answered = [text for text in tool_results[before:] if text]
+    results[label + '_wire'] = answered[0] if answered else None
+    on_screen = roster_rows(terminal, 'ROSTER_TASK')
+    if on_screen: return on_screen
+    wire = results[label + '_wire'] or ''
+    return [line.strip() for line in wire.splitlines()
+            if line.strip().startswith('#') and '[' in line]
+
+
+def probe_crash_window():
+    """The two designation-crash windows, built on disk and read back.
+
+    Both windows are one shape: a designation is written on the assumption that
+    a later event will clean it up, and an interruption between the write and the
+    event leaves a stale designation, because nothing reconciles.
+
+      Window 1 - the elder mark. `writePatriarchDesignation` commits the pointer
+      to the new patriarch and only THEN calls `markLeafElder` for the member it
+      moved off. Dying between the two loses the elder mark for good.
+
+      Window 3 - the closed patriarch. `setLeafMember` writes status `closed` to
+      the family file and only THEN calls `promoteNextPatriarch`, which moves the
+      designation. Dying between the two leaves the family file saying `closed`
+      for the member the pointer still names patriarch.
+
+    The window itself is sub-millisecond - two awaits in one function - so it
+    cannot be raced reliably from a harness. What can be done is build the exact
+    on-disk residue the interruption leaves and then let the REAL app resolve it
+    in a resumed session. The residue is the input; what the family does with it
+    is the answer, and either answer is worth having.
+
+    Window 3's residue is produced by the app itself: a member's process is
+    killed, its exit handler files it back as `closed`, and nothing promotes -
+    so the pointer keeps naming it. Window 1's residue is written by hand,
+    because only an interruption produces it and a write that fast cannot be
+    interrupted from outside.
+    """
+    results = {}
+
+    def flush_results():
+        """Leave the readings behind as they are taken, so a later failure still
+        has the evidence: this probe builds two families and kills a process, and
+        the interesting state is on disk long before the last assertion."""
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    # --- Window 3: the closed patriarch the app leaves behind on its own -------
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
+    # Neither window ever looks at a leaf's own screen: the members only have to
+    # exist, and one of them only has to be running so it can be killed. So the
+    # probe does not select one in the bar - that handoff is the slowest, flakiest
+    # gesture in the harness and it buys nothing here. `leaves()` reads the family
+    # file, which is the app's own record of who is in it.
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf new Alpha')
+    t.wait(lambda: len(t.leaves()) == 1, 'Alpha created', 90)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('/leaf new Bravo')
+    t.wait(lambda: len(t.leaves()) == 2, 'Bravo created', 90)
+    alpha, bravo = t.leaves()[0], t.leaves()[1]
+
+    # Ask for the designation and check the pointer, retrying: conferring is
+    # refused while the leaf still holds a turn ("Wait for the leaf turn"), and a
+    # leaf that is booting is a leaf mid-turn.
+    confer_patriarch(t, alpha['sessionId'], results, 'w3')
+    t.check(lambda: t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId'],
+            'Alpha never took the role')
+
+    # The interruption, produced by the app: kill the patriarch's process. This
+    # is what an OOM, a crash or a closed lid does, and it is the only way to
+    # leave the two-file write half-done. The exit handler files the member back
+    # as `closed` and does not promote, so the pointer keeps naming it.
+    t.wait(lambda: member_process(t, alpha['sessionId']) is not None, 'the patriarch has a process', 90)
+    victim = member_process(t, alpha['sessionId'])
+    t.check(lambda: victim is not None, 'the patriarch has no process to lose')
+    victim.terminate()
+    t.wait(lambda: next((m for m in t.family()['members'] if m['sessionId'] == alpha['sessionId']), {}).get('status') != 'open',
+           'the dead patriarch is filed back as closed', 60)
+    closed_row = next(m for m in t.family()['members'] if m['sessionId'] == alpha['sessionId'])
+    results['w3_familyFileSays'] = closed_row.get('status')
+    results['w3_pointerStillNamesIt'] = t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId']
+    t.check(lambda: closed_row.get('status') == 'closed',
+            'the family file does not say closed for the dead patriarch: ' + json.dumps(closed_row))
+    flush_results()
+
+    # Read it back through a resume: the family that resolves from disk.
+    #
+    # The killed member's writer lock is left behind - a process that is
+    # terminated cannot release it, and reclaiming it is the app's business on
+    # next use, not this window's on its way out. So the leave is told the
+    # family is held elsewhere and does not wait on the whole lock set, which
+    # is a claim about clean shutdown and not what this probe is testing.
+    t.exit(family_survives=True)
+    r = Terminal(session_id=t.id)
+    r.wait(lambda: 'All ' in r.text(), 'the family resumed', 180)
+    rows = ask_roster(r, results, 'w3_afterRoster')
+    results['w3_rosterRows'] = rows
+    alpha_row = next((row for row in rows if alpha['sessionId'] in row), None)
+    results['w3_alphaRow'] = alpha_row
+    results['w3_resolvesToClosedMember'] = bool(alpha_row and '[patriarch]' in alpha_row)
+    flush_results()
+    r.close_leaves(90)
+    r.exit(family_survives=True)
+
+    # --- Window 1: the elder mark the interrupted write never reached ----------
+    u = Terminal()
+    u.wait(lambda: 'All 1' in u.text(), 'initial session', 240)
+    u.proc.write('\x15'); u.pause(.4)
+    u.submit('/leaf new Alpha')
+    u.wait(lambda: len(u.leaves()) == 1, 'Alpha created', 90)
+    u.proc.write('\x15'); u.pause(.4)
+    u.submit('/leaf new Bravo')
+    u.wait(lambda: len(u.leaves()) == 2, 'Bravo created', 90)
+    a1, b1 = u.leaves()[0], u.leaves()[1]
+
+    confer_patriarch(u, a1['sessionId'], results, 'w1')
+    u.check(lambda: u.pointer(u.id).get('patriarchSessionId') == a1['sessionId'], 'Alpha never took the role')
+
+    # The residue, written by hand: the pointer has moved to Bravo and the family
+    # file is untouched, because `markLeafElder` for Alpha never ran. This is the
+    # instant between the pointer rename and the elder write, frozen.
+    pointer_path = root / 'leaf-families' / 'index' / (u.id + '.json')
+    pointer = json.loads(pointer_path.read_text(encoding='utf-8'))
+    pointer['patriarchSessionId'] = b1['sessionId']
+    pointer_path.write_text(json.dumps(pointer), encoding='utf-8')
+    alpha_member = next(m for m in u.family()['members'] if m['sessionId'] == a1['sessionId'])
+    results['w1_residueElderOnAlpha'] = bool(alpha_member.get('eldership'))
+    u.check(lambda: u.pointer(u.id).get('patriarchSessionId') == b1['sessionId'], 'the residue does not name Bravo')
+    u.check(lambda: not alpha_member.get('eldership'), 'the residue already marks Alpha an elder')
+
+    # The clean residue, resolved in the window that built it.
+    rows = ask_roster(u, results, 'w1_beforeResume')
+    results['w1_rosterRowsBeforeResume'] = rows
+    alpha_row = next((row for row in rows if a1['sessionId'] in row), None)
+    results['w1_alphaRowBeforeResume'] = alpha_row
+    flush_results()
+
+    # And again through a resume, so the loss is shown to survive the window.
+    #
+    # The family is held for the resume, and it is also not this probe's business
+    # whether the whole config root is quiet: Window 3 killed a process in the
+    # same root a moment ago, and a killed process cannot give its writer lock
+    # back. So both leaves here say the family is held elsewhere and skip the
+    # root-wide lock sweep.
+    u.exit(family_survives=True)
+    v = Terminal(session_id=u.id)
+    v.wait(lambda: 'All ' in v.text(), 'the family resumed', 180)
+    rows = ask_roster(v, results, 'w1_afterResume')
+    results['w1_rosterRowsAfterResume'] = rows
+    alpha_row = next((row for row in rows if a1['sessionId'] in row), None)
+    results['w1_alphaRowAfterResume'] = alpha_row
+    results['w1_elderMarkEverRestored'] = bool(alpha_row and '[elder]' in alpha_row)
+    flush_results()
+
+    # The leaves are not closed here on purpose. `/exit` is the owner cascade:
+    # a window leaving takes the leaves it owns with it, and the window that
+    # reshaped this family already left, so the members have no process left to
+    # close - asking `/leaf close` for one is a command that can never take,
+    # which is a probe failing on its own housekeeping. What the probe owes is
+    # the family left standing, and `exit` reads that back.
+    v.exit(family_survives=True)
+
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -2999,6 +3292,22 @@ def probe_merge_roles():
     t.exit()
     print(json.dumps(results, indent=1, sort_keys=True), flush=True)
 
+def probe_boot():
+    """Does this build paint a first frame at all?
+
+    A build that never starts is a build whose next user launches into a dead
+    window, which is a bigger fact than any family behaviour and deserves a
+    check that says only that. It is deliberately the smallest probe here: one
+    wait, one screen, no family.
+    """
+    t = Terminal()
+    try:
+        t.wait(lambda: 'All 1' in t.text(), 'the build paints its first frame', 120)
+        print(json.dumps(dict(booted=True, screen=t.text()[-800:]), indent=1, sort_keys=True), flush=True)
+    except AssertionError as error:
+        print(json.dumps(dict(booted=False, error=str(error), outputBytes=len(t.output),
+                              screen=t.text()[-800:]), indent=1, sort_keys=True), flush=True)
+
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
     probes = [
@@ -3016,6 +3325,8 @@ try:
         (args.probe_elder, probe_elder),
         (args.probe_arc, probe_arc),
         (args.probe_stress, probe_stress),
+        (args.probe_crash_window, probe_crash_window),
+        (args.probe_boot, probe_boot),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
     if chosen:
