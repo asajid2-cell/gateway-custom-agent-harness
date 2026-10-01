@@ -672,6 +672,55 @@ test('reviving an archived leaf files it back in without starting it', async () 
   }
 })
 
+test('a member that held the patriarch role is filed as an elder, and a merely parked member is not', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-elder-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = directory
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    workspace.forgetLeafFamilyRoot()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const held = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Held', transcriptPath: join(directory, 'held.jsonl'), forkMessageId: randomUUID() })
+    const parked = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Parked', transcriptPath: join(directory, 'parked.jsonl'), forkMessageId: randomUUID() })
+    const member = async (sessionId: string) => (await readLeafFamily(family, root)).members.find(item => item.sessionId === sessionId)!
+
+    // Holding the role is not eldership: the mark records that the role was held
+    // and given up, so a member that is the patriarch right now is not an elder.
+    await workspace.writePatriarchDesignation(root, held.sessionId)
+    assert.equal((await member(held.sessionId)).eldership, undefined, 'holding the role is not eldership')
+
+    // It is parked while it holds the designation, so the succession that parks
+    // it is what makes it an elder - and the roster files it as one.
+    await workspace.changeLeaf(held.sessionId, { status: 'archived' })
+    assert.equal((await member(held.sessionId)).eldership, true, 'a member that held the role and gave it up is an elder')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${held.number} Held \\[archived\\] \\[elder\\] ${held.sessionId}$`, 'm'), 'the elder is filed as one in the family view')
+
+    // A member that was merely parked never held the role, so it is not an elder:
+    // the two are the exact pair eldership exists to tell apart.
+    await workspace.changeLeaf(parked.sessionId, { status: 'closed' })
+    assert.equal((await member(parked.sessionId)).status, 'closed')
+    assert.equal((await member(parked.sessionId)).eldership, undefined, 'a member that never held the role is not an elder')
+
+    // The fact is durable: it is a record of what happened, so nothing clears it.
+    assert.equal((await member(held.sessionId)).eldership, true, 'eldership survives every later read')
+  } finally {
+    // The resolved root and the matriarch lease are module state this case took;
+    // give them back so the cases after it read their own family, not this one.
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    workspace.forgetLeafFamilyRoot()
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('worktree leaf rejects the current working tree before creating a fork', async () => {
   const { getCwdState, setCwdState, getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
   const { resolve } = await import('node:path')
@@ -962,7 +1011,9 @@ test('the designated patriarch is the one patriarch and root name, and original 
       const roster = await workspace.familyRoster()
       assert.match(roster, new RegExp(`^family ${root}$`, 'm'), 'the family is still named by its id, which never moves')
       assert.match(roster, new RegExp(`^#${sibling.number} Sibling \\[open\\] \\[patriarch\\] ${sibling.sessionId}$`, 'm'), 'the mark follows the designation')
-      assert.match(roster, new RegExp(`^#${creatorNumber} \\S.* \\[open\\] ${root}$`, 'm'), 'the creator is an ordinary row with no mark')
+      // The creator held the role until this designation took it away, so it is
+      // filed as an elder now: that is exactly the fact eldership records.
+      assert.match(roster, new RegExp(`^#${creatorNumber} \\S.* \\[open\\] \\[elder\\] ${root}$`, 'm'), 'the member the designation moved away from is an elder')
 
       // A pointer with no designation at all - the shape older code writes -
       // still names a parent: the family id, which is the creator.

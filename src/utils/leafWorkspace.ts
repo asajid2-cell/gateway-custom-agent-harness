@@ -12,7 +12,7 @@ import { checkHasTrustDialogAccepted } from './config.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { createFork } from '../commands/branch/branch.js'
 import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscriptPath, getTranscriptPathForSession, saveSessionName } from './sessionStorage.js'
-import { addLeafMember, ensureCreatorMember, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
+import { addLeafMember, ensureCreatorMember, markLeafElder, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
 import { LeafProcess, isLeafProcessAlive } from './leafProcess.js'
 import { LeafTakenError } from './leafChannel.js'
 import { leafColorEnv } from './leafColor.js'
@@ -703,11 +703,22 @@ async function familyPatriarchMember(members: readonly LeafMember[], familyId: s
   return members.find(member => member.sessionId === designated) ?? members.find(member => member.sessionId === familyId)
 }
 
-/** Write the designation where every member reads it, keeping the pointer's other fields. */
+/**
+ * Write the designation where every member reads it, keeping the pointer's other fields.
+ *
+ * This is the one place the patriarch moves, so it is also the one place a member
+ * becomes an elder: whoever the designation is moving away from has held the role
+ * and does not hold it now. Reading the outgoing member from the pointer that is
+ * about to be overwritten - and falling back to the family id, which is the
+ * patriarch a family has before any designation is written - catches every move,
+ * whether the member stepped down, was displaced, or left.
+ */
 export async function writePatriarchDesignation(familyId: string, patriarchSessionId: string): Promise<void> {
   const current = await readLeafFamilyPointer(familyId)
+  const previous = current?.patriarchSessionId ?? familyId
   const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
   await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId })
+  if (previous !== patriarchSessionId) await markLeafElder(familyPath(familyId), familyId, previous)
 }
 
 /** Re-read the designation and keep it where sync render paths can name the family. */
@@ -1082,7 +1093,7 @@ export async function familyRoster(): Promise<string> {
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
     const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
-    const role = `${member.sessionId === patriarchId ? ' [patriarch]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
+    const role = `${member.sessionId === patriarchId ? ' [patriarch]' : ''}${member.eldership ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
     lines.push(`#${member.number} ${member.name} [${state}]${role} ${member.sessionId}${settings ? ` ${settings}` : ''}`)
   }
   return lines.join('\n')

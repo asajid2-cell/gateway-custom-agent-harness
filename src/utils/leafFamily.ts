@@ -14,6 +14,11 @@ const memberSchema = z.object({
   scrollOffset: z.number().int().nonnegative().optional(),
   model: z.string().min(1).max(200).optional(),
   effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode']).optional(),
+  // An elder: a member that held the patriarch role and gave it up. A filing
+  // category, not a mode - it changes how a member is found in the family, not
+  // how it behaves, so an elder that is opened is an ordinary leaf. Absent means
+  // the member never held the role; the only value ever written is true.
+  eldership: z.literal(true).optional(),
 }).strict()
 const familySchema = z.object({
   version: z.literal(1), rootSessionId: z.string().uuid(), nextNumber: z.number().int().positive(),
@@ -149,5 +154,30 @@ export function updateLeafMember(path: string, rootSessionId: string, sessionId:
     const member = memberSchema.parse({ ...family.members[index], name: patch.name ?? family.members[index]!.name, status: patch.status ?? family.members[index]!.status, model: patch.model ?? family.members[index]!.model, effort: patch.effort ?? family.members[index]!.effort, draft: patch.draft ?? family.members[index]!.draft, scrollOffset: patch.scrollOffset ?? family.members[index]!.scrollOffset })
     family.members[index] = member
     return member
+  })
+}
+
+/**
+ * Record that a member has held the patriarch role.
+ *
+ * The role moves, and once it has moved away the member that held it is an
+ * elder: filed differently from a member that was merely parked, so the family
+ * can tell the two apart. This is the whole of the elder concept - a durable
+ * fact on the row and nothing else. It is set once and never cleared, because
+ * what it records is that the role was held, which does not stop being true.
+ *
+ * Idempotent, and silent about a member that is not in the family: a designation
+ * can name a session whose row has not been bootstrapped yet, and that is not a
+ * reason to fail the succession that is moving it.
+ */
+export async function markLeafElder(path: string, rootSessionId: string, sessionId: string): Promise<void> {
+  // Read before locking so an absent member (or a family file that does not
+  // exist yet) is not rewritten into being by the mutation below.
+  const family = await readLeafFamily(path, rootSessionId)
+  if (!family.members.some(member => member.sessionId === sessionId && !member.eldership)) return
+  await mutateFamily(path, rootSessionId, family => {
+    const index = family.members.findIndex(member => member.sessionId === sessionId)
+    if (index < 0) return
+    family.members[index] = memberSchema.parse({ ...family.members[index], eldership: true })
   })
 }

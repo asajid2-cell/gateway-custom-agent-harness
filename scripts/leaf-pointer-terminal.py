@@ -39,6 +39,7 @@ parser.add_argument('--probe-compact', action='store_true')
 parser.add_argument('--probe-merge-stress', action='store_true')
 parser.add_argument('--probe-merge-roles', action='store_true')
 parser.add_argument('--probe-queue', action='store_true')
+parser.add_argument('--probe-elder', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
 args = parser.parse_args()
@@ -96,7 +97,7 @@ class Handler(BaseHTTPRequestHandler):
         messages = body.get('messages', [])
         latest = json.dumps(messages[-1].get('content', '') if messages else '')
         view = view_tag(messages[-1].get('content', '') if messages else '')
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -1625,6 +1626,84 @@ def probe_creator_after_patriarch():
     t.exit()
 
 
+def probe_elder():
+    """An elder: a member that held the role, parked, and still answering.
+
+    Succession is rare and it is the whole point of a family, and nothing
+    witnesses it today. Archive is the near-neighbour - a member detaches, goes
+    hidden, and its transcript is kept - but nothing marks a member as having
+    HELD the role and being consultable afterwards. This drives the path that
+    matters: a member takes the designation, learns something only it has, is
+    parked, and is read back. What it must still answer with is the memory only
+    it had, and what the family must say about it is that it held the role.
+
+    Two readings are kept apart on purpose. The recall half is mechanical and
+    should hold already, because the bytes are on disk and the family holds the
+    path. The elder half is the product concept, and the assertion that names it
+    is the gate for the whole design rather than a bug report about a read.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('/leaf new Elder')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'the elder member', 75)
+    elder = t.leaves()[0]
+    t.assert_view(elder['sessionId'], 'the elder member', 75)
+
+    # The memory only this member has. The fixture answers the marker, so the
+    # turn is real and the bytes it leaves are this member's own.
+    t.submit('ELDER_SECRET_')
+    t.wait(lambda: 'FIXTURE_REPLY_ELDER_SECRET_' in t.text(), 'the elder learns something only it has', 45)
+
+    # It takes the designation first: an elder is a member that HELD the role,
+    # so holding it is the thing that has to be recorded before the park.
+    t.original()
+    t.submit('/leaf patriarch ' + elder['sessionId'])
+    t.wait(lambda: 'is now the family patriarch' in t.text(), 'the elder holds the role', 30)
+
+    # Park it. Archiving detaches and hides it while keeping its transcript. The
+    # wait is for "no longer open", not for the word `archived`: the member is a
+    # live process, and archiving it ends that process, whose exit handler files
+    # it back as `closed` (leafWorkspace.ts onExit). Which of the two words the
+    # row ends on is a race this probe must not depend on - what "parked" means
+    # here is that it is out of the open list and its bytes are still on disk.
+    t.submit('/leaf archive ' + elder['sessionId'])
+    t.wait(lambda: 'Leaf archive recorded' in t.text(), 'the archive is recorded', 30)
+    t.wait(lambda: any(member['sessionId'] == elder['sessionId'] and member['status'] != 'open'
+                       for member in t.leaves()), 'the elder is parked', 60)
+
+    # Consultable while parked: the bytes are on disk and the family holds the
+    # path, so a read reaches the memory without the member running. This is the
+    # difference between consulting an elder and restarting one.
+    t.submit('/leaf read ' + elder['sessionId'])
+    t.wait(lambda: 'ELDER_SECRET_' in t.after('/leaf read ' + elder['sessionId']),
+           'the parked elder is read on demand', 45)
+    t.check(lambda: '[peer session transcript' in t.after('/leaf read ' + elder['sessionId']),
+            'the parked elder read was not labelled as peer-authored text')
+
+    # THE ELDER MARK. A member that held the role and is now parked is an elder:
+    # the record carries the one durable fact that it held the role, so an
+    # ex-patriarch is filed differently from a member that was merely parked.
+    # The message prints the whole record, so a failure names what is there.
+    record = next((member for member in t.family()['members'] if member['sessionId'] == elder['sessionId']), None)
+    t.check(lambda: record is not None and record.get('eldership') is True,
+            'the family does not mark a member that held the role as an elder: ' + json.dumps(record))
+
+    # Back and recall: the member itself must still carry the memory it had.
+    # Reopening starts the member; it does not put it on screen, so the bar is
+    # how the probe gets to it - the same gesture a person makes to open an elder.
+    t.submit('/leaf reopen ' + elder['sessionId'])
+    t.wait(lambda: any(member['sessionId'] == elder['sessionId'] and member['status'] == 'open'
+                       for member in t.leaves()), 'the elder is reopened', 90)
+    t.leaf(0)
+    t.check(lambda: 'ELDER_SECRET_' in t.text(), 'the reopened elder lost the memory only it had')
+
+    t.original()
+    t.close_leaves(60)
+    t.exit()
+    print(json.dumps(dict(elder=True, parkedAs=record.get('status'), marked=True,
+                          readableWhileParked=True, reopened=True, recalled=True)), flush=True)
+
+
 def probe_queue():
     """The message queue: Tab hands a message over instead of sending it.
 
@@ -2676,6 +2755,7 @@ try:
         (args.probe_comms, probe_comms), (args.probe_merge, probe_merge),
         (args.probe_compact, probe_compact), (args.probe_merge_stress, probe_merge_stress),
         (args.probe_merge_roles, probe_merge_roles),
+        (args.probe_elder, probe_elder),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
     if chosen:
