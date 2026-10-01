@@ -599,3 +599,64 @@ test('a timed-out inline mouse probe re-probes after the backoff, so a late atta
     setIsInteractive(savedInteractive)
   }
 })
+
+test('a probe that recovers after a miss repaints the block once, so a late attach loads', async () => {
+  // Inline Gateway gets no pty signal when a client attaches — mux's
+  // redraw_nudge is alt-screen-gated — so after a byte replay the block shows
+  // whatever Gateway last wrote and its frontFrame can no longer be trusted.
+  // When the probe that missed at mount is finally answered, that reply *is*
+  // the attach signal, and the block must be repainted opaquely exactly once
+  // (not on every retry tick, which would flicker).
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin, take } = harness()
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  try {
+    assert.ok(isBoundedLayoutEnabled(), 'the test must exercise the bounded lane')
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as any, stderr: stdout as any, stdin: stdin as any,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    await sleep(200)
+    const ink = instances.get(stdout as any) as unknown as {
+      resume(): void
+      displayCursor: { x: number; y: number } | null
+      frontFrame: { cursor: { x: number; y: number } }
+    }
+    ink.resume()
+    // Probe #1 misses (no client yet): 1s timeout, then the 2s backoff, then
+    // the retried probe goes out. Discard everything up to now so the only
+    // bytes left to inspect are the ones the reply provokes.
+    await sleep(3300)
+    take()
+    // A client is attached now: answer the in-flight retried probe with a
+    // reply built from the frame's own cursor, so it passes validation.
+    const cursor = ink.displayCursor ?? ink.frontFrame.cursor
+    stdin.write(`\x1b[?${cursor.y + 1};${cursor.x + 1}R`)
+    await sleep(500)
+    const stream = take()
+    assert.ok(
+      stream.includes('\x1b[2J'),
+      `the recovered block was not repainted opaquely: ${JSON.stringify(stream)}`,
+    )
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
