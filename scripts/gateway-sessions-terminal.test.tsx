@@ -34,6 +34,12 @@ test('sessions panel renders live identity and handles policy keys and escape', 
     }
     await waitFor(() => output.includes('TERMINAL_PEER'))
     assert.ok(output.includes(getSessionId()))
+    // A peer with no checkpoint - an older session, or one that has never
+    // compacted - renders without a count line rather than as a naked zero.
+    assert.equal(output.includes('full compactions'), false)
+    await runtime.transport.update({ compactBoundaryCount: 4, microcompactBoundaryCount: 9 })
+    stdin.write('r')
+    await waitFor(() => output.includes('4 full compactions') && output.includes('9 microcompactions'))
     stdin.write('h')
     await waitFor(() => output.replace(/\x1b\[1C/g, ' ').includes('Inbound policy: hold'))
     stdin.write('\x1b')

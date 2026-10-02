@@ -813,7 +813,17 @@ export class GatewaySessionTransport {
     })
   }
 
-  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics'>>): Promise<void> {
+  setCompactionCounts(counts: { compactBoundaryCount: number; microcompactBoundaryCount: number } | undefined): void {
+    if (counts) {
+      this.peer.compactBoundaryCount = counts.compactBoundaryCount
+      this.peer.microcompactBoundaryCount = counts.microcompactBoundaryCount
+    } else {
+      delete this.peer.compactBoundaryCount
+      delete this.peer.microcompactBoundaryCount
+    }
+  }
+
+  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics' | 'compactBoundaryCount' | 'microcompactBoundaryCount'>>): Promise<void> {
     const subscribers = await this.serial(async () => {
       const next = gatewayPeerSchema.parse({ ...this.peer, ...values })
       await atomicJson(this.registrationPath, { peer: next, token: this.token })

@@ -53,6 +53,8 @@ export const gatewayPeerSchema = z.object({
   // running an older build writes registrations without it and must stay
   // readable. A future field here must keep the same property.
   topics: z.array(z.string().min(1).max(120)).max(8).optional(),
+  compactBoundaryCount: z.number().int().nonnegative().optional(),
+  microcompactBoundaryCount: z.number().int().nonnegative().optional(),
 }).strict()
 
 export const gatewayPeerMessageSchema = z.object({
@@ -404,14 +406,17 @@ export function appendSessionTopic(existing: readonly string[] | undefined, topi
  *
  * Exported for testing.
  */
-export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'> & { pid?: number }): string {
+export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'> & Partial<Pick<GatewayPeer, 'compactBoundaryCount' | 'microcompactBoundaryCount'>> & { pid?: number }): string {
   const purpose = peer.purpose.trim() || peer.name.trim() || 'no stated intent'
   // The opening purpose is a historical anchor, not a description of current
   // work. Surfacing the recent request topics beside it is what lets a peer be
   // found by what it is doing now rather than by what it started as.
   const recent = (peer.topics ?? []).map(topic => topic.replace(/\s+/g, ' ').trim()).filter(Boolean)
   const suffix = recent.length ? `\n    recent: ${recent.join(' | ')}` : ''
+  const counts = Number.isInteger(peer.compactBoundaryCount) && Number.isInteger(peer.microcompactBoundaryCount)
+    ? `\n    compactions: ${peer.compactBoundaryCount} full, ${peer.microcompactBoundaryCount} micro`
+    : ''
   const pid = typeof peer.pid === 'number' ? ` (pid ${peer.pid})` : ''
-  return `[${peer.status}] ${purpose}\n    name: ${peer.name}\n    id: ${peer.sessionId}${pid}\n    cwd: ${peer.cwd}${suffix}`
+  return `[${peer.status}] ${purpose}\n    name: ${peer.name}\n    id: ${peer.sessionId}${pid}\n    cwd: ${peer.cwd}${suffix}${counts}`
 }
 

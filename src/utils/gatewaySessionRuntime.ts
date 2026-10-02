@@ -8,6 +8,8 @@ import { enqueue, removeByFilter } from './messageQueueManager.js'
 import { isInteractiveLeaf } from './leafTerminal.js'
 import { startSessionReaper } from './sessionReaper.js'
 import type { GatewayPeer, GatewayInboundPolicy } from './gatewaySessionProtocol.js'
+import { loadSessionCompactionCounts, subscribeSessionCompactionCounts } from './sessionCompactionCounts.js'
+import { getTranscriptPathForSession } from './sessionStorage.js'
 
 const runtimes = new Map<string, GatewaySessionRuntime>()
 export function getGatewaySessionRuntime(sessionId: string): GatewaySessionRuntime | undefined { return runtimes.get(sessionId) }
@@ -65,6 +67,7 @@ export class GatewaySessionRuntime {
   private closing: Promise<void> | undefined
   private ready = false
   private stopReaper: (() => void) | undefined
+  private unsubscribeCounts: (() => void) | undefined
   constructor(sessionId: string, cwd: string, name: string) {
     this.transport = new GatewaySessionTransport({
       directory: join(getClaudeConfigHomeDir(), 'gateway-sessions'), sessionId, cwd, name,
@@ -93,8 +96,16 @@ export class GatewaySessionRuntime {
       try {
         await (await import('./gatewaySessionOwnership.js')).claimGatewaySessionWriter(this.transport.peer.sessionId)
         if (this.closing) return
+        const counts = await loadSessionCompactionCounts(this.transport.peer.sessionId, getTranscriptPathForSession(this.transport.peer.sessionId))
+        this.transport.setCompactionCounts(counts)
+        if (this.closing) return
         await this.transport.start()
         if (this.closing) return
+        this.unsubscribeCounts = subscribeSessionCompactionCounts((id, nextCounts) => {
+          if (id !== this.transport.peer.sessionId || this.closing) return
+          this.transport.setCompactionCounts(nextCounts)
+          void this.transport.update(nextCounts).catch(() => {})
+        })
         await this.delivery.reconcilePersisted(persistedIds)
         if (this.closing) return
         runtimes.set(this.transport.peer.sessionId, this)
@@ -129,6 +140,8 @@ export class GatewaySessionRuntime {
     this.stopReaper = undefined
     this.unsubscribeSwitch?.()
     this.unsubscribeSwitch = undefined
+    this.unsubscribeCounts?.()
+    this.unsubscribeCounts = undefined
     if (runtimes.get(this.transport.peer.sessionId) === this) runtimes.delete(this.transport.peer.sessionId)
     this.delivery.close()
     removeByFilter(command => command.uuid !== undefined && this.pendingIds.has(command.uuid))
