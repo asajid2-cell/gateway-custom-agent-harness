@@ -15,6 +15,15 @@ test('build stages the bundle and validates with Bun rather than Node', async ()
   assert.doesNotMatch(build, /\['node', '--check'/)
 })
 
+test('launcher owns the backend job through startup and unconditional cleanup', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  assert.match(script, /\. \(Join-Path \$PSScriptRoot 'owned-gateway-process\.ps1'\)/)
+  assert.match(script, /\$ownedGateway = Start-OwnedGatewayProcess/)
+  assert.match(script, /\$GatewayJob = \$ownedGateway\.Job/)
+  assert.match(script, /Stop-OwnedGateway -Process \$GatewayProcess\s*\} finally \{\s*if \(\$GatewayJob\) \{ \$GatewayJob\.Dispose\(\) \}/)
+  assert.doesNotMatch(script, /\$GatewayProcess = Start-Process/)
+})
+
 test('launcher diagnostics use an explicit safe-field allowlist', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
   assert.match(script, /@\('exitCode', 'attempt', 'port', 'errorType'\)/)

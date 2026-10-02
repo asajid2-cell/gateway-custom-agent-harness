@@ -180,6 +180,7 @@ $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
 $ClaudeArgs = @($args)
 $GatewayProcess = $null
+$GatewayJob = $null
 $StdoutLog = $null
 $StderrLog = $null
 $ScopedSettingsPath = $null
@@ -973,14 +974,17 @@ try {
     # health are covered independently by the gateway and compiled replay gates.
     $healthy = $true
   } else {
-    $GatewayProcess = Start-Process `
+    # Hold a non-inheritable job handle here: Windows reaps this exclusive backend
+    # chain even if the launcher dies before its finally block can run.
+    . (Join-Path $PSScriptRoot 'owned-gateway-process.ps1')
+    $ownedGateway = Start-OwnedGatewayProcess `
       -FilePath 'powershell.exe' `
       -ArgumentList $GatewayArgumentList `
       -WorkingDirectory $Root `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput $StdoutLog `
-      -RedirectStandardError $StderrLog `
-      -PassThru
+      -StdoutPath $StdoutLog `
+      -StderrPath $StderrLog
+    $GatewayJob = $ownedGateway.Job
+    $GatewayProcess = $ownedGateway.Process
 
     $healthy = $false
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -1039,7 +1043,11 @@ try {
     Pop-Location
   }
 } finally {
-  Stop-OwnedGateway -Process $GatewayProcess
+  try {
+    Stop-OwnedGateway -Process $GatewayProcess
+  } finally {
+    if ($GatewayJob) { $GatewayJob.Dispose() }
+  }
   if ($StdoutLog) {
     if ($KeepGatewayLogs) {
       [Console]::Error.WriteLine("cc gateway stdout log=$StdoutLog")
