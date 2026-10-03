@@ -585,7 +585,18 @@ export class GatewaySessionTransport {
           if (!stat.isFile() || stat.size > MAX_INBOX_BYTES) throw new Error('Invalid inbox size')
           raw = JSON.parse(await handle.readFile('utf8'))
         } finally { await handle.close() }
-        const inbox = gatewayInboxSchema.parse(raw)
+        const parsed = gatewayInboxSchema.safeParse(raw)
+        // A store this build cannot read is reported as one line naming the
+        // first issue, not as the raw issue array: this reason is surfaced
+        // verbatim on the comms surfaces, and a wall of JSON is unreadable
+        // where a person needs a reason.
+        if (!parsed.success) {
+          const [first] = parsed.error.issues
+          const at = first?.path.join('.') ?? 'store'
+          const count = parsed.error.issues.length
+          throw new Error(`Inbox store is invalid at ${at}: ${first?.message ?? 'unknown'} (${count} issue${count === 1 ? '' : 's'})`)
+        }
+        const inbox = parsed.data
         if (inbox.records.some(record => record.message.toSessionId !== this.peer.sessionId) || new Set(inbox.records.map(record => record.message.id)).size !== inbox.records.length) throw new Error('Invalid inbox records')
         this.records = inbox.records
         this.policy = inbox.policy

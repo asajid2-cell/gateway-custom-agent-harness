@@ -160,6 +160,27 @@ test('the schema refuses a nil-UUID reply target', async () => {
   )
 })
 
+test('a reader accepts a nil-UUID reply target and reads it as absent', async () => {
+  // The writer refuses nil, but a message already on the wire or in a store -
+  // written by a build that predates the refusal - still carries it. Reading
+  // must normalize it away rather than refuse, or one historical placeholder
+  // fails the whole inbox and the session never registers on the bus.
+  const { parsePeerMessage } = await import('../src/utils/gatewaySessionProtocol.ts')
+  const message = {
+    id: randomUUID(),
+    fromSessionId: randomUUID(),
+    fromRuntimeId: randomUUID(),
+    toSessionId: randomUUID(),
+    summary: 'Review the parser',
+    text: 'Please review the parser.',
+    replyTo: '00000000-0000-0000-0000-000000000000',
+    createdAt: new Date().toISOString(),
+  }
+  const parsed = parsePeerMessage(message)
+  assert.equal(parsed.replyTo, undefined, 'the nil reply target is read as absent')
+  assert.equal(parsed.id, message.id, 'the rest of the message is unchanged')
+})
+
 test('queue once; acknowledge only persisted message IDs; reconcile before restart drain', async () => {
   const records: GatewayInboxRecord[] = [{ message: { id: 'message-1', fromSessionId: 'sender', fromRuntimeId: 'runtime', toSessionId: 'receiver', summary: 'Notice', text: '/clear', createdAt: new Date().toISOString() }, senderName: 'Peer', state: 'queued', receivedAt: new Date().toISOString() }]
   const queued: string[] = []

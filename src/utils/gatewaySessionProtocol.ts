@@ -70,6 +70,21 @@ export const gatewayPeerSchema = z.object({
 
 export const NIL_UUID = '00000000-0000-0000-0000-000000000000'
 
+/**
+ * Drop a nil-UUID replyTo, which an older build wrote to mean "no reply target".
+ *
+ * The renderer already treats that value as absent (see `isReply` below), so a
+ * reader must too: a strict read makes one historical placeholder unreadable,
+ * and the inbox is parsed as a whole before a session can register - so a single
+ * old placeholder takes the whole session off the peer bus. That is what "the
+ * bus randomly drops a session" was: a store that could never be read.
+ */
+function withoutNilReplyTo(raw: unknown): unknown {
+  if (raw === null || typeof raw !== 'object') return raw
+  if ((raw as { replyTo?: unknown }).replyTo !== NIL_UUID) return raw
+  return Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([key]) => key !== 'replyTo'))
+}
+
 export const gatewayPeerMessageSchema = z.object({
   id: z.string().uuid(),
   fromSessionId: z.string().uuid(),
@@ -101,16 +116,27 @@ export const gatewayPeerMessageSchema = z.object({
  * this build does know is still validated.
  */
 export function parsePeerMessage(raw: unknown): GatewayPeerMessage {
-  const strict = gatewayPeerMessageSchema.safeParse(raw)
+  const normalized = withoutNilReplyTo(raw)
+  const strict = gatewayPeerMessageSchema.safeParse(normalized)
   if (strict.success) return strict.data
   if (!strict.error.issues.every(issue => issue.code === 'unrecognized_keys')) throw strict.error
   const known = new Set(Object.keys(gatewayPeerMessageSchema.shape))
-  const stripped = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([key]) => known.has(key)))
+  const stripped = Object.fromEntries(Object.entries(normalized as Record<string, unknown>).filter(([key]) => known.has(key)))
   return gatewayPeerMessageSchema.parse(stripped)
 }
 
+/**
+ * A message read back from a store, rather than off the wire.
+ *
+ * A store outlives the build that wrote it, so it is read with the wire's
+ * tolerance: a historical nil-UUID replyTo is normalized to absent rather than
+ * failing the record. A strict read here is what took a whole session off the
+ * bus, because the inbox is parsed as a unit before the session can register.
+ */
+export const storedPeerMessageSchema = z.preprocess(withoutNilReplyTo, gatewayPeerMessageSchema)
+
 export const gatewayInboxRecordSchema = z.object({
-  message: gatewayPeerMessageSchema,
+  message: storedPeerMessageSchema,
   senderName: z.string().min(1).max(200),
   state: z.enum(['held', 'queued', 'delivered', 'refused']),
   receivedAt: z.string().datetime(),
@@ -119,7 +145,7 @@ export const gatewayInboxRecordSchema = z.object({
 export const gatewayPeerHistoryEntrySchema = z.object({
   direction: z.enum(['sent', 'received']),
   status: z.enum(['queued', 'held', 'delivered', 'refused', 'failed', 'unknown']),
-  message: gatewayPeerMessageSchema,
+  message: storedPeerMessageSchema,
   peerName: z.string().min(1).max(200),
   recordedAt: z.string().datetime(),
   error: z.string().max(500).optional(),

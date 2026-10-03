@@ -653,3 +653,39 @@ test('a session restarted after a crash keeps its intent and is reachable again'
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('a store holding a historical nil reply target still registers', { timeout: 30000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-nil-reply-'))
+  const directory = join(root, 'private')
+  // The directory is created by a transport, so it carries the private ACL the
+  // store loader requires; a bare mkdir would not, and the load would be refused
+  // for that reason instead of reaching the record this test is about.
+  const seed = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Seed', cwd: root })
+  await seed.start()
+  await seed.close()
+  const sessionId = randomUUID()
+  // The exact shape an older build left behind: replyTo present and nil. The
+  // inbox is parsed as a whole before a session can register, so a strict read
+  // of this one record took the session off the bus entirely - which is what
+  // "the bus randomly drops a session" turned out to be.
+  const message = {
+    id: randomUUID(), fromSessionId: randomUUID(), fromRuntimeId: randomUUID(),
+    toSessionId: sessionId, summary: 'old', text: 'a message from before the change',
+    replyTo: '00000000-0000-0000-0000-000000000000', createdAt: new Date().toISOString(),
+  }
+  await writeFile(join(directory, `${sessionId}.inbox`), JSON.stringify({
+    policy: 'accept',
+    records: [{ message, senderName: 'Old peer', state: 'queued', receivedAt: new Date().toISOString() }],
+    history: [{ direction: 'sent', status: 'unknown', message, peerName: 'Old peer', recordedAt: new Date().toISOString() }],
+  }))
+  const peer = new GatewaySessionTransport({ directory, sessionId, name: 'Resumed peer', cwd: root })
+  try {
+    await peer.start()
+    assert.equal(peer.inbox().length, 1, 'the historical record survives the load')
+    assert.equal(peer.inbox()[0]!.message.replyTo, undefined, 'the nil reply target is read as absent')
+    assert.equal((await listGatewayPeers(directory)).length, 1, 'the session is back on the bus')
+  } finally {
+    await peer.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
