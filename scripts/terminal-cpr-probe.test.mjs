@@ -30,13 +30,13 @@ test('the DEC-private CPR a mux client preserves resolves as a cursor position',
   const parsed = parse('\x1b[?2;1R')
   assert.equal(parsed.length, 1)
   assert.equal(parsed[0].kind, 'response')
-  assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 2, col: 1 })
+  assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 2, col: 1, decPrivate: true })
 })
 
 test('the ConPTY page parameter on a private CPR is absorbed', () => {
   const parsed = parse('\x1b[?5;12;1R')
   assert.equal(parsed[0].kind, 'response')
-  assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 5, col: 12 })
+  assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 5, col: 12, decPrivate: true })
 })
 
 test('the plain CPR the probe also sends is recognized while the probe waits', () => {
@@ -44,10 +44,28 @@ test('the plain CPR the probe also sends is recognized while the probe waits', (
   try {
     const parsed = parse('\x1b[2;1R')
     assert.equal(parsed[0].kind, 'response')
-    assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 2, col: 1 })
+    assert.deepEqual(parsed[0].response, { type: 'cursorPosition', row: 2, col: 1, decPrivate: false })
   } finally {
     expectStandardCursorPosition(false)
   }
+})
+
+test('the reply form is tagged so the probe can tell a local terminal from a relay', () => {
+  // The inline probe keys local-vs-relay on this: only the private form gets
+  // through a relay/mux client, so a private reply means relay and a plain one
+  // means a native local terminal. Both must be distinguishable from the
+  // parsed response alone.
+  const privateReply = parse('\x1b[?3;7R')[0]
+  const plainReply = (() => {
+    expectStandardCursorPosition(true)
+    try {
+      return parse('\x1b[3;7R')[0]
+    } finally {
+      expectStandardCursorPosition(false)
+    }
+  })()
+  assert.equal(privateReply.response.decPrivate, true)
+  assert.equal(plainReply.response.decPrivate, false)
 })
 
 test('a plain CPR that collides with a function key stays a key when no probe waits', () => {
