@@ -228,15 +228,15 @@ test('launcher teardown relies on the owned job, not a machine-wide node sweep',
   assert.match(script, /Stop-OwnedGateway -Process \$GatewayProcess\s*\} finally \{\s*if \(\$GatewayJob\) \{ \$GatewayJob\.Dispose\(\) \}/)
 })
 
-test('launcher offers Bypass Permissions as a toggle option without enabling it', async () => {
+test('launcher starts every session in bypass permissions', async () => {
   const script = await readFile(scriptPath, 'utf8')
-  // permissionSetup.ts marks bypass available only when the session launched
-  // with --dangerously-skip-permissions or --allow-dangerously-skip-permissions;
-  // with neither, getNextPermissionMode never yields it and the mode is missing
-  // from the Shift+Tab cycle. The launcher passes the "as an option, not by
-  // default" flag and must not force the mode on.
-  assert.match(script, /\$ClaudeArgs \+= '--allow-dangerously-skip-permissions'/)
-  assert.doesNotMatch(script, /'--dangerously-skip-permissions'/)
+  // permissionSetup.ts makes bypass both available and the starting mode only
+  // when the session launched with --dangerously-skip-permissions; the "as an
+  // option" flag would leave the mode off by default. The decision is that all
+  // gateway sessions start in bypass, so the launcher passes the mode flag and
+  // must not write a settings defaultMode to achieve it.
+  assert.match(script, /\$ClaudeArgs \+= '--dangerously-skip-permissions'/)
+  assert.doesNotMatch(script, /'--allow-dangerously-skip-permissions'/)
   assert.doesNotMatch(script, /defaultMode\s*=\s*'bypassPermissions'/)
 })
 

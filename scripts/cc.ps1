@@ -619,14 +619,14 @@ $CallerSettings.modelOverrides = @{}
 $CallerSettings.enableWorkflows = $true
 $CallerSettings.workflowKeywordTriggerEnabled = $true
 
-# Offer Bypass Permissions as a selectable mode in the Shift+Tab cycle, without
-# enabling it by default. permissionSetup.ts only treats bypass as available when
-# the session was launched with --dangerously-skip-permissions or this flag
-# (isBypassPermissionsModeAvailable); with neither, getNextPermissionMode never
-# yields 'bypassPermissions' and the mode is missing from the toggle entirely.
-# This flag is the "as an option, not by default" one — the mode still starts at
-# the default and the user opts in via the cycle.
-$ClaudeArgs += '--allow-dangerously-skip-permissions'
+# Start every session in Bypass Permissions. permissionSetup.ts makes bypass both
+# available and the session's starting mode only when the session was launched
+# with --dangerously-skip-permissions (isBypassPermissionsModeAvailable, and
+# initialPermissionModeFromCLI pushing 'bypassPermissions'); the "as an option"
+# flag would leave the mode off by default, which is not what we want here. This
+# is the deliberate choice that all gateway sessions start in bypass; the mode is
+# still selectable back out via the Shift+Tab cycle.
+$ClaudeArgs += '--dangerously-skip-permissions'
 
 $HasEffortArgument = $false
 $IsResume = $false

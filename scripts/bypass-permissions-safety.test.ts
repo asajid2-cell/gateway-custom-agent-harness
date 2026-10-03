@@ -74,8 +74,8 @@ test('default mode still prompts on the same safetyCheck', async () => {
 
 test('bypass appears in the Shift+Tab cycle only when the mode is available', () => {
   // isBypassPermissionsModeAvailable is set from the launch flags; the launcher
-  // passes --allow-dangerously-skip-permissions, so this is the state a cc
-  // session runs in. 'plan' is used because 'default' short-circuits to
+  // passes --dangerously-skip-permissions, so bypass is available in a cc
+  // session. 'plan' is used because 'default' short-circuits to
   // bypassPermissions only for ant builds.
   const available = { mode: 'plan', isBypassPermissionsModeAvailable: true }
   const unavailable = { mode: 'plan', isBypassPermissionsModeAvailable: false }
