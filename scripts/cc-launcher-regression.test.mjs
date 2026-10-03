@@ -176,7 +176,22 @@ test('launcher answers the workspace-trust question per process, and can be opte
 
 test('interactive cc skips the full build when the compiled harness is fresh', async () => {
   const script = await readFile(scriptPath, 'utf8')
-  assert.match(script, /function Test-ClaudeArtifactFresh\s*\{[\s\S]*Get-ChildItem[\s\S]*LastWriteTimeUtc/)
+  // The freshness walk reads mtimes through the .NET directory API instead of
+  // Get-ChildItem + Measure-Object, which builds a FileInfo per file and then
+  // re-walks the list. Measured ~690ms against ~77ms for the same tree, on the
+  // launch path before the gateway is spawned.
+  assert.match(script, /function Test-ClaudeArtifactFresh\s*\{[\s\S]*Get-NewestWriteTimeUtc/)
+  assert.match(script, /\[IO\.Directory\]::EnumerateFiles\([\s\S]*AllDirectories\)/)
+  assert.match(script, /\[IO\.File\]::GetLastWriteTimeUtc/)
+  const fresh = script.slice(
+    script.indexOf('function Test-ClaudeArtifactFresh'),
+    script.indexOf('function Initialize-ClaudeArtifact'),
+  )
+  assert.doesNotMatch(
+    fresh,
+    /Get-ChildItem/,
+    'the launch-path freshness check must not use the pipeline scan',
+  )
   assert.match(
     script,
     /if \(-not \(Test-ClaudeArtifactFresh\)\) \{[\s\S]*\$startInfo\.Arguments = 'run build'/,
@@ -187,6 +202,30 @@ test('interactive cc skips the full build when the compiled harness is fresh', a
     false,
     'the launcher must not rebuild unconditionally',
   )
+})
+
+test('launcher names the two gateway-unhealthy modes instead of one timeout', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // A backend that dies at startup is not a 15s timeout. The diagnostic records
+  // which happened, the message names the exit code and elapsed time, and the
+  // child's stderr survives so the reason is recoverable.
+  assert.match(script, /errorType = 'exited'/)
+  assert.match(script, /errorType = 'timeout'/)
+  assert.match(script, /\$gatewayExitCode = \$GatewayProcess\.ExitCode/)
+  assert.match(script, /backend exited \(code \$gatewayExitCode\) after \$\{elapsedMs\}ms/)
+  assert.match(script, /did not become healthy within 15 seconds \(waited \$\{elapsedMs\}ms\)/)
+  assert.match(script, /\$PreserveGatewayLogs = \$true/)
+  assert.match(script, /if \(\$KeepGatewayLogs -or \$PreserveGatewayLogs\)/)
+})
+
+test('launcher teardown relies on the owned job, not a machine-wide node sweep', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // The job handle is authoritative for the backend chain and is disposed in the
+  // same finally that stops the wrapper, so teardown must not enumerate every
+  // node.exe on the machine on each exit (a WMI query that stalls under load).
+  assert.doesNotMatch(script, /Get-CimInstance Win32_Process/)
+  assert.doesNotMatch(script, /Test-OwnedGatewayProcess/)
+  assert.match(script, /Stop-OwnedGateway -Process \$GatewayProcess\s*\} finally \{\s*if \(\$GatewayJob\) \{ \$GatewayJob\.Dispose\(\) \}/)
 })
 
 test('partner prewarm has one finite launch-path budget', async () => {

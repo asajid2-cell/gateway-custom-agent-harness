@@ -185,6 +185,7 @@ $StdoutLog = $null
 $StderrLog = $null
 $ScopedSettingsPath = $null
 $ExitCode = 1
+$PreserveGatewayLogs = $false
 
 function ConvertFrom-WindowsCommandLine {
   param([string]$CommandLine)
@@ -244,6 +245,29 @@ if (Test-Path Env:CC_RAW_ARGS) {
   $ClaudeArgs = @(ConvertFrom-WindowsCommandLine -CommandLine $env:CC_RAW_ARGS)
 }
 
+function Get-NewestWriteTimeUtc {
+  param([string[]]$Paths)
+
+  # Read mtimes straight from the filesystem. Get-ChildItem builds a FileInfo and
+  # a PSObject for every file, then Measure-Object walks that whole list again;
+  # on this tree that is ~690ms against ~77ms for the same walk through
+  # [IO.Directory]::EnumerateFiles, and it runs before the gateway is spawned.
+  # src/ holds no reparse points, so the recursive enumeration cannot loop.
+  $newest = [DateTime]::MinValue
+  foreach ($path in $Paths) {
+    if ([IO.Directory]::Exists($path)) {
+      foreach ($file in [IO.Directory]::EnumerateFiles($path, '*', [IO.SearchOption]::AllDirectories)) {
+        $written = [IO.File]::GetLastWriteTimeUtc($file)
+        if ($written -gt $newest) { $newest = $written }
+      }
+    } elseif ([IO.File]::Exists($path)) {
+      $written = [IO.File]::GetLastWriteTimeUtc($path)
+      if ($written -gt $newest) { $newest = $written }
+    }
+  }
+  return $newest
+}
+
 function Test-ClaudeArtifactFresh {
   if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) { return $false }
   $buildInputs = @(
@@ -256,17 +280,8 @@ function Test-ClaudeArtifactFresh {
     (Join-Path $Root 'bun.lockb'),
     (Join-Path $Root 'tsconfig.json')
   )
-  $inputFiles = @(
-    foreach ($inputPath in $buildInputs) {
-      if (Test-Path -LiteralPath $inputPath -PathType Container) {
-        Get-ChildItem -LiteralPath $inputPath -File -Recurse -Force
-      } elseif (Test-Path -LiteralPath $inputPath -PathType Leaf) {
-        Get-Item -LiteralPath $inputPath
-      }
-    }
-  )
-  if ($inputFiles.Count -eq 0) { return $false }
-  $latestInput = ($inputFiles | Measure-Object -Property LastWriteTimeUtc -Maximum).Maximum
+  $latestInput = Get-NewestWriteTimeUtc -Paths $buildInputs
+  if ($latestInput -eq [DateTime]::MinValue) { return $false }
   return (Get-Item -LiteralPath $ClaudeScript).LastWriteTimeUtc -ge $latestInput
 }
 
@@ -631,60 +646,21 @@ function Test-LoopbackPortOccupied {
   }
 }
 
-function Test-OwnedGatewayProcess {
-  param(
-    $Process,
-    [string[]]$GatewayPaths,
-    [int]$Port
-  )
-
-  if ($Process.Name -ne 'node.exe' -or [string]::IsNullOrEmpty($Process.CommandLine)) {
-    return $false
-  }
-
-  try {
-    $arguments = @(ConvertFrom-WindowsCommandLine -CommandLine $Process.CommandLine)
-    for ($i = 0; $i -lt ($arguments.Count - 2); $i++) {
-      try {
-        $candidatePath = [IO.Path]::GetFullPath([string]$arguments[$i])
-        if (
-          ($candidatePath -in @($GatewayPaths | ForEach-Object { [IO.Path]::GetFullPath($_) })) -and
-          ([string]$arguments[$i + 1] -eq '--port') -and
-          ([int]$arguments[$i + 2] -eq $Port)
-        ) {
-          return $true
-        }
-      } catch {
-        continue
-      }
-    }
-  } catch {
-    return $false
-  }
-  return $false
-}
-
 function Stop-OwnedGateway {
   param($Process)
 
   if ($null -eq $Process) {
     return
   }
+  # The launcher holds the whole backend chain in a job object with
+  # KILL_ON_JOB_CLOSE, and the caller disposes that handle in the same finally
+  # that calls this. The wrapper is therefore all this has to stop: the job reaps
+  # the keysafe/supervisor/backend descendants when the handle closes, and it
+  # does so even when the launcher dies before this runs. What stood here instead
+  # asked Win32_Process for every node.exe on the machine and filtered by command
+  # line - a machine-wide WMI query on every exit, a stall under load, and
+  # redundant now that the job owns the chain.
   try {
-    $gatewayPaths = @($GatewayScript, $GatewaySupervisor)
-    $gatewayProcessIds = @()
-    try {
-      $gatewayProcessIds = @(
-        Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-          Where-Object { Test-OwnedGatewayProcess -Process $_ -GatewayPaths $gatewayPaths -Port $Port } |
-          Select-Object -ExpandProperty ProcessId
-      )
-    } catch {
-      $gatewayProcessIds = @()
-    }
-    foreach ($gatewayProcessId in @($gatewayProcessIds | Sort-Object -Descending)) {
-      Stop-Process -Id ([int]$gatewayProcessId) -Force -ErrorAction SilentlyContinue
-    }
     [void]$Process.WaitForExit(1000)
     if (-not $Process.HasExited) {
       Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
@@ -986,8 +962,16 @@ try {
     $GatewayJob = $ownedGateway.Job
     $GatewayProcess = $ownedGateway.Process
 
+    # Two different failures hid under one message. A backend that dies at
+    # startup (a refused credential, a provider that closed the socket) exits
+    # the wrapper within a few seconds; a gateway that never binds runs to the
+    # deadline. The first is not a timeout, so "did not become healthy within 15
+    # seconds" named the wrong thing and reported no exit code. Tell them apart,
+    # record which one happened, and keep the child's stderr on the exit path so
+    # the reason survives for the next launch.
     $healthy = $false
-    $deadline = [DateTime]::UtcNow.AddSeconds(15)
+    $healthStarted = [DateTime]::UtcNow
+    $deadline = $healthStarted.AddSeconds(15)
     while (-not $healthy -and [DateTime]::UtcNow -lt $deadline) {
       if ($GatewayProcess.HasExited) {
         break
@@ -1007,8 +991,18 @@ try {
     }
 
     if (-not $healthy) {
-      Write-LaunchDiagnostic 'gateway-unhealthy' @{ port = $Port }
-      throw "Model gateway did not become healthy within 15 seconds. Safe diagnostics: $DiagnosticPath"
+      $elapsedMs = [int]([DateTime]::UtcNow - $healthStarted).TotalMilliseconds
+      if ($GatewayProcess.HasExited) {
+        $gatewayExitCode = $null
+        try { $gatewayExitCode = $GatewayProcess.ExitCode } catch {}
+        $failureFields = @{ port = $Port; errorType = 'exited' }
+        if ($null -ne $gatewayExitCode) { $failureFields.exitCode = $gatewayExitCode }
+        Write-LaunchDiagnostic 'gateway-unhealthy' $failureFields
+        $PreserveGatewayLogs = $true
+        throw "Model gateway backend exited (code $gatewayExitCode) after ${elapsedMs}ms without becoming healthy. Safe diagnostics: $DiagnosticPath"
+      }
+      Write-LaunchDiagnostic 'gateway-unhealthy' @{ port = $Port; errorType = 'timeout' }
+      throw "Model gateway did not become healthy within 15 seconds (waited ${elapsedMs}ms). Safe diagnostics: $DiagnosticPath"
     }
   }
 
@@ -1049,14 +1043,14 @@ try {
     if ($GatewayJob) { $GatewayJob.Dispose() }
   }
   if ($StdoutLog) {
-    if ($KeepGatewayLogs) {
+    if ($KeepGatewayLogs -or $PreserveGatewayLogs) {
       [Console]::Error.WriteLine("cc gateway stdout log=$StdoutLog")
     } else {
       Remove-Item -LiteralPath $StdoutLog -Force -ErrorAction SilentlyContinue
     }
   }
   if ($StderrLog) {
-    if ($KeepGatewayLogs) {
+    if ($KeepGatewayLogs -or $PreserveGatewayLogs) {
       [Console]::Error.WriteLine("cc gateway stderr log=$StderrLog")
     } else {
       Remove-Item -LiteralPath $StderrLog -Force -ErrorAction SilentlyContinue
