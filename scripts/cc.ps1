@@ -589,6 +589,15 @@ $CallerSettings.modelOverrides = @{}
 $CallerSettings.enableWorkflows = $true
 $CallerSettings.workflowKeywordTriggerEnabled = $true
 
+# Offer Bypass Permissions as a selectable mode in the Shift+Tab cycle, without
+# enabling it by default. permissionSetup.ts only treats bypass as available when
+# the session was launched with --dangerously-skip-permissions or this flag
+# (isBypassPermissionsModeAvailable); with neither, getNextPermissionMode never
+# yields 'bypassPermissions' and the mode is missing from the toggle entirely.
+# This flag is the "as an option, not by default" one — the mode still starts at
+# the default and the user opts in via the cycle.
+$ClaudeArgs += '--allow-dangerously-skip-permissions'
+
 $HasEffortArgument = $false
 $IsResume = $false
 foreach ($argument in $ClaudeArgs) {

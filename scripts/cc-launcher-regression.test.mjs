@@ -228,6 +228,18 @@ test('launcher teardown relies on the owned job, not a machine-wide node sweep',
   assert.match(script, /Stop-OwnedGateway -Process \$GatewayProcess\s*\} finally \{\s*if \(\$GatewayJob\) \{ \$GatewayJob\.Dispose\(\) \}/)
 })
 
+test('launcher offers Bypass Permissions as a toggle option without enabling it', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // permissionSetup.ts marks bypass available only when the session launched
+  // with --dangerously-skip-permissions or --allow-dangerously-skip-permissions;
+  // with neither, getNextPermissionMode never yields it and the mode is missing
+  // from the Shift+Tab cycle. The launcher passes the "as an option, not by
+  // default" flag and must not force the mode on.
+  assert.match(script, /\$ClaudeArgs \+= '--allow-dangerously-skip-permissions'/)
+  assert.doesNotMatch(script, /'--dangerously-skip-permissions'/)
+  assert.doesNotMatch(script, /defaultMode\s*=\s*'bypassPermissions'/)
+})
+
 test('partner prewarm has one finite launch-path budget', async () => {
   const policy = JSON.parse(await readFile(new URL('./launcher-policy.json', import.meta.url), 'utf8'))
   assert.ok(Number.isSafeInteger(policy.prewarmTimeoutMs))
