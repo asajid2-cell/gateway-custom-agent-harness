@@ -2,6 +2,7 @@ import { test, expect } from 'bun:test'
 import { handleMouseEvent } from '../src/ink/components/App.tsx'
 import {
   createSelectionState,
+  finishSelection,
   hasSelection,
   startSelection,
   updateSelection,
@@ -28,9 +29,10 @@ import type { ParsedMouse } from '../src/ink/parse-keypress.ts'
 // This file is the SEAM GATE. It requires both halves of the fix:
 //   - the App-side per-press flag (item 1) -> case (a3);
 //   - the inline branch finishing a dropped-release selection (item 2) -> (b2).
-// (b2) is EXPECTED RED until the inline branch (ink.tsx handleInlineMouse)
-// gains the matching finishSelection the App branch already has; it is the gate
-// that item 2 must turn green.
+// (b2) mirrors the inline branch's matching finishSelection (the App branch
+// already had one). The mirror alone cannot prove the production switch - a
+// mirror ahead of production is a false green - so the real-instance companion
+// (app-mouse-inline-real.test.tsx) drives the actual private handleInlineMouse.
 
 const LEFT = 0
 const DRAG = 0x20
@@ -56,7 +58,9 @@ function noButtonMotion(col: number, row: number): ParsedMouse {
  * Mirror of ink.tsx handleInlineMouse's INLINE branch (ink.tsx:266-327).
  * Branch-for-branch:
  *   - wheel            -> consume
- *   - button 35        -> clear the pending press, consume (no finishSelection)
+ *   - button 35        -> clear the pending press, finish a dropped-release
+ *     selection, consume (production: decideInlineMouse 'hover' ->
+ *     `if (this.selection.isDragging) finishSelection(...)`)
  *   - left press on a pointer target -> seed the selection via startSelection
  *     (production: seedPressSelection -> startSelection) and consume
  *   - left press on NO target        -> decline (return false -> App press branch)
@@ -98,6 +102,12 @@ function makeInlineHandler(selection: SelectionState, selectableCells: Set<strin
       if (wheel) return true
       if (m.button === NO_BUTTON_MOTION) {
         inlinePress = null
+        // Production ca463a6 case 'hover': the inline lane consumes mode-1003
+        // motion, so a dropped release (the up event never arrived) is
+        // recovered HERE - symmetric with App's own no-button-motion recovery
+        // (App.tsx). Without it isDragging stays true and copy-on-select, which
+        // only fires on a finished selection, never runs. This is the (b2) gate.
+        if (selection.isDragging) finishSelection(selection)
         hover.push({ col, row })
         return true
       }
