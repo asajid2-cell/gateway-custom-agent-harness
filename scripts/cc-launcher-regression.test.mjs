@@ -492,3 +492,26 @@ test('the model picker promotes the focused model to the launch default on f', a
   assert.match(picker, /"modelPicker:setDefault": \(\) => \{/)
   assert.match(picker, /setGatewayDefaultModel\(target\)/)
 })
+
+test('interactive cc narrates its startup phases instead of staying blank', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // Measured: the launcher writes nothing user-visible until the session paints
+  // its first frame - the console is blank ~10s on a fresh launch and ~30s+ when
+  // a rebuild runs. Without narration a slow launch is indistinguishable from
+  // one that will never open ("cc just stays blank, no lines print").
+  assert.match(script, /function Write-LaunchProgress \{/)
+  assert.match(script, /if \(-not \$ShowLaunchProgress\) \{ return \}/)
+  assert.match(script, /\$ShowLaunchProgress = -not \$PrintRequested/,
+    'print mode must stay silent so callers see only harness output')
+  assert.match(script, /Write-LaunchProgress 'the compiled harness is stale; rebuilding before launch\.\.\.'/)
+  assert.match(script, /Write-LaunchProgress "starting the model gateway on port \$Port\.\.\."/)
+  assert.match(script, /Write-LaunchProgress 'waiting for the model gateway to become healthy\.\.\.'/)
+  assert.match(script, /Write-LaunchProgress 'launching the session\.\.\.'/)
+})
+
+test('the launch-path build is bounded so a hung build fails loudly', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // An unbounded WaitForExit leaves a stuck build as a permanent blank console.
+  assert.match(script, /WaitForExit\(600000\)/)
+  assert.match(script, /Claude harness build did not finish within 10 minutes\./)
+})

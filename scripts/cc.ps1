@@ -20,6 +20,24 @@ function Write-LaunchDiagnostic {
     # Diagnostics must never prevent launch or hide the original failure.
   }
 }
+$ShowLaunchProgress = $false
+function Write-LaunchProgress {
+  param([string]$Message)
+
+  # An interactive launch does real work before the session paints its first
+  # frame: it may rebuild the harness, spawn the gateway, and wait for health.
+  # Until now none of that wrote a byte the user could see, so the console was
+  # blank for the whole startup (~10s fresh, ~30s when a rebuild runs) and a slow
+  # or stalled launch was indistinguishable from one that would never open -
+  # the reported "cc just stays blank, no lines print, nothing ever opens".
+  # Print mode stays silent so callers and fixtures see only harness output.
+  if (-not $ShowLaunchProgress) { return }
+  try {
+    [Console]::Error.WriteLine("cc: $Message")
+  } catch {
+    # Progress must never prevent the launch it is describing.
+  }
+}
 Write-LaunchDiagnostic 'launch-start'
 $GatewayScript = Join-Path $PSScriptRoot 'model-gateway.mjs'
 $GatewaySupervisor = Join-Path $PSScriptRoot 'gateway-supervisor.mjs'
@@ -290,6 +308,7 @@ function Initialize-ClaudeArtifact {
     if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
       throw 'Selected candidate is missing or stale; build it explicitly before launch.'
     }
+    Write-LaunchProgress 'the compiled harness is stale; rebuilding before launch...'
     Write-LaunchDiagnostic 'build-start'
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $ClaudeRunner
@@ -303,7 +322,14 @@ function Initialize-ClaudeArtifact {
     try {
       [void]$buildProcess.Start()
       $buildProcess.StandardInput.BaseStream.Close()
-      $buildProcess.WaitForExit()
+      # Bounded: a build that never finishes must fail loudly instead of leaving
+      # the console blank forever with no output - the same "cc never opens"
+      # symptom the progress line above exists to make visible.
+      if (-not $buildProcess.WaitForExit(600000)) {
+        try { $buildProcess.Kill() } catch {}
+        Write-LaunchDiagnostic 'build-exit' @{ exitCode = -1 }
+        throw 'Claude harness build did not finish within 10 minutes.'
+      }
       $buildExitCode = $buildProcess.ExitCode
     } finally {
       $buildProcess.Dispose()
@@ -581,6 +607,10 @@ $PrintRequested = $ClaudeArgs | Where-Object {
 if ($PrintRequested -and -not (Test-HasPrintInput -Arguments $ClaudeArgs)) {
   throw 'cc: --print requires a prompt argument or redirected stdin. Invoke cc without --print for the interactive REPL.'
 }
+
+# Interactive REPL only: narrate the startup phases so the blank console before
+# the first frame is never unexplained. Print mode stays silent.
+$ShowLaunchProgress = -not $PrintRequested
 
 # Gateway owns its provider-qualified model catalog. Do not pass inherited
 # Anthropic modelOverrides into the Gateway child settings; legacy model IDs
@@ -961,6 +991,7 @@ try {
   } else {
     # Hold a non-inheritable job handle here: Windows reaps this exclusive backend
     # chain even if the launcher dies before its finally block can run.
+    Write-LaunchProgress "starting the model gateway on port $Port..."
     . (Join-Path $PSScriptRoot 'owned-gateway-process.ps1')
     $ownedGateway = Start-OwnedGatewayProcess `
       -FilePath 'powershell.exe' `
@@ -978,6 +1009,7 @@ try {
     # seconds" named the wrong thing and reported no exit code. Tell them apart,
     # record which one happened, and keep the child's stderr on the exit path so
     # the reason survives for the next launch.
+    Write-LaunchProgress 'waiting for the model gateway to become healthy...'
     $healthy = $false
     $healthStarted = [DateTime]::UtcNow
     $deadline = $healthStarted.AddSeconds(15)
@@ -1020,6 +1052,7 @@ try {
   Push-Location $LaunchDirectory
   try {
     # Keep the harness attached directly to the caller's console
+    Write-LaunchProgress 'launching the session...'
     for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
       Write-LaunchDiagnostic 'harness-start' @{ attempt = $attempt; port = $Port }
       & $ClaudeRunner $ClaudeScript @ClaudeArgs
