@@ -15,17 +15,27 @@ test('build stages the bundle and validates with Bun rather than Node', async ()
   assert.doesNotMatch(build, /\['node', '--check'/)
 })
 
-test('an unknown permissions.defaultMode downgrades instead of rejecting the settings file', async () => {
+test('an unknown permissions.defaultMode warns and downgrades instead of rejecting the settings file', async () => {
   const types = await readFile(new URL('../src/utils/settings/types.ts', import.meta.url), 'utf8')
+  const validation = await readFile(new URL('../src/utils/settings/validation.ts', import.meta.url), 'utf8')
   // A newer Claude Code can write a mode this build's enum lacks (e.g. `auto`).
-  // Any invalid setting makes the loader skip the entire file, so this field has
-  // to swallow an unknown value and fall back to the default mode, the same way
-  // one bad permission rule no longer rejects the file.
+  // Any invalid setting makes the loader skip the entire file, so the field has
+  // to swallow an unknown value and fall back to the default mode.
   assert.match(
     types,
-    /defaultMode: z\s*\.enum\([\s\S]*?\)\s*\.optional\(\)\s*\.catch\(undefined\)/,
+    /defaultMode: z\s*\.enum\([\s\S]*?\)\s*\.optional\(\)[\s\S]*?\.catch\(undefined\)/,
     'defaultMode must tolerate a mode this build does not know',
   )
+  // File sources drop it earlier with a visible warning that records the value,
+  // so adopting a new mode stays a deliberate choice rather than a silent drop.
+  assert.match(validation, /perms\.defaultMode/)
+  assert.match(
+    validation,
+    /Unknown permissions\.defaultMode \$\{JSON\.stringify\(defaultMode\)\} was ignored/,
+    'the unknown mode must be named in the warning',
+  )
+  assert.match(validation, /logForDebugging\([\s\S]*?unknown permissions\.defaultMode/)
+  assert.match(validation, /delete perms\.defaultMode/)
 })
 
 test('launcher owns the backend job through startup and unconditional cleanup', async () => {
