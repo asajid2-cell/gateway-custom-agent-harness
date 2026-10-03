@@ -194,8 +194,11 @@ test('a leaf registers on the shared bus as a leaf, not as the session it forked
 
   // A peer message cannot wait for a person to look at a paused leaf: delivery
   // wakes the leaf's input, exactly as the family channel does.
+  // Anchored on the guard and call within one line rather than a `\n`-joined
+  // block: the file is LF in git but checks out CRLF under core.autocrlf, and
+  // a `\n\s+` pattern silently stops matching on a CRLF working tree.
   const runtime = await readFile(new URL('../src/utils/gatewaySessionRuntime.ts', import.meta.url), 'utf8')
-  assert.match(runtime, /if \(isInteractiveLeaf\(\)\) \{\n\s+void import\('\.\/leafTerminal\.js'\)\.then\(leaf => leaf\.wakeLeafInput\(\)\)\.catch\(\(\) => \{\}\)/)
+  assert.match(runtime, /if \(isInteractiveLeaf\(\)\) \{[^}]*void import\('\.\/leafTerminal\.js'\)\.then\(leaf => leaf\.wakeLeafInput\(\)\)\.catch\(\(\) => \{\}\)/)
 })
 
 test('a leaf inherits no peer capability from its parent', async () => {
