@@ -15,27 +15,30 @@ test('build stages the bundle and validates with Bun rather than Node', async ()
   assert.doesNotMatch(build, /\['node', '--check'/)
 })
 
-test('an unknown permissions.defaultMode warns and downgrades instead of rejecting the settings file', async () => {
+test('settings compatibility is guarded generally, in both directions', async () => {
   const types = await readFile(new URL('../src/utils/settings/types.ts', import.meta.url), 'utf8')
   const validation = await readFile(new URL('../src/utils/settings/validation.ts', import.meta.url), 'utf8')
-  // A newer Claude Code can write a mode this build's enum lacks (e.g. `auto`).
-  // Any invalid setting makes the loader skip the entire file, so the field has
-  // to swallow an unknown value and fall back to the default mode.
+  const settings = await readFile(new URL('../src/utils/settings/settings.ts', import.meta.url), 'utf8')
+  // A newer Claude Code can write a value this build's schema lacks (e.g. an
+  // unknown permission mode). Any invalid setting makes the loader skip the
+  // whole file, so the field must swallow an unknown value rather than reject.
   assert.match(
     types,
     /defaultMode: z\s*\.enum\([\s\S]*?\)\s*\.optional\(\)[\s\S]*?\.catch\(undefined\)/,
     'defaultMode must tolerate a mode this build does not know',
   )
-  // File sources drop it earlier with a visible warning that records the value,
-  // so adopting a new mode stays a deliberate choice rather than a silent drop.
-  assert.match(validation, /perms\.defaultMode/)
-  assert.match(
-    validation,
-    /Unknown permissions\.defaultMode \$\{JSON\.stringify\(defaultMode\)\} was ignored/,
-    'the unknown mode must be named in the warning',
-  )
-  assert.match(validation, /logForDebugging\([\s\S]*?unknown permissions\.defaultMode/)
-  assert.match(validation, /delete perms\.defaultMode/)
+  // One general guard replaces the single-field special case: it drops any
+  // value this build does not accept (warning + log), and records the fields it
+  // does accept and the ones it does not know - both directions logged.
+  assert.match(validation, /export function guardSettingsCompatibility/)
+  assert.match(validation, /collectSwallowedValues/)
+  assert.match(validation, /acceptedFields/)
+  assert.match(validation, /unknownFields/)
+  assert.match(validation, /logForDebugging\([\s\S]*?accepted fields in/)
+  assert.match(validation, /logForDebugging\([\s\S]*?unknown fields in/)
+  // The file loader uses the guard, not the old single-field filter.
+  assert.match(settings, /guardSettingsCompatibility\(data, path\)/)
+  assert.doesNotMatch(settings, /filterInvalidPermissionRules/)
 })
 
 test('launcher owns the backend job through startup and unconditional cleanup', async () => {
