@@ -25,6 +25,7 @@ parser.add_argument('--standard-cpr-only', action='store_true')
 parser.add_argument('--probe-full-tui', action='store_true')
 parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--probe-selection', action='store_true')
+parser.add_argument('--probe-inline-ownership', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
 parser.add_argument('--probe-close-matriarch', action='store_true')
@@ -130,7 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         view = view_tag(messages[-1].get('content', '') if messages else '')
         answered = tool_result_text(messages[-1].get('content', '') if messages else '')
         tool_results.append(answered)
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK', 'OWNERSHIP_MARKER_ALPHA') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -1018,6 +1019,73 @@ def probe_selection():
         t.wait(lambda: 'Session metadata' not in t.text(), f'rename dialog {attempt} dismissed')
     t.exit()
     print(json.dumps(dict(selection=True, transcriptSelection=True, bottomBarSelection=True, promptSelection=True, bareClickNoCopy=True, clickStillWorks=True)), flush=True)
+
+def probe_inline_ownership():
+    """ITEM 2 re-root: on the REAL target, does CC own the mouse well enough
+    that its own controls work AND a drag selection still finishes?
+
+    Ahmed's live symptom: "selection wins - I can select everything, it never
+    clears, and I cannot click or interact with anything." That is a
+    user-visible failure of the inline mouse lane, and it was green on every
+    guard/wire assertion we had (armed? SGR-on-wire?) because those assert the
+    proxy, not the outcome. This probe asserts the OUTCOME in one continuous
+    interaction, with NO mode toggle in between:
+
+      (A) clicking a bottom-bar control opens it (the lane owns the mouse), and
+      (B) a drag-select then finishes on release - the selection clears and the
+          text is copied - with no keystroke or resize to shake it loose.
+
+    It is run under --mux-report-filter (a mux pane that answers only the
+    DEC-private CPR), which is the topology the real session is in. Both must
+    hold simultaneously; either one alone is the bug.
+    """
+    evidence = {}
+
+    # The decision path is what the item turns on, and it is a debug log line,
+    # not a screen reading. Point the log INSIDE the evidence dir so the raw
+    # arm/relay/timeout verdicts are captured with the run rather than left in
+    # a config home that is deleted with the fixture.
+    t = Terminal(env_extra=dict(DEBUG='1', CLAUDE_CODE_DEBUG_LOGS_DIR=str(root / 'inline-mouse.log')))
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('OWNERSHIP_MARKER_ALPHA')
+    t.wait(lambda: 'FIXTURE_REPLY_OWNERSHIP_MARKER_ALPHA' in t.text(), 'root reply')
+
+    def last_copied(since):
+        if len(t.clipboard_writes()) <= since: return None
+        return base64.b64decode(t.clipboard_writes()[-1]).decode('utf-8', 'replace')
+
+    # (A) The bottom bar renders and a control in it is a pointer target.
+    #     A click must open the control - not be swallowed by a selection.
+    t.check(lambda: '✎ Rename' in t.text() or 'session:' in t.text(), 'bottom bar is on screen')
+    t.click('✎ Rename')
+    t.wait(lambda: 'Session metadata' in t.text(), 'clicking the bottom-bar control opens it (lane owns the mouse)')
+    evidence['bottomBarClickOpens'] = True
+    t.proc.write('\x1b'); t.pause(.6)
+    t.wait(lambda: 'Session metadata' not in t.text(), 'dialog dismissed')
+
+    # (B) A drag-select finishes on release: the copy happens, and no stale
+    #     drag state carries out of the gesture. No mode toggle, no resize.
+    #     Drag across the whole marker: the reply line starts with an indent, so
+    #     the end column is the marker's own length past its first character.
+    anchor = t.point('FIXTURE_REPLY_OWNERSHIP_MARKER_ALPHA')
+    before = len(t.clipboard_writes())
+    t.drag(anchor, (min(args.columns - 1, anchor[0] + len('FIXTURE_REPLY_OWNERSHIP_MARKER_ALPHA')), anchor[1]))
+    t.check(lambda: len(t.clipboard_writes()) > before, 'drag-select did not finish: no copy reached the clipboard')
+    copied = last_copied(before)
+    t.check(lambda: 'FIXTURE_REPLY_OWNERSHIP_MARKER_ALPHA' in copied,
+            'drag-select copied the wrong text: ' + repr(copied))
+    evidence['dragSelectFinishes'] = True
+
+    # (C) The two must not be mutually exclusive: after the selection, a click
+    #     on a control STILL opens it. If owning the mouse killed selection -
+    #     or selection killed the click - one of (A)/(B)/(C) is the bug.
+    t.proc.write('\x1b'); t.pause(.4)
+    t.click('✎ Rename')
+    t.wait(lambda: 'Session metadata' in t.text(), 'control still clicks AFTER a selection (no mode toggle between)')
+    evidence['clickAfterSelection'] = True
+
+    t.exit()
+    print(json.dumps(dict(inlineOwnership=True, **evidence)), flush=True)
 
 def probe_parity():
     """Behaviors an ordinary inline gateway session has to reach on its own.
@@ -3685,6 +3753,7 @@ try:
     probes = [
         (args.probe_full_tui, probe_full_tui), (args.probe_lifecycle, probe_lifecycle),
         (args.probe_selection, probe_selection), (args.probe_parity, probe_parity),
+        (args.probe_inline_ownership, probe_inline_ownership),
         (args.probe_parentage, probe_parentage), (args.probe_queue, probe_queue),
         (args.probe_close_matriarch, probe_close_matriarch), (args.probe_resumed_member, probe_resumed_member),
         (args.probe_owner_cascade, probe_owner_cascade),

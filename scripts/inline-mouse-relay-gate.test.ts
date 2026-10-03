@@ -18,12 +18,21 @@ import type { SelectionState } from '../src/ink/selection.ts'
 import type { ParsedMouse, TerminalResponse } from '../src/ink/parse-keypress.ts'
 import type { InlineMouseState, InlinePress } from '../src/ink/ink.tsx'
 
-// ITEM 2 repro: gate the inline (main-screen) mouse lane's OWNERSHIP on
-// local-vs-relay. The signal is Option B — the CPR-probe reply FORM, which is
-// the only local-vs-relay discriminator the code has (a relay/mux client
-// strips the plain DSR reply and lets the DEC-private one through, while
-// native ConPTY answers the plain form and ignores the private one; see
-// scripts/leaf-pointer-terminal.py --mux-report-filter).
+// ITEM 2: the inline (main-screen) mouse lane OWNS the mouse on both the local
+// terminal and the mux/relay path. The CPR-probe reply FORM (Option B — a mux
+// client strips the plain DSR reply and lets only the DEC-private one through,
+// while native ConPTY answers the plain form and ignores the private one; see
+// scripts/leaf-pointer-terminal.py --mux-report-filter) still tells us which
+// topology we are in, but it no longer decides ownership.
+//
+// The re-root: yielding the mouse to a mux client left the bottom-bar controls
+// dead — the lane armed nothing, the client kept the mouse for native
+// selection, and CC never saw the click (proven by
+// `--probe-inline-ownership --mux-report-filter`, which fails on the yield
+// build). The app supplies both itself — a virtual ScrollBox for scroll and
+// its own app-painted selection for select/copy — so the lane owns the mouse
+// everywhere and the client forwards the pointer. Thus a relay session DOES
+// own the inline mouse; the reply form is informational only.
 //
 // The harness shape matches the co-verification file
 // (gateway-mouse-verify/scripts/app-mouse-seam-coverify.test.ts): every event
@@ -33,20 +42,14 @@ import type { InlineMouseState, InlinePress } from '../src/ink/ink.tsx'
 // fix extracted from ink.tsx:266-327, so a branch can never drift from
 // production.
 //
-// The three symbols the fix introduces are imported dynamically so that, with
-// the fix stashed (base), the cases still RUN and FAIL on their own assertions
-// rather than taking the whole file down with a load error.
+// The symbols the fix extracts are imported dynamically so that, with the fix
+// stashed (base), the cases still RUN and FAIL on their own assertions rather
+// than taking the whole file down with a load error.
 
 let decideInlineMouse: typeof import('../src/ink/ink.tsx').decideInlineMouse | undefined
 let inlineMouseRelayFromReply: typeof import('../src/ink/ink.tsx').inlineMouseRelayFromReply | undefined
-let setInlineMouseRelayDetected: typeof import('../src/utils/fullscreen.ts').setInlineMouseRelayDetected | undefined
-let resetRelayForTesting: typeof import('../src/utils/fullscreen.ts')._resetInlineMouseRelayForTesting | undefined
 try {
   ;({ decideInlineMouse, inlineMouseRelayFromReply } = await import('../src/ink/ink.tsx'))
-} catch {}
-try {
-  ;({ setInlineMouseRelayDetected, _resetInlineMouseRelayForTesting: resetRelayForTesting } =
-    await import('../src/utils/fullscreen.ts'))
 } catch {}
 
 const LEFT = 0
@@ -84,8 +87,8 @@ function parsePlainResponse(sequence: string): TerminalResponse | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Env scaffolding: make `isInlineMouseOwned()` return true for a plain local
-// gateway session, so the relay clause is the only thing that can flip it.
+// Env scaffolding: a plain gateway session with an interactive TTY owns the
+// inline mouse. Nothing about the topology may flip that now.
 // ---------------------------------------------------------------------------
 const savedEnv = {
   gateway: process.env.CLAUDE_CODE_USE_GATEWAY,
@@ -112,11 +115,9 @@ function enableLocalInlineSession(): void {
 
 beforeEach(() => {
   enableLocalInlineSession()
-  resetRelayForTesting?.()
 })
 
 afterEach(() => {
-  resetRelayForTesting?.()
   setIsInteractive(false)
   if (savedEnv.gateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
   else process.env.CLAUDE_CODE_USE_GATEWAY = savedEnv.gateway
@@ -154,17 +155,19 @@ test('the probe reply form is the local-vs-relay signal', () => {
 })
 
 // ---------------------------------------------------------------------------
-// (2) The exported predicate. Fails on base (no relay clause), passes on fix.
+// (2) The exported predicate. A relay/mux session DOES own the inline mouse —
+// the yield that gated this away is exactly the bug that made the bottom-bar
+// controls dead on the relay path. Nothing about local-vs-relay flips it.
 // ---------------------------------------------------------------------------
-test('a relay session does not own the inline mouse', () => {
-  expect(typeof setInlineMouseRelayDetected).toBe('function')
-  // Precondition: a plain local gateway session owns the mouse.
+test('a relay session owns the inline mouse, same as a local one', async () => {
+  // A plain gateway session owns it...
   expect(isInlineMouseOwned()).toBe(true)
-  // The probe resolved via the DEC-private form => relay/mux client.
-  setInlineMouseRelayDetected!(true)
-  expect(isInlineMouseOwned()).toBe(false)
-  // And a later local resolution clears the verdict.
-  setInlineMouseRelayDetected!(false)
+  // ...and there is no longer any verdict that can revoke ownership, so a mux
+  // client's DEC-private reply cannot disable it. The predicate module must not
+  // export a relay toggle at all.
+  const fullscreen = await import('../src/utils/fullscreen.ts')
+  expect('setInlineMouseRelayDetected' in fullscreen).toBe(false)
+  expect('_resetInlineMouseRelayForTesting' in fullscreen).toBe(false)
   expect(isInlineMouseOwned()).toBe(true)
 })
 
