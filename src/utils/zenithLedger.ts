@@ -142,6 +142,40 @@ async function readJsonl<T>(path: string, schema: z.ZodType<T>): Promise<{ recor
 }
 
 /**
+ * In-process serialization per lock target.
+ *
+ * `proper-lockfile` serializes *processes*; it does not serialize two appends
+ * issued from the same process. A sweep records one observation per session in a
+ * tight loop, and every one of those calls `lock()` on the same target - which
+ * proper-lockfile answers with `ELOCKED` the moment the retry budget runs out.
+ * Measured before this mutex: 60 concurrent appends in one process left only 24
+ * written, 36 refused with "Lock file is already being held". The unit suite
+ * never spanned that many appends against one file, so it never saw it.
+ *
+ * The chain makes at most one `lock()` per target in flight at a time, so the
+ * file lock contends only with other processes (the case it exists for) and not
+ * with this one. It is keyed by target, so the two ledgers stay independent.
+ */
+const appendChains = new Map<string, Promise<unknown>>()
+
+async function withAppendChain<T>(key: string, run: () => Promise<T>): Promise<T> {
+  const previous = appendChains.get(key) ?? Promise.resolve()
+  // Swallow a predecessor's rejection on the chain itself: one failed append
+  // must not cascade to every append queued behind it.
+  const next = previous.then(run, run)
+  // Keep the chain alive if this link rejects; the caller still sees the error.
+  const link = next.catch(() => {})
+  appendChains.set(key, link)
+  try {
+    return await next
+  } finally {
+    // Drop the entry once this link is the tail, so an idle ledger holds no map
+    // entry and a long-lived process does not grow one per key forever.
+    if (appendChains.get(key) === link) appendChains.delete(key)
+  }
+}
+
+/**
  * Append one record under a lock.
  *
  * The lock is taken on a sibling `.lock` target rather than on the JSONL itself,
@@ -151,17 +185,19 @@ async function readJsonl<T>(path: string, schema: z.ZodType<T>): Promise<{ recor
  * what makes the fold safe to read.
  */
 async function appendRecord(path: string, record: unknown): Promise<void> {
-  await mkdir(zenithLedgerDir(), { recursive: true, mode: 0o700 })
   const lockTarget = `${path}.lock`
-  // The lock target must exist for proper-lockfile to lock it; a zero-byte
-  // placeholder is enough, and it is never read.
-  await writeFile(lockTarget, '', { flag: 'a', mode: 0o600 }).catch(() => {})
-  const release = await lock(lockTarget, { realpath: false, stale: 15000, retries: { retries: 8, minTimeout: 50, maxTimeout: 400 } })
-  try {
-    await writeFile(path, `${JSON.stringify(record)}\n`, { flag: 'a', mode: 0o600 })
-  } finally {
-    await release().catch(() => {})
-  }
+  return withAppendChain(lockTarget, async () => {
+    await mkdir(zenithLedgerDir(), { recursive: true, mode: 0o700 })
+    // The lock target must exist for proper-lockfile to lock it; a zero-byte
+    // placeholder is enough, and it is never read.
+    await writeFile(lockTarget, '', { flag: 'a', mode: 0o600 }).catch(() => {})
+    const release = await lock(lockTarget, { realpath: false, stale: 15000, retries: { retries: 20, minTimeout: 25, maxTimeout: 500 } })
+    try {
+      await writeFile(path, `${JSON.stringify(record)}\n`, { flag: 'a', mode: 0o600 })
+    } finally {
+      await release().catch(() => {})
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -314,20 +350,17 @@ export async function familyRootFor(sessionId: string): Promise<string> {
  * the only source that is a statement about a running process.
  */
 export async function sweepSessions(options: { directory?: string; asker?: { sessionId: string; token?: string } } = {}): Promise<{ recorded: number; answered: number; asked: number }> {
-  const { broadcastIdentify, listGatewayPeers } = await import('./gatewaySessionTransport.js')
+  const { broadcastIdentify } = await import('./gatewaySessionTransport.js')
   const directory = options.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions')
+  // One pass, not two. `broadcastIdentify` lists the peers itself, so counting
+  // from a separate `listGatewayPeers` made every sweep probe the whole registry
+  // twice - and a probe that has to reach a foreign endpoint is the expensive
+  // half of a sweep, so doubling it is what a busy machine turns into a timeout.
   // The asker is not asked (it already knows who it is), so it is not counted:
   // `asked` is how many sessions were put the question, not how many are
   // registered, and a caller comparing it against `answered` is measuring how
   // many peers refused to say who they are.
-  const registered = await listGatewayPeers(directory).catch(() => [])
-  const asked = registered.filter(peer => peer.sessionId !== options.asker?.sessionId).length
-  // The asker has to be a registered session and has to be named on the wire,
-  // so a coordinator sweeping on behalf of the bus passes its own registration.
-  // Without one there is nobody to attribute the questions to and the answers
-  // are empty, which is a truthful "none asked" rather than a sweep that found
-  // no sessions.
-  const identities = await broadcastIdentify(directory, options.asker)
+  const { identities, asked } = await broadcastIdentify(directory, options.asker)
   let recorded = 0
   for (const identity of identities) {
     // The observed session's pid, never this process's. `broadcastIdentify`
@@ -343,7 +376,7 @@ export async function sweepSessions(options: { directory?: string; asker?: { ses
     })
     recorded++
   }
-  return { recorded, answered: identities.length, asked }
+  return { recorded, answered: identities.length, asked: asked.filter(id => id !== options.asker?.sessionId).length }
 }
 
 // ---------------------------------------------------------------------------

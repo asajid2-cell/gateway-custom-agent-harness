@@ -200,6 +200,29 @@ test('a torn last line is skipped, not fatal, and the intact history still reads
   })
 })
 
+test('a sweep-sized burst of concurrent appends all land, because the file lock is not asked to serialize one process', { timeout: 60000 }, async () => {
+  await withLedger(async () => {
+    const { recordSessionObservation, sessionHistory, ledgerHealth } = await ledger()
+    // A sweep records one observation per session in a tight loop, all against
+    // one file. proper-lockfile serializes processes, not callers within a
+    // process, so without an in-process chain every append past the retry budget
+    // is refused with "Lock file is already being held" - measured at 36 of 60
+    // lost before the chain existed. The unit suite recorded a handful at a time
+    // and never spanned a burst, which is exactly why this case is here.
+    const family = randomUUID()
+    const ids = Array.from({ length: 60 }, () => randomUUID())
+    await Promise.all(ids.map((sessionId, index) =>
+      recordSessionObservation({ sessionId, familyRootSessionId: family, name: `burst-${index}`, pid: 1000 + index }),
+    ))
+    const health = await ledgerHealth()
+    assert.equal(health.sessions.records, 60, 'every append in the burst is on disk')
+    assert.equal(health.sessions.skipped, 0, 'no line was refused or torn')
+    const history = await sessionHistory(ids[0]!)
+    assert.equal(history.state, 'known')
+    assert.equal(history.state === 'known' && history.observations.length, 1)
+  })
+})
+
 test('the ambiguity detector reports the collisions that have actually cost work here', async () => {
   await withLedger(async () => {
     const { recordSessionObservation, ambiguities } = await ledger()
@@ -298,7 +321,7 @@ test('a session that is not Zenith cannot write ownership', async () => {
   }
 })
 
-test('a live session answers identify with what it is, from the running process', async () => {
+test('a live session answers identify with what it is, from the running process', { timeout: 30000 }, async () => {
   // C3's second source. The registration file is a session's claim about itself
   // that outlives it; `identify` is the same claim made by the process while it
   // is still running, which is the only version that cannot be stale. This is
@@ -315,7 +338,7 @@ test('a live session answers identify with what it is, from the running process'
     await live.start()
     await asker.start()
     try {
-      const identities = await broadcastIdentify(sessions, { sessionId: asker.peer.sessionId })
+      const { identities } = await broadcastIdentify(sessions, { sessionId: asker.peer.sessionId })
       const mine = identities.find(identity => identity.sessionId === live.peer.sessionId)
       assert.ok(mine, `a running session must answer identify: ${JSON.stringify(identities)}`)
       assert.equal(mine.sessionId, live.peer.sessionId)
@@ -332,7 +355,7 @@ test('a live session answers identify with what it is, from the running process'
   }
 })
 
-test('the sweep records only the sessions that answered, and a silent one stays UNKNOWN', async () => {
+test('the sweep records only the sessions that answered, and a silent one stays UNKNOWN', { timeout: 30000 }, async () => {
   // The sweep must not turn a non-answer into a row. A registration whose
   // session is gone answers nothing, and recording it would make the ledger
   // assert that a session was observed when it was only advertised - exactly the

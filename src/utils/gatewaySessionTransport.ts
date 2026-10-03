@@ -395,7 +395,7 @@ export type GatewayPeerIdentity = {
  * say who it is, which is exactly the case a ledger built on files alone reads
  * as UNKNOWN. A session that does not answer is left out rather than guessed at.
  */
-export async function broadcastIdentify(directory: string, asker?: { sessionId: string; token?: string }): Promise<readonly GatewayPeerIdentity[]> {
+export async function broadcastIdentify(directory: string, asker?: { sessionId: string; token?: string }): Promise<{ identities: readonly GatewayPeerIdentity[]; asked: readonly string[] }> {
   // Two tokens, and swapping them is the whole difficulty of this call. The
   // `token` on the wire is the *receiver's*, read from its registration - the
   // same handshake every other request makes, and the only proof the asker may
@@ -415,12 +415,13 @@ export async function broadcastIdentify(directory: string, asker?: { sessionId: 
       return undefined
     }
   })()
-  if (!self) return []
+  if (!self) return { identities: [], asked: [] }
   const candidates = await listGatewayPeers(directory)
   // The asker is on the list too, and it knows who it is - asking it is a round
   // trip to learn something already in hand, and a sweep that recorded the
   // questioner as one of its own answers would be reporting on the wrong subject.
-  const asked = await Promise.all(candidates.filter(peer => peer.sessionId !== self.sessionId).map(async peer => {
+  const asked = candidates.filter(peer => peer.sessionId !== self.sessionId)
+  const answers = await Promise.all(asked.map(async peer => {
     try {
       const target = await readRegistrationUnchecked(directory, peer.sessionId)
       const answer = await callGatewayPeer(
@@ -440,7 +441,11 @@ export async function broadcastIdentify(directory: string, asker?: { sessionId: 
       return undefined
     }
   }))
-  return asked.filter((identity): identity is GatewayPeerIdentity => identity !== undefined)
+  // The asked ids are returned alongside so a caller measuring how many peers
+  // refused to answer does not have to list the registry a second time - a
+  // second listing is a second probe of every peer, which is the costliest part
+  // of a sweep and the part a busy machine turns into a timeout.
+  return { identities: answers.filter((identity): identity is GatewayPeerIdentity => identity !== undefined), asked: asked.map(peer => peer.sessionId) }
 }
 
 /**
