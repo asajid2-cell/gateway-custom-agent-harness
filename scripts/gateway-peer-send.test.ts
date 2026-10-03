@@ -29,6 +29,22 @@ test('the gateway scheme is an address, not a teammate name', () => {
     scheme: 'gateway',
     target: '11111111-1111-4111-8111-111111111111',
   })
+  // A bare session ID is an address too. The roster and every peer message
+  // header print it without a prefix, so a sender copies it bare; read as
+  // 'other' it fell into the silent-mailbox hole that a teammate name does.
+  // The shape is unambiguous - no teammate name and no agent ID is a UUID.
+  assert.deepEqual(parseAddress('11111111-1111-4111-8111-111111111111'), {
+    scheme: 'gateway',
+    target: '11111111-1111-4111-8111-111111111111',
+  })
+  assert.deepEqual(parseAddress('AABBCCDD-1122-3344-5566-778899AABBCC'), {
+    scheme: 'gateway',
+    target: 'AABBCCDD-1122-3344-5566-778899AABBCC',
+  })
+  // A near-miss that is not an ID shape stays a name, so the fallback cannot
+  // widen into hijacking teammate names.
+  assert.equal(parseAddress('11111111-1111-4111-8111-11111111111').scheme, 'other')
+  assert.equal(parseAddress('session_manager').scheme, 'other')
   // The neighbouring schemes still parse, since the order of the checks matters.
   assert.deepEqual(parseAddress('uds:/tmp/x.sock'), { scheme: 'uds', target: '/tmp/x.sock' })
   assert.deepEqual(parseAddress('bridge:session_01'), { scheme: 'bridge', target: 'session_01' })
@@ -310,6 +326,24 @@ test('a peer send is not refused for carrying model or effort', async () => {
   )
   assert.equal(local.data.success, false)
   assert.match(local.data.message, /only supported when resuming a local subagent/)
+})
+
+test('a bare session ID cannot be swallowed by a teammate mailbox', async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  // The proven defect: a bare UUID target parsed as 'other', so it fell through
+  // to teammate routing, wrote ~/.claude/teams/<team>/inboxes/<uuid>.json that
+  // no live session reads, and returned success: true. A sender saw an ack and
+  // believed the peer had the message. The address shape must reach the peer
+  // transport instead, where a target that is not live is a refusal.
+  const result = await SendMessageTool.call(
+    { to: '00000000-0000-4000-8000-000000000abc', message: 'Are you there?', summary: 'Routing probe' },
+    { getAppState: () => getDefaultAppState() },
+    async () => ({ behavior: 'deny' }),
+  )
+  assert.equal(result.data.success, false, JSON.stringify(result.data))
+  assert.match(result.data.message, /Gateway peer bus|is not live|No live session named/)
+  assert.doesNotMatch(result.data.message, /'s inbox/)
 })
 
 test('a reply sent through SendMessage carries the id it answers, so the request retires', { timeout: 60000 }, async () => {
