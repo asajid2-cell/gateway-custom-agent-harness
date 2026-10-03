@@ -181,14 +181,31 @@ export async function recordSessionObservation(input: {
   familyRootSessionId: string
   name: string
   buildId?: string
+  /**
+   * The pid of the session being *observed*, when the caller can name it.
+   *
+   * This must never default to the recorder's own pid: an observation is about
+   * another session, and writing `process.pid` here made every row claim the
+   * observer's process - so `ownerOf` asked whether the *ledger writer* was
+   * running and answered a question about a session that was never recorded.
+   * A sweep that observed a killed chat then read it as live, because the
+   * coordinator doing the observing was alive. Absent means UNKNOWN, which is
+   * the honest answer for an observation that cannot name its subject's process.
+   */
+  pid?: number
+  processStartedAt?: string
 }): Promise<SessionObservation> {
-  const observation: SessionObservation = sessionObservationSchema.parse({
+  const observation = sessionObservationSchema.parse({
     version: 1,
     sessionId: input.sessionId,
     familyRootSessionId: input.familyRootSessionId,
     name: input.name,
-    pid: process.pid,
-    processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+    ...(input.pid !== undefined ? { pid: input.pid } : {}),
+    ...(input.processStartedAt !== undefined
+      ? { processStartedAt: input.processStartedAt }
+      : input.pid !== undefined
+        ? { processStartedAt: new Date().toISOString() }
+        : {}),
     observedAt: new Date().toISOString(),
     ...(input.buildId ? { buildId: input.buildId } : {}),
   })
@@ -313,10 +330,15 @@ export async function sweepSessions(options: { directory?: string; asker?: { ses
   const identities = await broadcastIdentify(directory, options.asker)
   let recorded = 0
   for (const identity of identities) {
+    // The observed session's pid, never this process's. `broadcastIdentify`
+    // fills it from the registration it addressed, so the row says which
+    // process is behind the session - and `ownerOf` then resolves liveness
+    // against the owner rather than against whoever ran the sweep.
     await recordSessionObservation({
       sessionId: identity.sessionId,
       familyRootSessionId: await familyRootFor(identity.sessionId),
       name: identity.name,
+      ...(identity.pid !== undefined ? { pid: identity.pid } : {}),
       ...(identity.buildId ? { buildId: identity.buildId } : {}),
     })
     recorded++
@@ -465,21 +487,29 @@ export async function assign(
  * coordinator can release on a lane's behalf when the lane has gone.
  */
 export async function release(workKey: string, options: { sessionId?: string; reason?: string; zenith?: string | false } = {}): Promise<boolean> {
-  const sessionId = options.sessionId ?? getSessionId()
+  const caller = getSessionId()
   if (options.zenith !== false && options.zenith !== '') {
     const { holdsZenith } = await import('./zenithRole.js')
-    const caller = getSessionId()
     // The holder releasing its own row needs no role: a lane giving its work
     // back is not a coordination act, and refusing it would strand the row.
-    if (sessionId !== caller && !(await holdsZenith(caller))) return false
+    // Any other release - a coordinator on a lane's behalf - needs Zenith.
+    const releasingForSomeoneElse = options.sessionId !== undefined && options.sessionId !== caller
+    if (releasingForSomeoneElse && !(await holdsZenith(caller))) return false
   }
   const existing = await ownerOf(workKey)
-  if (existing.state !== 'owned' || existing.sessionId !== sessionId) return false
+  // The row names its owner, so that is the session a release closes. Falling
+  // back to the caller made a bare `release <key>` a no-op for the coordinator
+  // who assigned it - and would let a live lane's row be closed by anyone the
+  // gate did not catch, because the comparison then read the caller's own id
+  // against a row that was never theirs.
+  if (existing.state !== 'owned') return false
+  const closing = options.sessionId ?? existing.sessionId
+  if (closing !== existing.sessionId) return false
   await appendRecord(ledgerPath('assignments'), {
     version: 1,
     event: 'release',
     workKey,
-    sessionId,
+    sessionId: closing,
     at: new Date().toISOString(),
     ...(options.reason?.trim() ? { reason: options.reason.trim() } : {}),
   } satisfies AssignmentEvent)

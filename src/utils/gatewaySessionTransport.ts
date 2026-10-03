@@ -373,6 +373,16 @@ export type GatewayPeerIdentity = {
   purpose: string
   startedAt: string
   buildId?: string
+  /**
+   * The answering process's pid, filled from the registration it answered over.
+   *
+   * The identify reply itself cannot carry a pid the receiver would be asserting
+   * about itself, but the registration already holds its own and is what the
+   * call was addressed through - so a sweep can record the *observed* session's
+   * process rather than its own. Absent means the registration was unreadable,
+   * which reads as UNKNOWN.
+   */
+  pid?: number
 }
 
 /**
@@ -419,7 +429,10 @@ export async function broadcastIdentify(directory: string, asker?: { sessionId: 
         PROBE_TIMEOUT_MS,
       ) as Partial<GatewayPeerIdentity> & { ok?: boolean }
       if (answer?.ok !== true || answer.sessionId !== peer.sessionId) return undefined
-      return answer as GatewayPeerIdentity
+      // The pid travels from the registration this call addressed, not from the
+      // reply, so a caller building a session's history attributes liveness to
+      // the session that answered rather than to itself.
+      return { ...(answer as GatewayPeerIdentity), ...(peer.pid !== undefined ? { pid: peer.pid } : {}) }
     } catch {
       // An older build answers a ping but not an identify. That is not a
       // failure of the session, so its file answer stands in - with no buildId,

@@ -43,9 +43,12 @@ async function viaSkill(input: string): Promise<string> {
   const { clearBundledSkills, getBundledSkills } = await import('../src/skills/bundledSkills.ts')
   registerZenithLedgerSkill()
   try {
-    const skill = getBundledSkills().find(entry => entry.name === 'zenith-ledger')!
-    const result = await skill.getPromptForCommand(input, {} as never)
-    return result.map(part => (part.type === 'text' ? part.text : '')).join('')
+    // `getBundledSkills` is typed as the plain `Command` surface, which does not
+    // carry the optional prompt builder - only a skill that registered one has
+    // it, and this is the skill that did.
+    const skill = getBundledSkills().find(entry => entry.name === 'zenith-ledger') as { getPromptForCommand?: (args: string, context: never) => Promise<{ type: string; text?: string }[]> }
+    const result = await skill.getPromptForCommand!(input, {} as never)
+    return result.map((part: { type: string; text?: string }) => (part.type === 'text' ? (part.text ?? '') : '')).join('')
   } finally {
     clearBundledSkills()
   }
