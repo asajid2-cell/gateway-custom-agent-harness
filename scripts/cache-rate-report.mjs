@@ -92,6 +92,11 @@ console.log(`  cacheRead        ${totCR.toLocaleString()}`)
 console.log(`  freshInput       ${totI.toLocaleString()}`)
 console.log(`  cacheWrite       ${totCW.toLocaleString()}`)
 console.log(`  %-hit aggregate  ${pct(totCR, totI).toFixed(1)}%`)
+// cacheWrite==0 is the corroboration that the harness has no cache lever: it
+// never writes a cache block of its own, so every cacheRead is provider-side
+// prefix reuse on a byte-identical prefix. A non-zero cacheWrite would mean the
+// harness is minting its own cache blocks and this metric would need re-reading.
+if (totCW === 0) console.log('  note             cacheWrite=0 => no harness cache lever; cacheRead is pure provider-side prefix reuse')
 
 // Per-session spread: the aggregate can be carried by one healthy session, so
 // report the floor and ceiling too. The target floors the worst session.
@@ -159,4 +164,17 @@ console.log('  concurrent  reqs    hit%')
 for (const c of [...buckets.keys()].sort((a, b) => a - b)) {
   const b = buckets.get(c)
   console.log(`    ${String(c).padStart(3)}      ${String(b.n).padStart(6)}  ${pct(b.cr, b.i).toFixed(1)}%`)
+}
+// Name the shape, because this is the headline proof: a FLAT slope is
+// cross-session prefix reuse (the same prefix is cached once and read by every
+// session); a FALLING slope would be per-session caching (each session
+// re-writing its own copy, so more sessions = more misses).
+const concKeys = [...buckets.keys()].sort((a, b) => a - b)
+if (concKeys.length >= 2) {
+  const first = buckets.get(concKeys[0]), last = buckets.get(concKeys[concKeys.length - 1])
+  const delta = pct(last.cr, last.i) - pct(first.cr, first.i)
+  const shape = Math.abs(delta) < 3 ? 'FLAT' : delta < 0 ? 'FALLING' : 'RISING'
+  console.log(`  shape: ${shape} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}pp from ${concKeys[0]} to ${concKeys[concKeys.length - 1]} concurrent)`)
+  if (shape === 'FLAT') console.log('  => cross-session prefix reuse: hit rate holds as concurrent sessions grow')
+  if (shape === 'FALLING') console.log('  => per-session caching: the same prefix is re-written per session')
 }
