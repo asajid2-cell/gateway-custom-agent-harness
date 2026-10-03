@@ -1,12 +1,11 @@
 import { join } from 'path'
 import { getSessionId } from '../bootstrap/state.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
+import { SESSION_ID_PATTERN, SESSION_ID_PREFIX_PATTERN } from './peerAddress.js'
 import { gatewaySessionCommsProblem, getGatewaySessionRuntime } from './gatewaySessionRuntime.js'
 import { listGatewayPeers } from './gatewaySessionTransport.js'
 import { renderTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 import type { PeerMessageKind } from './gatewaySessionProtocol.js'
-
-const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 export type GatewayPeerSendResult = {
   ok: boolean
@@ -54,6 +53,28 @@ export async function resolveGatewayPeer(
     const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
     return {
       error: `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk. Live sessions: ${available.join(', ')}. Use /sessions list.`,
+    }
+  }
+  // A truncated ID is an address the sender pasted short, not a name. Expanding
+  // it to the one live session it names keeps a short address from being a
+  // silent drop; an ambiguous or unmatched prefix is refused rather than
+  // guessed, because guessing is the same wrong-recipient failure as a mailbox
+  // nobody reads. Unlike an exact ID, an empty live set cannot resolve a prefix
+  // (the transport cannot expand one), so it is a refusal that names the fix.
+  if (SESSION_ID_PREFIX_PATTERN.test(address)) {
+    const prefix = address.toLowerCase()
+    const live = peers.filter(peer => peer.sessionId.toLowerCase().startsWith(prefix))
+    if (live.length === 1) {
+      return { sessionId: live[0]!.sessionId, label: `${live[0]!.name} (${live[0]!.sessionId})` }
+    }
+    if (live.length > 1) {
+      return {
+        error: `Session id "${address}" is a truncated ID and matches ${live.length} live sessions; address it by the full ID: ${live.map(peer => peer.sessionId).join(', ')}.`,
+      }
+    }
+    const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
+    return {
+      error: `Session id "${address}" is a truncated ID and matches no live session. ${available.length ? `Live sessions: ${available.join(', ')}.` : 'No other live sessions are registered.'} Use /sessions list, or address a session by its full ID.`,
     }
   }
   const matches = peers.filter(peer => peer.name === address)

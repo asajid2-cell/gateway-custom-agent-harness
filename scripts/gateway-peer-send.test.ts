@@ -42,8 +42,11 @@ test('the gateway scheme is an address, not a teammate name', () => {
     target: 'AABBCCDD-1122-3344-5566-778899AABBCC',
   })
   // A near-miss that is not an ID shape stays a name, so the fallback cannot
-  // widen into hijacking teammate names.
-  assert.equal(parseAddress('11111111-1111-4111-8111-11111111111').scheme, 'other')
+  // widen into hijacking teammate names. A truncated ID is now an address too
+  // (see the prefix test below), so the near-miss has to break the UUID shape
+  // itself - a short first group, or a non-hex character.
+  assert.equal(parseAddress('1111111-1111-4111-8111-111111111111').scheme, 'other')
+  assert.equal(parseAddress('11111111-1111-4111-8111-11111111111g').scheme, 'other')
   assert.equal(parseAddress('session_manager').scheme, 'other')
   // The neighbouring schemes still parse, since the order of the checks matters.
   assert.deepEqual(parseAddress('uds:/tmp/x.sock'), { scheme: 'uds', target: '/tmp/x.sock' })
@@ -379,6 +382,125 @@ test('a reply sent through SendMessage carries the id it answers, so the request
     assert.equal(result.data.success, true, result.data.message)
     const arrived = receiver.transport.inbox().find(record => record.message.text === 'The parser review is done.')
     assert.equal(arrived?.message.replyTo, requestId)
+  } finally {
+    await sender.close()
+    await receiver.close()
+    const { runCleanupFunctions } = await import('../src/utils/cleanupRegistry.ts')
+    await runCleanupFunctions()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('a truncated session ID is an address, not a teammate name', () => {
+  // The incident: a session addressed a peer by the first 8 hex of its ID -
+  // "ab1f387b" - copied from a roster line or a truncated display. Read as a
+  // teammate name it fell through to teammate routing, wrote a mailbox no live
+  // session reads, and returned success: true, so the sender believed the
+  // message arrived. A truncated ID is still an address: it must reach
+  // resolution, which expands a unique prefix or refuses loudly - never reports
+  // success while delivering nowhere.
+  assert.deepEqual(parseAddress('ab1f387b'), { scheme: 'gateway', target: 'ab1f387b' })
+  assert.deepEqual(parseAddress('ab1f387b-cffb'), { scheme: 'gateway', target: 'ab1f387b-cffb' })
+  assert.deepEqual(parseAddress('ab1f387b-cffb-47d2-9f7a'), { scheme: 'gateway', target: 'ab1f387b-cffb-47d2-9f7a' })
+  // A near-miss with a non-hex character is not an ID shape and still routes as
+  // a teammate, so the widened shape cannot swallow ordinary names.
+  assert.equal(parseAddress('ab1f387b-cffb-47d2-9f7a-922e2fe61a8g').scheme, 'other')
+  assert.equal(parseAddress('researcher').scheme, 'other')
+})
+
+test('a truncated session ID resolves to its unique live session', { timeout: 60000 }, async () => {
+  const { resolveGatewayPeer } = await import('../src/utils/gatewayPeerSend.ts')
+  // A prefix the sender pasted short is still an address. Resolution must expand
+  // it to the one session it names, so the convenience of a short address never
+  // costs a silent drop.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-prefix-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const live = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Live peer', cwd: registry })
+  try {
+    await live.start()
+    const id = live.peer.sessionId
+    assert.deepEqual(await resolveGatewayPeer(id.slice(0, 8)), { sessionId: id, label: `Live peer (${id})` })
+    // A prefix that names no live session is refused, never routed onward. The
+    // first character is flipped so the probe cannot accidentally be a prefix of
+    // the live id.
+    const miss = (id[0] === '0' ? '1' : '0') + id.slice(1, 8)
+    const none = await resolveGatewayPeer(miss)
+    assert.ok('error' in none, 'a prefix that matches nothing must not resolve')
+    assert.match(none.error, /truncated ID/)
+    assert.match(none.error, /Live peer/)
+  } finally {
+    await live.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a truncated session ID that matches two live sessions is refused', { timeout: 60000 }, async () => {
+  const { resolveGatewayPeer } = await import('../src/utils/gatewayPeerSend.ts')
+  // Guessing between two sessions is the same silent-wrong-recipient failure as
+  // a mailbox nobody reads, so an ambiguous prefix is a refusal that names both.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-peer-ambiguous-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  const sessions = join(registry, 'gateway-sessions')
+  const shared = 'ab1f387b-cffb-47d2-9f7a-'
+  const first = new GatewaySessionTransport({ directory: sessions, sessionId: `${shared}111111111111`, name: 'Peer A', cwd: registry })
+  const second = new GatewaySessionTransport({ directory: sessions, sessionId: `${shared}222222222222`, name: 'Peer B', cwd: registry })
+  try {
+    await first.start()
+    await second.start()
+    const result = await resolveGatewayPeer('ab1f387b')
+    assert.ok('error' in result, 'an ambiguous prefix must not resolve to a target')
+    assert.match(result.error, /matches 2 live sessions/)
+    assert.match(result.error, new RegExp(`${shared}111111111111`))
+    assert.match(result.error, new RegExp(`${shared}222222222222`))
+    // The full ID still resolves exactly, so the refusal names the fix.
+    assert.deepEqual(await resolveGatewayPeer(`${shared}111111111111`), { sessionId: `${shared}111111111111`, label: `${shared}111111111111` })
+  } finally {
+    await first.close()
+    await second.close()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a truncated session ID delivers to the peer it names, not a mailbox', { timeout: 60000 }, async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  const { GatewaySessionRuntime } = await import('../src/utils/gatewaySessionRuntime.ts')
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  // The end-to-end shape of the incident: the sender has only the first 8 hex of
+  // the target's ID. It must reach the live session, not be written to a mailbox
+  // that returns success.
+  const home = await mkdtemp(join(tmpdir(), 'gateway-peer-prefix-send-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = home
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  const receiver = new GatewaySessionRuntime(randomUUID(), home, 'Requester')
+  const sender = new GatewaySessionRuntime(getSessionId(), home, 'Responder')
+  try {
+    await sender.start(new Set())
+    await receiver.start(new Set())
+    await receiver.setPolicy('accept')
+    const full = receiver.transport.peer.sessionId
+    const result = await SendMessageTool.call(
+      { to: full.slice(0, 8), message: 'Are you there?', summary: 'Prefix probe' },
+      { getAppState: () => getDefaultAppState() },
+      async () => ({ behavior: 'deny' }),
+    )
+    assert.equal(result.data.success, true, result.data.message)
+    const arrived = receiver.transport.inbox().find(record => record.message.text === 'Are you there?')
+    assert.ok(arrived, 'the truncated address must deliver to the live session it names')
+    assert.doesNotMatch(result.data.message, /'s inbox/)
   } finally {
     await sender.close()
     await receiver.close()
