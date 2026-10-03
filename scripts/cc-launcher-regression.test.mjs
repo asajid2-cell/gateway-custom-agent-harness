@@ -15,6 +15,19 @@ test('build stages the bundle and validates with Bun rather than Node', async ()
   assert.doesNotMatch(build, /\['node', '--check'/)
 })
 
+test('an unknown permissions.defaultMode downgrades instead of rejecting the settings file', async () => {
+  const types = await readFile(new URL('../src/utils/settings/types.ts', import.meta.url), 'utf8')
+  // A newer Claude Code can write a mode this build's enum lacks (e.g. `auto`).
+  // Any invalid setting makes the loader skip the entire file, so this field has
+  // to swallow an unknown value and fall back to the default mode, the same way
+  // one bad permission rule no longer rejects the file.
+  assert.match(
+    types,
+    /defaultMode: z\s*\.enum\([\s\S]*?\)\s*\.optional\(\)\s*\.catch\(undefined\)/,
+    'defaultMode must tolerate a mode this build does not know',
+  )
+})
+
 test('launcher owns the backend job through startup and unconditional cleanup', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
   assert.match(script, /\. \(Join-Path \$PSScriptRoot 'owned-gateway-process\.ps1'\)/)
