@@ -24,7 +24,7 @@
  *   bun scripts/cache-rate-report.mjs --model deepseek-v4.1 --backend opencode-go
  *   bun scripts/cache-rate-report.mjs --since 2026-10-01
  */
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -33,11 +33,20 @@ function arg(name, fallback) {
   const i = args.indexOf(`--${name}`)
   return i >= 0 && args[i + 1] ? args[i + 1] : fallback
 }
+function flag(name) {
+  return args.includes(`--${name}`)
+}
 
 const modelFilter = arg('model', 'deepseek-v4.1')
 const backendFilter = arg('backend', 'opencode-go')
 const since = arg('since', null)
 const sinceMs = since ? Date.parse(since) : 0
+// --boundaries additionally reads each session's transcript to timestamp its
+// compaction boundaries, so a hard break can be split into "compaction rewrite"
+// vs "not compaction". Off by default: it is a heavier read and unnecessary for
+// the headline numbers.
+const withBoundaries = flag('boundaries')
+const projectsDir = arg('projects', join(homedir(), '.claude', 'projects', 'C--Users-Ahmed'))
 const ledgerDir = process.env.GATEWAY_TOKEN_LEDGER_DIR || join(homedir(), '.claude', 'token-ledger')
 const ledgerPath = join(ledgerDir, 'tokens.jsonl')
 
@@ -142,6 +151,117 @@ for (const b of breaksBySession.slice(0, 8)) {
     `    ${b.sid.slice(0, 12)}  ${String(b.n).padStart(5)}  ${String(b.med).padStart(11)}  ${String(b.breaks).padStart(6)}  ${((b.breaks / b.n) * 100).toFixed(1).padStart(5)}%  ${b.maxFresh.toLocaleString()}`,
   )
 }
+
+// Hard-break attribution: the ceiling of what is actually attackable, and the
+// shape of the loss. A HARD break is cacheRead==0 on a request that arrives
+// after the session has already cached something - the prefix was rewritten.
+//   - "sub-60s" = the break sits between two adjacent requests, so no idle
+//     expiry explains it: the prefix itself changed between them.
+//   - "cascade" = a run of >=2 consecutive hard breaks, i.e. the whole context
+//     re-sent fresh back-to-back. That is provider cache-write-back lag (the
+//     requests outran cache establishment), NOT a harness rewrite.
+// The freshInput in a hard break is the only avoidable fresh; everything else
+// is warm-up, which no prefix hygiene removes. Report the ceiling explicitly so
+// nobody over-claims a win.
+console.log('')
+console.log('## hard-break attribution (cacheRead=0 after the session had cached, fresh>=10K)')
+const bySess = new Map()
+for (const r of rows) {
+  const a = bySess.get(r.s) || []
+  a.push(r)
+  bySess.set(r.s, a)
+}
+let hardFresh = 0
+const hardBySess = new Map()
+for (const [sid, a] of bySess) {
+  let sawCache = false
+  for (const r of a) {
+    if (r.cr > 1000) sawCache = true
+    if (sawCache && r.cr === 0 && r.i >= 10000) {
+      hardFresh += r.i
+      const s = hardBySess.get(sid) || { n: 0, fresh: 0 }
+      s.n++; s.fresh += r.i; hardBySess.set(sid, s)
+    }
+  }
+}
+const ceiling = totCR + totI > hardFresh ? pct(totCR, totI - hardFresh) : 0
+console.log(`  hard-break fresh                 ${hardFresh.toLocaleString()}  (${((hardFresh / totI) * 100).toFixed(1)}% of all freshInput)`)
+console.log(`  ceiling if ALL removed           ${ceiling.toFixed(2)}%  (aggregate ${pct(totCR, totI).toFixed(2)}% + ${(ceiling - pct(totCR, totI)).toFixed(2)}pp)`)
+console.log(`  => the rest of freshInput (${(((totI - hardFresh) / totI) * 100).toFixed(1)}%) is warm-up, not attackable by prefix hygiene`)
+
+// Cascade runs: consecutive hard breaks with no correctly-cached request between.
+const runHist = new Map()
+let cascadeRuns = 0, cascadeResend = 0, cascadeFresh = 0
+for (const [, a] of bySess) {
+  let sawCache = false, run = []
+  const flush = () => {
+    if (run.length > 1) {
+      cascadeRuns++
+      runHist.set(run.length, (runHist.get(run.length) || 0) + 1)
+      cascadeFresh += run.reduce((s, z) => s + z.i, 0)
+      for (let k = 1; k < run.length; k++) cascadeResend += run[k].i
+    }
+    run = []
+  }
+  for (const r of a) {
+    if (r.cr > 1000) sawCache = true
+    if (sawCache && r.cr === 0 && r.i >= 10000) run.push(r)
+    else flush()
+  }
+  flush()
+}
+console.log('')
+console.log(`  cascade runs (>=2 consecutive hard breaks)  ${cascadeRuns}`)
+console.log(`  cascade fresh total                         ${cascadeFresh.toLocaleString()}`)
+console.log(`  fresh that is RE-SEND within a cascade      ${cascadeResend.toLocaleString()}  (2nd+ copies <= avoidable by waiting for cache establishment)`)
+for (const n of [...runHist.keys()].sort((a, b) => a - b)) console.log(`    run of ${n}: ${runHist.get(n)}`)
+
+// Sub-60s split by compaction (--boundaries). A hard break that sits between two
+// requests less than a minute apart cannot be idle expiry, so the prefix itself
+// changed. Reading each session's transcript for compact_boundary timestamps
+// lets us ask how many of THOSE are compaction (a boundary within +/-3min) and
+// how many are something else. This is the measurement that refuted compaction
+// as the prime suspect. Off by default because it reads every transcript.
+if (withBoundaries) {
+  console.log('')
+  console.log('## sub-60s hard breaks split by compaction (--boundaries)')
+  const boundaryBySession = new Map()
+  if (existsSync(projectsDir)) {
+    for (const f of readdirSync(projectsDir).filter((f) => f.endsWith('.jsonl'))) {
+      const sid = f.replace(/\.jsonl$/, '')
+      const ts = []
+      for (const line of readFileSync(join(projectsDir, f), 'utf8').split('\n')) {
+        if (!line.includes('compact_boundary')) continue
+        let o
+        try { o = JSON.parse(line) } catch { continue }
+        const t = Date.parse(o.timestamp || o.ts || '')
+        if (!isNaN(t)) ts.push(t)
+      }
+      if (ts.length) boundaryBySession.set(sid, ts)
+    }
+  } else {
+    console.log(`  (no projects dir at ${projectsDir}; split unavailable)`)
+  }
+  const BW = 3 * 60 * 1000
+  let bWith = 0, bWithFresh = 0, bWithout = 0, bWithoutFresh = 0
+  for (const [sid, a] of bySess) {
+    let sawCache = false
+    const bs = boundaryBySession.get(sid) || []
+    for (let x = 0; x < a.length; x++) {
+      const r = a[x]
+      if (r.cr > 1000) sawCache = true
+      if (!(sawCache && r.cr === 0 && r.i >= 10000)) continue
+      const gap = x > 0 ? r.t - a[x - 1].t : Infinity
+      if (!(gap < 60000)) continue
+      if (bs.some((b) => Math.abs(b - r.t) <= BW)) { bWith++; bWithFresh += r.i }
+      else { bWithout++; bWithoutFresh += r.i }
+    }
+  }
+  console.log(`  with a compaction boundary +/-3min   ${bWith}  fresh ${bWithFresh.toLocaleString()}`)
+  console.log(`  WITHOUT any compaction boundary      ${bWithout}  fresh ${bWithoutFresh.toLocaleString()}`)
+  console.log('  => compaction is a minority of the rewritten prefixes; the rest is cache-write-back lag (cascade) and volatile prefix content')
+}
+
 
 // Concurrency slope: does the rate degrade as more sessions run at once? A
 // flat slope is true cross-session prefix reuse; a falling slope is
