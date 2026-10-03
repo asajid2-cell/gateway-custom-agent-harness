@@ -9,7 +9,7 @@ import { getSessionId } from '../bootstrap/state.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
-  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage,
+  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage, parseGatewayPeer,
   type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
@@ -290,7 +290,10 @@ async function readRegistrationUnchecked(directory: string, sessionId: string): 
     const stat = await handle.stat()
     if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino || stat.size > 16384 || (process.platform !== 'win32' && (stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0))) throw new Error('Invalid session registration')
     const value = JSON.parse(await handle.readFile('utf8'))
-    const peer = gatewayPeerSchema.parse(value.peer)
+    // Read with the wire's tolerance: a registration written by a newer build
+    // carries fields this one does not know, and a strict read drops that peer
+    // from discovery entirely rather than dropping the field. See `parseGatewayPeer`.
+    const peer = parseGatewayPeer(value.peer)
     if (peer.sessionId !== sessionId || typeof value.token !== 'string' || !/^[a-f0-9]{64}$/.test(value.token)) throw new Error('Invalid session registration')
     const expectedEndpoint = process.platform === 'win32'
       ? `\\\\.\\pipe\\gateway-${peer.runtimeId}`

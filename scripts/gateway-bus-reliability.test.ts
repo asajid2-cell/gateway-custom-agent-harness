@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.ts'
 import { GATEWAY_SESSION_PROTOCOL } from '../src/utils/gatewaySessionProtocol.ts'
@@ -513,6 +513,69 @@ test('a refusal for a dead family reference names the family members that are st
     await live.close()
     if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a registration written by a newer build still parses, its unknown field dropped', async () => {
+  // The other direction of the build skew the sibling test above covers. A field
+  // added to the schema is written by every session launched after it and read by
+  // every session launched before it, and the reader is `.strict()` - so the
+  // newer session's registration fails to parse in the older reader, which is
+  // exactly what "the bus randomly drops a session" was. The write side stays
+  // strict (this build writes only fields it knows); the read side has to match
+  // the wire's tolerance, the same way `parsePeerMessage` already does for a
+  // message from a newer build.
+  const { gatewayPeerSchema, parseGatewayPeer } = await import('../src/utils/gatewaySessionProtocol.ts')
+  const base = {
+    protocol: GATEWAY_SESSION_PROTOCOL,
+    sessionId: randomUUID(),
+    runtimeId: randomUUID(),
+    name: 'Future',
+    cwd: process.cwd(),
+    purpose: '',
+    pid: process.pid,
+    endpoint: `\\\\.\\pipe\\gateway-${randomUUID()}`,
+    status: 'idle' as const,
+    startedAt: new Date().toISOString(),
+  }
+  // The red direction is the reader: parse with `gatewayPeerSchema` and this
+  // fails on the unknown key, which is the defect.
+  assert.equal(gatewayPeerSchema.safeParse({ ...base, futureField: 'from-a-newer-build' }).success, false)
+  const parsed = parseGatewayPeer({ ...base, futureField: 'from-a-newer-build' })
+  assert.equal(parsed.sessionId, base.sessionId, 'the known fields must survive the read')
+  assert.ok(!('futureField' in parsed), 'a field this build does not know is dropped, not carried')
+  // And the known fields are still validated rather than skipped, so this is a
+  // tolerant read and not an unvalidated one.
+  assert.throws(() => parseGatewayPeer({ ...base, sessionId: 'not-a-uuid' }))
+})
+
+test('a peer from a newer build stays visible on the bus', async () => {
+  // The same skew, measured at the surface that acts on it: discovery. A
+  // registration the reader cannot parse is dropped from the live set, so the
+  // session is not merely missing a field - it is invisible, and a sender is
+  // told it has exited. This is a real live transport whose registration is
+  // rewritten with one field a future build would add.
+  const { listGatewayPeers } = await import('../src/utils/gatewaySessionTransport.ts')
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-newer-build-'))
+  const sessions = join(registry, 'gateway-sessions')
+  const live = new GatewaySessionTransport({ directory: sessions, sessionId: randomUUID(), name: 'Future peer', cwd: registry })
+  await live.start()
+  try {
+    // Rewrite the registration the transport itself wrote, so the token that
+    // answers its ping stays the real one - only the peer gains a field. A
+    // hand-written token would be refused by the ping and drop the peer for a
+    // reason that has nothing to do with what is under test.
+    const path = join(sessions, `${live.peer.sessionId}.json`)
+    const stored = JSON.parse(await readFile(path, 'utf8')) as { peer: Record<string, unknown>; token: string }
+    await writeFile(path, JSON.stringify({ ...stored, peer: { ...stored.peer, futureField: 'from-a-newer-build' } }))
+    const listed = await listGatewayPeers(sessions)
+    assert.ok(
+      listed.some(peer => peer.sessionId === live.peer.sessionId),
+      'a peer whose registration carries a field this build does not know must stay on the bus',
+    )
+  } finally {
+    await live.close()
     await rm(registry, { recursive: true, force: true })
   }
 })

@@ -68,6 +68,30 @@ export const gatewayPeerSchema = z.object({
   buildId: z.string().min(1).max(100).optional(),
 }).strict()
 
+/**
+ * Parse a registration another build may have written.
+ *
+ * The write side stays `.strict()`: this build writes only fields it knows. The
+ * read side cannot be, for the same reason `parsePeerMessage` is not. The dist
+ * rebuilds on launch, so a fleet is restarted session by session and runs
+ * several builds at once - and every field ever added to this schema (`topics`,
+ * `compactBoundaryCount`, `buildId`) is written by the sessions launched after
+ * it and read by the sessions launched before it. A strict read rejects the
+ * newer registration on an unknown key, and the reader then drops that peer
+ * from discovery entirely: the session is not missing a field, it is invisible,
+ * and a sender is told it has exited. That is what "the bus randomly drops a
+ * session" was. Unknown keys are dropped and every known field is still
+ * validated.
+ */
+export function parseGatewayPeer(raw: unknown): GatewayPeer {
+  const strict = gatewayPeerSchema.safeParse(raw)
+  if (strict.success) return strict.data
+  if (!strict.error.issues.every(issue => issue.code === 'unrecognized_keys')) throw strict.error
+  const known = new Set(Object.keys(gatewayPeerSchema.shape))
+  const stripped = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([key]) => known.has(key)))
+  return gatewayPeerSchema.parse(stripped)
+}
+
 export const NIL_UUID = '00000000-0000-0000-0000-000000000000'
 
 /**
