@@ -17,6 +17,95 @@ export type GatewayPeerSendResult = {
 }
 
 /**
+ * The label a resolved peer is echoed back under.
+ *
+ * A name alone is not an identity: names are built from the family-local leaf
+ * index, so "Leaf 5" and "Leaf 9" each name two different live sessions on this
+ * machine. A coordinator reading a name back cannot tell which one it reached,
+ * which is how a directive went to the wrong lane. Always carrying the session
+ * ID - and the family root, when the registration names one - makes the echo an
+ * identity rather than a label that happens to collide.
+ */
+function describePeer(peer: { sessionId: string; name: string; topics?: string[] }): string {
+  return `${peer.name} (${peer.sessionId})`
+}
+
+/**
+ * The build a peer is running relative to this one, when that is knowable.
+ *
+ * A live session answers the behaviour it loaded, and the dist rebuilds on
+ * launch, so two sessions can differ in what they do with nothing on the wire
+ * saying so. This is what turns "does that session have the fix?" into a fact
+ * about its registration rather than an assumption. A peer with no buildId is
+ * UNKNOWN - an older build predates the field - and is said to be unknown rather
+ * than assumed old, because a guess here is what a stale ledger turns into.
+ */
+export function buildNote(peerBuildId: string | undefined): string {
+  const own = typeof MACRO !== 'undefined' && MACRO.BUILD_TIME ? MACRO.BUILD_TIME : undefined
+  if (!peerBuildId) return ''
+  if (!own) return ` It is running build ${peerBuildId}.`
+  if (peerBuildId === own) return ''
+  const older = peerBuildId < own
+  return older
+    ? ` It is running an older build than this session (${peerBuildId}); a behaviour added since it started may not be live there.`
+    : ` It is running a newer build than this session (${peerBuildId}).`
+}
+
+/**
+ * The build note for a resolved peer, or an empty string when it is the same
+ * build or unknowable. Read from the live registration at send time, so a peer
+ * that restarted onto a new build between two sends is reported correctly.
+ */
+export async function peerBuildNote(sessionId: string): Promise<string> {
+  try {
+    const peers = await listGatewayPeers(join(getClaudeConfigHomeDir(), 'gateway-sessions'))
+    const found = peers.find(peer => peer.sessionId === sessionId)
+    return buildNote(found?.buildId)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The live members of a dead reference's family, named so the sender can reach
+ * one.
+ *
+ * A reference that names a leaf ("Leaf 5: box") usually resolves as a family
+ * address, so what a sender needs when it is refused is not the machine's whole
+ * live list - which can be twenty sessions across unrelated families - but the
+ * members of the family the reference named, since one of those is almost always
+ * what the sender meant. Only members that are live are offered, because
+ * offering a closed one is the same wrong-mailbox failure at a smaller scale.
+ *
+ * Best-effort by design: resolving a leaf reference needs the family registry,
+ * which a session outside the family cannot always read, so a failure here
+ * degrades to the caller's own live list rather than blocking the refusal.
+ */
+async function liveFamilyMembers(reference: string, peers: readonly { sessionId: string; name: string }[]): Promise<string> {
+  try {
+    const { resolveLeafRef, listLeafMembers } = await import('./leafWorkspace.js')
+    // The reference resolves the family (a member row, by id or label), and the
+    // family's own roster is what says which of its members are live. Matching
+    // the live set against the roster rather than against the one resolved
+    // member keeps a member that is not itself live from being offered.
+    if (!(await resolveLeafRef(reference))) return ''
+    const family = await listLeafMembers()
+    const memberIds = new Set(family.map(member => member.sessionId))
+    const live = peers.filter(peer => memberIds.has(peer.sessionId))
+    if (live.length === 0) return ''
+    return ` The family's live members: ${live.map(peer => `${peer.name} (${peer.sessionId})`).join(', ')}.`
+  } catch {
+    return ''
+  }
+}
+
+/** A name that matched more than one live session, with each candidate's stable id. */
+function ambiguousNameError(address: string, matches: Array<{ sessionId: string; name: string }>): string {
+  const candidates = matches.map(peer => `${peer.name} (${peer.sessionId})`)
+  return `"${address}" matches ${matches.length} live sessions; a name is not an identity here, so address it by session ID: ${candidates.join(', ')}.`
+}
+
+/**
  * Resolve an address to a live Gateway session.
  *
  * A session ID is exact; a name is matched against the advertised name, and an
@@ -52,7 +141,7 @@ export async function resolveGatewayPeer(
     if (peers.length === 0 || peers.some(peer => peer.sessionId === address)) return { sessionId: address, label: address }
     const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
     return {
-      error: `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk. Live sessions: ${available.join(', ')}. Use /sessions list.`,
+      error: `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk. Live sessions: ${available.join(', ')}.${await liveFamilyMembers(address, peers)} Use /sessions list.`,
     }
   }
   // A truncated ID is an address the sender pasted short, not a name. Expanding
@@ -65,7 +154,7 @@ export async function resolveGatewayPeer(
     const prefix = address.toLowerCase()
     const live = peers.filter(peer => peer.sessionId.toLowerCase().startsWith(prefix))
     if (live.length === 1) {
-      return { sessionId: live[0]!.sessionId, label: `${live[0]!.name} (${live[0]!.sessionId})` }
+      return { sessionId: live[0]!.sessionId, label: describePeer(live[0]!) }
     }
     if (live.length > 1) {
       return {
@@ -74,23 +163,31 @@ export async function resolveGatewayPeer(
     }
     const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
     return {
-      error: `Session id "${address}" is a truncated ID and matches no live session. ${available.length ? `Live sessions: ${available.join(', ')}.` : 'No other live sessions are registered.'} Use /sessions list, or address a session by its full ID.`,
+      error: `Session id "${address}" is a truncated ID and matches no live session. ${available.length ? `Live sessions: ${available.join(', ')}.` : 'No other live sessions are registered.'}${await liveFamilyMembers(address, peers)} Use /sessions list, or address a session by its full ID.`,
     }
   }
   const matches = peers.filter(peer => peer.name === address)
   if (matches.length === 1) {
-    return { sessionId: matches[0]!.sessionId, label: `${matches[0]!.name} (${matches[0]!.sessionId})` }
+    return { sessionId: matches[0]!.sessionId, label: describePeer(matches[0]!) }
   }
   if (matches.length > 1) {
-    return { error: `"${address}" matches ${matches.length} live sessions; address it by session ID: ${matches.map(peer => peer.sessionId).join(', ')}` }
+    return { error: ambiguousNameError(address, matches) }
   }
   const idle = peers.filter(peer => peer.name.toLowerCase() === address.toLowerCase())
   if (idle.length === 1) {
-    return { sessionId: idle[0]!.sessionId, label: `${idle[0]!.name} (${idle[0]!.sessionId})` }
+    return { sessionId: idle[0]!.sessionId, label: describePeer(idle[0]!) }
+  }
+  // A case-insensitive match is still a name match, so ambiguity refuses here
+  // too. Without this, two sessions whose names differ only in case fell past
+  // every branch into "No live session named" - a false statement about a name
+  // that plainly matched, which reads as the bus being broken rather than the
+  // address being ambiguous.
+  if (idle.length > 1) {
+    return { error: ambiguousNameError(address, idle) }
   }
   const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
   return {
-    error: `No live session named "${address}". ${available.length ? `Live sessions: ${available.join(', ')}.` : 'No other live sessions are registered.'} Use /sessions list, or address a session by its ID.`,
+    error: `No live session named "${address}". ${available.length ? `Live sessions: ${available.join(', ')}.` : 'No other live sessions are registered.'}${await liveFamilyMembers(address, peers)} Use /sessions list, or address a session by its ID.`,
   }
 }
 
@@ -116,7 +213,7 @@ export async function readViaGatewayPeer(
   if ('error' in resolved) return { ok: false, message: resolved.error }
   try {
     const slice = await runtime.transport.readPeer(resolved.sessionId, options)
-    return { ok: true, cursor: slice.cursor, slice, message: renderTranscriptSlice(slice, resolved.label) }
+    return { ok: true, cursor: slice.cursor, slice, message: renderTranscriptSlice(slice, resolved.label) + await peerBuildNote(resolved.sessionId) }
   } catch (error) {
     const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
     return { ok: false, message: `Reading ${resolved.label} failed: ${reason || 'transport error'}` }
@@ -151,9 +248,24 @@ export async function sendViaGatewayPeer(
   if (receipt?.ok === false) {
     return {
       ok: false,
-      message: `Delivery to ${resolved.label} was refused: ${String(receipt.reason ?? 'refused').slice(0, 300)}`,
+      message: `Delivery to ${resolved.label} was refused: ${String(receipt.reason ?? 'refused').slice(0, 300)}${await peerBuildNote(resolved.sessionId)}`,
       messageId: receipt.id,
       state: receipt.state,
+    }
+  }
+  // Success is a claim about a receipt, so it needs one. A transport that
+  // returned nothing, or a receipt with no id or an unrecognised state, leaves
+  // delivery unproven - reporting ok there is the same silent success a mailbox
+  // write used to be, and a sender who reads it stops looking for the message
+  // that never arrived.
+  const SETTLED_STATES = ['queued', 'held', 'delivered']
+  const state = receipt?.state
+  if (!receipt || typeof receipt.id !== 'string' || !SETTLED_STATES.includes(state)) {
+    return {
+      ok: false,
+      messageId: typeof receipt?.id === 'string' ? receipt.id : undefined,
+      state,
+      message: `Delivery to ${resolved.label} is unconfirmed: the transport returned no receipt${state ? ` (state "${String(state)}")` : ''}. Do NOT assume delivery; check \`receipt\` or \`history\` before re-sending.`,
     }
   }
   // Report the kind back, because it changes what the receipt means: a
@@ -163,8 +275,8 @@ export async function sendViaGatewayPeer(
   const delivered = kind === 'directive' ? 'Delivered a directive to' : 'Delivered an inquiry to'
   return {
     ok: true,
-    messageId: receipt?.id,
-    state: receipt?.state,
-    message: `${delivered} ${resolved.label} (${receipt?.state ?? 'unknown'}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.`,
+    messageId: receipt.id,
+    state,
+    message: `${delivered} ${resolved.label} (${state}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.${await peerBuildNote(resolved.sessionId)}`,
   }
 }

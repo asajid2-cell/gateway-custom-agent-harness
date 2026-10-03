@@ -5,6 +5,7 @@ import { lstat, mkdir, open, readdir, readFile, rename, stat, unlink } from 'nod
 import { createConnection, createServer, type Server } from 'node:net'
 import { join } from 'node:path'
 import { isProcessRunning } from './genericProcessUtils.js'
+import { getSessionId } from '../bootstrap/state.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
@@ -357,6 +358,79 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
 }
 
 /**
+ * What a running session says about itself when asked directly.
+ *
+ * The third source of identity, after the registration file and the process
+ * scan: a registration can be stale, unreadable, or written by a build that knew
+ * no other fields, and a session that is running can always answer for itself.
+ */
+export type GatewayPeerIdentity = {
+  sessionId: string
+  runtimeId: string
+  name: string
+  cwd: string
+  status: string
+  purpose: string
+  startedAt: string
+  buildId?: string
+}
+
+/**
+ * Ask every registered session to identify itself (C3).
+ *
+ * The sweep reads files first and asks second, because the file is cheap and
+ * usually right - a registration that answers a ping is already proof the
+ * session behind it is running. `identify` is for the rest: a session whose
+ * registration is missing or unreadable but whose process is alive can still
+ * say who it is, which is exactly the case a ledger built on files alone reads
+ * as UNKNOWN. A session that does not answer is left out rather than guessed at.
+ */
+export async function broadcastIdentify(directory: string, asker?: { sessionId: string; token?: string }): Promise<readonly GatewayPeerIdentity[]> {
+  // Two tokens, and swapping them is the whole difficulty of this call. The
+  // `token` on the wire is the *receiver's*, read from its registration - the
+  // same handshake every other request makes, and the only proof the asker may
+  // talk to it at all. The asker's own token travels as `senderToken`, because
+  // the receiver resolves the sender's registration to attribute the request;
+  // an identify carrying only the asker's token is refused as an unregistered
+  // sender, which is correct, since it proved nothing about the receiver.
+  const self = await (async () => {
+    const id = asker?.sessionId ?? getSessionId()
+    if (asker?.token) return { sessionId: id, token: asker.token }
+    // Read the asker's own token from its registration when the caller does not
+    // already hold it: the token never has to leave the transport, and a caller
+    // cannot ask in another session's name by supplying a foreign id.
+    try {
+      return { sessionId: id, token: (await readRegistrationUnchecked(directory, id)).token }
+    } catch {
+      return undefined
+    }
+  })()
+  if (!self) return []
+  const candidates = await listGatewayPeers(directory)
+  // The asker is on the list too, and it knows who it is - asking it is a round
+  // trip to learn something already in hand, and a sweep that recorded the
+  // questioner as one of its own answers would be reporting on the wrong subject.
+  const asked = await Promise.all(candidates.filter(peer => peer.sessionId !== self.sessionId).map(async peer => {
+    try {
+      const target = await readRegistrationUnchecked(directory, peer.sessionId)
+      const answer = await callGatewayPeer(
+        peer.endpoint,
+        { type: 'identify', token: target.token, senderToken: self.token, fromSessionId: self.sessionId },
+        PROBE_TIMEOUT_MS,
+      ) as Partial<GatewayPeerIdentity> & { ok?: boolean }
+      if (answer?.ok !== true || answer.sessionId !== peer.sessionId) return undefined
+      return answer as GatewayPeerIdentity
+    } catch {
+      // An older build answers a ping but not an identify. That is not a
+      // failure of the session, so its file answer stands in - with no buildId,
+      // which reads as UNKNOWN rather than as a guess.
+      return undefined
+    }
+  }))
+  return asked.filter((identity): identity is GatewayPeerIdentity => identity !== undefined)
+}
+
+/**
  * How long a dead registration is kept before a listing lets it go.
  *
  * Not zero, because a registration is not only a liveness advertisement: a
@@ -426,11 +500,18 @@ export class GatewaySessionTransport {
     onInboxChanged?: () => void
   }) {
     const runtimeId = randomUUID()
+    // The build this process is running, as the build's own timestamp. The dist
+    // rebuilds on launch, so two live sessions can differ in behaviour with
+    // nothing on the wire saying so; this is what makes "is that fix live?"
+    // a lookup rather than a guess. Absent under a test or a stubbed build,
+    // which reads as unknown rather than as old.
+    const buildId = typeof MACRO !== 'undefined' && MACRO.BUILD_TIME ? MACRO.BUILD_TIME : undefined
     this.peer = gatewayPeerSchema.parse({
       protocol: GATEWAY_SESSION_PROTOCOL, sessionId: options.sessionId, runtimeId,
       name: options.name, cwd: options.cwd, purpose: options.purpose ?? '',
       pid: process.pid, startedAt: new Date().toISOString(), status: 'idle',
       endpoint: process.platform === 'win32' ? `\\\\.\\pipe\\gateway-${runtimeId}` : join(options.directory, `${runtimeId}.sock`),
+      ...(buildId ? { buildId } : {}),
     })
     this.policy = options.policy ?? 'accept'
   }
@@ -592,6 +673,29 @@ export class GatewaySessionTransport {
     const expected = Buffer.from(this.token)
     if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error('Unauthorized')
     if (request.type === 'ping') return { ok: true, runtimeId: this.peer.runtimeId }
+    // Identify (C3): the file is the first answer, this is the second. A
+    // registration can be stale, unreadable, or written by an older build that
+    // knew no other field, and a session that is *running* can always say who it
+    // is and what it is doing right now. Answered from the live process, so it
+    // is a statement about a running session rather than a file that may outlive
+    // one. It carries the receiver's token as `token` like every other request,
+    // and the asker's as `senderToken` + `fromSessionId`, so an anonymous caller
+    // is refused exactly as it is for a message.
+    if (request.type === 'identify') {
+      const sender = authenticatedSender ?? await readRegistration(this.options.directory, request.fromSessionId)
+      if (sender.peer.sessionId !== request.fromSessionId || sender.token !== request.senderToken) throw new Error('Invalid sender')
+      return {
+        ok: true,
+        runtimeId: this.peer.runtimeId,
+        sessionId: this.peer.sessionId,
+        name: this.peer.name,
+        cwd: this.peer.cwd,
+        status: this.peer.status,
+        purpose: this.peer.purpose,
+        startedAt: this.peer.startedAt,
+        ...(this.peer.buildId ? { buildId: this.peer.buildId } : {}),
+      }
+    }
     if (request.type === 'watch_idle') {
       const sender = authenticatedSender ?? await readRegistration(this.options.directory, request.fromSessionId)
       if (sender.peer.runtimeId !== request.fromRuntimeId || sender.token !== request.senderToken || sender.peer.sessionId === this.peer.sessionId) throw new Error('Invalid subscriber')

@@ -55,7 +55,20 @@ export const gatewayPeerSchema = z.object({
   topics: z.array(z.string().min(1).max(120)).max(8).optional(),
   compactBoundaryCount: z.number().int().nonnegative().optional(),
   microcompactBoundaryCount: z.number().int().nonnegative().optional(),
+  // Which build the running process loaded, as its build timestamp.
+  //
+  // A registration answers what a session IS right now, and the answer changes
+  // when the code it is running changes. The dist rebuilds on launch, so a
+  // session started before a rebuild runs the old code and speaks the old
+  // behaviour - which is how "is the fix live?" became a question a coordinator
+  // could only answer by guessing, and how a stale ledger claiming a shipped fix
+  // was "unbuilt" got believed. Optional, for the same reason `topics` is: a
+  // live fleet on an older build writes registrations without it and must stay
+  // readable. A missing buildId means "unknown", never "old".
+  buildId: z.string().min(1).max(100).optional(),
 }).strict()
+
+export const NIL_UUID = '00000000-0000-0000-0000-000000000000'
 
 export const gatewayPeerMessageSchema = z.object({
   id: z.string().uuid(),
@@ -64,7 +77,13 @@ export const gatewayPeerMessageSchema = z.object({
   toSessionId: z.string().uuid(),
   summary: z.string().min(1).max(200),
   text: z.string().min(1).max(MAX_PEER_MESSAGE_BYTES).refine(text => Buffer.byteLength(text, 'utf8') <= MAX_PEER_MESSAGE_BYTES, 'Message exceeds byte limit'),
-  replyTo: z.string().uuid().optional(),
+  // A nil UUID is not a reply target. A message header echoed back to the user
+  // read "Reply-to: 00000000-0000-...", which names a message that cannot exist
+  // and invites a reader to correlate against it. The sender meant "no reply
+  // target", so the field is absent rather than empty - and an absent field is
+  // what `isReply` already tests, so rejecting the nil value keeps one meaning
+  // for "this is not a reply".
+  replyTo: z.string().uuid().refine(id => id !== NIL_UUID, 'replyTo cannot be the nil UUID; omit the field instead').optional(),
   kind: z.enum(PEER_MESSAGE_KINDS).optional(),
   createdAt: z.string().datetime(),
 }).strict()
@@ -252,7 +271,11 @@ export function parseGatewayPeerText(text: string): GatewayPeerTextParts | undef
 
 export function formatGatewayPeerMessage(record: GatewayInboxRecord): string {
   const { message, senderName } = record
-  const isReply = message.replyTo !== undefined
+  // A message written by an older build can still carry the nil UUID, and the
+  // header is the last place it can be dropped before a reader sees it. Treat it
+  // as absent here too, so the two meanings of "set" and "names a real message"
+  // cannot diverge between the schema and the render.
+  const isReply = message.replyTo !== undefined && message.replyTo !== NIL_UUID
   const kind = peerMessageKind(message)
   // The header carries the routing facts and the body carries the request, so a
   // reader can act on the first line. The reply instruction sits AFTER the

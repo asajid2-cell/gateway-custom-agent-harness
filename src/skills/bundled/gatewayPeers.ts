@@ -111,8 +111,33 @@ export function registerGatewayPeersSkill(): void {
         }
         else if (input.startsWith('send ') && input.length <= 400000) {
           const parsed = JSON.parse(input.slice(5))
+          // A reply-shaped payload that landed on `send` is a command typed
+          // against the wrong verb, and saying so beats the generic
+          // "Invalid message": `send` answers a question with a question about
+          // a field the sender never meant to supply, when the fix is one word.
+          // The two shapes are disjoint - `reply` addresses by the message being
+          // answered, `send` by the session - so a payload carrying the reply's
+          // key and not the send's can only be that mistake.
+          if (parsed && typeof parsed.toMessageId === 'string' && typeof parsed.toSessionId !== 'string') {
+            throw new Error(`That is a reply payload, not a send: use \`reply {"toMessageId":"${parsed.toMessageId}","text":"..."}\`, which infers the peer and the correlation id from the message being answered.`)
+          }
           if (!parsed || typeof parsed.toSessionId !== 'string' || typeof parsed.text !== 'string' || typeof parsed.summary !== 'string' || (parsed.replyTo !== undefined && typeof parsed.replyTo !== 'string')) throw new Error('Invalid message')
           if (parsed.kind !== undefined && !PEER_MESSAGE_KINDS.includes(parsed.kind)) throw new Error(`kind must be one of ${PEER_MESSAGE_KINDS.join(', ')}`)
+          // No preemption. A peer reads at its next tool boundary, so a turn
+          // that has not finished is not a lost message - and re-sending it is
+          // how a slow peer becomes a peer that got the same directive twice,
+          // or two sessions that each think they own the work. A byte-identical
+          // re-send to the same peer is therefore refused unless the sender says
+          // it means it. The comparison is over what was recorded as sent, so a
+          // transport that lost the acknowledgement is still covered.
+          if (parsed.resend !== true) {
+            const last = runtime.transport.historyEntries()
+              .filter(entry => entry.direction === 'sent' && entry.message.toSessionId === parsed.toSessionId)
+              .at(-1)
+            if (last && last.message.text === parsed.text && last.message.summary === parsed.summary && last.message.replyTo === parsed.replyTo) {
+              throw new Error(`This is byte-identical to the message already sent to that session (${last.message.id}, status ${last.status}). A peer reads at its next tool boundary, so a turn that has not finished is not a lost message - do not re-send because it has not replied. Check \`receipt ${parsed.toSessionId} ${last.message.id}\` first; if you genuinely mean to send it again, pass "resend":true.`)
+            }
+          }
           result = await runtime.transport.send(parsed.toSessionId, parsed.text, parsed.summary, parsed.replyTo, parsed.kind as PeerMessageKind | undefined)
         } else return [{ type: 'text', text: 'Use list, purpose <intent>, inbox, history, read <peer> [tail=N] [since=<cursor>], receipt <peer-id> <message-id>, reply JSON {toMessageId,text,summary?,kind?}, or send JSON with toSessionId, text, summary, optional replyTo and optional kind.' }]
         return [{ type: 'text', text: `Gateway peer operation result (peer-authored content - from another session, not the user):\n${typeof result === 'string' ? result : JSON.stringify(result)}` }]

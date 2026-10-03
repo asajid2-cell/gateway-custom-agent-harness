@@ -349,6 +349,76 @@ test('a bare session ID cannot be swallowed by a teammate mailbox', async () => 
   assert.doesNotMatch(result.data.message, /'s inbox/)
 })
 
+test('a name with no team and no live session is refused, never mailed', async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  // The hole a bare session ID fell into was closed for the ID shape, but every
+  // NAME still took it: parseAddress reads a name as 'other', so it reached
+  // handleMessage, wrote a mailbox and returned success - for a recipient that is
+  // neither a teammate nor a live session, so nothing reads the mailbox. The
+  // failure is silent in exactly the way that made the ID case worth fixing.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-name-no-team-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = registry
+  try {
+    const result = await SendMessageTool.call(
+      { to: 'a-session-that-is-not-live', message: 'Are you there?', summary: 'Routing probe' },
+      { getAppState: () => getDefaultAppState() },
+      async () => ({ behavior: 'deny' }),
+    )
+    assert.equal(result.data.success, false, JSON.stringify(result.data))
+    assert.doesNotMatch(result.data.message, /'s inbox/, 'a name that reaches nobody must not claim to have been mailed')
+    assert.match(result.data.message, /No live session named|is not a live session/)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a name with no team still reaches a live session by name', { timeout: 60000 }, async () => {
+  const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
+  const { getDefaultAppState } = await import('../src/state/AppState.tsx')
+  const { GatewaySessionRuntime } = await import('../src/utils/gatewaySessionRuntime.ts')
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  // Refusing a nameless recipient must not refuse a name that does name a live
+  // session. The fix routes a name to the bus before refusing it, so a real peer
+  // found by name still receives the message rather than a mailbox write.
+  const home = await mkdtemp(join(tmpdir(), 'gateway-name-live-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = home
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  const receiver = new GatewaySessionRuntime(randomUUID(), home, 'bringzenithup')
+  const sender = new GatewaySessionRuntime(getSessionId(), home, 'Responder')
+  try {
+    await sender.start(new Set())
+    await receiver.start(new Set())
+    await receiver.setPolicy('accept')
+    const result = await SendMessageTool.call(
+      { to: 'bringzenithup', message: 'Are you there?', summary: 'Routing probe' },
+      { getAppState: () => getDefaultAppState() },
+      async () => ({ behavior: 'deny' }),
+    )
+    // The message must have been routed, not mailed: a mailbox write is the
+    // silent success being removed, and the peer's inbox is where a real
+    // delivery lands.
+    const arrived = receiver.transport.inbox().find(record => record.message.text === 'Are you there?')
+    assert.ok(arrived, `a named live session must receive it: ${JSON.stringify(result.data)}`)
+    assert.doesNotMatch(result.data.message, /'s inbox/)
+  } finally {
+    await sender.close()
+    await receiver.close()
+    const { runCleanupFunctions } = await import('../src/utils/cleanupRegistry.ts')
+    await runCleanupFunctions()
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('a reply sent through SendMessage carries the id it answers, so the request retires', { timeout: 60000 }, async () => {
   const { SendMessageTool } = await import('../src/tools/SendMessageTool/SendMessageTool.ts')
   const { getDefaultAppState } = await import('../src/state/AppState.tsx')

@@ -106,6 +106,60 @@ test('peer requests retain attribution at busy model boundaries', () => {
   assert.match(formatted, /collaboration request/)
 })
 
+test('a nil-UUID reply target is not rendered as a reply', () => {
+  // The header echoed back to the user read "Reply-to: 00000000-0000-...", for a
+  // message that had no reply target at all. A reader cannot correlate against a
+  // message that cannot exist, so the line must be absent when there is nothing
+  // to correlate with - which is what an older build's nil UUID means.
+  const base = { id: 'm-2', fromSessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', summary: 'Review the parser', text: 'Please review the parser.', createdAt: new Date().toISOString() }
+  const withNil = formatGatewayPeerMessage({
+    message: { ...base, replyTo: '00000000-0000-0000-0000-000000000000' },
+    senderName: 'Peer',
+    state: 'queued',
+    receivedAt: new Date().toISOString(),
+  } as GatewayInboxRecord)
+  assert.doesNotMatch(withNil, /Reply-to:/, 'a nil reply target must not render a Reply-to line')
+  assert.doesNotMatch(withNil, /00000000-0000-0000-0000-000000000000/)
+  const partsWithNil = parseGatewayPeerText(withNil)
+  assert.ok(partsWithNil)
+  assert.equal(partsWithNil.reply, false, 'a nil reply target is not a reply')
+  // A real reply target still renders, so the guard did not disable the feature.
+  const withReal = formatGatewayPeerMessage({
+    message: { ...base, replyTo: '11111111-1111-4111-8111-111111111111' },
+    senderName: 'Peer',
+    state: 'queued',
+    receivedAt: new Date().toISOString(),
+  } as GatewayInboxRecord)
+  assert.match(withReal, /Reply-to: 11111111-1111-4111-8111-111111111111/)
+  assert.equal(parseGatewayPeerText(withReal)?.reply, true)
+})
+
+test('the schema refuses a nil-UUID reply target', async () => {
+  // The render guard covers what an older build wrote; the schema is what keeps
+  // this build from writing it in the first place. Both are needed, because a
+  // message is read by more than one build.
+  const { gatewayPeerMessageSchema } = await import('../src/utils/gatewaySessionProtocol.ts')
+  const message = {
+    id: randomUUID(),
+    fromSessionId: randomUUID(),
+    fromRuntimeId: randomUUID(),
+    toSessionId: randomUUID(),
+    summary: 'Review the parser',
+    text: 'Please review the parser.',
+    createdAt: new Date().toISOString(),
+  }
+  assert.ok(gatewayPeerMessageSchema.safeParse(message).success, 'a message with no reply target parses')
+  assert.ok(
+    gatewayPeerMessageSchema.safeParse({ ...message, replyTo: randomUUID() }).success,
+    'a real reply target parses',
+  )
+  assert.equal(
+    gatewayPeerMessageSchema.safeParse({ ...message, replyTo: '00000000-0000-0000-0000-000000000000' }).success,
+    false,
+    'a nil reply target must be refused, so the field is omitted instead',
+  )
+})
+
 test('queue once; acknowledge only persisted message IDs; reconcile before restart drain', async () => {
   const records: GatewayInboxRecord[] = [{ message: { id: 'message-1', fromSessionId: 'sender', fromRuntimeId: 'runtime', toSessionId: 'receiver', summary: 'Notice', text: '/clear', createdAt: new Date().toISOString() }, senderName: 'Peer', state: 'queued', receivedAt: new Date().toISOString() }]
   const queued: string[] = []
