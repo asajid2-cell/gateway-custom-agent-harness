@@ -5,7 +5,7 @@ import { access, mkdir, open, readFile, rename, unlink, writeFile } from 'node:f
 import { StringDecoder } from 'node:string_decoder'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { getSessionId, getSessionResumeDirectory } from '../bootstrap/state.js'
+import { getSessionBypassPermissionsMode, getSessionId, getSessionResumeDirectory } from '../bootstrap/state.js'
 import { asSessionId } from '../types/ids.js'
 import { getCwd } from './cwd.js'
 import { checkHasTrustDialogAccepted } from './config.js'
@@ -1952,6 +1952,30 @@ function launch(member: LeafMember, rootSessionId: string): Launching {
   return launching
 }
 
+/**
+ * The CLI arguments a leaf is started with.
+ *
+ * A leaf is a separate process, so a permission mode the parent offers is not
+ * inherited by being open in the parent: the leaf's own startup decides
+ * availability from its own argv. With no bypass flag the leaf's Shift+Tab
+ * cycle never yields bypassPermissions, so the option was missing in every leaf
+ * even though the session that spawned it had it. The parent's launcher grants
+ * bypass as an option (--allow-dangerously-skip-permissions); the leaf
+ * re-applies the same settings and Statsig gates itself, so offering it here
+ * cannot defeat a disable. When the parent is already in bypass the leaf starts
+ * there too, matching how teammates are spawned.
+ */
+export function leafLaunchArgs(
+  member: Pick<LeafMember, 'sessionId' | 'model' | 'effort'>,
+  hasTranscript: boolean,
+): string[] {
+  const args = [process.argv[1]!, ...(hasTranscript ? ['--resume', member.sessionId] : ['--session-id', member.sessionId])]
+  args.push(getSessionBypassPermissionsMode() ? '--dangerously-skip-permissions' : '--allow-dangerously-skip-permissions')
+  if (member.model) args.push('--model', member.model)
+  if (member.effort) args.push('--effort', member.effort)
+  return args
+}
+
 async function launchOnce(
   member: LeafMember,
   rootSessionId: string,
@@ -1983,9 +2007,7 @@ async function launchOnce(
     }
   }
   await ensureLeafOwnerEndpoint()
-  const processArgs = [process.argv[1]!, ...(hasTranscript ? ['--resume', member.sessionId] : ['--session-id', member.sessionId])]
-  if (member.model) processArgs.push('--model', member.model)
-  if (member.effort) processArgs.push('--effort', member.effort)
+  const processArgs = leafLaunchArgs(member, hasTranscript)
   const child = new LeafProcess({ executable: process.execPath, args: processArgs, cwd: member.cwd ?? getCwd(), env: {
     ...process.env, GATEWAY_LEAF_SESSION: member.sessionId, GATEWAY_INTERACTIVE_LEAF: '1',
     GATEWAY_LEAF_TRANSCRIPT: member.transcriptPath,

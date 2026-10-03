@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import { strict as assert } from 'node:assert'
 import { hasPermissionsToUseTool } from '../src/utils/permissions/permissions.ts'
 import { getNextPermissionMode } from '../src/utils/permissions/getNextPermissionMode.ts'
+import { leafLaunchArgs } from '../src/utils/leafWorkspace.ts'
+import { setSessionBypassPermissionsMode } from '../src/bootstrap/state.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
 
 /**
@@ -79,4 +81,32 @@ test('bypass appears in the Shift+Tab cycle only when the mode is available', ()
   const unavailable = { mode: 'plan', isBypassPermissionsModeAvailable: false }
   assert.equal(getNextPermissionMode(available as never), 'bypassPermissions')
   assert.equal(getNextPermissionMode(unavailable as never), 'default')
+})
+
+test('a leaf is launched offering bypass as an option when the parent is not in bypass', () => {
+  // The leaf is a separate process: it only offers bypass if its own argv says
+  // so. Without this the option is missing in every leaf while the parent that
+  // spawned it has it. The flag is the "as an option, not by default" one, so
+  // the leaf still starts at the default and the user opts in via the cycle.
+  setSessionBypassPermissionsMode(false)
+  try {
+    const args = leafLaunchArgs({ sessionId: '11111111-1111-4111-8111-111111111111' }, true)
+    assert.ok(args.includes('--allow-dangerously-skip-permissions'), 'leaf offers bypass as an option')
+    assert.ok(!args.includes('--dangerously-skip-permissions'), 'leaf does not start in bypass')
+    assert.deepEqual(args.slice(1, 3), ['--resume', '11111111-1111-4111-8111-111111111111'])
+  } finally {
+    setSessionBypassPermissionsMode(false)
+  }
+})
+
+test('a leaf starts in bypass when the parent is in bypass', () => {
+  setSessionBypassPermissionsMode(true)
+  try {
+    const args = leafLaunchArgs({ sessionId: '11111111-1111-4111-8111-111111111111' }, false)
+    assert.ok(args.includes('--dangerously-skip-permissions'), 'leaf inherits the parent bypass mode')
+    assert.ok(!args.includes('--allow-dangerously-skip-permissions'), 'no redundant option flag')
+    assert.deepEqual(args.slice(1, 3), ['--session-id', '11111111-1111-4111-8111-111111111111'])
+  } finally {
+    setSessionBypassPermissionsMode(false)
+  }
 })
