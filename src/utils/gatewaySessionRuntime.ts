@@ -145,7 +145,15 @@ export class GatewaySessionRuntime {
     if (runtimes.get(this.transport.peer.sessionId) === this) runtimes.delete(this.transport.peer.sessionId)
     this.delivery.close()
     removeByFilter(command => command.uuid !== undefined && this.pendingIds.has(command.uuid))
-    this.closing = (this.starting ?? Promise.resolve()).catch(() => {}).then(() => this.transport.close())
+    // Release the writer claim the runtime took when it started. Without this the
+    // claim lives in the ownership map until process cleanup, which runs after
+    // the config home it was taken in may be gone - and a release that stats a
+    // vanished lock throws. Closing is when the runtime stops being the writer,
+    // so it is where the claim should end.
+    this.closing = (this.starting ?? Promise.resolve()).catch(() => {})
+      .then(() => this.transport.close())
+      .then(async () => { await (await import('./gatewaySessionOwnership.js')).releaseGatewaySessionWriter(this.transport.peer.sessionId) })
+      .catch(() => {})
     return this.closing
   }
   list(): Promise<GatewayPeer[]> { return listGatewayPeers(join(getClaudeConfigHomeDir(), 'gateway-sessions')) }

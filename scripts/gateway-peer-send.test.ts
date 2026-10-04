@@ -465,6 +465,42 @@ test('a reply sent through SendMessage carries the id it answers, so the request
   }
 })
 
+test('a closed runtime releases its writer claim, so a later claim is not blocked by a vanished lock', { timeout: 60000 }, async () => {
+  const { GatewaySessionRuntime } = await import('../src/utils/gatewaySessionRuntime.ts')
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  const { readdir } = await import('node:fs/promises')
+  // The claim a runtime takes when it starts must end when the runtime closes.
+  // Left in the ownership map it outlives the config home it was taken in, and
+  // the release then stats a lock that is already gone and throws ENOENT - which
+  // is an unhandled rejection reported between tests, and on a real machine a
+  // writer claim held by a session that has stopped being the writer.
+  const first = await mkdtemp(join(tmpdir(), 'gateway-writer-close-'))
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  try {
+    process.env.CLAUDE_CONFIG_DIR = first
+    const runtime = new GatewaySessionRuntime(getSessionId(), first, 'Writer')
+    await runtime.start(new Set())
+    // While the runtime is the writer, its claim is on disk. This is the
+    // positive control: the assertion below is only meaningful if the claim
+    // existed to begin with.
+    const claimed = await readdir(join(first, 'gateway-writers'))
+    assert.ok(claimed.includes(`${getSessionId()}.lock`), `the runtime claims the writer while live: ${JSON.stringify(claimed)}`)
+    await runtime.close()
+    // After close, the claim is gone - the release is what takes it off disk, so
+    // a missing lock here is the proof that close released rather than leaked.
+    const after = await readdir(join(first, 'gateway-writers')).catch(() => [] as string[])
+    assert.ok(!after.includes(`${getSessionId()}.lock`), `close releases the writer claim: ${JSON.stringify(after)}`)
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(first, { recursive: true, force: true }).catch(() => {})
+  }
+})
+
 test('a truncated session ID is an address, not a teammate name', () => {
   // The incident: a session addressed a peer by the first 8 hex of its ID -
   // "ab1f387b" - copied from a roster line or a truncated display. Read as a
