@@ -196,3 +196,30 @@ export function renderZenithState(state: ZenithState): string {
     ? `Zenith is held by ${claim.zenithSessionId} (running since ${since})${purpose}.`
     : `Zenith is held by ${claim.zenithSessionId}, whose process is gone (claimed ${since})${purpose}.`
 }
+
+/**
+ * Take the role at session mount when the launcher asked for it (`cc zenith`).
+ *
+ * Both mounts call this - the interactive REPL and a headless print session -
+ * because a launch verb that worked in one and silently did nothing in the
+ * other would be worse than not having it. The launcher cannot take the claim
+ * itself: it would record the launcher's pid and its own process, and the role
+ * would then read as live after the chat behind it was gone. Here the id is the
+ * session's, which is the whole reason the claim is written at mount.
+ *
+ * Returns the outcome so the caller can log a refusal; undefined means the
+ * launch did not ask for the role, and a throw is swallowed to a warning
+ * because a claim that failed must not turn a live session off the bus.
+ */
+export async function claimZenithFromLaunchEnv(): Promise<ZenithClaimOutcome | undefined> {
+  if (process.env.CC_ZENITH !== '1') return undefined
+  const purpose = process.env.CC_ZENITH_PURPOSE?.trim()
+  try {
+    return await claimZenith({
+      ...(purpose ? { purpose } : {}),
+      force: process.env.CC_ZENITH_MODE === 'take',
+    })
+  } catch {
+    return undefined
+  }
+}

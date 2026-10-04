@@ -515,3 +515,42 @@ test('the launch-path build is bounded so a hung build fails loudly', async () =
   assert.match(script, /WaitForExit\(600000\)/)
   assert.match(script, /Claude harness build did not finish within 10 minutes\./)
 })
+
+test('cc zenith resolves the role before launch and refuses a live holder', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // The launcher resolves; the harness writes. A claim naming a launcher-side id
+  // would keep reading as live after the chat behind it was gone, so the role is
+  // taken at mount (useGatewaySession.ts) and the launcher only checks it here.
+  assert.match(script, /\[string\]\$ClaudeArgs\[0\] -eq 'zenith'/)
+  // The claim is read from the session's config home, the same one zenithRole
+  // uses, so the launcher and the session cannot disagree about who holds it.
+  assert.match(script, /\$env:CLAUDE_CONFIG_DIR/)
+  assert.match(script, /Join-Path \$ZenithConfigHome 'zenith\.json'/)
+  assert.match(script, /\$env:CC_ZENITH = '1'/)
+  assert.match(script, /\$env:CC_ZENITH_MODE = 'take'/)
+  assert.match(script, /\$env:CC_ZENITH_PURPOSE = \$ZenithPurpose/)
+  // Displacing a live holder is the user's decision, not a launch side effect.
+  assert.match(
+    script,
+    /cc zenith: the role is held by \$ZenithSession, which is still running\./,
+    'a live holder must be named and refused, never silently displaced',
+  )
+  // The harness side, where the session id is real. Both mounts must take the
+  // claim, or the verb works in a REPL and silently not in a headless run.
+  const role = await readFile(new URL('../src/utils/zenithRole.ts', import.meta.url), 'utf8')
+  assert.match(role, /export async function claimZenithFromLaunchEnv/)
+  assert.match(role, /process\.env\.CC_ZENITH !== '1'/)
+  assert.match(role, /force: process\.env\.CC_ZENITH_MODE === 'take'/)
+  const hook = await readFile(new URL('../src/hooks/useGatewaySession.ts', import.meta.url), 'utf8')
+  const headless = await readFile(new URL('../src/cli/print.ts', import.meta.url), 'utf8')
+  assert.match(hook, /claimZenithFromLaunchEnv\(\)/)
+  assert.match(headless, /claimZenithFromLaunchEnv\(\)/)
+  assert.ok(
+    hook.indexOf('claimZenithFromLaunchEnv()') > hook.indexOf('runtime.start(gatewayMessageIds'),
+    'the interactive claim must be taken only after the registration lands',
+  )
+  assert.ok(
+    headless.indexOf('claimZenithFromLaunchEnv()') > headless.indexOf('runtime.start(gatewayMessageIds'),
+    'the headless claim must be taken only after the registration lands',
+  )
+})

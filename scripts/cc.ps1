@@ -59,12 +59,6 @@ $ClaudeScript = if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
 } else {
   Join-Path $Root 'dist\cli.js'
 }
-$CapabilityCatalogPath = Join-Path $Root 'scripts\effort-capabilities.json'
-if (-not (Test-Path -LiteralPath $CapabilityCatalogPath -PathType Leaf)) {
-  throw "Effort capability catalog is missing: $CapabilityCatalogPath"
-}
-$CapabilityCatalog = Get-Content -Raw -LiteralPath $CapabilityCatalogPath |
-  ConvertFrom-Json
 
 function Resolve-SelectedCodexHome {
   if (-not [string]::IsNullOrWhiteSpace($TandemCodexHome)) {
@@ -197,6 +191,99 @@ $Effort = if ($env:MODEL_GATEWAY_EFFORT) { $env:MODEL_GATEWAY_EFFORT } else { $n
 $KeepGatewayLogs = $env:MODEL_GATEWAY_KEEP_LOGS -eq '1'
 $GatewayToken = 'local-gateway'
 $ClaudeArgs = @($args)
+
+# `cc zenith` starts the session as the interface plane (zenithRole.ts). The
+# launcher only *resolves* here: the role is written by the harness at mount,
+# where the session id is real - a claim naming a launcher-side id would keep
+# reading as live after the chat behind it was gone. So this runs before any
+# gateway work, says what it found, and refuses to start a second Zenith when
+# one is already running. The refusal is the point of the role: displacing a
+# live holder is the user's decision, not a side effect of launching a session.
+# Placed above the capability catalog and model resolution so `--status` and a
+# refusal cost nothing but a file read, and no gateway is ever spawned for them.
+if ($ClaudeArgs.Count -gt 0 -and [string]$ClaudeArgs[0] -eq 'zenith') {
+  $ZenithRest = @($ClaudeArgs | Select-Object -Skip 1)
+  $ZenithMode = 'claim'
+  $ZenithPurpose = ''
+  $ZenithPassThrough = @()
+  for ($zi = 0; $zi -lt $ZenithRest.Count; $zi++) {
+    $zarg = [string]$ZenithRest[$zi]
+    switch -Regex ($zarg) {
+      '^--status$' { $ZenithMode = 'status'; continue }
+      '^--take$'   { $ZenithMode = 'take';   continue }
+      '^--share$'  { $ZenithMode = 'share';  continue }
+      '^--purpose$' {
+        if ($zi + 1 -ge $ZenithRest.Count) { throw 'cc zenith: --purpose needs a value.' }
+        $zi++
+        $ZenithPurpose = [string]$ZenithRest[$zi]
+        continue
+      }
+      '^--purpose=(.*)$' { $ZenithPurpose = $Matches[1]; continue }
+      default { $ZenithPassThrough += $zarg }
+    }
+  }
+  # The claim lives in the *session's* config home, which is what zenithRole
+  # reads and writes (getClaudeConfigHomeDir honors CLAUDE_CONFIG_DIR). Reading
+  # the user's home instead would let the launcher refuse a launch over a claim
+  # the session it is about to start will never see - and, worse, could read a
+  # live holder that the session's own home shows as free. One config home, one
+  # answer, whichever one the session actually runs in.
+  $ZenithConfigHome = if ([string]::IsNullOrWhiteSpace($env:CLAUDE_CONFIG_DIR)) {
+    Join-Path $env:USERPROFILE '.claude'
+  } else {
+    $env:CLAUDE_CONFIG_DIR
+  }
+  $ZenithClaimFile = Join-Path $ZenithConfigHome 'zenith.json'
+  $ZenithHeld = $false
+  $ZenithSession = ''
+  $ZenithAlive = $false
+  if (Test-Path -LiteralPath $ZenithClaimFile -PathType Leaf) {
+    try {
+      $zclaim = Get-Content -Raw -LiteralPath $ZenithClaimFile | ConvertFrom-Json
+      if ($zclaim -and -not [string]::IsNullOrWhiteSpace([string]$zclaim.zenithSessionId)) {
+        $ZenithHeld = $true
+        $ZenithSession = [string]$zclaim.zenithSessionId
+        # A pid whose process is gone is not a holder: a dead host's claim must
+        # not strand the role forever. Only the pid is checked here - the current
+        # holder's process is never running on this machine, so the check is
+        # deliberately the same conservative one zenithRole uses on Windows.
+        $ZenithAlive = $null -ne (Get-Process -Id ([int]$zclaim.pid) -ErrorAction SilentlyContinue)
+      }
+    } catch {
+      # An unreadable claim reads as absent, the same safe direction the module
+      # takes - a corrupt pointer must not make the role permanently untakeable.
+    }
+  }
+  if ($ZenithMode -eq 'status') {
+    if (-not $ZenithHeld) { [Console]::Out.WriteLine('Zenith is unheld; a session can take the role.') }
+    elseif ($ZenithAlive) { [Console]::Out.WriteLine("Zenith is held by $ZenithSession, which is still running.") }
+    else { [Console]::Out.WriteLine("Zenith is held by $ZenithSession, whose process is gone; cc zenith would replace it.") }
+    exit 0
+  }
+  if ($ZenithMode -eq 'share') {
+    # Another body alongside a running Zenith. It joins the bus as an ordinary
+    # session and does not take the role, so it can be messaged and can work
+    # under the holder without a second claim contesting the first.
+    $ZenithMode = 'none'
+  } elseif ($ZenithHeld -and $ZenithAlive -and $ZenithMode -ne 'take') {
+    throw "cc zenith: the role is held by $ZenithSession, which is still running. Displacing a live Zenith is your decision, not a launch side effect - end it, run 'cc zenith --take' to replace it, or 'cc zenith --share' to work alongside it."
+  }
+  if ($ZenithMode -ne 'none') {
+    if ($ZenithHeld -and -not $ZenithAlive) { Write-Host "cc zenith: replacing the claim of $ZenithSession, whose process is gone." }
+    $env:CC_ZENITH = '1'
+    if ($ZenithMode -eq 'take') { $env:CC_ZENITH_MODE = 'take' }
+    if (-not [string]::IsNullOrWhiteSpace($ZenithPurpose)) { $env:CC_ZENITH_PURPOSE = $ZenithPurpose }
+  }
+  $ClaudeArgs = @($ZenithPassThrough)
+}
+
+$CapabilityCatalogPath = Join-Path $Root 'scripts\effort-capabilities.json'
+if (-not (Test-Path -LiteralPath $CapabilityCatalogPath -PathType Leaf)) {
+  throw "Effort capability catalog is missing: $CapabilityCatalogPath"
+}
+$CapabilityCatalog = Get-Content -Raw -LiteralPath $CapabilityCatalogPath |
+  ConvertFrom-Json
+
 $GatewayProcess = $null
 $GatewayJob = $null
 $StdoutLog = $null

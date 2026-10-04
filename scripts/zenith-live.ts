@@ -57,10 +57,10 @@ async function waitFor(check: () => boolean, label: string, timeout = 120000) {
   }
 }
 
-function spawn(agentArgs: string[], events: Record<string, any>[]) {
+function spawn(agentArgs: string[], events: Record<string, any>[], leading: string[] = []) {
   const process = new LeafProcess({
     executable: 'powershell.exe',
-    args: ['-NoProfile', '-File', launcher, '--print', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json', '--permission-prompt-tool', 'stdio', '--model', 'gateway-gpt-luna', ...agentArgs],
+    args: ['-NoProfile', '-File', launcher, ...leading, '--print', '--verbose', '--input-format', 'stream-json', '--output-format', 'stream-json', '--permission-prompt-tool', 'stdio', '--model', 'gateway-gpt-luna', ...agentArgs],
     cwd: directory,
     env,
     onState: () => {},
@@ -193,6 +193,45 @@ async function main(): Promise<void> {
   const survivors = []
   for (const chat of chats.slice(0, 2)) survivors.push(await ledger.sessionHistory(chat.id))
   record('the survivors keep their known identity after the departure', survivors.every(h => h.state === 'known'), survivors.map(h => h.state))
+
+  // (5) `cc zenith` is the entry point: the launcher resolves, the session takes
+  // the role. A live chat started through it must end up holding a claim that
+  // names *its* session id - not the launcher's pid, which is the defect the
+  // mount-side claim exists to avoid, and which only a real session can expose.
+  await role.releaseZenith()
+  {
+    const events: Record<string, any>[] = []
+    const started = spawn(['--max-turns', '4'], events, ['zenith'])
+    chats.push(started)
+    await started.process.start()
+    started.process.send('You are the live Zenith body. Reply exactly ZENITH_ROLE_READY. Never use tools.')
+    await waitFor(() => events.some(event => event.type === 'result'), 'zenith ready')
+    started.id = (events.find(event => event.type === 'result')?.session_id as string) ?? ''
+    // The claim is written at mount, so wait for it rather than assuming the
+    // registration and the claim landed in the same tick.
+    let claim = await role.readZenithClaim()
+    for (let attempt = 0; attempt < 60 && claim?.zenithSessionId !== started.id; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 250))
+      claim = await role.readZenithClaim()
+    }
+    record('a chat started by cc zenith holds the role under its own session id', claim?.zenithSessionId === started.id, {
+      claimed: claim?.zenithSessionId,
+      session: started.id,
+      pidIsLauncher: claim?.pid === started.process.pid,
+    })
+    record('the role derives from the session, not the launcher pid', claim !== undefined && claim.pid !== started.process.pid, { claimedPid: claim?.pid, launcherPid: started.process.pid })
+
+    // A second `cc zenith` is refused while the first is running, and no gateway
+    // is spawned for the refusal - so the exit is fast and the message names the
+    // holder. This is the decision the role exists to force.
+    const again = await new Promise<{ code: number | null; stderr: string }>(resolve => {
+      execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', launcher, 'zenith'], {
+        cwd: directory, env, windowsHide: true, timeout: 30000,
+      }, (error, _stdout, stderr) => resolve({ code: error ? ((error as { code?: number }).code ?? 1) : 0, stderr: String(stderr) }))
+    })
+    record('a second cc zenith refuses a live holder instead of displacing it', again.code !== 0 && again.stderr.includes(claim?.zenithSessionId ?? '\u0000'), { code: again.code, namesHolder: again.stderr.includes(claim?.zenithSessionId ?? '\u0000') })
+    await role.releaseZenith()
+  }
 }
 
 try {

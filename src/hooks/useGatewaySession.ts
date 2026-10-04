@@ -156,6 +156,16 @@ export function useGatewaySession(name: string, status: 'idle' | 'busy' | 'waiti
           return
         }
         stopHookRef.current = stopHook
+        // `cc zenith` starts the session as the interface plane (zenithRole.ts).
+        // The claim belongs at mount rather than in the launcher - see
+        // claimZenithFromLaunchEnv - and the same call serves the headless
+        // print mount, so the verb cannot work in one and not the other. A
+        // refusal is a warning, not a start failure: the launcher already
+        // checked, and a race must not turn a live session off the bus.
+        const zenithOutcome = await (await import('../utils/zenithRole.js')).claimZenithFromLaunchEnv()
+        if (zenithOutcome && !zenithOutcome.taken) {
+          logForDebugging(`cc zenith: the role is held by ${zenithOutcome.claim.zenithSessionId}${zenithOutcome.alive ? ', which is still running' : ''}; this session continues without it.`)
+        }
         // Seed intent only while it is unstated. An explicit declaration outranks
         // the derived one, and a later name/status refresh must never clobber it.
         const purpose = runtime.transport.peer.purpose.trim() ? runtime.transport.peer.purpose : sessionPurposeSeed(sessionMessages, name)
