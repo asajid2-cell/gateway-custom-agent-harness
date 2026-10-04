@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import http from 'node:http'
 import os from 'node:os'
@@ -14,7 +14,15 @@ const supervisor = path.join(root, 'gateway-supervisor.mjs')
 
 async function stopTree(child) {
   if (child.exitCode !== null) return
-  child.kill()
+  if (process.platform === 'win32') {
+    // child.kill() is TerminateProcess on Windows, so the supervisor never runs
+    // its own tree-kill and the keysafe/powershell descendant chain survives,
+    // holding the inherited stderr pipe open and keeping this test process alive
+    // forever. Kill the whole tree instead.
+    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' })
+  } else {
+    child.kill()
+  }
   await Promise.race([
     once(child, 'exit'),
     new Promise(resolve => setTimeout(resolve, 2000)),
