@@ -48,8 +48,9 @@ import type { InlineMouseState, InlinePress } from '../src/ink/ink.tsx'
 
 let decideInlineMouse: typeof import('../src/ink/ink.tsx').decideInlineMouse | undefined
 let inlineMouseRelayFromReply: typeof import('../src/ink/ink.tsx').inlineMouseRelayFromReply | undefined
+let resolveInlineProbeArm: typeof import('../src/ink/ink.tsx').resolveInlineProbeArm | undefined
 try {
-  ;({ decideInlineMouse, inlineMouseRelayFromReply } = await import('../src/ink/ink.tsx'))
+  ;({ decideInlineMouse, inlineMouseRelayFromReply, resolveInlineProbeArm } = await import('../src/ink/ink.tsx'))
 } catch {}
 
 const LEFT = 0
@@ -152,6 +153,53 @@ test('the probe reply form is the local-vs-relay signal', () => {
   expect(inlineMouseRelayFromReply!(true, plainReply as { decPrivate: boolean })).toBe(false)
   // Non-Windows sends only the private form: no local-vs-relay information.
   expect(inlineMouseRelayFromReply!(false, privateReply as { decPrivate: boolean })).toBe(false)
+})
+
+// ---------------------------------------------------------------------------
+// (1b) The ARMING rule, the seam this lane owns. The cursor-position reply is
+// matched to the parked composer column with `col === cursor.x + 1`. That lock
+// is right for a native terminal, where the reply IS the terminal's own cursor.
+// It is wrong for a relay client: the answer comes back from xterm.js whose
+// terminal cursor is parked on the COMPOSER column (the composer is declared as
+// a column inside the box via useDeclaredCursor), so the reply column is a
+// stable composer column, not cursor.x + 1. The strict lock rejects it, the
+// lane never arms, and it re-probes every frame — the click/select either/or.
+//
+// The reply FORM already tells us which topology we are in, so a relay is
+// armed on the ROW alone (the inline block is a full-width anchored region, so
+// its origin needs no column lock). A native terminal keeps the strict lock
+// byte-for-byte, so this must not perturb native arming.
+// ---------------------------------------------------------------------------
+test('resolveInlineProbeArm: a relay arms on the row alone; a native keeps the strict column lock', () => {
+  expect(typeof resolveInlineProbeArm).toBe('function')
+  const rows = 34
+  const cursor = { x: 0, y: 33 } // composer parked on the bottom row, col 0
+
+  // Relay: DEC-private reply, column is xterm's terminal (composer) column and
+  // NOT cursor.x + 1 — the exact shape measured live (row=34 col=141 vs
+  // expected col=1). It arms, and the origin comes from the row.
+  const relayReply = parseResponse('\x1b[?34;141R')
+  expect(relayReply).toEqual({ type: 'cursorPosition', row: 34, col: 141, decPrivate: true })
+  expect(resolveInlineProbeArm!(true, relayReply as never, cursor, rows)).toEqual({
+    arm: true,
+    relay: true,
+    origin: 34 - 1 - 33,
+  })
+
+  // Native: the plain-form reply still has to land on the parked cursor. A
+  // mismatched column is rejected exactly as before.
+  const nativeOnCursor = parsePlainResponse('\x1b[34;1R')
+  expect(resolveInlineProbeArm!(true, nativeOnCursor as never, cursor, rows)).toEqual({
+    arm: true,
+    relay: false,
+    origin: 0,
+  })
+  const nativeOffCursor = parsePlainResponse('\x1b[34;141R')
+  expect(resolveInlineProbeArm!(true, nativeOffCursor as never, cursor, rows)).toEqual({ arm: false })
+
+  // A row outside the viewport is always rejected, relay or native.
+  expect(resolveInlineProbeArm!(true, parseResponse('\x1b[?99;1R') as never, cursor, rows)).toEqual({ arm: false })
+  expect(resolveInlineProbeArm!(true, undefined, cursor, rows)).toEqual({ arm: false })
 })
 
 // ---------------------------------------------------------------------------
