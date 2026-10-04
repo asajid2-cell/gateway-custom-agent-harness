@@ -4,6 +4,7 @@ import { join } from 'path'
 import { GatewaySessionTransport, listGatewayPeers } from './gatewaySessionTransport.js'
 import { GatewaySessionDelivery } from './gatewaySessionDelivery.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
+import { logForDebugging } from './debug.js'
 import { enqueue, removeByFilter } from './messageQueueManager.js'
 import { isInteractiveLeaf } from './leafTerminal.js'
 import { startSessionReaper } from './sessionReaper.js'
@@ -96,8 +97,18 @@ export class GatewaySessionRuntime {
       try {
         await (await import('./gatewaySessionOwnership.js')).claimGatewaySessionWriter(this.transport.peer.sessionId)
         if (this.closing) return
-        const counts = await loadSessionCompactionCounts(this.transport.peer.sessionId, getTranscriptPathForSession(this.transport.peer.sessionId))
-        this.transport.setCompactionCounts(counts)
+        // Compaction counts are decoration on the peer record, not a
+        // registration precondition: a fault reading the checkpoint (an IO
+        // error on the transcript, a corrupt checkpoint the reader surfaces
+        // rather than swallows) must not take the session off the bus. Degrade
+        // to "no counts" and let the rest of start() stay strict - the claim,
+        // the publish and the reconcile below are what registration is.
+        try {
+          const counts = await loadSessionCompactionCounts(this.transport.peer.sessionId, getTranscriptPathForSession(this.transport.peer.sessionId))
+          this.transport.setCompactionCounts(counts)
+        } catch (error) {
+          logForDebugging(`[gateway] compaction counts unavailable for ${this.transport.peer.sessionId} · ${error instanceof Error ? error.message : String(error)}`, { level: 'warn' })
+        }
         if (this.closing) return
         await this.transport.start()
         if (this.closing) return
