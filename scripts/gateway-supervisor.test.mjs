@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import http from 'node:http'
@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { GATEWAY_RELOAD_EXIT_CODE } from './gateway-keysafe.mjs'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const supervisor = path.join(root, 'gateway-supervisor.mjs')
@@ -85,6 +86,9 @@ test('gateway supervisor restarts a crashed local gateway and keeps the same por
     env: {
       ...process.env,
       TEST_GATEWAY_STARTS: counter,
+      // Point the vault at the fixture root so the supervisor spawns the fake
+      // gateway directly instead of wrapping it in a real keysafe chain.
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
@@ -225,6 +229,7 @@ test('consumer recovers across a supervised child restart with the follow-up too
       TEST_GATEWAY_STARTS: starts,
       TEST_GATEWAY_EVENTS: events,
       TEST_GATEWAY_REQUESTS: requests,
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '250',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '250',
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
@@ -348,6 +353,7 @@ test('gateway supervisor does not abandon a session after repeated child crashes
     env: {
       ...process.env,
       TEST_GATEWAY_STARTS: counter,
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '5',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '5',
       MODEL_GATEWAY_SUPERVISOR_WINDOW_MS: '1000',
@@ -374,6 +380,157 @@ test('gateway supervisor does not abandon a session after repeated child crashes
     assert.equal(child.exitCode, null, stderr)
     assert.ok(starts.length >= 5, `expected repeated restarts, got ${starts.length}`)
     assert.doesNotMatch(stderr, /restart-limit-exhausted/)
+  } finally {
+    await stopTree(child)
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('gateway supervisor treats the reload exit code as a deliberate restart, not a failure', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'gateway-supervisor-reload-'))
+  const childScript = path.join(temp, 'reload-gateway.mjs')
+  const counter = path.join(temp, 'starts.txt')
+  const port = await findPort()
+  // First start exits with the reload code immediately; the supervisor must
+  // respawn at once and the second start serves normally.
+  await writeFile(childScript, `
+    import { appendFile, readFile } from 'node:fs/promises'
+    import http from 'node:http'
+    await appendFile(process.env.TEST_GATEWAY_STARTS, 'start\\n')
+    const starts = (await readFile(process.env.TEST_GATEWAY_STARTS, 'utf8')).split('\\n').filter(Boolean).length
+    if (starts === 1) process.exit(${GATEWAY_RELOAD_EXIT_CODE})
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ status: 'ok' }))
+    })
+    server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1')
+  `)
+
+  const child = spawn(process.execPath, [
+    supervisor,
+    '--gateway',
+    childScript,
+    '--port',
+    String(port),
+  ], {
+    cwd: root,
+    env: {
+      ...process.env,
+      TEST_GATEWAY_STARTS: counter,
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
+      MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
+      MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '1',
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  })
+  let stderr = ''
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', chunk => { stderr += chunk })
+
+  try {
+    const deadline = Date.now() + 10000
+    let response = null
+    while (Date.now() < deadline) {
+      try {
+        response = await fetch(`http://127.0.0.1:${port}/health`)
+        if (response.ok) break
+      } catch {}
+      await wait(10)
+    }
+    assert.equal(response?.status, 200, stderr)
+    assert.deepEqual(
+      (await readFile(counter, 'utf8')).trim().split(/\r?\n/).filter(Boolean),
+      ['start', 'start'],
+    )
+    assert.match(stderr, /reload-keys requested; restarting with a fresh keysafe chain/)
+    // A reload must not be logged or counted as a crash restart.
+    assert.doesNotMatch(stderr, /child-exit code=75/)
+    assert.doesNotMatch(stderr, /restart-limit-exhausted/)
+  } finally {
+    await stopTree(child)
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('a key added to the vault becomes live after a reload without restarting cc', { skip: process.platform !== 'win32' }, async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'gateway-supervisor-live-keys-'))
+  const vault = path.join(temp, '.keysafe')
+  const keysafeDir = path.join(temp, '.claude', 'skills', 'keysafe', 'scripts')
+  await mkdir(vault, { recursive: true })
+  await mkdir(keysafeDir, { recursive: true })
+  // A stand-in keysafe that injects a predictable env var instead of decrypting
+  // a real vault, so this proves the chain + reload mechanics with no secrets.
+  await writeFile(path.join(keysafeDir, 'keysafe.ps1'), `
+param(
+  [Parameter(Position=0)][string]$Cmd,
+  [Parameter(Position=1)][string]$Name,
+  [string]$EnvVar = "",
+  [string]$Command = "",
+  [switch]$FromStdin
+)
+if ($Cmd -eq 'run') {
+  Set-Item -Path ('Env:' + $EnvVar) -Value ('fake-' + $Name)
+  & ([ScriptBlock]::Create($Command))
+  exit $LASTEXITCODE
+}
+exit 1
+`)
+  await writeFile(path.join(vault, 'opencode-go.cred'), 'fixture\n')
+  await writeFile(path.join(vault, 'ds.cred'), 'fixture\n')
+  const port = await findPort()
+
+  const child = spawn(process.execPath, [supervisor, '--port', String(port)], {
+    cwd: root,
+    env: {
+      ...process.env,
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
+      MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  })
+  let stderr = ''
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', chunk => { stderr += chunk })
+
+  const readAccounts = async () => {
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/gateway/opencode-account?sessionId=test`, { signal: AbortSignal.timeout(1000) })
+        if (response.ok) return (await response.json()).available
+      } catch {}
+      await wait(100)
+    }
+    throw new Error(`gateway never became ready: ${stderr}`)
+  }
+
+  try {
+    assert.deepEqual(await readAccounts(), [1])
+
+    // Add a second key while the gateway is already running, then reload.
+    await writeFile(path.join(vault, 'opencode-go2.cred'), 'fixture\n')
+    const reload = await fetch(`http://127.0.0.1:${port}/gateway/reload-keys`, { method: 'POST', signal: AbortSignal.timeout(5000) })
+    assert.equal(reload.status, 200)
+    assert.deepEqual((await reload.json()).available, [1])
+
+    const deadline = Date.now() + 20_000
+    let available = null
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/gateway/opencode-account?sessionId=test`, { signal: AbortSignal.timeout(1000) })
+        if (response.ok) {
+          available = (await response.json()).available
+          if (available.includes(2)) break
+        }
+      } catch {}
+      await wait(100)
+    }
+    assert.deepEqual(available, [1, 2])
+    assert.match(stderr, /reload-keys requested; restarting with a fresh keysafe chain/)
   } finally {
     await stopTree(child)
     await rm(temp, { recursive: true, force: true })

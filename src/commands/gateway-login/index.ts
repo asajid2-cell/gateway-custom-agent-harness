@@ -5,7 +5,7 @@ const command = (name: string, description: string, keyName: string) =>
     type: 'local-jsx',
     name,
     description,
-    argumentHint: keyName === 'opencode-go' ? '[switch <number> [session|global]|status|remove]' : '[status|remove]',
+    argumentHint: keyName === 'opencode-go' ? '[new|switch <number> [session|global]|status|remove]' : '[status|remove]',
     load: async () => {
       const module = await import('./login.js')
       return {
@@ -20,6 +20,19 @@ export const openCodeLogin = command(
   'Add, replace, inspect, or remove the OpenCode Go API key',
   'opencode-go',
 )
+
+// Re-read the Keysafe vault into the running gateway without restarting cc.
+export const refreshLogin: Command = {
+  type: 'local-jsx',
+  name: 'refreshlogin',
+  description: 'Reload gateway API keys from Keysafe without restarting cc',
+  load: async () => {
+    const module = await import('./login.js')
+    return {
+      call: (onDone, context, args) => module.refreshLogin(onDone, context, args),
+    }
+  },
+}
 
 export const deepSeekLogin = command(
   'deepseeklogin',

@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { access } from 'node:fs/promises'
+import { access, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
@@ -23,7 +23,62 @@ function keyLabel(keyName: string): string {
   if (keyName === 'ds') return 'DeepSeek'
   if (keyName === 'openrouter') return 'OpenRouter'
   if (keyName === 'commandcode') return 'Command Code'
-  return 'OpenCode Go'
+  const suffix = keyName.slice('opencode-go'.length)
+  return suffix ? `OpenCode Go ${suffix}` : 'OpenCode Go'
+}
+
+// The next free OpenCode vault slot: `opencode-go` is slot 1, then
+// `opencode-go2`, `opencode-go3`, ... in the first gap. This is the number the
+// gateway will report for the key, so it is chosen before the key is stored.
+async function nextOpenCodeSlot(): Promise<string> {
+  const used = new Set<number>()
+  try {
+    for (const entry of await readdir(join(homedir(), '.keysafe'))) {
+      const match = /^opencode-go([2-9]|[1-9][0-9]+)?\.cred$/.exec(entry)
+      if (match) used.add(Number(match[1] || 1))
+    }
+  } catch {}
+  let number = 1
+  while (used.has(number)) number += 1
+  return number === 1 ? 'opencode-go' : `opencode-go${number}`
+}
+
+async function reloadGatewayKeys(): Promise<{ ok: boolean; available?: number[]; error?: string }> {
+  const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
+  if (!base) return { ok: false, error: 'Reloading keys requires gateway mode.' }
+  try {
+    const response = await fetch(new URL('/gateway/reload-keys', base), {
+      method: 'POST',
+      signal: AbortSignal.timeout(10_000),
+    })
+    const body = await response.json().catch(() => ({}))
+    return response.ok
+      ? { ok: true, available: body.available }
+      : { ok: false, error: body.error ?? 'The gateway refused the key reload.' }
+  } catch {
+    return { ok: false, error: 'Could not reach the gateway to reload keys.' }
+  }
+}
+
+// The reloaded gateway exits to pick up the new chain, so the account list is
+// read back after it has come up again rather than from the reload response.
+async function waitForOpenCodeAccounts(timeoutMs = 8_000): Promise<number[] | null> {
+  const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
+  if (!base) return null
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const url = new URL('/gateway/opencode-account', base)
+      url.searchParams.set('sessionId', getSessionId())
+      const response = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+      if (response.ok) {
+        const body = await response.json()
+        if (Array.isArray(body.available)) return body.available
+      }
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  return null
 }
 
 function keyCommand(keyName: string): string {
@@ -94,8 +149,12 @@ export const call: LocalJSXCommandCall = async (
       } catch { onDone('Could not reach the gateway account selector. Restart cc with the updated gateway.') }
       return null
     }
+    if (action === 'new') {
+      const slot = await nextOpenCodeSlot()
+      return <GatewayLoginDialog keyName={slot} reload onDone={onDone} />
+    }
     if (action !== 'remove') {
-      onDone('Use /opencodelogin switch 2 [session|global], /opencodelogin status, or /opencodelogin remove.')
+      onDone('Use /opencodelogin new, /opencodelogin switch 2 [session|global], /opencodelogin status, or /opencodelogin remove.')
       return null
     }
   }
@@ -104,7 +163,7 @@ export const call: LocalJSXCommandCall = async (
     const stored = await access(keyPath(keyName)).then(() => true).catch(() => false)
     onDone(
       stored
-        ? `${keyLabel(keyName)} key is stored in Keysafe. Restart the gateway terminal after changing it.`
+        ? `${keyLabel(keyName)} key is stored in Keysafe. Run /refreshlogin after changing it.`
         : `${keyLabel(keyName)} key is not configured. Run /${keyCommand(keyName)} to add it.`,
     )
     return null
@@ -126,6 +185,7 @@ export const call: LocalJSXCommandCall = async (
 function GatewayLoginDialog(props: {
   keyName: string
   onDone: (result?: string) => void
+  reload?: boolean
 }): React.ReactNode {
   const [value, setValue] = useState('')
   const [cursorOffset, setCursorOffset] = useState(0)
@@ -143,15 +203,25 @@ function GatewayLoginDialog(props: {
     setBusy(true)
     setError(null)
     const result = await runKeysafe(props.keyName, 'capture', value.trim())
-    setBusy(false)
     if (!result.ok) {
+      setBusy(false)
       setError(result.output || 'Keysafe could not store the key.')
       return
     }
     setValue('')
-    props.onDone(
-      `${label} key saved in Keysafe. Start a new terminal, or restart the current gateway terminal, to inject it.`,
-    )
+    if (props.reload) {
+      const reload = await reloadGatewayKeys()
+      const accounts = reload.ok ? await waitForOpenCodeAccounts() : null
+      setBusy(false)
+      props.onDone(
+        reload.ok
+          ? `${label} key saved in Keysafe. Gateway reloaded; OpenCode accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
+          : `${label} key saved in Keysafe, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.`,
+      )
+      return
+    }
+    setBusy(false)
+    props.onDone(`${label} key saved in Keysafe. Run /refreshlogin to load it without restarting cc.`)
   }
 
   return (
@@ -178,9 +248,29 @@ function GatewayLoginDialog(props: {
             onChangeCursorOffset={setCursorOffset}
           />
         </Box>
-        {busy && <Text dimColor>Saving key...</Text>}
+        {busy && <Text dimColor>{props.reload ? 'Saving key and reloading the gateway...' : 'Saving key...'}</Text>}
         {error && <Text color="error">{error}</Text>}
       </Box>
     </Dialog>
   )
+}
+
+// Re-read the vault into the running gateway without restarting cc. The gateway
+// answers, exits, and the supervisor respawns it under a fresh keysafe chain.
+export const refreshLogin: LocalJSXCommandCall = async (
+  onDone,
+  _context: LocalJSXCommandContext,
+) => {
+  const reload = await reloadGatewayKeys()
+  if (!reload.ok) {
+    onDone(reload.error ?? 'Could not reload the gateway keys.')
+    return null
+  }
+  const accounts = await waitForOpenCodeAccounts()
+  onDone(
+    accounts
+      ? `Gateway reloaded from Keysafe. OpenCode accounts: ${accounts.join(', ') || 'none'}.`
+      : 'Gateway reloaded from Keysafe, but the account list did not come back. Check the gateway terminal.',
+  )
+  return null
 }

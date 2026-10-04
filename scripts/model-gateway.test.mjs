@@ -93,6 +93,31 @@ test('OpenCode retries cycle numbered credentials and wrap to the original', asy
   }
 })
 
+test('OpenCode credential pool follows keys added to the environment after it is built', () => {
+  const env = { OPENCODE_API_KEY: 'one', OPENCODE_API_KEY2: 'two' }
+  const credentials = openCodeCredentialPool(env)
+  assert.deepEqual(credentials.numbers, [1, 2])
+  assert.equal(credentials.key, 'one')
+  credentials.advance()
+  assert.equal(credentials.key, 'two')
+
+  // A key that appears after the pool exists is picked up on the next access,
+  // and the current selection keeps following its own number.
+  env.OPENCODE_API_KEY4 = 'four'
+  assert.deepEqual(credentials.numbers, [1, 2, 4])
+  assert.equal(credentials.number, 2)
+  credentials.advance()
+  assert.equal(credentials.number, 4)
+  credentials.advance()
+  assert.equal(credentials.number, 1)
+  assert.equal(credentials.redact('one two four'), '[REDACTED] [REDACTED] [REDACTED]')
+
+  // A key that disappears is dropped, and the selection falls back cleanly.
+  delete env.OPENCODE_API_KEY2
+  assert.deepEqual(credentials.numbers, [1, 4])
+  assert.equal(credentials.number, 1)
+})
+
 test('OpenCode usage follows credential rotation and caches each workspace separately', async () => {
   const original = randomUUID()
   const second = randomUUID()

@@ -1,0 +1,144 @@
+/**
+ * Live keysafe chain for the model gateway.
+ *
+ * The gateway only ever reads `process.env` (see model-gateway-spec.md): nobody
+ * prints a key, and no key is ever an argument or a file. Keys reach the
+ * gateway's environment through a short-lived keysafe child, one vault record
+ * per layer, nested inside-out - the same shape scripts/cc.ps1 builds once at
+ * launch.
+ *
+ * Building the chain only at launch is what made the credential set a snapshot:
+ * a key added to ~/.keysafe afterwards stayed invisible until the next `cc`.
+ * The supervisor now rebuilds the chain from the vault on every spawn, so a
+ * reload (POST /gateway/reload-keys -> exit GATEWAY_RELOAD_EXIT_CODE) picks up
+ * whatever is in ~/.keysafe at that moment. cc.ps1 is left alone: the supervisor
+ * strips the gateway key variables it inherited and re-injects them from the
+ * vault, so the vault stays the single source of truth and a key deleted from it
+ * cannot survive as a stale inherited value.
+ *
+ * This module is pure and side-effect free so the supervisor, the gateway, and
+ * the tests can all import it.
+ */
+import { existsSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+// A deliberate reload is not a crash. The gateway answers the reload request and
+// then exits with this code; the supervisor treats it as an immediate restart
+// and does not count it against the restart limit. 75 is EX_TEMPFAIL.
+export const GATEWAY_RELOAD_EXIT_CODE = 75
+
+export function keysafeHome() {
+  return process.env.MODEL_GATEWAY_KEYSAFE_HOME || homedir()
+}
+
+export function keysafeScriptPath(home = keysafeHome()) {
+  return process.env.MODEL_GATEWAY_KEYSAFE_SCRIPT || join(home, '.claude', 'skills', 'keysafe', 'scripts', 'keysafe.ps1')
+}
+
+export function keysafeVaultDir(home = keysafeHome()) {
+  return join(home, '.keysafe')
+}
+
+// Non-OpenCode providers always sit in the chain when their vault record exists.
+export const GATEWAY_KEY_ENV_VARS = ['DEEPSEEK_API_KEY', 'AMD_API_KEY', 'COMMANDCODE_API_KEY']
+
+export function isGatewayKeyEnvVar(name) {
+  return GATEWAY_KEY_ENV_VARS.includes(name) || /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
+}
+
+function openCodeNumber(name) {
+  return Number(name.slice('opencode-go'.length) || 1)
+}
+
+/**
+ * The provider layers for this machine's vault, innermost first, in the same
+ * order cc.ps1 uses: numbered OpenCode records, then amd-ds, then commandcode,
+ * then the always-required ds base layer.
+ */
+export function listKeysafeProviders(home = keysafeHome()) {
+  let entries = []
+  try {
+    entries = readdirSync(keysafeVaultDir(home))
+  } catch {
+    return []
+  }
+  const names = new Set(
+    entries.filter(entry => entry.endsWith('.cred')).map(entry => entry.slice(0, -'.cred'.length)),
+  )
+  const providers = []
+  for (const name of [...names]
+    .filter(name => /^opencode-go([2-9]|[1-9][0-9]+)?$/.test(name))
+    .sort((a, b) => openCodeNumber(a) - openCodeNumber(b))) {
+    providers.push({ credential: name, envVar: `OPENCODE_API_KEY${name.slice('opencode-go'.length)}` })
+  }
+  if (names.has('amd-ds')) providers.push({ credential: 'amd-ds', envVar: 'AMD_API_KEY' })
+  if (names.has('commandcode')) providers.push({ credential: 'commandcode', envVar: 'COMMANDCODE_API_KEY' })
+  if (names.has('ds')) providers.push({ credential: 'ds', envVar: 'DEEPSEEK_API_KEY' })
+  return providers
+}
+
+export function stripGatewayKeys(env) {
+  const next = { ...env }
+  for (const name of Object.keys(next)) {
+    if (isGatewayKeyEnvVar(name)) delete next[name]
+  }
+  return next
+}
+
+const psQuote = value => `'${String(value).replace(/'/g, "''")}'`
+
+/**
+ * Resolve how the supervisor should spawn the gateway.
+ *
+ * Returns { file, args, env }. With no vault records (or off Windows, or a
+ * missing keysafe script) it is a plain `node <gateway>` spawn with the
+ * inherited environment untouched, so development and the supervisor tests do
+ * not need a vault. With records it is a powershell.exe invocation of the outer
+ * keysafe layer, whose -Command nests the remaining layers around the gateway;
+ * the environment handed to it has the inherited gateway key variables removed
+ * so the fresh chain is the only source.
+ */
+export function buildGatewayLaunch({
+  gatewayPath,
+  gatewayArgs = [],
+  nodePath = process.execPath,
+  home = keysafeHome(),
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  if (!gatewayPath) throw new Error('buildGatewayLaunch requires gatewayPath')
+  const providers = listKeysafeProviders(home)
+  const keysafe = keysafeScriptPath(home)
+  if (platform !== 'win32' || providers.length === 0 || !existsSync(keysafe)) {
+    return { file: nodePath, args: [gatewayPath, ...gatewayArgs], env }
+  }
+
+  // Build the chain from the inside out. The outer provider becomes the
+  // powershell.exe invocation; every earlier layer wraps the command accumulated
+  // so far, so the gateway inherits one more environment variable per layer.
+  // `&` is required: a single-quoted path is a string expression, not a command,
+  // so a bare quoted executable would be a parse error in the child PowerShell.
+  let command = `& ${[nodePath, gatewayPath, ...gatewayArgs].map(psQuote).join(' ')}`
+  for (const provider of providers.slice(0, -1)) {
+    command = `& ${psQuote(keysafe)} run ${provider.credential} -EnvVar ${provider.envVar} -Command ${psQuote(command)}; exit $LASTEXITCODE`
+  }
+  const outer = providers[providers.length - 1]
+  return {
+    file: 'powershell.exe',
+    args: [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+      keysafe,
+      'run',
+      outer.credential,
+      '-EnvVar',
+      outer.envVar,
+      '-Command',
+      command,
+    ],
+    env: stripGatewayKeys(env),
+  }
+}

@@ -26,6 +26,7 @@ import {
   openCodeZenHeaders,
   isOpenCodeZenProtocol,
 } from './opencode-zen.mjs'
+import { GATEWAY_RELOAD_EXIT_CODE } from './gateway-keysafe.mjs'
 import {
   COMMANDCODE_MODEL_IDS,
   COMMANDCODE_ROUTES,
@@ -2238,23 +2239,37 @@ async function waitForRetry(delayMs, signal) {
 }
 
 export function openCodeCredentialPool(env = process.env) {
-  const names = Object.keys(env)
+  // Resolve the key set on every access rather than freezing it at construction.
+  // The gateway still only reads env; this lets the live set follow a change in
+  // that env (the supervisor re-injects the vault on reload) and keeps the pool
+  // honest in tests that add a key after the pool exists.
+  const namesFor = () => Object.keys(env)
     .filter(name => /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) && env[name])
     .sort((a, b) => Number(a.slice('OPENCODE_API_KEY'.length) || 1) - Number(b.slice('OPENCODE_API_KEY'.length) || 1))
-  let index = 0
+  const numberOf = name => Number(name.slice('OPENCODE_API_KEY'.length) || 1)
+  // Selection follows the current key's number, so a key added or removed
+  // between accesses does not silently slide the selection to a different key.
+  let preferred = 1
+  const indexFor = names => {
+    const at = names.findIndex(name => numberOf(name) === preferred)
+    return at < 0 ? 0 : at
+  }
   return {
-    get key() { return env[names[index]] },
-    get size() { return names.length },
-    get number() { return Number(names[index]?.slice('OPENCODE_API_KEY'.length) || 1) },
-    get numbers() { return names.map(name => Number(name.slice('OPENCODE_API_KEY'.length) || 1)) },
+    get key() { const names = namesFor(); return env[names[indexFor(names)]] },
+    get size() { return namesFor().length },
+    get number() { const names = namesFor(); return numberOf(names[indexFor(names)] ?? '') || 1 },
+    get numbers() { return namesFor().map(numberOf) },
     select(number) {
-      const next = names.findIndex(name => Number(name.slice('OPENCODE_API_KEY'.length) || 1) === number)
-      if (next < 0) return false
-      index = next
+      if (!namesFor().some(name => numberOf(name) === number)) return false
+      preferred = number
       return true
     },
-    advance() { index = (index + 1) % Math.max(1, names.length) },
-    redact(message) { return names.reduce((text, name) => redactSecret(text, env[name]), message) },
+    advance() {
+      const names = namesFor()
+      if (names.length === 0) return
+      preferred = numberOf(names[(indexFor(names) + 1) % names.length])
+    },
+    redact(message) { return namesFor().reduce((text, name) => redactSecret(text, env[name]), message) },
   }
 }
 
@@ -4226,7 +4241,7 @@ const server = http.createServer(async (req, res) => {
     }
     const pool = await sessionOpenCodeCredentials(sessionId)
     if (!pool.numbers.includes(number)) {
-      json(res, 400, { error: `Account ${number} is not loaded. Available: ${pool.numbers.join(', ')}. Restart cc after adding a key.` })
+      json(res, 400, { error: `Account ${number} is not loaded. Available: ${pool.numbers.join(', ')}. Run /refreshlogin after adding a key.` })
       return
     }
     if (scope === 'global') {
@@ -4257,6 +4272,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/opencode-account') {
     const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
     json(res, 200, { number: pool.number, global: openCodeGlobalNumber, available: pool.numbers })
+    return
+  }
+
+  // Reload the credential set from Keysafe. The gateway cannot re-read the vault
+  // itself (it only ever reads env), so it answers the caller, flushes, and exits
+  // with a code the supervisor recognizes as a deliberate restart; the supervisor
+  // respawns it under a freshly built keysafe chain. Answered before the exit so
+  // /refreshlogin gets the account list it is about to load.
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/reload-keys') {
+    const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    process.stderr.write('model-gateway route path=/gateway/reload-keys backend=reload-keys\n')
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ reloading: true, available: pool.numbers }), () => {
+      setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
+    })
     return
   }
 

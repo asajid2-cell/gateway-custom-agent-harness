@@ -1,6 +1,7 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { GATEWAY_RELOAD_EXIT_CODE, buildGatewayLaunch } from './gateway-keysafe.mjs'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const args = process.argv.slice(2)
@@ -47,6 +48,16 @@ function log(message) {
 
 function stopChild() {
   if (!child || child.exitCode !== null) return
+  if (process.platform === 'win32' && child.pid) {
+    // The child is now a keysafe powershell layer wrapping the gateway, so a
+    // single-PID kill would orphan the node grandchild and leave the port held.
+    // Kill only this process tree, never by image name.
+    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+    return
+  }
   child.kill()
 }
 
@@ -64,9 +75,13 @@ process.once('SIGTERM', () => shutdown('SIGTERM'))
 
 function startChild() {
   childStartedAt = Date.now()
-  child = spawn(process.execPath, [gatewayPath, ...args], {
+  // Rebuild the keysafe chain from the vault on every spawn, so a key added or
+  // removed since the last start is picked up by the next one. See
+  // gateway-keysafe.mjs for why the gateway still only ever reads env.
+  const launch = buildGatewayLaunch({ gatewayPath, gatewayArgs: args })
+  child = spawn(launch.file, launch.args, {
     cwd: process.cwd(),
-    env: process.env,
+    env: launch.env,
     stdio: 'inherit',
     // stdio is inherited, but a console is not: without this a console-less
     // supervisor parent makes Windows give the child a brand-new visible one.
@@ -81,6 +96,19 @@ function startChild() {
   child.once('exit', (code, signal) => {
     if (stopping) {
       process.exit(0)
+      return
+    }
+
+    // A requested key reload is a deliberate restart, not a failure: respawn at
+    // once with a fresh chain and do not let it count against the restart limit.
+    if (code === GATEWAY_RELOAD_EXIT_CODE) {
+      log('reload-keys requested; restarting with a fresh keysafe chain')
+      restartTimes = []
+      restartNumber = 0
+      restartTimer = setTimeout(() => {
+        restartTimer = null
+        if (!stopping) startChild()
+      }, 0)
       return
     }
 
