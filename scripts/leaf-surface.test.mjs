@@ -907,7 +907,12 @@ test('a leaf may start over its own transcript when nothing conversational is in
   assert.match(predicate, /entry\.type === 'user' \|\| entry\.type === 'assistant'/)
   const launch = workspace.slice(workspace.indexOf('async function launchOnce'), workspace.indexOf('async function reportReplies'))
   assert.match(launch, /hasTranscript = await transcriptHasTurn\(member\.transcriptPath\)/)
-  assert.match(launch, /hasTranscript \? \['--resume', member\.sessionId\] : \['--session-id', member\.sessionId\]/)
+  // The start-or-resume decision is made once, in the one place that builds the
+  // member's argv; `launchOnce` hands it the answer rather than repeating the
+  // ternary, so the assertion follows the decision to `leafLaunchArgs`.
+  const args = workspace.slice(workspace.indexOf('export function leafLaunchArgs'), workspace.indexOf('async function launchOnce'))
+  assert.match(args, /hasTranscript \? \['--resume', member\.sessionId\] : \['--session-id', member\.sessionId\]/)
+  assert.match(launch, /leafLaunchArgs\(member, hasTranscript\)/)
   assert.doesNotMatch(launch, /readFile\(member\.transcriptPath/)
 })
 
