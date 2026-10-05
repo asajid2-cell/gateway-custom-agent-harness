@@ -1014,17 +1014,14 @@ try {
   )
   $ClaudeArgs += @('--settings', $ScopedSettingsPath)
 
-  # Start the Gateway through a short-lived keysafe child. Optional providers are
-  # included only when their vault record is present, and no value ever becomes an
-  # argument or file.
+  # Start the Gateway through ONE short-lived keysafe child. Optional providers
+  # are included only when their vault record is present, and no value ever
+  # becomes an argument or file.
   $GatewayCommand = 'node "' + $GatewaySupervisor + '" --port ' + [string]$Port
-  # Build the keysafe chain from the inside out. Each optional provider wraps the
-  # command accumulated so far, so the Gateway inherits one more environment
-  # variable per layer and every key stays out of arguments, files, and logs.
-  # Keysafe injects a single record per child, which is why this nests rather
-  # than passing multiple secrets to one invocation. Do not convert this into a
-  # nested powershell.exe -EncodedCommand chain: Defender blocks that shape.
-  $KeysafeCommand = $GatewayCommand
+  # keysafe's run-many decrypts several vault records and injects them all into
+  # the single Gateway process, so the launcher opens one PowerShell wrapper
+  # instead of one per key. Every key still stays out of arguments, files, and
+  # logs, and each value is redacted from the child's output.
   $OpenCodeProviders = @(Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.keysafe') -Filter 'opencode-go*.cred' -ErrorAction SilentlyContinue |
     Where-Object { $_.BaseName -match '^opencode-go([2-9]|[1-9][0-9]+)?$' } |
     Sort-Object { if ($_.BaseName -eq 'opencode-go') { 1 } else { [int]$_.BaseName.Substring('opencode-go'.Length) } } |
@@ -1036,36 +1033,31 @@ try {
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
     @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )
+  # DeepSeek is the base layer and is always required.
+  $InjectSpecs = @('ds=DEEPSEEK_API_KEY')
   foreach ($Provider in $OptionalKeyProviders) {
     if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ('.keysafe\' + $Provider.Credential + '.cred')) -PathType Leaf)) {
       continue
     }
-    $KeysafeCommand = '& ' +
-      ("'" + $Keysafe.Replace("'", "''") + "'") +
-      ' run ' + $Provider.Credential +
-      ' -EnvVar ' + $Provider.EnvVar +
-      ' -Command ' +
-      ("'" + ([string]$KeysafeCommand).Replace("'", "''") + "'") +
-      '; exit $LASTEXITCODE'
+    $InjectSpecs += ($Provider.Credential + '=' + $Provider.EnvVar)
   }
-  # DeepSeek is the base layer and is always required.
   $GatewayArgumentList = @(
     '-NoProfile'
     '-ExecutionPolicy'
     'Bypass'
     '-File'
     $Keysafe
-    'run'
-    'ds'
-    '-EnvVar'
-    'DEEPSEEK_API_KEY'
+    'run-many'
+    '-Inject'
+    '"' + ($InjectSpecs -join ';') + '"'
     '-Command'
-    $KeysafeCommand
+    $GatewayCommand
   )
 
   # Start-Process serializes ArgumentList items into a native command line.
-  # Quote the one outer -Command value so spaces and nested switches remain
-  # inside keysafe's Command parameter; the key itself is never an argument.
+  # The -Inject value is pre-quoted above (it contains ';'); quote the -Command
+  # value here (it contains spaces and nested quotes) so both stay single
+  # tokens. No key is ever an argument.
   $GatewayArgumentList = @($GatewayArgumentList)
   $GatewayArgumentList[-1] = '"' +
     ([string]$GatewayArgumentList[-1]).Replace('"', '\"') +

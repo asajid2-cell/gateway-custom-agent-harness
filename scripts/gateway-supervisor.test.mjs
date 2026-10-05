@@ -468,18 +468,21 @@ test('a key added to the vault becomes live after a reload without restarting cc
   const keysafeDir = path.join(temp, '.claude', 'skills', 'keysafe', 'scripts')
   await mkdir(vault, { recursive: true })
   await mkdir(keysafeDir, { recursive: true })
-  // A stand-in keysafe that injects a predictable env var instead of decrypting
-  // a real vault, so this proves the chain + reload mechanics with no secrets.
+  // A stand-in keysafe that injects predictable env vars instead of decrypting
+  // a real vault, so this proves the injection + reload mechanics with no secrets.
   await writeFile(path.join(keysafeDir, 'keysafe.ps1'), `
 param(
   [Parameter(Position=0)][string]$Cmd,
-  [Parameter(Position=1)][string]$Name,
-  [string]$EnvVar = "",
+  [string]$Inject = "",
   [string]$Command = "",
   [switch]$FromStdin
 )
-if ($Cmd -eq 'run') {
-  Set-Item -Path ('Env:' + $EnvVar) -Value ('fake-' + $Name)
+if ($Cmd -eq 'run-many') {
+  foreach ($spec in ($Inject -split ';')) {
+    if (-not $spec) { continue }
+    $parts = $spec -split '=', 2
+    Set-Item -Path ('Env:' + $parts[1]) -Value ('fake-' + $parts[0])
+  }
   & ([ScriptBlock]::Create($Command))
   exit $LASTEXITCODE
 }

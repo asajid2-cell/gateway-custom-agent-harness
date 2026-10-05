@@ -3,9 +3,9 @@
  *
  * The gateway only ever reads `process.env` (see model-gateway-spec.md): nobody
  * prints a key, and no key is ever an argument or a file. Keys reach the
- * gateway's environment through a short-lived keysafe child, one vault record
- * per layer, nested inside-out - the same shape scripts/cc.ps1 builds once at
- * launch.
+ * gateway's environment through one short-lived keysafe child that injects
+ * every vault record at once (keysafe run-many) - the same shape scripts/cc.ps1
+ * builds once at launch.
  *
  * Building the chain only at launch is what made the credential set a snapshot:
  * a key added to ~/.keysafe afterwards stayed invisible until the next `cc`.
@@ -52,9 +52,10 @@ function openCodeNumber(name) {
 }
 
 /**
- * The provider layers for this machine's vault, innermost first, in the same
- * order cc.ps1 uses: numbered OpenCode records, then amd-ds, then commandcode,
- * then the always-required ds base layer.
+ * The provider records for this machine's vault: numbered OpenCode records,
+ * then amd-ds, then commandcode, then the always-required ds base layer. The
+ * order no longer affects nesting (one invocation injects them all) but keeps
+ * the list stable for callers and tests.
  */
 export function listKeysafeProviders(home = keysafeHome()) {
   let entries = []
@@ -94,10 +95,10 @@ const psQuote = value => `'${String(value).replace(/'/g, "''")}'`
  * Returns { file, args, env }. With no vault records (or off Windows, or a
  * missing keysafe script) it is a plain `node <gateway>` spawn with the
  * inherited environment untouched, so development and the supervisor tests do
- * not need a vault. With records it is a powershell.exe invocation of the outer
- * keysafe layer, whose -Command nests the remaining layers around the gateway;
- * the environment handed to it has the inherited gateway key variables removed
- * so the fresh chain is the only source.
+ * not need a vault. With records it is a powershell.exe invocation of one
+ * keysafe layer (run-many) that injects every record into the gateway; the
+ * environment handed to it has the inherited gateway key variables removed so
+ * the fresh injection is the only source.
  */
 export function buildGatewayLaunch({
   gatewayPath,
@@ -114,16 +115,13 @@ export function buildGatewayLaunch({
     return { file: nodePath, args: [gatewayPath, ...gatewayArgs], env }
   }
 
-  // Build the chain from the inside out. The outer provider becomes the
-  // powershell.exe invocation; every earlier layer wraps the command accumulated
-  // so far, so the gateway inherits one more environment variable per layer.
   // `&` is required: a single-quoted path is a string expression, not a command,
   // so a bare quoted executable would be a parse error in the child PowerShell.
-  let command = `& ${[nodePath, gatewayPath, ...gatewayArgs].map(psQuote).join(' ')}`
-  for (const provider of providers.slice(0, -1)) {
-    command = `& ${psQuote(keysafe)} run ${provider.credential} -EnvVar ${provider.envVar} -Command ${psQuote(command)}; exit $LASTEXITCODE`
-  }
-  const outer = providers[providers.length - 1]
+  const command = `& ${[nodePath, gatewayPath, ...gatewayArgs].map(psQuote).join(' ')}`
+  // One keysafe invocation injects every record into the single gateway process,
+  // so the gateway is reached through one PowerShell wrapper instead of a nested
+  // chain of one wrapper per key.
+  const inject = providers.map(provider => `${provider.credential}=${provider.envVar}`).join(';')
   return {
     file: 'powershell.exe',
     args: [
@@ -132,10 +130,9 @@ export function buildGatewayLaunch({
       'Bypass',
       '-File',
       keysafe,
-      'run',
-      outer.credential,
-      '-EnvVar',
-      outer.envVar,
+      'run-many',
+      '-Inject',
+      inject,
       '-Command',
       command,
     ],

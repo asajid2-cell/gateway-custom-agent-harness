@@ -66,23 +66,24 @@ test('an empty vault spawns the gateway directly with the inherited environment'
   }
 })
 
-test('a populated vault nests the keysafe layers around the gateway and strips inherited keys', async () => {
+test('a populated vault injects every key through one keysafe run-many call and strips inherited keys', async () => {
   const home = await fixtureVault(['opencode-go', 'opencode-go3', 'amd-ds', 'commandcode', 'ds'])
   const env = { ...process.env, OPENCODE_API_KEY: 'stale', DEEPSEEK_API_KEY: 'stale', KEEP_ME: 'yes' }
   try {
     const launch = buildGatewayLaunch({ gatewayPath: 'C:\\gw\\model-gateway.mjs', gatewayArgs: ['--port', '4011'], home, env, platform: 'win32' })
     assert.equal(launch.file, 'powershell.exe')
-    assert.deepEqual(launch.args.slice(0, 5), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', keysafeScriptPath(home)])
-    // The base ds layer is the outer invocation; everything else nests in -Command.
-    assert.deepEqual(launch.args.slice(5, 9), ['run', 'ds', '-EnvVar', 'DEEPSEEK_API_KEY'])
-    assert.equal(launch.args[9], '-Command')
-    const chain = launch.args[10]
-    assert.match(chain, /model-gateway\.mjs/)
-    for (const name of ['opencode-go', 'opencode-go3', 'amd-ds', 'commandcode']) {
-      assert.match(chain, new RegExp(`run ${name} -EnvVar`))
-    }
-    // Each layer exits with the child's code so a reload propagates outward.
-    assert.match(chain, /exit \$LASTEXITCODE/)
+    assert.deepEqual(launch.args.slice(0, 6), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', keysafeScriptPath(home), 'run-many'])
+    assert.equal(launch.args[6], '-Inject')
+    // One cred=ENVVAR spec per vault record, in vault order.
+    assert.equal(
+      launch.args[7],
+      'opencode-go=OPENCODE_API_KEY;opencode-go3=OPENCODE_API_KEY3;amd-ds=AMD_API_KEY;commandcode=COMMANDCODE_API_KEY;ds=DEEPSEEK_API_KEY',
+    )
+    assert.equal(launch.args[8], '-Command')
+    // The command is a single gateway invocation, not a nested keysafe chain.
+    const command = launch.args[9]
+    assert.match(command, /model-gateway\.mjs/)
+    assert.doesNotMatch(command, /keysafe/)
     // The stale inherited values are gone; unrelated variables survive.
     assert.equal('OPENCODE_API_KEY' in launch.env, false)
     assert.equal('DEEPSEEK_API_KEY' in launch.env, false)
