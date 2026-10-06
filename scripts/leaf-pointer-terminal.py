@@ -22,10 +22,25 @@ parser.add_argument('cli', type=Path)
 parser.add_argument('--fullscreen', action='store_true')
 parser.add_argument('--mux-report-filter', action='store_true')
 parser.add_argument('--standard-cpr-only', action='store_true')
+# A client's CPR reply carries the CLIENT terminal's cursor column, which is
+# wherever the browser xterm left it - not the column the app parked its own
+# cursor on. The harness's pyte mirrors the app, so its cursor column already
+# equals the app's; this shifts the reported column to model a client that
+# answers from its own (different) cursor, which is the shape the live mux log
+# showed (`col=11 · expected col=1`).
+parser.add_argument('--cpr-col-shift', type=int, default=0)
+# A client's terminal can be TALLER than the pty the app was handed (muxd's
+# pty vs the browser xterm), so the client reports a cursor ROW beyond the
+# height the app believes it has. That is the shape that made HEAD reject a
+# lone DEC-private reply at the row bound, before it ever looked at the relay
+# flag. Shift the reported row to model it.
+parser.add_argument('--cpr-row-shift', type=int, default=0)
 parser.add_argument('--probe-full-tui', action='store_true')
 parser.add_argument('--probe-lifecycle', action='store_true')
 parser.add_argument('--probe-selection', action='store_true')
+parser.add_argument('--probe-scroll', action='store_true')
 parser.add_argument('--probe-inline-ownership', action='store_true')
+parser.add_argument('--probe-inline-arm', action='store_true')
 parser.add_argument('--probe-parity', action='store_true')
 parser.add_argument('--probe-parentage', action='store_true')
 parser.add_argument('--probe-close-matriarch', action='store_true')
@@ -131,7 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         view = view_tag(messages[-1].get('content', '') if messages else '')
         answered = tool_result_text(messages[-1].get('content', '') if messages else '')
         tool_results.append(answered)
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK', 'OWNERSHIP_MARKER_ALPHA') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK', 'OWNERSHIP_MARKER_ALPHA', 'SCROLL_TOP_SENTINEL') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -253,7 +268,7 @@ class Screen(pyte.Screen):
             if args.mux_report_filter and not kwargs.get('private'): return
             if args.standard_cpr_only and kwargs.get('private'): return
             private = '?' if kwargs.get('private') else ''
-            self.reply(f'\x1b[{private}{self.cursor.y + 1};{self.cursor.x + 1}R')
+            self.reply(f'\x1b[{private}{self.cursor.y + 1 + args.cpr_row_shift};{self.cursor.x + 1 + args.cpr_col_shift}R')
     def report_device_attributes(self, mode=0, **kwargs):
         self.reply('\x1b[?1;2c')
 
@@ -1020,6 +1035,41 @@ def probe_selection():
     t.exit()
     print(json.dumps(dict(selection=True, transcriptSelection=True, bottomBarSelection=True, promptSelection=True, bareClickNoCopy=True, clickStillWorks=True)), flush=True)
 
+def probe_scroll():
+    """The mouse wheel must walk the bounded virtual transcript to its FIRST
+    message.
+
+    The transcript is taller than the block, so the opening turn is scrolled
+    off the top. The intro/logo is the head of that same scrollable content, so
+    "can't scroll above the intro" and "can't reach the first turn" are the same
+    fact. A wheel-up SGR event must reach the transcript and walk it back far
+    enough that the first turn is on screen again. This is the OUTCOME, not the
+    proxy: it does not care whether the event was routed through onWheel, the
+    keybinding path, or anything else - only whether the first turn comes back.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    t.submit('SCROLL_TOP_SENTINEL')
+    t.wait(lambda: 'FIXTURE_REPLY_SCROLL_TOP_SENTINEL' in t.text(), 'sentinel reply')
+    # Each bulk turn is one ~1400-char line that wraps to a dozen rows, so a
+    # handful of them pushes the sentinel several screens off the top.
+    target = len(requests) + 8
+    for _ in range(8):
+        t.submit('BULK_TURN_')
+    t.wait(lambda: len(requests) >= target, 'bulk turns complete', 90)
+    t.check(lambda: 'FIXTURE_REPLY_SCROLL_TOP_SENTINEL' not in t.text(),
+            'the sentinel is still on screen: the transcript did not grow taller than the block')
+    # Wheel up (64) at the centre of the block; 65 would be wheel-down. Enough
+    # notches to cross the whole transcript (the wheel moves ~1 row per notch
+    # at a human cadence; the acceleration curve only ramps for sub-40ms
+    # bursts), then a margin.
+    for _ in range(160):
+        t.proc.write(f'\x1b[<64;{args.columns // 2};{args.rows // 2}M')
+        t.pause(.02)
+    t.wait(lambda: 'FIXTURE_REPLY_SCROLL_TOP_SENTINEL' in t.text(),
+           'the wheel did not walk the transcript back to the first turn', 20)
+    print(json.dumps(dict(scroll=True, reachedFirstTurn=True, columns=args.columns, rows=args.rows)), flush=True)
+
 def probe_inline_ownership():
     """ITEM 2 re-root: on the REAL target, does CC own the mouse well enough
     that its own controls work AND a drag selection still finishes?
@@ -1086,6 +1136,47 @@ def probe_inline_ownership():
 
     t.exit()
     print(json.dumps(dict(inlineOwnership=True, **evidence)), flush=True)
+
+def probe_inline_arm():
+    """Does the inline mouse ARM on this topology, and does a rejected probe
+    back off instead of re-probing every frame?
+
+    The outcome is read two ways: ENABLE_MOUSE_TRACKING on the wire (the app
+    writing `\\x1b[?1000h...` to the pty) is the user-visible fact - the wheel
+    works only if that reached the terminal - and the debug log carries the
+    arm/reject/timeout verdicts. A rejected probe used to re-probe once per
+    render frame (~5/s, the measured storm); with backoff the probe-sent count
+    over a fixed window must be small, not one-per-frame.
+    """
+    log_file = root / 'arm.log'
+    t = Terminal(env_extra=dict(DEBUG='1', CLAUDE_CODE_DEBUG_LOGS_DIR=str(log_file)))
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 60)
+    # Give the arm path a couple of seconds to settle (probe, reply, verdict).
+    t.pause(3.0)
+
+    try: log = log_file.read_text(encoding='utf-8', errors='replace')
+    except OSError: log = ''
+    armed_on_wire = '\x1b[?1000h' in t.output
+    sent = log.count('[inline-mouse] probe sent')
+    rejected = log.count('probe reply rejected')
+    timed_out = log.count('probe TIMED OUT')
+    armed = log.count('[inline-mouse] probe resolved')
+    last_reject = ''
+    for line in log.splitlines():
+        if 'probe reply rejected' in line: last_reject = line.strip()
+    t.exit()
+    print(json.dumps(dict(
+        inlineArm=True,
+        armedOnWire=armed_on_wire,
+        armVerdicts=armed,
+        rejects=rejected,
+        timeouts=timed_out,
+        probesSent=sent,
+        cprColShift=args.cpr_col_shift,
+        muxReportFilter=args.mux_report_filter,
+        standardCprOnly=args.standard_cpr_only,
+        lastReject=last_reject,
+    ), sort_keys=True), flush=True)
 
 def probe_parity():
     """Behaviors an ordinary inline gateway session has to reach on its own.
@@ -3752,8 +3843,10 @@ try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
     probes = [
         (args.probe_full_tui, probe_full_tui), (args.probe_lifecycle, probe_lifecycle),
-        (args.probe_selection, probe_selection), (args.probe_parity, probe_parity),
+        (args.probe_selection, probe_selection), (args.probe_scroll, probe_scroll),
+        (args.probe_parity, probe_parity),
         (args.probe_inline_ownership, probe_inline_ownership),
+        (args.probe_inline_arm, probe_inline_arm),
         (args.probe_parentage, probe_parentage), (args.probe_queue, probe_queue),
         (args.probe_close_matriarch, probe_close_matriarch), (args.probe_resumed_member, probe_resumed_member),
         (args.probe_owner_cascade, probe_owner_cascade),
