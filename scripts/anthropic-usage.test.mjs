@@ -2,14 +2,14 @@ import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { createServer } from 'node:http'
 
-import { readAnthropicQuota } from '../src/utils/anthropicUsage.ts'
+import { anthropicQuotaFromPayload, readAnthropicQuota } from '../src/utils/anthropicUsage.ts'
 
 /**
  * The gateway's own readout of the subscription limit, served over the same
  * local surface a Gateway session talks to. The client cannot ask Anthropic
  * itself - a Gateway session never reads Claude.ai auth state - so this is the
  * only source the footer has, and the tests pin both its gating and its
- * reduction to one remaining-percent figure.
+ * reduction to the normalized per-window shape.
  */
 async function usageServer(respond) {
   const paths = []
@@ -49,23 +49,59 @@ async function withEnv(vars, run) {
 
 const gatewayBaseUrl = port => `http://127.0.0.1:${port}`
 
-test('an Anthropic quota is not read outside gateway mode or without a base URL', async () => {
-  const fake = await usageServer(() => ({ status: 200, body: { five_hour: { utilization: 0.37 } } }))
-  try {
-    const outsideGateway = await withEnv(
-      {
-        CLAUDE_CODE_USE_GATEWAY: undefined,
-        CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(fake.port),
-      },
-      () => readAnthropicQuota(),
-    )
-    assert.equal(outsideGateway, null)
+test('the payload maps to the normalized windows the gateway serves', () => {
+  const parsed = anthropicQuotaFromPayload({
+    windows: {
+      H: { usedPercent: 37, resetsAt: 1_791_264_085_000 },
+      W: { usedPercent: 88, resetsAt: null },
+    },
+    asof: 5,
+    stale: false,
+  })
+  assert.deepEqual(parsed.windows.H, { usedPercent: 37, resetsAt: 1_791_264_085_000 })
+  assert.deepEqual(parsed.windows.W, { usedPercent: 88, resetsAt: null })
+  assert.equal(parsed.asof, 5)
+  assert.equal(parsed.stale, false)
+  assert.equal(anthropicQuotaFromPayload({ windows: {} }), null)
+})
 
-    const withoutBaseUrl = await withEnv(
-      { CLAUDE_CODE_USE_GATEWAY: '1', CLAUDE_CODE_GATEWAY_BASE_URL: undefined },
-      () => readAnthropicQuota(),
+test('the legacy utilization object maps with the endpoint unit, not a fraction', () => {
+  // The usage endpoint answers `utilization` as the percent *used*, 0-100.
+  // Reading it as a fraction is the bug this pins: 37 used is 63% left, not
+  // (1 - 37) * 100 clamped to 0%.
+  const parsed = anthropicQuotaFromPayload({
+    five_hour: { utilization: 37, resets_at: '2026-10-06T05:00:00Z' },
+    seven_day: { utilization: 88 },
+  })
+  assert.deepEqual(parsed.windows.H, {
+    usedPercent: 37,
+    resetsAt: Date.parse('2026-10-06T05:00:00Z'),
+  })
+  assert.deepEqual(parsed.windows.W, { usedPercent: 88, resetsAt: null })
+  assert.equal(anthropicQuotaFromPayload({}), null)
+  assert.equal(anthropicQuotaFromPayload({ five_hour: { utilization: null } }), null)
+  assert.equal(anthropicQuotaFromPayload(null), null)
+})
+
+test('an Anthropic quota is not read outside gateway mode or without a base URL', async () => {
+  const fake = await usageServer(() => ({ status: 200, body: { windows: { H: { usedPercent: 37 } } } }))
+  try {
+    await assert.rejects(
+      withEnv(
+        {
+          CLAUDE_CODE_USE_GATEWAY: undefined,
+          CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(fake.port),
+        },
+        () => readAnthropicQuota(),
+      ),
     )
-    assert.equal(withoutBaseUrl, null)
+
+    await assert.rejects(
+      withEnv(
+        { CLAUDE_CODE_USE_GATEWAY: '1', CLAUDE_CODE_GATEWAY_BASE_URL: undefined },
+        () => readAnthropicQuota(),
+      ),
+    )
 
     // Neither refusal may cost a request: there is nothing to ask for.
     assert.equal(fake.hits(), 0)
@@ -74,11 +110,17 @@ test('an Anthropic quota is not read outside gateway mode or without a base URL'
   }
 })
 
-test('an Anthropic quota reports the remaining share of the limiting window', async () => {
+test('an Anthropic quota returns the normalized windows the gateway serves', async () => {
   const fake = await usageServer(() => ({
     status: 200,
-    // Fractions, the scale the endpoint answers with.
-    body: { five_hour: { utilization: 0.37 }, seven_day: { utilization: 0.88 } },
+    body: {
+      windows: {
+        H: { usedPercent: 37, resetsAt: 1_791_264_085_000 },
+        W: { usedPercent: 88, resetsAt: null },
+      },
+      asof: 1_234,
+      stale: false,
+    },
   }))
   try {
     const quota = await withEnv(
@@ -88,20 +130,19 @@ test('an Anthropic quota reports the remaining share of the limiting window', as
       },
       () => readAnthropicQuota(),
     )
-    // The weekly window is nearer its limit, so it governs - and the figure is
-    // what is left, not what was used.
-    assert.deepEqual(quota, { remainingPercent: 12 })
+    assert.deepEqual(quota.windows.W, { usedPercent: 88, resetsAt: null })
+    assert.equal(quota.asof, 1_234)
     assert.deepEqual(fake.paths, ['/gateway/anthropic-usage'])
   } finally {
     await fake.close()
   }
 })
 
-test('an Anthropic quota stays null when the gateway has nothing or cannot answer', async () => {
-  // A gateway that has seen no Anthropic traffic reports an empty object, which
+test('an Anthropic quota is null when the gateway has nothing and rejects when it cannot answer', async () => {
+  // A gateway that has seen no Anthropic traffic reports empty windows, which
   // is not a limit: a session that never reached the provider shows no figure
   // rather than a fabricated one.
-  const empty = await usageServer(() => ({ status: 200, body: {} }))
+  const empty = await usageServer(() => ({ status: 200, body: { windows: {} } }))
   const failing = await usageServer(() => ({ status: 503, body: { error: 'unavailable' } }))
   try {
     const emptyQuota = await withEnv(
@@ -113,26 +154,30 @@ test('an Anthropic quota stays null when the gateway has nothing or cannot answe
     )
     assert.equal(emptyQuota, null)
 
-    const unreachable = await withEnv(
-      {
-        CLAUDE_CODE_USE_GATEWAY: '1',
-        CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(failing.port),
-      },
-      () => readAnthropicQuota(),
+    // A refused status rejects, so the caller keeps the last good figure
+    // instead of flickering to nothing.
+    await assert.rejects(
+      withEnv(
+        {
+          CLAUDE_CODE_USE_GATEWAY: '1',
+          CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(failing.port),
+        },
+        () => readAnthropicQuota(),
+      ),
     )
-    assert.equal(unreachable, null)
 
     // A refused connection reads the same way as a refused status.
     const deadPort = failing.port
     await failing.close()
-    const offline = await withEnv(
-      {
-        CLAUDE_CODE_USE_GATEWAY: '1',
-        CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(deadPort),
-      },
-      () => readAnthropicQuota(),
+    await assert.rejects(
+      withEnv(
+        {
+          CLAUDE_CODE_USE_GATEWAY: '1',
+          CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(deadPort),
+        },
+        () => readAnthropicQuota(),
+      ),
     )
-    assert.equal(offline, null)
   } finally {
     await empty.close()
   }
