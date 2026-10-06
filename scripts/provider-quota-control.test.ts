@@ -47,6 +47,9 @@ async function mountQuota(provider: ProviderName, value: ProviderQuota) {
     // The renderer writes changed cells and cursor moves, so assertions are made
     // against the characters that reached the terminal with escapes taken out.
     rendered: () => output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''),
+    // The raw bytes, escapes kept, for assertions about the styling the renderer
+    // emitted (an underline is an SGR sequence, not a character).
+    raw: () => output,
     clear: () => { output = '' },
     // A press and a release on the same cell is the click.
     click: async () => {
@@ -54,6 +57,13 @@ async function mountQuota(provider: ProviderName, value: ProviderQuota) {
       stdin.write('\x1b[<0;1;1m')
       await wait(100)
     },
+    // A mouse-motion report over the control, which is what drives onMouseEnter.
+    hover: async () => {
+      stdin.write('\x1b[<35;2;1M')
+      await wait(100)
+    },
+    // One key per call: a chunk like ' \t' is not parsed as a Space keydown, so
+    // only separate writes exercise the keyboard path a focus target would use.
     keys: async (keys: string) => {
       stdin.write(keys)
       await wait(100)
@@ -79,11 +89,15 @@ test('a click cycles the Codex quota weekly then hourly and back', async () => {
     await control.click()
     assert.match(control.rendered(), /W/)
     // Click-only, like the resume control beside it: the click must not leave a
-    // focus target that Space or Tab re-activates, which would step the window
-    // without a pointer.
+    // focus target that Space or Enter re-activates, which would step the window
+    // without a pointer. Each key is sent on its own - a chunk like ' \t' is not
+    // parsed as a keydown, so it would pass against a Button too.
     control.clear()
-    await control.keys(' \t')
-    assert.doesNotMatch(control.rendered(), /H/)
+    await control.keys(' ')
+    assert.equal(control.rendered(), '')
+    control.clear()
+    await control.keys('\r')
+    assert.equal(control.rendered(), '')
   } finally {
     control.unmount()
   }
@@ -139,6 +153,28 @@ test('a stale figure carries the marker', async () => {
     assert.match(control.rendered(), /Anthropic W remaining 88% \(stale\)/)
   } finally {
     control.unmount()
+  }
+})
+
+test('the hover underline marks only a control with a second window', async () => {
+  // The underline is how the control advertises that it is clickable. A single
+  // window has nothing to step to, so hovering it must not underline - that
+  // would advertise a dead control, which the click assertions cannot see.
+  const two = await mountQuota('Codex', quota({
+    W: { usedPercent: 23, resetsAt: null },
+    H: { usedPercent: 0, resetsAt: null },
+  }))
+  const one = await mountQuota('Anthropic', quota({ W: { usedPercent: 12, resetsAt: null } }))
+  try {
+    two.clear()
+    await two.hover()
+    assert.match(two.raw(), /\x1b\[4m/)
+    one.clear()
+    await one.hover()
+    assert.doesNotMatch(one.raw(), /\x1b\[4m/)
+  } finally {
+    two.unmount()
+    one.unmount()
   }
 })
 
