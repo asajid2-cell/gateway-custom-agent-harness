@@ -9,7 +9,7 @@ function Write-LaunchDiagnostic {
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $DiagnosticPath))
     # Never include arguments, environment values, prompts, or exception text.
     $record = @{ time = [DateTime]::UtcNow.ToString('o'); pid = $PID; event = $Event }
-    foreach ($key in @('exitCode', 'attempt', 'port', 'errorType')) {
+    foreach ($key in @('exitCode', 'attempt', 'port', 'errorType', 'elapsedMs')) {
       if ($Fields.ContainsKey($key)) { $record[$key] = $Fields[$key] }
     }
     if ((Test-Path -LiteralPath $DiagnosticPath) -and (Get-Item -LiteralPath $DiagnosticPath).Length -gt 1048576) {
@@ -283,6 +283,9 @@ if (-not (Test-Path -LiteralPath $CapabilityCatalogPath -PathType Leaf)) {
 }
 $CapabilityCatalog = Get-Content -Raw -LiteralPath $CapabilityCatalogPath |
   ConvertFrom-Json
+# Stage stamps make a slow launch tell us which step it stalled in, instead of
+# leaving a blank console and an unattributable multi-minute gap.
+Write-LaunchDiagnostic 'config-read'
 
 $GatewayProcess = $null
 $GatewayJob = $null
@@ -812,7 +815,10 @@ if (-not (Test-Path -LiteralPath $Keysafe)) {
 
 # The global cc launcher intentionally points at this worktree. Rebuild only
 # when its source or build inputs are newer than the published bundle.
+Write-LaunchProgress 'checking the compiled harness...'
+Write-LaunchDiagnostic 'artifact-check'
 Initialize-ClaudeArtifact
+Write-LaunchDiagnostic 'artifact-ready'
 
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
@@ -1002,6 +1008,7 @@ $env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1'
 $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = '1'
 $env:MODEL_GATEWAY_LOG_TIMING = '1'
 $env:MODEL_GATEWAY_LOG_EVENT_SHAPE = if ($env:MODEL_GATEWAY_CAPTURE_EVENT_SHAPE -eq '1') { '1' } else { $null }
+Write-LaunchDiagnostic 'env-setup'
 
 try {
   $ScopedSettingsPath = Join-Path `
@@ -1071,6 +1078,7 @@ try {
     # Hold a non-inheritable job handle here: Windows reaps this exclusive backend
     # chain even if the launcher dies before its finally block can run.
     Write-LaunchProgress "starting the model gateway on port $Port..."
+    Write-LaunchDiagnostic 'gateway-spawn-start' @{ port = $Port }
     . (Join-Path $PSScriptRoot 'owned-gateway-process.ps1')
     $ownedGateway = Start-OwnedGatewayProcess `
       -FilePath 'powershell.exe' `
@@ -1089,6 +1097,7 @@ try {
     # record which one happened, and keep the child's stderr on the exit path so
     # the reason survives for the next launch.
     Write-LaunchProgress 'waiting for the model gateway to become healthy...'
+    Write-LaunchDiagnostic 'gateway-health-start' @{ port = $Port }
     $healthy = $false
     $healthStarted = [DateTime]::UtcNow
     $deadline = $healthStarted.AddSeconds(15)
@@ -1124,6 +1133,7 @@ try {
       Write-LaunchDiagnostic 'gateway-unhealthy' @{ port = $Port; errorType = 'timeout' }
       throw "Model gateway did not become healthy within 15 seconds (waited ${elapsedMs}ms). Safe diagnostics: $DiagnosticPath"
     }
+    Write-LaunchDiagnostic 'gateway-health-end' @{ port = $Port; elapsedMs = [int]([DateTime]::UtcNow - $healthStarted).TotalMilliseconds }
   }
 
   # Claude resolves transcripts from the caller's directory. Keep that
