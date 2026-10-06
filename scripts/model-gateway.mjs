@@ -2256,15 +2256,33 @@ export function openCodeCredentialPool(env = process.env) {
   // Selection follows the current key's number, so a key added or removed
   // between accesses does not silently slide the selection to a different key.
   let preferred = 1
+  // The number that actually served the last upstream reply, which is not
+  // always the selected one: the preference file can re-select on the next
+  // access, and a failover advances the pool past the key that just answered.
+  // The usage read follows this so it reports the account that is really in use.
+  let lastServedNumber = null
   const indexFor = names => {
     const at = names.findIndex(name => numberOf(name) === preferred)
     return at < 0 ? 0 : at
   }
+  const currentNumber = () => {
+    const names = namesFor()
+    return numberOf(names[indexFor(names)] ?? '') || 1
+  }
   return {
     get key() { const names = namesFor(); return env[names[indexFor(names)]] },
     get size() { return namesFor().length },
-    get number() { const names = namesFor(); return numberOf(names[indexFor(names)] ?? '') || 1 },
+    get number() { return currentNumber() },
     get numbers() { return namesFor().map(numberOf) },
+    get lastServed() { return lastServedNumber },
+    // The key for a specific number, so a read can target an account without
+    // moving the pool's own selection.
+    keyFor(number) {
+      const name = namesFor().find(name => numberOf(name) === number)
+      return name ? env[name] : undefined
+    },
+    // Called when an upstream reply is 2xx, to record which key answered.
+    markServed() { lastServedNumber = currentNumber() },
     select(number) {
       if (!namesFor().some(name => numberOf(name) === number)) return false
       preferred = number
@@ -2331,6 +2349,9 @@ export async function fetchWithRetry({
         })).toLowerCase().includes('privacy settings'))
       )
       if (response.ok || !(credentialFailure || await retryableResponse(provider, response, control)) || attempt > retries) {
+        // A 2xx is the key that answered, recorded for the usage read; pools
+        // that do not rotate (or do not track this) simply ignore the call.
+        if (response.ok) credentials?.markServed?.()
         return response
       }
 
@@ -3776,39 +3797,65 @@ const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
   },
 }
 
-const openCodeUsageCache = new Map()
+const OPENCODE_USAGE_ENDPOINT =
+  process.env.MODEL_GATEWAY_OPENCODE_USAGE_URL ||
+  'https://opencode.ai/zen/go/v1/usage'
 
-export async function readOpenCodeSubscriptionUsage(credentials = openCodeCredentials, endpoint = 'https://opencode.ai/zen/go/v1/usage') {
-  const key = credentials.key
-  if (!key) return {}
-  const cached = openCodeUsageCache.get(key)
-  if (cached && Date.now() - cached.at < 30_000) return cached.value
-  if (cached?.pending) return cached.pending
-  const pending = (async () => {
-    try {
-      const response = await fetch(endpoint, {
-        headers: { authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(5_000),
-      })
-      if (!response.ok) return {}
-      const payload = await response.json()
-      const usage = {}
-      for (const name of ['rolling', 'weekly', 'monthly']) {
-        const window = payload?.usage?.[name]
-        if (typeof window?.percent !== 'number' || !Number.isFinite(window.percent)) continue
-        usage[name] = { percent: window.percent, resetsAt: window.resetsAt ?? null }
+/**
+ * The subscription's windows as `{ H?, W?, M? }` of `{ usedPercent, resetsAt }`.
+ * `rolling` is the short window (the gateway's `H`), `weekly` the weekly one,
+ * `monthly` the monthly cap. `percent` is already used 0-100 - the same scale
+ * the footer prints - and `resetsAt` is an ISO timestamp.
+ */
+function openCodeUsageWindows(payload) {
+  const windows = {}
+  for (const [name, kind] of [['rolling', 'H'], ['weekly', 'W'], ['monthly', 'M']]) {
+    const window = payload?.usage?.[name]
+    const used = clampUsedPercent(window?.percent)
+    if (used === null) continue
+    windows[kind] = { usedPercent: used, resetsAt: resetToEpochMs(window?.resetsAt) }
+  }
+  return windows
+}
+
+/**
+ * The OpenCode subscription's own usage, normalized to the shared ProviderQuota
+ * shape and shared across gateways through the quota cache (one account, so the
+ * key is the account NUMBER, not the credential).
+ *
+ * The figure belongs to the account that is actually serving, which is the
+ * pool's `lastServed` when a turn has answered and its selected number
+ * otherwise - the preference file can re-select a different key between turns,
+ * so the selected number alone would describe the wrong account.
+ */
+export async function readOpenCodeSubscriptionUsage(credentials = openCodeCredentials, endpoint = OPENCODE_USAGE_ENDPOINT) {
+  const number = Number.isSafeInteger(credentials.lastServed) && credentials.lastServed > 0
+    ? credentials.lastServed
+    : credentials.number
+  const key = credentials.keyFor ? credentials.keyFor(number) : credentials.key
+  if (!key) return { windows: {}, asof: Date.now(), stale: true }
+  const payload = await readQuotaThroughCache({
+    key: quotaKey('opencode', number),
+    ttlMs: QUOTA_TTL_MS.opencode,
+    read: async () => {
+      try {
+        const response = await fetch(endpoint, {
+          headers: { authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(5_000),
+        })
+        // A non-OK reply is a failure, not an empty account: returning the last
+        // good figure stale beats telling the footer there is no limit.
+        if (!response.ok) return { windows: null }
+        return { windows: openCodeUsageWindows(await response.json()), account: number }
+      } catch {
+        return { windows: null }
       }
-      const value = { usage }
-      openCodeUsageCache.set(key, { at: Date.now(), value })
-      return value
-    } catch {
-      return {}
-    } finally {
-      if (openCodeUsageCache.get(key)?.pending) openCodeUsageCache.delete(key)
-    }
-  })()
-  openCodeUsageCache.set(key, { pending })
-  return pending
+    },
+  })
+  // Nothing good has ever been read for this account, so there is no figure to
+  // report - an empty window set, not a crash.
+  if (!payload) return { windows: {}, asof: Date.now(), stale: true }
+  return payload
 }
 
 /**

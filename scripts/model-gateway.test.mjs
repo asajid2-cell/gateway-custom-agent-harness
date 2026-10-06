@@ -128,22 +128,96 @@ test('OpenCode usage follows credential rotation and caches each workspace separ
   const server = createServer((req, res) => {
     seen.push(req.headers.authorization)
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ usage: { monthly: { percent: req.headers.authorization === `Bearer ${original}` ? 100 : 12, resetsAt: '2026-10-30T00:00:00Z' } }, secret: 'must not relay' }))
+    res.end(JSON.stringify({
+      usage: {
+        rolling: { percent: 40, resetsAt: '2026-10-05T05:00:00Z' },
+        monthly: { percent: req.headers.authorization === `Bearer ${original}` ? 100 : 12, resetsAt: '2026-10-30T00:00:00Z' },
+      },
+      secret: 'must not relay',
+    }))
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
+  const previousCache = process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = freshQuotaCacheDir()
   try {
     const url = `http://127.0.0.1:${server.address().port}`
-    assert.equal((await readOpenCodeSubscriptionUsage(credentials, url)).usage.monthly.percent, 100)
+    const first = await readOpenCodeSubscriptionUsage(credentials, url)
+    // The windows are keyed H/W/M and carry used percent 0-100 directly.
+    assert.equal(first.windows.H.usedPercent, 40)
+    assert.equal(first.windows.M.usedPercent, 100)
+    assert.equal(first.account, 1)
     credentials.advance()
     const reads = await Promise.all([readOpenCodeSubscriptionUsage(credentials, url), readOpenCodeSubscriptionUsage(credentials, url)])
-    assert.deepEqual(reads[0], { usage: { monthly: { percent: 12, resetsAt: '2026-10-30T00:00:00Z' } } })
+    assert.equal(reads[0].windows.M.usedPercent, 12)
+    assert.equal(reads[0].account, 2)
+    assert.deepEqual(reads[0], reads[1])
     credentials.advance()
-    assert.equal((await readOpenCodeSubscriptionUsage(credentials, url)).usage.monthly.percent, 100)
+    assert.equal((await readOpenCodeSubscriptionUsage(credentials, url)).windows.M.usedPercent, 100)
     assert.deepEqual(seen, [`Bearer ${original}`, `Bearer ${second}`])
   } finally {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
+    if (previousCache === undefined) delete process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+    else process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = previousCache
+  }
+})
+
+test('the OpenCode usage read follows the key that actually served', async () => {
+  const first = randomUUID()
+  const second = randomUUID()
+  const credentials = openCodeCredentialPool({ OPENCODE_API_KEY: first, OPENCODE_API_KEY2: second })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ usage: { monthly: { percent: 5, resetsAt: '2026-10-30T00:00:00Z' } } }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const previousCache = process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = freshQuotaCacheDir()
+  try {
+    const url = `http://127.0.0.1:${server.address().port}`
+    // The pool served on key 2 (a failover), but its selection has since moved
+    // back to key 1. The usage read must still describe the key that answered.
+    credentials.select(2)
+    credentials.markServed()
+    credentials.select(1)
+    const payload = await readOpenCodeSubscriptionUsage(credentials, url)
+    assert.equal(payload.account, 2)
+    assert.deepEqual(seen, [`Bearer ${second}`])
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    if (previousCache === undefined) delete process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+    else process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = previousCache
+  }
+})
+
+test('OpenCode usage reports an empty figure stale when the endpoint fails', async () => {
+  const credentials = openCodeCredentialPool({ OPENCODE_API_KEY: randomUUID() })
+  const server = createServer((req, res) => {
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: 'boom' }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const previousCache = process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = freshQuotaCacheDir()
+  try {
+    const url = `http://127.0.0.1:${server.address().port}`
+    const payload = await readOpenCodeSubscriptionUsage(credentials, url)
+    // Nothing good has ever been read, so there is no figure - but it is an
+    // empty window set marked stale, not an absent payload, so the footer keeps
+    // whatever it last showed rather than reading "no limit".
+    assert.deepEqual(payload.windows, {})
+    assert.equal(payload.stale, true)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    if (previousCache === undefined) delete process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+    else process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = previousCache
   }
 })
 
@@ -2873,6 +2947,60 @@ test('a 429 with Retry-After holds the next read and serves the last figure stal
     if (gateway) await stopChild(gateway.child)
     if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
     else process.env.ANTHROPIC_API_KEY = previousKey
+    await new Promise(resolve => usage.server.close(resolve))
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
+test('the opencode usage route returns the shared shape for the serving account', async () => {
+  // The route used to answer in the endpoint's own `{ usage: { monthly: {
+  // percent } } }` shape, so the client had to know OpenCode's window names and
+  // that `percent` is used rather than remaining. It now returns the shared
+  // ProviderQuota shape, keyed H/W/M, with the account that served.
+  const configDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-opencode-config-'))
+  const reads = []
+  const usage = await fakeCodexServer((req, res) => {
+    reads.push({ url: req.url, authorization: req.headers.authorization })
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      usage: {
+        rolling: { percent: 40, resetsAt: '2026-10-05T05:00:00Z' },
+        weekly: { percent: 70, resetsAt: '2026-10-12T00:00:00Z' },
+        monthly: { percent: 100, resetsAt: '2026-10-30T00:00:00Z' },
+      },
+    }))
+  })
+  const previousKey = process.env.OPENCODE_API_KEY
+  const key = randomUUID()
+  process.env.OPENCODE_API_KEY = key
+  let gateway
+  try {
+    gateway = await startGatewayForTest({
+      CLAUDE_CONFIG_DIR: configDir,
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
+      MODEL_GATEWAY_OPENCODE_USAGE_URL: `http://127.0.0.1:${usage.port}/v1/usage`,
+    })
+    // Two sessions' worth of concurrent reads of one account share a single
+    // upstream call through the shared cache.
+    const [first, concurrent] = await Promise.all([
+      getGatewayJson(gateway.port, '/gateway/opencode-usage?sessionId=s1'),
+      getGatewayJson(gateway.port, '/gateway/opencode-usage?sessionId=s1'),
+    ])
+    assert.equal(concurrent.body, first.body)
+    assert.equal(first.status, 200)
+    const body = JSON.parse(first.body)
+    assert.deepEqual(body.windows, {
+      H: { usedPercent: 40, resetsAt: Date.parse('2026-10-05T05:00:00Z') },
+      W: { usedPercent: 70, resetsAt: Date.parse('2026-10-12T00:00:00Z') },
+      M: { usedPercent: 100, resetsAt: Date.parse('2026-10-30T00:00:00Z') },
+    })
+    assert.equal(body.account, 1)
+    assert.equal(body.stale, false)
+    assert.deepEqual(reads, [{ url: '/v1/usage', authorization: `Bearer ${key}` }])
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    if (previousKey === undefined) delete process.env.OPENCODE_API_KEY
+    else process.env.OPENCODE_API_KEY = previousKey
     await new Promise(resolve => usage.server.close(resolve))
     await rm(configDir, { recursive: true, force: true })
   }
