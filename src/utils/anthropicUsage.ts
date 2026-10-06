@@ -17,13 +17,6 @@ function clampPercent(value: number): number {
   return Math.max(0, Math.min(100, value))
 }
 
-function epochMs(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value !== 'string') return null
-  const parsed = Date.parse(value)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
 /** A window from the normalized ProviderQuota the gateway serves. */
 function normalizedWindow(value: unknown): QuotaWindow | null {
   if (!isObject(value)) return null
@@ -35,47 +28,28 @@ function normalizedWindow(value: unknown): QuotaWindow | null {
 /**
  * Reduce a `/gateway/anthropic-usage` reply to the one normalized shape.
  *
- * Two payloads are accepted while the gateway's own normalization lands
- * (phase 2): the normalized `ProviderQuota` it will serve, and the legacy
- * `{five_hour, seven_day}` utilization object it serves today. The legacy
- * branch reads `utilization` as the percent *used* (0-100) - the scale the
- * usage endpoint answers with. The reply-header fallback carries a fraction
- * instead and cannot be told apart from here, which is exactly the ambiguity
- * the gateway-side normalization removes.
+ * The gateway reads the subscription's usage endpoint and normalizes it, so the
+ * client consumes only `windows` - each window's `usedPercent` is already the
+ * percent *used* (0-100) and its reset is epoch ms. Reading the raw utilization
+ * object here is what let the unit ambiguity through: a fraction (0-1) and a
+ * percentage (0-100) cannot be told apart client-side, so the gateway resolves
+ * it instead and the client never sees it.
  */
 export function anthropicQuotaFromPayload(payload: unknown): ProviderQuota | null {
   if (!isObject(payload)) return null
   const windows: ProviderQuota['windows'] = {}
+  if (!isObject(payload.windows)) return null
 
-  if (isObject(payload.windows)) {
-    for (const kind of WINDOW_KINDS) {
-      const window = normalizedWindow((payload.windows as Record<string, unknown>)[kind])
-      if (window) windows[kind] = window
-    }
-    if (Object.keys(windows).length === 0) return null
-    return {
-      windows,
-      asof: finiteNumber(payload.asof) ?? Date.now(),
-      stale: payload.stale === true,
-    }
-  }
-
-  // Legacy utilization object still served today: five_hour -> H, seven_day -> W.
-  const legacy: Array<[QuotaWindowKind, unknown]> = [
-    ['H', payload.five_hour],
-    ['W', payload.seven_day],
-  ]
-  for (const [kind, value] of legacy) {
-    if (!isObject(value)) continue
-    const usedPercent = finiteNumber(value.utilization)
-    if (usedPercent === null) continue
-    windows[kind] = {
-      usedPercent: clampPercent(usedPercent),
-      resetsAt: epochMs(value.resets_at),
-    }
+  for (const kind of WINDOW_KINDS) {
+    const window = normalizedWindow((payload.windows as Record<string, unknown>)[kind])
+    if (window) windows[kind] = window
   }
   if (Object.keys(windows).length === 0) return null
-  return { windows, asof: Date.now(), stale: false }
+  return {
+    windows,
+    asof: finiteNumber(payload.asof) ?? Date.now(),
+    stale: payload.stale === true,
+  }
 }
 
 /**

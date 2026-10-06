@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { readAnthropicQuota } from '../utils/anthropicUsage.js'
 import { readOpenCodeQuota } from '../utils/opencodeUsage.js'
-import { readCodexQuota, codexQuotaToProviderQuota } from '../utils/codexRateLimits.js'
+import { readCodexQuota } from '../utils/codexRateLimits.js'
 import type { ProviderName, ProviderQuota } from '../utils/bottomBarUsage.js'
 
 // The gateway is asked on a local surface that answers immediately, so the
@@ -18,10 +18,9 @@ async function readProviderQuota(provider: ProviderName): Promise<QuotaRead> {
   try {
     if (provider === 'Anthropic') return { ok: true, quota: await readAnthropicQuota() }
     if (provider === 'OpenCode') return { ok: true, quota: await readOpenCodeQuota() }
-    // Codex is still read from a local subprocess in phase 1; a null reading is
-    // a failure to read, so it keeps the previous figure the same way.
-    const raw = await readCodexQuota()
-    return raw ? { ok: true, quota: codexQuotaToProviderQuota(raw) } : { ok: false }
+    // All three are read from the gateway's normalized endpoints now; Codex no
+    // longer spawns a local app-server.
+    return { ok: true, quota: await readCodexQuota() }
   } catch {
     return { ok: false }
   }

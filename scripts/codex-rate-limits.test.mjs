@@ -1,121 +1,193 @@
 import { strict as assert } from 'node:assert'
 import test from 'node:test'
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { createServer } from 'node:http'
+import { readFile } from 'node:fs/promises'
 
-import {
-  codexQuotaToProviderQuota,
-  isCodexGatewayModel,
-  quotaFromRateLimits,
-  readCodexQuotaFromRollouts,
-} from '../src/utils/codexRateLimits.ts'
+import { codexQuotaFromPayload, readCodexQuota } from '../src/utils/codexRateLimits.ts'
 import { formatProviderQuota } from '../src/utils/bottomBarUsage.ts'
 
-
-test('Codex quota opt-in covers Gateway Codex model family', () => {
-  assert.equal(isCodexGatewayModel('gateway-gpt-luna'), true)
-  assert.equal(isCodexGatewayModel('gateway-gpt-sol'), true)
-  assert.equal(isCodexGatewayModel('gateway-gpt-terra'), true)
-  assert.equal(isCodexGatewayModel('gateway-opencode-glm-5.3-flash'), false)
-})
-
-
-
-test('Codex RPC rate limits normalize nested limit windows', () => {
-  assert.deepEqual(
-    quotaFromRateLimits({
-      rateLimits: {
-        primary: { usedPercent: 58, resetsAt: 1788795032 },
-        rateLimitsByLimitId: {
-          codex_bengalfox: {
-            primary: { usedPercent: 0, resetsAt: 1788393413 },
-            secondary: { usedPercent: 0, resetsAt: 1788980213 },
-          },
-        },
-      },
-    }, 123),
-    {
-      remainingPercent: 42,
-      primaryUsedPercent: 58,
-      secondaryUsedPercent: 0,
-      resetsPrimary: 1788795032,
-      resetsSecondary: 1788980213,
-      asof: 123,
-    },
-  )
-})
-
-test('Codex quota uses the most restrictive primary or secondary window', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'gateway-codex-quota-'))
-  try {
-    await mkdir(join(root, '2026', '09', '02'), { recursive: true })
-    await writeFile(
-      join(root, '2026', '09', '02', 'rollout-test.jsonl'),
-      `${JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: {
-        primary: { used_percent: 12, resets_at: 100 },
-        secondary: { used_percent: 37, resets_at: 200 },
-      } } })}\n`,
-    )
-
-    const quota = readCodexQuotaFromRollouts(root)
-    assert.deepEqual(quota, {
-      remainingPercent: 63,
-      primaryUsedPercent: 12,
-      secondaryUsedPercent: 37,
-      resetsPrimary: 100,
-      resetsSecondary: 200,
-      asof: quota.asof,
-    })
-    // The primary 5-hour window is H, the weekly secondary is W, and each keeps
-    // its own figure rather than collapsing to the most restrictive one.
-    const providerQuota = codexQuotaToProviderQuota(quota)
-    assert.equal(formatProviderQuota('Codex', providerQuota, 'H'), 'Codex H remaining 88%')
-    assert.equal(formatProviderQuota('Codex', providerQuota, 'W'), 'Codex W remaining 63%')
-  } finally {
-    await rm(root, { recursive: true, force: true })
+/**
+ * The gateway's own readout of the Codex account's limits, served over the same
+ * local surface a Gateway session talks to. The gateway holds one long-lived
+ * `codex app-server` per gateway; the client no longer spawns one per poll nor
+ * scrapes rollout JSONL, so these tests pin the reduction to the normalized
+ * per-window shape and the gating of the single HTTP read.
+ */
+async function usageServer(respond) {
+  const paths = []
+  let hits = 0
+  const server = createServer((req, res) => {
+    hits += 1
+    paths.push(req.url)
+    const { status, body } = respond()
+    res.writeHead(status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(body))
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  return {
+    port: server.address().port,
+    hits: () => hits,
+    paths,
+    close: () => new Promise(resolve => server.close(resolve)),
   }
-})
+}
 
-test('Codex windows map the primary 5-hour and secondary weekly windows', () => {
-  const mapped = codexQuotaToProviderQuota({
-    remainingPercent: 42,
-    primaryUsedPercent: 58,
-    secondaryUsedPercent: 0,
-    resetsPrimary: 1_788_795_032,
-    resetsSecondary: 1_788_980_213,
-    asof: 123,
+async function withEnv(vars, run) {
+  const saved = new Map()
+  for (const [key, value] of Object.entries(vars)) {
+    saved.set(key, process.env[key])
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  try {
+    return await run()
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+const gatewayBaseUrl = port => `http://127.0.0.1:${port}`
+
+test('the payload maps to the normalized windows the gateway serves', () => {
+  const parsed = codexQuotaFromPayload({
+    windows: {
+      H: { usedPercent: 58, resetsAt: 1_788_795_032_000 },
+      W: { usedPercent: 0, resetsAt: 1_788_980_213_000 },
+    },
+    asof: 5,
+    stale: false,
   })
-  // The app-server answers resetsAt in epoch seconds; the shape carries ms.
-  assert.deepEqual(mapped.windows.H, { usedPercent: 58, resetsAt: 1_788_795_032_000 })
-  assert.deepEqual(mapped.windows.W, { usedPercent: 0, resetsAt: 1_788_980_213_000 })
-  assert.equal(mapped.asof, 123)
-  assert.equal(mapped.stale, false)
-  // A window the reader did not find is simply absent, not a zero.
-  const onlyPrimary = codexQuotaToProviderQuota({
-    remainingPercent: 42,
-    primaryUsedPercent: 58,
-    secondaryUsedPercent: null,
-    resetsPrimary: null,
-    resetsSecondary: null,
-    asof: 1,
-  })
+  // The primary 5-hour window is H, the weekly secondary is W, and each keeps
+  // its own figure rather than collapsing to the most restrictive one.
+  assert.deepEqual(parsed.windows.H, { usedPercent: 58, resetsAt: 1_788_795_032_000 })
+  assert.deepEqual(parsed.windows.W, { usedPercent: 0, resetsAt: 1_788_980_213_000 })
+  assert.equal(parsed.asof, 5)
+  assert.equal(parsed.stale, false)
+  assert.equal(formatProviderQuota('Codex', parsed, 'H'), 'Codex H remaining 42%')
+  assert.equal(formatProviderQuota('Codex', parsed, 'W'), 'Codex W remaining 100%')
+  // A window the gateway did not report is simply absent, not a zero.
+  const onlyPrimary = codexQuotaFromPayload({ windows: { H: { usedPercent: 58 } } })
   assert.deepEqual(Object.keys(onlyPrimary.windows), ['H'])
   assert.equal(formatProviderQuota('Codex', onlyPrimary, 'W'), null)
+  assert.equal(codexQuotaFromPayload({ windows: {} }), null)
 })
 
-test('Codex quota is unavailable when rollout snapshots have no numeric limits', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'gateway-codex-quota-'))
+test('a legacy rate-limits object is no longer accepted', () => {
+  // The client consumes only the normalized shape; the gateway owns the mapping
+  // from a rate-limits object, so the raw object never reaches here.
+  assert.equal(codexQuotaFromPayload({
+    rateLimits: {
+      primary: { usedPercent: 60, resetsAt: 123 },
+      secondary: { used_percent: 20, resets_at: 456 },
+    },
+  }), null)
+  assert.equal(codexQuotaFromPayload({}), null)
+  assert.equal(codexQuotaFromPayload(null), null)
+})
+
+test('a Codex quota is not read outside gateway mode or without a base URL', async () => {
+  const fake = await usageServer(() => ({ status: 200, body: { windows: { H: { usedPercent: 58 } } } }))
   try {
-    await writeFile(
-      join(root, 'rollout-empty.jsonl'),
-      `${JSON.stringify({ type: 'token_count', rate_limits: {
-        primary: { used_percent: null },
-        secondary: { used_percent: null },
-      } })}\n`,
+    await assert.rejects(
+      withEnv(
+        {
+          CLAUDE_CODE_USE_GATEWAY: undefined,
+          CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(fake.port),
+        },
+        () => readCodexQuota(),
+      ),
     )
-    assert.equal(readCodexQuotaFromRollouts(root), null)
+
+    await assert.rejects(
+      withEnv(
+        { CLAUDE_CODE_USE_GATEWAY: '1', CLAUDE_CODE_GATEWAY_BASE_URL: undefined },
+        () => readCodexQuota(),
+      ),
+    )
+
+    // Neither refusal may cost a request: there is nothing to ask for.
+    assert.equal(fake.hits(), 0)
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await fake.close()
   }
+})
+
+test('a Codex quota returns the normalized windows the gateway serves', async () => {
+  const fake = await usageServer(() => ({
+    status: 200,
+    body: {
+      windows: {
+        H: { usedPercent: 58, resetsAt: 1_788_795_032_000 },
+        W: { usedPercent: 0, resetsAt: null },
+      },
+      asof: 1_234,
+      stale: false,
+    },
+  }))
+  try {
+    const quota = await withEnv(
+      {
+        CLAUDE_CODE_USE_GATEWAY: '1',
+        CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(fake.port),
+      },
+      () => readCodexQuota(),
+    )
+    assert.deepEqual(quota.windows.H, { usedPercent: 58, resetsAt: 1_788_795_032_000 })
+    assert.equal(quota.asof, 1_234)
+    assert.deepEqual(fake.paths, ['/gateway/codex-usage'])
+  } finally {
+    await fake.close()
+  }
+})
+
+test('a Codex quota is null when the gateway has nothing and rejects when it cannot answer', async () => {
+  const empty = await usageServer(() => ({ status: 200, body: { windows: {} } }))
+  const failing = await usageServer(() => ({ status: 503, body: { error: 'unavailable' } }))
+  try {
+    const emptyQuota = await withEnv(
+      {
+        CLAUDE_CODE_USE_GATEWAY: '1',
+        CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(empty.port),
+      },
+      () => readCodexQuota(),
+    )
+    assert.equal(emptyQuota, null)
+
+    await assert.rejects(
+      withEnv(
+        {
+          CLAUDE_CODE_USE_GATEWAY: '1',
+          CLAUDE_CODE_GATEWAY_BASE_URL: gatewayBaseUrl(failing.port),
+        },
+        () => readCodexQuota(),
+      ),
+    )
+  } finally {
+    await empty.close()
+    await failing.close()
+  }
+})
+
+test('the client no longer spawns the Codex app-server or scrapes rollouts', async () => {
+  // The reader is a single HTTP call now; the process cost and the stale
+  // rollout figure both belonged to the deleted implementation.
+  const source = await readFile(
+    new URL('../src/utils/codexRateLimits.ts', import.meta.url),
+    'utf8',
+  )
+  // Asserted on code tokens, not words: the prose above may name the deleted
+  // mechanism, but the implementation must not carry any of it.
+  assert.doesNotMatch(source, /child_process/)
+  assert.doesNotMatch(source, /spawn\(/)
+  assert.doesNotMatch(source, /'app-server'|--listen/)
+  assert.doesNotMatch(source, /account\/rateLimits\/read/)
+  assert.doesNotMatch(source, /readdir|readFileSync|openSync|readSync/)
+  const hookSource = await readFile(
+    new URL('../src/hooks/useProviderQuota.ts', import.meta.url),
+    'utf8',
+  )
+  assert.doesNotMatch(hookSource, /codexQuotaToProviderQuota/)
 })

@@ -65,19 +65,15 @@ test('the payload maps to the normalized windows the gateway serves', () => {
   assert.equal(anthropicQuotaFromPayload({ windows: {} }), null)
 })
 
-test('the legacy utilization object maps with the endpoint unit, not a fraction', () => {
-  // The usage endpoint answers `utilization` as the percent *used*, 0-100.
-  // Reading it as a fraction is the bug this pins: 37 used is 63% left, not
-  // (1 - 37) * 100 clamped to 0%.
-  const parsed = anthropicQuotaFromPayload({
+test('a legacy utilization object is no longer accepted', () => {
+  // The client consumes only the normalized shape; the gateway owns the unit
+  // ambiguity (utilization as percent used vs. a fraction) so the raw object
+  // never reaches here. A payload without `windows` is "no figure", not a
+  // guess - and crucially not the 0%-while-60%-used misread this once caused.
+  assert.equal(anthropicQuotaFromPayload({
     five_hour: { utilization: 37, resets_at: '2026-10-06T05:00:00Z' },
     seven_day: { utilization: 88 },
-  })
-  assert.deepEqual(parsed.windows.H, {
-    usedPercent: 37,
-    resetsAt: Date.parse('2026-10-06T05:00:00Z'),
-  })
-  assert.deepEqual(parsed.windows.W, { usedPercent: 88, resetsAt: null })
+  }), null)
   assert.equal(anthropicQuotaFromPayload({}), null)
   assert.equal(anthropicQuotaFromPayload({ five_hour: { utilization: null } }), null)
   assert.equal(anthropicQuotaFromPayload(null), null)

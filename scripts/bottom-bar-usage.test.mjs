@@ -98,20 +98,32 @@ test('a stale figure says so and a wild used percent is clamped', () => {
   )
 })
 
-test('OpenCode maps rolling, weekly and monthly to H, W and M without collapsing', () => {
+test('OpenCode keeps each normalized window rather than collapsing them', () => {
   const parsed = openCodeQuotaFromPayload({
-    usage: { rolling: { percent: 0 }, weekly: { percent: 0 }, monthly: { percent: 100 } },
+    windows: {
+      H: { usedPercent: 0, resetsAt: null },
+      W: { usedPercent: 0, resetsAt: null },
+      M: { usedPercent: 100, resetsAt: null },
+    },
+    asof: 7,
+    account: 3,
   })
   // The monthly window is exhausted, but it no longer dominates the others:
   // each window keeps its own figure instead of one collapsed number reading 0%.
   assert.deepEqual(parsed.windows.H, { usedPercent: 0, resetsAt: null })
   assert.deepEqual(parsed.windows.W, { usedPercent: 0, resetsAt: null })
   assert.deepEqual(parsed.windows.M, { usedPercent: 100, resetsAt: null })
+  assert.equal(parsed.asof, 7)
+  assert.equal(parsed.account, 3)
   assert.equal(formatProviderQuota('OpenCode', parsed, 'M'), 'OpenCode M remaining 0%')
   assert.equal(formatProviderQuota('OpenCode', parsed, 'W'), 'OpenCode W remaining 100%')
+  // The legacy usage object is no longer accepted; the gateway owns that mapping.
+  assert.equal(openCodeQuotaFromPayload({
+    usage: { rolling: { percent: 0 }, weekly: { percent: 0 }, monthly: { percent: 100 } },
+  }), null)
   // Nothing to report reads as nothing, not as an empty limit.
   assert.equal(openCodeQuotaFromPayload({}), null)
-  assert.equal(openCodeQuotaFromPayload({ usage: { monthly: { percent: '100' } } }), null)
+  assert.equal(openCodeQuotaFromPayload({ windows: {} }), null)
 })
 
 test('context usage exposes used and remaining tokens and percentages', () => {
