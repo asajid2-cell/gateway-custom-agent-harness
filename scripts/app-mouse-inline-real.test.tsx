@@ -6,7 +6,7 @@ import { BoundedMainScreen } from '../src/ink/components/BoundedMainScreen.tsx'
 import instances from '../src/ink/instances.ts'
 import { isBoundedLayoutEnabled } from '../src/utils/fullscreen.ts'
 import { getIsInteractive, setIsInteractive } from '../src/bootstrap/state.ts'
-import { hasSelection, startSelection } from '../src/ink/selection.ts'
+import { hasSelection, startSelection, updateSelection } from '../src/ink/selection.ts'
 import type { ParsedMouse } from '../src/ink/parse-keypress.ts'
 
 // REAL-INSTANCE b2 verification (newtok, independent verifier). This is the
@@ -58,6 +58,8 @@ type RealInk = {
   handleInlineMouse(mouse: ParsedMouse): boolean
 }
 
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
 test('real handleInlineMouse finishes a dropped-release selection on no-button motion (b2)', async () => {
   const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
   const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
@@ -94,6 +96,60 @@ test('real handleInlineMouse finishes a dropped-release selection on no-button m
     const consumed = ink.handleInlineMouse(noButtonMotion(2, 0))
     expect(consumed).toBe(true)
     expect(ink.selection.isDragging).toBe(false) // b2: the REAL switch finished it
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
+
+test('a keypress finishes a dropped-release drag with no FOCUS_OUT or 1003 motion', async () => {
+  // The FOCUS_OUT-independent recovery. A dropped release can leave
+  // isDragging=true with neither recovery signal available: tmux drops focus
+  // events unless `focus-events on`, and mode-1003 motion never arrives when
+  // 1003 is not armed. A keypress is the one signal that needs neither — you
+  // cannot type while holding the button — so the lane must finish the drag
+  // and let copy-on-select fire rather than swallowing input forever.
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin } = harness()
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  try {
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as never, stderr: stdout as never, stdin: stdin as never,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    await sleep(250)
+    const ink = instances.get(stdout as never) as unknown as RealInk
+    ink.inlineOrigin = 0
+    ink.inlineTracking = true
+
+    // A real drag is in progress: press seeded the anchor, motion set focus.
+    startSelection(ink.selection, 0, 0)
+    updateSelection(ink.selection, 3, 0)
+    expect(ink.selection.isDragging).toBe(true)
+    expect(hasSelection(ink.selection)).toBe(true)
+
+    // The release was dropped. A keypress arrives instead of FOCUS_OUT/1003.
+    stdin.write('a')
+    await sleep(200)
+    expect(ink.selection.isDragging).toBe(false) // the key finished the drag
+    expect(hasSelection(ink.selection)).toBe(true) // highlight kept for copy
   } finally {
     app?.unmount()
     stdin.destroy()
