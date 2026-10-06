@@ -156,21 +156,23 @@ test('the probe reply form is the local-vs-relay signal', () => {
 })
 
 // ---------------------------------------------------------------------------
-// (1b) The ARMING rule, the seam this lane owns. The cursor-position reply is
-// matched to the parked composer column with `col === cursor.x + 1`. That lock
-// is right for a native terminal, where the reply IS the terminal's own cursor.
-// It is wrong for a relay client: the answer comes back from xterm.js whose
-// terminal cursor is parked on the COMPOSER column (the composer is declared as
-// a column inside the box via useDeclaredCursor), so the reply column is a
-// stable composer column, not cursor.x + 1. The strict lock rejects it, the
-// lane never arms, and it re-probes every frame — the click/select either/or.
+// (1b) The ARMING rule, the seam this lane owns. HEAD matched the reply column
+// to the parked composer column (`col === cursor.x + 1`). That lock is right for
+// a native terminal, where the reply IS the terminal's own cursor. It is wrong
+// for a relay client, and it is ALSO wrong when a client's DEC-private reply
+// loses its `?` in the mux/pty path and arrives as a plain reply: the column is
+// then xterm's terminal cursor column, not our parked one. The 2026-10-03 logs
+// show exactly that — `row=36 col=11 · expected col=1 · rows=38`, re-probing
+// every frame, never arming. So the column lock is gone: a reply of EITHER form
+// arms when its row lies inside the viewport we believe we are drawing.
 //
-// The reply FORM already tells us which topology we are in, so a relay is
-// armed on the ROW alone (the inline block is a full-width anchored region, so
-// its origin needs no column lock). A native terminal keeps the strict lock
-// byte-for-byte, so this must not perturb native arming.
+// The row bound is kept for the native/plain case (a stale reply from another
+// size must not arm a wrong origin), but a DEC-private reply is a client and may
+// report a row outside our own count — muxd's pty can be sized differently from
+// the browser xterm, and the mouse events arrive in that same client space, so
+// the client's row is the authoritative anchor and must not be rejected.
 // ---------------------------------------------------------------------------
-test('resolveInlineProbeArm: a relay arms on the row alone; a native keeps the strict column lock', () => {
+test('resolveInlineProbeArm: any form arms on an in-range row; a client may sit outside our rows', () => {
   expect(typeof resolveInlineProbeArm).toBe('function')
   const rows = 34
   const cursor = { x: 0, y: 33 } // composer parked on the bottom row, col 0
@@ -186,20 +188,64 @@ test('resolveInlineProbeArm: a relay arms on the row alone; a native keeps the s
     origin: 34 - 1 - 33,
   })
 
-  // Native: the plain-form reply still has to land on the parked cursor. A
-  // mismatched column is rejected exactly as before.
+  // The classification-flip case: the SAME client reply arrives as a plain
+  // reply (the `?` was dropped). Its column still does not match our parked
+  // cursor, but the row is in range, so it must arm — this is the case that
+  // re-probed every frame on HEAD.
+  const plainOffCursor = parsePlainResponse('\x1b[34;141R')
+  expect(resolveInlineProbeArm!(true, plainOffCursor as never, cursor, rows)).toEqual({
+    arm: true,
+    relay: false,
+    origin: 0,
+  })
+  // A native reply on our parked cursor still arms, unchanged.
   const nativeOnCursor = parsePlainResponse('\x1b[34;1R')
   expect(resolveInlineProbeArm!(true, nativeOnCursor as never, cursor, rows)).toEqual({
     arm: true,
     relay: false,
     origin: 0,
   })
-  const nativeOffCursor = parsePlainResponse('\x1b[34;141R')
-  expect(resolveInlineProbeArm!(true, nativeOffCursor as never, cursor, rows)).toEqual({ arm: false })
 
-  // A row outside the viewport is always rejected, relay or native.
-  expect(resolveInlineProbeArm!(true, parseResponse('\x1b[?99;1R') as never, cursor, rows)).toEqual({ arm: false })
+  // A DEC-private reply is a client: a row outside our own count is its own
+  // coordinate space (the browser xterm taller than muxd's pty) and arms.
+  expect(resolveInlineProbeArm!(true, parseResponse('\x1b[?43;3R') as never, cursor, rows)).toEqual({
+    arm: true,
+    relay: true,
+    origin: 43 - 1 - 33,
+  })
+  // A PLAIN reply outside our rows is rejected (native stale-reply guard).
+  expect(resolveInlineProbeArm!(true, parsePlainResponse('\x1b[99;1R') as never, cursor, rows)).toEqual({ arm: false })
+  // A row below 1 is never placeable.
+  expect(resolveInlineProbeArm!(true, parseResponse('\x1b[?0;1R') as never, cursor, rows)).toEqual({ arm: false })
   expect(resolveInlineProbeArm!(true, undefined, cursor, rows)).toEqual({ arm: false })
+})
+
+// ---------------------------------------------------------------------------
+// (1c) The reply must actually reach the arming rule. This is the parse+querier
+// half of the chain: the exact bytes the relay answers (`\e[?43;3R`, 197x47, the
+// shape Leaf 6 measured) must tokenize as a cursorPosition response and resolve
+// the pending probe. If this passes and the live session still does not arm, the
+// drop is upstream of the app (the mux/pty input path), not in the gateway.
+// ---------------------------------------------------------------------------
+test('the relay CPR reply resolves the probe query through the real parser', async () => {
+  const { TerminalQuerier, cursorPosition } = await import('../src/ink/terminal-querier.ts')
+  const { PassThrough } = await import('node:stream')
+  const stdout = new PassThrough() as unknown as NodeJS.WriteStream
+  const querier = new TerminalQuerier(stdout)
+  const pending = querier.send(cursorPosition(false))
+  const [items] = parseMultipleKeypresses({ ...INITIAL_STATE }, '\x1b[?43;3R')
+  for (const item of items) {
+    if (item.kind === 'response') querier.onResponse(item.response)
+  }
+  const position = await Promise.race([
+    pending,
+    new Promise(resolve => setTimeout(() => resolve('TIMEOUT'), 200)),
+  ])
+  expect(position).toEqual({ type: 'cursorPosition', row: 43, col: 3, decPrivate: true })
+  // ...and that resolved reply arms at the real client geometry (47 rows).
+  expect(
+    resolveInlineProbeArm!(true, position as never, { x: 0, y: 41 }, 47),
+  ).toEqual({ arm: true, relay: true, origin: 43 - 1 - 41 })
 })
 
 // ---------------------------------------------------------------------------
