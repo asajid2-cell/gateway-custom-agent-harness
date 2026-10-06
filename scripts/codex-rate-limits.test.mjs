@@ -5,11 +5,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  codexQuotaToProviderQuota,
   isCodexGatewayModel,
   quotaFromRateLimits,
   readCodexQuotaFromRollouts,
 } from '../src/utils/codexRateLimits.ts'
-import { formatBottomBarUsage } from '../src/utils/bottomBarUsage.ts'
+import { formatProviderQuota } from '../src/utils/bottomBarUsage.ts'
 
 
 test('Codex quota opt-in covers Gateway Codex model family', () => {
@@ -66,19 +67,41 @@ test('Codex quota uses the most restrictive primary or secondary window', async 
       resetsSecondary: 200,
       asof: quota.asof,
     })
-    assert.match(
-      formatBottomBarUsage(
-        'gateway-gpt-luna',
-        null,
-        200_000,
-        undefined,
-        quota,
-      ),
-      /Codex remaining 63%/,
-    )
+    // The primary 5-hour window is H, the weekly secondary is W, and each keeps
+    // its own figure rather than collapsing to the most restrictive one.
+    const providerQuota = codexQuotaToProviderQuota(quota)
+    assert.equal(formatProviderQuota('Codex', providerQuota, 'H'), 'Codex H remaining 88%')
+    assert.equal(formatProviderQuota('Codex', providerQuota, 'W'), 'Codex W remaining 63%')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('Codex windows map the primary 5-hour and secondary weekly windows', () => {
+  const mapped = codexQuotaToProviderQuota({
+    remainingPercent: 42,
+    primaryUsedPercent: 58,
+    secondaryUsedPercent: 0,
+    resetsPrimary: 1_788_795_032,
+    resetsSecondary: 1_788_980_213,
+    asof: 123,
+  })
+  // The app-server answers resetsAt in epoch seconds; the shape carries ms.
+  assert.deepEqual(mapped.windows.H, { usedPercent: 58, resetsAt: 1_788_795_032_000 })
+  assert.deepEqual(mapped.windows.W, { usedPercent: 0, resetsAt: 1_788_980_213_000 })
+  assert.equal(mapped.asof, 123)
+  assert.equal(mapped.stale, false)
+  // A window the reader did not find is simply absent, not a zero.
+  const onlyPrimary = codexQuotaToProviderQuota({
+    remainingPercent: 42,
+    primaryUsedPercent: 58,
+    secondaryUsedPercent: null,
+    resetsPrimary: null,
+    resetsSecondary: null,
+    asof: 1,
+  })
+  assert.deepEqual(Object.keys(onlyPrimary.windows), ['H'])
+  assert.equal(formatProviderQuota('Codex', onlyPrimary, 'W'), null)
 })
 
 test('Codex quota is unavailable when rollout snapshots have no numeric limits', async () => {

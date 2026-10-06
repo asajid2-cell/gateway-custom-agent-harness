@@ -3,6 +3,7 @@ import { open, readdir, stat, type FileHandle } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import type { ProviderQuota } from './bottomBarUsage.js'
 
 export type CodexQuota = {
   remainingPercent: number
@@ -91,6 +92,29 @@ export function quotaFromRateLimits(value: unknown, asof = Date.now()): CodexQuo
     resetsSecondary: secondary?.resetsAt ?? null,
     asof,
   }
+}
+
+// The app-server answers `resetsAt` in epoch seconds; the normalized shape
+// carries epoch ms.
+function toEpochMs(seconds: number | null): number | null {
+  return seconds === null ? null : seconds * 1000
+}
+
+/**
+ * Reduce a Codex reading to the normalized shape: the 5-hour primary window is
+ * `H` and the weekly secondary is `W`. This is a phase-1 bridge - the reader
+ * moves into the gateway later, and the client then consumes ProviderQuota
+ * directly rather than adapting CodexQuota into it.
+ */
+export function codexQuotaToProviderQuota(quota: CodexQuota): ProviderQuota {
+  const windows: ProviderQuota['windows'] = {}
+  if (quota.primaryUsedPercent !== null) {
+    windows.H = { usedPercent: quota.primaryUsedPercent, resetsAt: toEpochMs(quota.resetsPrimary) }
+  }
+  if (quota.secondaryUsedPercent !== null) {
+    windows.W = { usedPercent: quota.secondaryUsedPercent, resetsAt: toEpochMs(quota.resetsSecondary) }
+  }
+  return { windows, asof: quota.asof, stale: false }
 }
 
 function codexExecutable(): string {

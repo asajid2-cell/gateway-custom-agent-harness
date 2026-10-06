@@ -14,13 +14,72 @@ export type WeeklyUtilization = {
 }
 
 /**
- * The one figure a provider quota contributes to the readout: how much of the
- * subscription's limit is left. Codex answers from its rollout rate limits and
- * Anthropic from the utilization endpoint, but both reduce to a percentage, so
- * the formatter takes this shape rather than either provider's own type.
+ * A subscription's limits, normalized to the one shape every provider's quota
+ * is reduced to before it reaches the readout: per-window usage as the percent
+ * that has been *used*, and the epoch-ms time each window resets.
+ *
+ * `H` is the hourly window (Codex's 5-hour window, Anthropic's `five_hour`,
+ * OpenCode's `rolling`), `W` the weekly, `M` the monthly. A provider reports
+ * only the windows it has; one it omits is simply not shown, rather than
+ * printed as a zero.
  */
-export type ProviderQuotaRemaining = {
-  remainingPercent: number
+export type QuotaWindowKind = 'H' | 'W' | 'M'
+export type QuotaWindow = {
+  /** Percent of the window's limit that has been used, 0-100. */
+  usedPercent: number
+  /** Epoch ms when the window resets, or null when the provider does not say. */
+  resetsAt: number | null
+}
+export type ProviderName = 'Codex' | 'Anthropic' | 'OpenCode'
+export type ProviderQuota = {
+  windows: Partial<Record<QuotaWindowKind, QuotaWindow>>
+  /** Epoch ms when the upstream last answered. */
+  asof: number
+  /** Served from a fallback or an older reading rather than a fresh one. */
+  stale: boolean
+  /** The OpenCode key number actually serving, when the provider reports it. */
+  account?: number
+}
+
+/**
+ * The windows each provider has, in the order a click cycles them. Weekly
+ * leads, so it is what the readout shows until a click moves it on.
+ */
+export const QUOTA_CYCLE: Record<ProviderName, QuotaWindowKind[]> = {
+  Codex: ['W', 'H'],
+  Anthropic: ['W', 'H'],
+  OpenCode: ['W', 'H', 'M'],
+}
+
+/**
+ * The windows a provider actually reported, in cycle order. A window the
+ * provider omitted is left out rather than shown as a zero, so this is the
+ * list both the shown window and every click step are drawn from.
+ */
+export function availableQuotaKinds(
+  provider: ProviderName,
+  quota: ProviderQuota,
+): QuotaWindowKind[] {
+  return QUOTA_CYCLE[provider].filter(kind => quota.windows[kind])
+}
+
+/**
+ * The window a click moves to: the one after `current` in the provider's
+ * reported windows, wrapping back to the first. The first window is what a
+ * fresh control shows, and a window that vanished between readings falls back
+ * to it. With fewer than two windows there is nothing to cycle to, so the same
+ * window comes back.
+ */
+export function nextQuotaKind(
+  provider: ProviderName,
+  quota: ProviderQuota,
+  current: QuotaWindowKind | null,
+): QuotaWindowKind | null {
+  const available = availableQuotaKinds(provider, quota)
+  if (available.length === 0) return null
+  const index = current === null ? -1 : available.indexOf(current)
+  if (index < 0) return available[0]
+  return available[(index + 1) % available.length]
 }
 
 /**
@@ -96,7 +155,7 @@ export function getWeeklyRemainingPercent(
   return Math.round(Math.max(0, Math.min(1, 1 - weekly.utilization)) * 100)
 }
 
-export function getGatewayProviderLabel(model: string): string {
+export function getGatewayProviderLabel(model: string): ProviderName | 'Gateway' {
   const lower = model.toLowerCase()
   if (lower.includes('opencode')) return 'OpenCode'
   if (lower.includes('gateway-claude-')) return 'Anthropic'
@@ -106,35 +165,6 @@ export function getGatewayProviderLabel(model: string): string {
 
 export function isAnthropicGatewayModel(model: string): boolean {
   return model.toLowerCase().includes('gateway-claude-')
-}
-
-/**
- * The subscription's own limit as `/gateway/anthropic-usage` reports it: the
- * session window and the weekly window, each a fraction of its limit that has
- * been used. The readout carries one number, so it reports the window nearest
- * its limit - the same reduction the Codex reader applies across its windows.
- *
- * `utilization` is a fraction, not a percentage: the provider answers
- * `five_hour.utilization = 0.05` for five percent used, the same scale the
- * `anthropic-ratelimit-unified-*-utilization` reply headers carry, and the same
- * scale the rest of this client assumes - StatusLine and rateLimitMessages both
- * multiply it by 100 to display it.
- */
-export function getAnthropicRemainingPercent(
-  utilization:
-    | {
-        five_hour?: { utilization: number | null } | null
-        seven_day?: { utilization: number | null } | null
-      }
-    | null
-    | undefined,
-): number | null {
-  if (!utilization) return null
-  const used = [utilization.five_hour, utilization.seven_day]
-    .map(window => window?.utilization)
-    .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-  if (used.length === 0) return null
-  return Math.round(Math.max(0, Math.min(100, (1 - Math.max(...used)) * 100)))
 }
 
 // A session can be resumed by id or by name: `cc --resume <name>` resolves the
@@ -151,12 +181,27 @@ export function formatSessionResumeCommand(
   return `cd ${quotePowerShellLiteral(directory)}; & cc --resume ${target}`
 }
 
+/**
+ * One window of a provider's quota as the readout prints it: which provider,
+ * which window, and how much of that window is left. A window the provider did
+ * not report prints nothing, and a figure served from a fallback says so.
+ */
+export function formatProviderQuota(
+  provider: ProviderName,
+  quota: ProviderQuota,
+  kind: QuotaWindowKind,
+): string | null {
+  const window = quota.windows[kind]
+  if (!window) return null
+  const remaining = Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)))
+  return `${provider} ${kind} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
+}
+
 export function formatBottomBarUsage(
   model: string,
   usage: CurrentUsage | null,
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
-  providerQuota?: ProviderQuotaRemaining | null,
   options?: { includeModel?: boolean },
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
@@ -175,15 +220,9 @@ export function formatBottomBarUsage(
     parts.push(`model ${model}`)
   }
 
-  // Both providers report one remaining figure, so the label is what tells
-  // them apart - and it is only ever printed for the provider the model
-  // belongs to, because the caller reads the quota of that same provider.
-  if (providerQuota) {
-    const provider = getGatewayProviderLabel(model)
-    if (provider === 'Codex' || provider === 'Anthropic' || provider === 'OpenCode') {
-      parts.push(`${provider} remaining ${providerQuota.remainingPercent}%`)
-    }
-  }
+  // The provider quota used to be a part of this string. It is its own element
+  // now (ProviderQuotaControl), because it is the one part a click changes, so
+  // the readout is only the model, the tokens, the context and the weekly share.
 
   if (usage) {
     parts.push(
