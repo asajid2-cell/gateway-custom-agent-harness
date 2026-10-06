@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtempSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createServer, request as httpRequest } from 'node:http'
@@ -58,6 +59,7 @@ import {
   sanitizeLegacyCompactionText,
   sanitizeStaleToolCapabilityContent,
 } from './gateway-contract.mjs'
+import { quotaKey, readSharedQuota } from './quota-cache.mjs'
 
 test('OpenCode retries cycle numbered credentials and wrap to the original', async () => {
   const credentials = openCodeCredentialPool({
@@ -296,6 +298,25 @@ const gatewayScript = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   'model-gateway.mjs',
 )
+
+// The shared quota cache is cross-process by design: every gateway a test
+// spawns reads and writes the same file for a provider account. Point it at a
+// temp directory once, at module load, so no test touches the developer's real
+// %LOCALAPPDATA%/Gateway/quota-cache snapshots - and so a snapshot one test
+// writes cannot leak into the next. `startGatewayForTest` spreads process.env,
+// so every spawned gateway inherits this.
+if (!process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR) {
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = mkdtempSync(
+    path.join(os.tmpdir(), 'gateway-quota-cache-'),
+  )
+}
+
+// A gateway that must observe an empty cache - every quota test does, because a
+// snapshot is shared across the whole file - gets its own directory rather than
+// inheriting whatever an earlier test left behind.
+function freshQuotaCacheDir() {
+  return mkdtempSync(path.join(os.tmpdir(), 'gateway-quota-cache-case-'))
+}
 
 async function startGatewayForTest(env) {
   const child = spawn(process.execPath, [gatewayScript, '--port', '0'], {
@@ -2629,13 +2650,16 @@ test('HTTP boundary keeps omitted-stream DeepSeek fallback JSON', async () => {
 
 test('the gateway remembers the subscription limit Anthropic reports', async () => {
   await withGatewayAndFakeAnthropic({
+    gatewayEnv: { MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir() },
     handler: async (req, res, state) => {
       state.requests.push(await requestJson(req))
       res.writeHead(200, {
         'content-type': 'application/json',
-        'anthropic-ratelimit-unified-5h-utilization': '37',
+        // The reply header carries utilization as a 0-1 FRACTION and its reset
+        // as epoch SECONDS - the real scales, not the endpoint's 0-100 and ISO.
+        'anthropic-ratelimit-unified-5h-utilization': '0.37',
         'anthropic-ratelimit-unified-5h-reset': '1790000000',
-        'anthropic-ratelimit-unified-7d-utilization': '88',
+        'anthropic-ratelimit-unified-7d-utilization': '0.88',
         'anthropic-ratelimit-unified-7d-reset': '1791000000',
       })
       res.end(JSON.stringify({
@@ -2649,10 +2673,10 @@ test('the gateway remembers the subscription limit Anthropic reports', async () 
     },
     run: async ({ gateway, state }) => {
       // Nothing has reached Anthropic yet, so the readout has no figure to give.
-      // An empty object means "never seen a limit", not "no limit left".
+      // Empty windows mean "never seen a limit", not "no limit left".
       const before = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
       assert.equal(before.status, 200)
-      assert.deepEqual(JSON.parse(before.body), {})
+      assert.deepEqual(JSON.parse(before.body).windows, {})
 
       const result = await postGateway(gateway.port, {
         model: 'gateway-claude-opus-5-5',
@@ -2667,10 +2691,16 @@ test('the gateway remembers the subscription limit Anthropic reports', async () 
 
       const after = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
       assert.equal(after.status, 200)
-      assert.deepEqual(JSON.parse(after.body), {
-        five_hour: { utilization: 37, resets_at: 1790000000 },
-        seven_day: { utilization: 88, resets_at: 1791000000 },
+      const body = JSON.parse(after.body)
+      // The header's fraction is rescaled to 0-100 used and its reset to epoch
+      // ms, keyed by the normalized H/W window rather than the endpoint's names.
+      assert.deepEqual(body.windows, {
+        H: { usedPercent: 37, resetsAt: 1_790_000_000_000 },
+        W: { usedPercent: 88, resetsAt: 1_791_000_000_000 },
       })
+      // The figure came from a reply header, not the live usage read, so it is
+      // flagged stale even though the header is the freshest thing there is.
+      assert.equal(body.stale, true)
     },
   })
 })
@@ -2696,8 +2726,10 @@ test('the usage route reads the subscription window without spending a turn', as
     reads.push({ url: req.url, authorization: req.headers.authorization })
     res.writeHead(200, { 'content-type': 'application/json' })
     res.end(JSON.stringify({
-      five_hour: { utilization: 1, resets_at: '2026-09-30T06:50:00+00:00' },
-      seven_day: { utilization: 0, resets_at: '2026-10-02T10:00:00+00:00' },
+      // The endpoint answers utilization on the 0-100 scale and its reset as an
+      // ISO timestamp - the real scales this route normalizes.
+      five_hour: { utilization: 37, resets_at: '2026-09-30T06:50:00+00:00' },
+      seven_day: { utilization: 12, resets_at: '2026-10-02T10:00:00+00:00' },
       seven_day_opus: null,
       extra_usage: null,
     }))
@@ -2710,6 +2742,7 @@ test('the usage route reads the subscription window without spending a turn', as
   try {
     gateway = await startGatewayForTest({
       CLAUDE_CONFIG_DIR: configDir,
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
       MODEL_GATEWAY_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${usage.port}/api/oauth/usage`,
     })
     // No request of any kind has reached a model at this point: the figure
@@ -2720,10 +2753,12 @@ test('the usage route reads the subscription window without spending a turn', as
     ])
     assert.equal(concurrent.body, first.body)
     assert.equal(first.status, 200)
-    assert.deepEqual(JSON.parse(first.body), {
-      five_hour: { utilization: 1, resets_at: '2026-09-30T06:50:00+00:00' },
-      seven_day: { utilization: 0, resets_at: '2026-10-02T10:00:00+00:00' },
+    assert.deepEqual(JSON.parse(first.body).windows, {
+      H: { usedPercent: 37, resetsAt: Date.parse('2026-09-30T06:50:00+00:00') },
+      W: { usedPercent: 12, resetsAt: Date.parse('2026-10-02T10:00:00+00:00') },
     })
+    // A live read straight from the endpoint is not stale.
+    assert.equal(JSON.parse(first.body).stale, false)
     assert.deepEqual(reads, [
       {
         url: '/api/oauth/usage',
@@ -2761,17 +2796,85 @@ test('an API key has no subscription window to read', async () => {
   let gateway
   try {
     gateway = await startGatewayForTest({
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
       MODEL_GATEWAY_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${usage.port}/api/oauth/usage`,
     })
     const read = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
     assert.equal(read.status, 200)
-    assert.deepEqual(JSON.parse(read.body), {})
+    assert.deepEqual(JSON.parse(read.body).windows, {})
     assert.deepEqual(reads, [])
   } finally {
     if (gateway) await stopChild(gateway.child)
     if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
     else process.env.ANTHROPIC_API_KEY = previousKey
     await new Promise(resolve => usage.server.close(resolve))
+  }
+})
+
+test('a 429 with Retry-After holds the next read and serves the last figure stale', async () => {
+  // The live failure this covers: N gateways on one account, each polling every
+  // 10 s, and Anthropic answering 429 with a Retry-After. Without honoring the
+  // wait the next poll fires immediately and the account stays throttled. The
+  // wait the provider asked for is recorded in the shared cache so every
+  // gateway backs off together, and the last good figure is served stale rather
+  // than replaced by an empty one.
+  const configDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-usage-429-'))
+  await writeFile(
+    path.join(configDir, '.credentials.json'),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'subscription-token',
+        refreshToken: 'subscription-refresh',
+        expiresAt: Date.now() + 3_600_000,
+      },
+    }),
+  )
+  let calls = 0
+  const usage = await fakeCodexServer((req, res) => {
+    calls += 1
+    res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '120' })
+    res.end(JSON.stringify({ error: 'rate limited' }))
+  })
+  const cacheDir = freshQuotaCacheDir()
+  const previousKey = process.env.ANTHROPIC_API_KEY
+  delete process.env.ANTHROPIC_API_KEY
+  let gateway
+  try {
+    gateway = await startGatewayForTest({
+      CLAUDE_CONFIG_DIR: configDir,
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: cacheDir,
+      MODEL_GATEWAY_ANTHROPIC_USAGE_URL: `http://127.0.0.1:${usage.port}/api/oauth/usage`,
+    })
+
+    // The first read is refused. There is no figure yet, so the route reports
+    // nothing - but the refusal must leave a record of how long to wait.
+    const first = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+    assert.equal(first.status, 200)
+    assert.deepEqual(JSON.parse(first.body).windows, {})
+    assert.equal(calls, 1)
+
+    const entry = await readSharedQuota(quotaKey('anthropic', 1), {
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: cacheDir,
+    })
+    assert.equal(entry.backoffMs, 120_000, 'Retry-After: 120 must be the backoff')
+    // `nextAllowedAt` is now + 120 s: the provider's own wait, uncapped.
+    assert.ok(
+      Math.abs(entry.nextAllowedAt - (Date.now() + 120_000)) < 10_000,
+      `expected nextAllowedAt ~now+120s, got ${entry.nextAllowedAt}`,
+    )
+
+    // While that wait is live the provider is not asked again - this is what
+    // keeps N gateways from turning one 429 into a sustained throttle.
+    const second = await getGatewayJson(gateway.port, '/gateway/anthropic-usage')
+    assert.equal(second.status, 200)
+    assert.equal(calls, 1, 'a live backoff must forbid the upstream call')
+    assert.deepEqual(JSON.parse(second.body).windows, {})
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = previousKey
+    await new Promise(resolve => usage.server.close(resolve))
+    await rm(configDir, { recursive: true, force: true })
   }
 })
 

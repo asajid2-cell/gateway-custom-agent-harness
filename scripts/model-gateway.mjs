@@ -28,6 +28,12 @@ import {
 } from './opencode-zen.mjs'
 import { GATEWAY_RELOAD_EXIT_CODE } from './gateway-keysafe.mjs'
 import {
+  QUOTA_TTL_MS,
+  quotaKey,
+  readQuotaThroughCache,
+  readSharedQuota,
+} from './quota-cache.mjs'
+import {
   COMMANDCODE_MODEL_IDS,
   COMMANDCODE_ROUTES,
   commandCodeEffortLevels,
@@ -3825,43 +3831,89 @@ export async function readOpenCodeSubscriptionUsage(credentials = openCodeCreden
 const ANTHROPIC_USAGE_ENDPOINT =
   process.env.MODEL_GATEWAY_ANTHROPIC_USAGE_URL ||
   'https://api.anthropic.com/api/oauth/usage'
-// The endpoint is cheap, but every session on this Gateway asks about the same
-// account, so one read per window serves them all. Short enough that a figure
-// the user just changed is visible on the next poll.
-const ANTHROPIC_USAGE_TTL_MS = 30_000
-let anthropicUsageRead = null
-let anthropicUsageInFlight = null
 
+// Every gateway on the machine asks about the same subscription. Sharing the
+// answer through the quota cache, and letting one failure back them all off, is
+// what stops N sessions from being N pollers against one account - which is
+// exactly how the endpoint started answering 429 and leaving the footer stale.
+const ANTHROPIC_QUOTA_KEY = quotaKey('anthropic', 1)
+// Backoff starts at a minute and doubles to a quarter hour. A rejected grant is
+// not a bad moment - the sign-in is finished and hammering cannot fix it - so
+// it gets the long wait outright.
+const ANTHROPIC_BACKOFF_BASE_MS = 60_000
+const ANTHROPIC_BACKOFF_MAX_MS = 15 * 60_000
+const ANTHROPIC_SIGNIN_BACKOFF_MS = 10 * 60_000
+
+/** A used percentage clamped to 0-100, or null when it is not a number. */
+function clampUsedPercent(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.max(0, Math.min(100, value))
+}
+
+/**
+ * A reset instant as epoch milliseconds, from either an ISO timestamp the
+ * endpoint sends or a reply header's epoch SECONDS. Null when there is nothing
+ * usable, so a figure with no reset is reported rather than a fabricated one.
+ */
+function resetToEpochMs(value) {
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    // Seconds since the epoch are ~1.7e9, milliseconds ~1.7e12; anything below
+    // the 2001 millisecond boundary is a seconds value.
+    return Math.round(value < 1e12 ? value * 1000 : value)
+  }
+  return null
+}
+
+/**
+ * The endpoint's own windows as `{ H?, W? }` of `{ usedPercent, resetsAt }`.
+ * `utilization` is a percentage 0-100 here - the same scale the client's own
+ * Usage screen prints - NOT the 0-1 fraction the reply headers carry, so it is
+ * taken as-is. `five_hour` is the session window, `seven_day` the weekly one.
+ */
 function anthropicUsageWindows(payload) {
   const windows = {}
-  for (const key of ['five_hour', 'seven_day']) {
-    const window = payload?.[key]
-    const utilization = window?.utilization
-    if (typeof utilization !== 'number' || !Number.isFinite(utilization)) continue
-    windows[key] = { utilization, resets_at: window?.resets_at ?? null }
+  for (const [key, kind] of [['five_hour', 'H'], ['seven_day', 'W']]) {
+    const used = clampUsedPercent(payload?.[key]?.utilization)
+    if (used === null) continue
+    windows[kind] = { usedPercent: used, resetsAt: resetToEpochMs(payload?.[key]?.resets_at) }
   }
   return windows
 }
 
-async function readAnthropicSubscriptionUsage() {
-  if (anthropicUsageInFlight) return anthropicUsageInFlight
-  anthropicUsageInFlight = fetchAnthropicSubscriptionUsage()
-  try {
-    return await anthropicUsageInFlight
-  } finally {
-    anthropicUsageInFlight = null
-  }
+function nextAnthropicBackoff(previousMs) {
+  if (!Number.isFinite(previousMs) || previousMs <= 0) return ANTHROPIC_BACKOFF_BASE_MS
+  return Math.min(previousMs * 2, ANTHROPIC_BACKOFF_MAX_MS)
 }
 
-async function fetchAnthropicSubscriptionUsage() {
+/**
+ * A `Retry-After` as milliseconds, uncapped: unlike the upstream retry loop,
+ * this value is a wait the provider asked for, not a retry delay the gateway
+ * chooses, so a `Retry-After: 120` really does hold the read for two minutes.
+ */
+function quotaRetryAfterMs(value) {
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000)
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) return null
+  return Math.max(0, timestamp - Date.now())
+}
+
+/**
+ * One upstream read for `readQuotaThroughCache`. Returns `{ windows }` on a
+ * usable answer, or `{ windows: null, backoffMs }` when it could not answer so
+ * the caller records how long to wait before trying again.
+ */
+async function readAnthropicUpstream() {
   // A key is not a subscription: there is no window to report, and the endpoint
-  // would only answer 401.
-  if (process.env.ANTHROPIC_API_KEY) return {}
-  const cached = anthropicUsageRead
-  if (cached && Date.now() - cached.at < ANTHROPIC_USAGE_TTL_MS) {
-    return cached.windows
-  }
-  let windows
+  // would only answer 401. An empty window set is a real answer, not a failure.
+  if (process.env.ANTHROPIC_API_KEY) return { windows: {} }
+  const previous = await readSharedQuota(ANTHROPIC_QUOTA_KEY)
+  const priorBackoff = Number.isFinite(previous?.backoffMs) ? previous.backoffMs : 0
   try {
     const token = await anthropicAccessToken()
     const response = await fetch(ANTHROPIC_USAGE_ENDPOINT, {
@@ -3873,18 +3925,30 @@ async function fetchAnthropicSubscriptionUsage() {
       },
       signal: AbortSignal.timeout(5_000),
     })
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    windows = anthropicUsageWindows(await response.json())
+    if (!response.ok) {
+      process.stderr.write(
+        `model-gateway warning: could not read the Anthropic subscription usage: HTTP ${response.status}\n`,
+      )
+      return {
+        windows: null,
+        backoffMs: response.status === 401
+          ? ANTHROPIC_SIGNIN_BACKOFF_MS
+          : (quotaRetryAfterMs(response.headers.get('retry-after')) ?? nextAnthropicBackoff(priorBackoff)),
+      }
+    }
+    return { windows: anthropicUsageWindows(await response.json()) }
   } catch (error) {
-    // Deliberately not cached, so the next poll retries instead of holding the
-    // failure for the whole window.
+    const message = errorMessage(error)
     process.stderr.write(
-      `model-gateway warning: could not read the Anthropic subscription usage: ${errorMessage(error)}\n`,
+      `model-gateway warning: could not read the Anthropic subscription usage: ${message}\n`,
     )
-    return {}
+    return {
+      windows: null,
+      backoffMs: message.toLowerCase().includes('sign-in is no longer valid')
+        ? ANTHROPIC_SIGNIN_BACKOFF_MS
+        : nextAnthropicBackoff(priorBackoff),
+    }
   }
-  anthropicUsageRead = { at: Date.now(), windows }
-  return windows
 }
 
 /**
@@ -3893,25 +3957,66 @@ async function fetchAnthropicSubscriptionUsage() {
  * the live read above: when the usage endpoint cannot be reached, the figure
  * the last real reply carried is still a figure, and reporting nothing would
  * read as "no limit" rather than "not known right now".
+ *
+ * The reply header carries utilization as a FRACTION 0-1 - unlike the endpoint
+ * above, which answers 0-100 - and its reset as epoch SECONDS, so both are
+ * rescaled here before the two sources can be compared.
  */
 let anthropicSubscriptionWindows = null
 
 function recordAnthropicSubscriptionWindows(upstream) {
   const windows = {}
-  for (const [key, abbrev] of [['five_hour', '5h'], ['seven_day', '7d']]) {
+  // The header names carry `5h`/`7d`; the window key is the normalized `H`/`W`.
+  for (const [kind, abbrev] of [['H', '5h'], ['W', '7d']]) {
     const utilization = upstream.headers.get(
       `anthropic-ratelimit-unified-${abbrev}-utilization`,
     )
     if (utilization === null) continue
+    const used = clampUsedPercent(Number(utilization) * 100)
+    if (used === null) continue
     const reset = upstream.headers.get(`anthropic-ratelimit-unified-${abbrev}-reset`)
-    windows[key] = {
-      utilization: Number(utilization),
-      resets_at: reset === null ? null : Number(reset),
+    windows[kind] = {
+      usedPercent: used,
+      resetsAt: resetToEpochMs(reset === null ? null : Number(reset)),
     }
   }
   // An API-key session answers without these headers, and a failed reply may
   // too; a reading nobody sent is not a reading, so the last real one stands.
-  if (Object.keys(windows).length > 0) anthropicSubscriptionWindows = windows
+  if (Object.keys(windows).length > 0) {
+    anthropicSubscriptionWindows = { windows, asof: Date.now() }
+  }
+}
+
+/**
+ * The figure the footer reads: the newest of the live subscription read (shared
+ * across gateways through the quota cache) and the header snapshot from the
+ * last real reply. A window set with no figures is not a candidate - a reading
+ * beats no reading, however old - and `stale` is true whenever the header path,
+ * a backed-off cache read, or an expired live read is what answered.
+ */
+export async function readAnthropicQuota() {
+  const live = await readQuotaThroughCache({
+    key: ANTHROPIC_QUOTA_KEY,
+    ttlMs: QUOTA_TTL_MS.anthropic,
+    read: readAnthropicUpstream,
+  })
+  const header = anthropicSubscriptionWindows
+  const candidates = []
+  if (live && live.windows && Object.keys(live.windows).length > 0) candidates.push(live)
+  if (header && Object.keys(header.windows).length > 0) {
+    candidates.push({ windows: header.windows, asof: header.asof, stale: true })
+  }
+  if (candidates.length === 0) {
+    return { windows: {}, asof: live?.asof ?? header?.asof ?? Date.now(), stale: true }
+  }
+  candidates.sort((a, b) => b.asof - a.asof)
+  const newest = candidates[0]
+  const expired = Date.now() - newest.asof > QUOTA_TTL_MS.anthropic
+  return {
+    windows: newest.windows,
+    asof: newest.asof,
+    stale: newest.stale === true || expired,
+  }
 }
 
 function normalizeAnthropicContent(content, nested = false) {
@@ -4298,12 +4403,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/anthropic-usage') {
     process.stderr.write('model-gateway route path=/gateway/anthropic-usage backend=anthropic-usage\n')
-    const live = await readAnthropicSubscriptionUsage()
-    json(
-      res,
-      200,
-      Object.keys(live).length > 0 ? live : anthropicSubscriptionWindows ?? {},
-    )
+    json(res, 200, await readAnthropicQuota())
     return
   }
 
