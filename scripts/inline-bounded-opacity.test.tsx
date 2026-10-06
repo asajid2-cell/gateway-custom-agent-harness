@@ -775,3 +775,70 @@ test('a burst of viewer FOCUS_IN events repaints the block only once', async () 
     setIsInteractive(savedInteractive)
   }
 })
+
+// A mux viewer attaching at a different size replays raw bytes, and before the
+// resize lands the block can be written taller than the real viewport, scrolling
+// a copy of the intro into rows the app still believes are blank. The writer
+// skips cells that are blank in BOTH frames, so a later resize that only diffs
+// leaves that copy sitting below the freshly painted block — the "intro painted
+// twice" a viewer reports before a hard refresh. A resize invalidates the
+// terminal's content exactly as the alt-screen path already treats it, so it
+// must repaint the block opaquely (erase + full block), not diff over it.
+test('a resize repaints the inline block opaquely, so a stale duplicate cannot survive', async () => {
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin, take } = harness()
+  const screen = new ReplayScreen(COLUMNS, ROWS)
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  const resize = async (rows: number) => {
+    screen.resizeTo(rows)
+    stdout.rows = rows
+    stdout.emit('resize')
+    await sleep(300)
+    screen.feed(take())
+  }
+  const countRow0 = () => screen.visible().filter(r => r.includes('row-0')).length
+  try {
+    assert.ok(isBoundedLayoutEnabled(), 'the test must exercise the bounded lane')
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as any, stderr: stdout as any, stdin: stdin as any,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    await sleep(300)
+    screen.feed(take())
+    assert.deepEqual(screen.visible().slice(0, 3), ['row-0', 'row-1', 'row-2'])
+
+    // The viewer replays a copy of the block's first rows into the rows below
+    // it, which the app's frontFrame says are blank (the block is 3 rows in an
+    // 8-row viewport). This is the second copy a viewer sees before refresh.
+    screen.feed('\x1b[H' + '\n'.repeat(6) + 'row-0' + '\n' + 'row-1')
+    assert.equal(countRow0(), 2, 'the harness must be able to see the duplicate')
+
+    // The resize that follows must clear it: the block is repainted opaquely.
+    await resize(9)
+    assert.equal(
+      countRow0(),
+      1,
+      `the duplicate survived the resize:\n${screen.visible().join('\n')}`,
+    )
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
