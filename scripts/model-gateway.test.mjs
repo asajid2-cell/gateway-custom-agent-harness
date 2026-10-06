@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -60,6 +60,7 @@ import {
   sanitizeStaleToolCapabilityContent,
 } from './gateway-contract.mjs'
 import { quotaKey, readSharedQuota } from './quota-cache.mjs'
+import { codexQuotaWindows } from './codex-quota.mjs'
 
 test('OpenCode retries cycle numbered credentials and wrap to the original', async () => {
   const credentials = openCodeCredentialPool({
@@ -390,6 +391,17 @@ if (!process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR) {
 // inheriting whatever an earlier test left behind.
 function freshQuotaCacheDir() {
   return mkdtempSync(path.join(os.tmpdir(), 'gateway-quota-cache-case-'))
+}
+
+// Poll a predicate until it holds, or fail after a bound. Used for the Codex
+// push notification, which arrives asynchronously after the first read.
+async function waitFor(predicate, { timeoutMs = 5_000, intervalMs = 25 } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return true
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+  }
+  return false
 }
 
 async function startGatewayForTest(env) {
@@ -3003,6 +3015,112 @@ test('the opencode usage route returns the shared shape for the serving account'
     else process.env.OPENCODE_API_KEY = previousKey
     await new Promise(resolve => usage.server.close(resolve))
     await rm(configDir, { recursive: true, force: true })
+  }
+})
+
+test('codex rate limits are keyed by window duration, not position', () => {
+  // The app-server labels its two buckets only primary and secondary, so the
+  // duration is the only honest label for a window.
+  assert.deepEqual(
+    codexQuotaWindows({
+      primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1_790_000_000 },
+      secondary: { usedPercent: 88, windowDurationMins: 10080, resetsAt: 1_791_000_000 },
+    }),
+    {
+      H: { usedPercent: 40, resetsAt: 1_790_000_000_000 },
+      W: { usedPercent: 88, resetsAt: 1_791_000_000_000 },
+    },
+  )
+  // A month-long bucket is M; a window with no duration is dropped rather than
+  // guessed at; and a non-object input yields no windows.
+  assert.deepEqual(
+    codexQuotaWindows({
+      primary: { usedPercent: 10, windowDurationMins: 43200 },
+      secondary: { usedPercent: 5 },
+    }),
+    { M: { usedPercent: 10, resetsAt: null } },
+  )
+  assert.deepEqual(codexQuotaWindows(null), {})
+})
+
+// A stand-in for `codex app-server --listen stdio://`: it answers the handshake
+// and `account/rateLimits/read`, records each start to the log, then pushes an
+// `account/rateLimits/updated` notification. Written to a temp file so the
+// gateway can be pointed at it through MODEL_GATEWAY_CODEX_APP_SERVER.
+const FAKE_CODEX_APP_SERVER = `
+import readline from 'node:readline'
+import { appendFileSync } from 'node:fs'
+
+if (process.env.MODEL_GATEWAY_CODEX_TEST_LOG) {
+  appendFileSync(process.env.MODEL_GATEWAY_CODEX_TEST_LOG, 'spawn\\n')
+}
+const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  let message
+  try { message = JSON.parse(line) } catch { return }
+  if (message.method === 'initialize') {
+    send({ id: message.id, result: {} })
+    return
+  }
+  if (message.method === 'account/rateLimits/read') {
+    send({ id: message.id, result: { rateLimits: {
+      primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1790000000 },
+      secondary: { usedPercent: 88, windowDurationMins: 10080, resetsAt: 1791000000 },
+    } } })
+    setTimeout(() => send({ method: 'account/rateLimits/updated', params: { rateLimits: {
+      primary: { usedPercent: 50, windowDurationMins: 300, resetsAt: 1790000000 },
+    } } }), 300)
+  }
+})
+`
+
+test('the codex usage route reuses one app-server and follows its updates', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'gateway-codex-'))
+  const fakePath = path.join(dir, 'fake-codex-app-server.mjs')
+  const logPath = path.join(dir, 'spawns.log')
+  await writeFile(fakePath, FAKE_CODEX_APP_SERVER)
+  const previousFake = process.env.MODEL_GATEWAY_CODEX_APP_SERVER
+  const previousLog = process.env.MODEL_GATEWAY_CODEX_TEST_LOG
+  process.env.MODEL_GATEWAY_CODEX_APP_SERVER = fakePath
+  process.env.MODEL_GATEWAY_CODEX_TEST_LOG = logPath
+  let gateway
+  try {
+    gateway = await startGatewayForTest({})
+    const first = await getGatewayJson(gateway.port, '/gateway/codex-usage')
+    assert.equal(first.status, 200)
+    const body = JSON.parse(first.body)
+    assert.deepEqual(body.windows, {
+      H: { usedPercent: 40, resetsAt: 1_790_000_000_000 },
+      W: { usedPercent: 88, resetsAt: 1_791_000_000_000 },
+    })
+    assert.equal(body.stale, false)
+
+    // A second read must reuse the running app-server rather than spawn
+    // another. A wrongly-spawned child announces itself asynchronously, so give
+    // it a moment and assert the log never grew past the single start.
+    assert.equal((await readFile(logPath, 'utf8')).trim().split('\n').length, 1)
+    const second = await getGatewayJson(gateway.port, '/gateway/codex-usage')
+    assert.equal(second.status, 200)
+    assert.ok(Object.keys(JSON.parse(second.body).windows).length >= 1)
+    const respawned = await waitFor(async () => {
+      const text = await readFile(logPath, 'utf8')
+      return text.trim().split('\n').length !== 1
+    }, { timeoutMs: 800, intervalMs: 25 })
+    assert.equal(respawned, false, 'a second read must not spawn another app-server')
+
+    // The pushed notification updates the snapshot without a re-read.
+    const updated = await waitFor(async () => {
+      const next = JSON.parse((await getGatewayJson(gateway.port, '/gateway/codex-usage')).body)
+      return next.windows.H?.usedPercent === 50
+    })
+    assert.equal(updated, true, 'the updated notification must refresh the snapshot')
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    if (previousFake === undefined) delete process.env.MODEL_GATEWAY_CODEX_APP_SERVER
+    else process.env.MODEL_GATEWAY_CODEX_APP_SERVER = previousFake
+    if (previousLog === undefined) delete process.env.MODEL_GATEWAY_CODEX_TEST_LOG
+    else process.env.MODEL_GATEWAY_CODEX_TEST_LOG = previousLog
+    await rm(dir, { recursive: true, force: true })
   }
 })
 

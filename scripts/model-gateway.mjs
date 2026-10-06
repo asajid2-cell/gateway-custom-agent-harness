@@ -33,6 +33,7 @@ import {
   readQuotaThroughCache,
   readSharedQuota,
 } from './quota-cache.mjs'
+import { readCodexQuota, stopCodexQuota } from './codex-quota.mjs'
 import {
   COMMANDCODE_MODEL_IDS,
   COMMANDCODE_ROUTES,
@@ -4448,6 +4449,12 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/codex-usage') {
+    process.stderr.write('model-gateway route path=/gateway/codex-usage backend=codex-usage\n')
+    json(res, 200, await readCodexQuota())
+    return
+  }
+
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/anthropic-usage') {
     process.stderr.write('model-gateway route path=/gateway/anthropic-usage backend=anthropic-usage\n')
     json(res, 200, await readAnthropicQuota())
@@ -4544,6 +4551,12 @@ server.on('error', error => {
     `model-gateway error: ${error instanceof Error ? error.message : String(error)}\n`,
   )
   process.exitCode = 1
+})
+
+// The Codex app-server is a child of this process, so stop it on the way out
+// rather than leaving it to be reparented.
+process.on('exit', () => {
+  stopCodexQuota()
 })
 
 if (
