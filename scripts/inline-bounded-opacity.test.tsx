@@ -71,11 +71,15 @@ class ReplayScreen {
     for (let i = 0; i < data.length; i++) {
       const ch = data[i]!
       if (ch === '\x1b') {
-        const match = /^\x1b\[(\??)(\d*)(?:;(\d+))?([A-Za-z@])/.exec(data.slice(i))
+        const match = /^\x1b\[([?<>]?)(\d*)(?:;(\d+))?([A-Za-z@])/.exec(data.slice(i))
         assert.ok(match, `replay does not understand escape at index ${i}`)
         const [whole, priv, first, , final] = match
         const n = first === '' ? 1 : Number(first)
-        if (priv !== '?') {
+        // Only a plain CSI (no ?/</> prefix) can move cells. Private and
+        // query-prefixed forms are screen-neutral: the lane writes them to
+        // interrogate the terminal (DA1 `c`, DSR `n`, XTVERSION `q`), not to
+        // draw. Ignore them the way a real terminal answers without repainting.
+        if (priv === '') {
           if (final === 'H') {
             this.x = 0
             this.y = 0
@@ -91,6 +95,9 @@ class ReplayScreen {
             // Erase scrollback, which the resize path sends with its full
             // reset. Nothing above the viewport is modelled, so this is the
             // one erasure that changes no visible cell.
+          } else if (final === 'n' || final === 'c' || final === 'q') {
+            // Terminal queries (DSR, DA1, XTVERSION) the inline lane writes to
+            // interrogate the terminal. They draw nothing.
           } else if (final !== 'm') {
             throw new Error(`replay does not implement CSI ${first}${final}`)
           }
@@ -646,6 +653,114 @@ test('a probe that recovers after a miss repaints the block once, so a late atta
     assert.ok(
       stream.includes('\x1b[2J'),
       `the recovered block was not repainted opaquely: ${JSON.stringify(stream)}`,
+    )
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
+
+// A viewer that attaches, reattaches or resyncs replays raw bytes into the
+// terminal, so the app cannot trust what is on screen against its frontFrame.
+// muxd's redraw_nudge is alt-screen-gated, so an inline gateway gets no pty
+// signal for the attach; muxd injects FOCUS_IN (CSI I) into the child instead.
+// That must repaint the block opaquely. Without the fix the app sees no diff
+// and writes nothing, leaving the replayed screen in place — the "black screen
+// with a sliver" a mux viewer reports before a hard refresh.
+test('a viewer FOCUS_IN repaints the block opaquely, so a mux attach loads', async () => {
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin, take } = harness()
+  const screen = new ReplayScreen(COLUMNS, ROWS)
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  try {
+    assert.ok(isBoundedLayoutEnabled(), 'the test must exercise the bounded lane')
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as any, stderr: stdout as any, stdin: stdin as any,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    await sleep(300)
+    screen.feed(take())
+    assert.deepEqual(screen.visible().slice(0, 3), ['row-0', 'row-1', 'row-2'])
+
+    // The viewer attaches: the terminal is handed a replay the app never drew.
+    seedPreviousScreen(screen)
+
+    // muxd injects FOCUS_IN into the child on attach/resync.
+    stdin.write('\x1b[I')
+    await sleep(500)
+    screen.feed(take())
+
+    const visible = screen.visible()
+    assert.deepEqual(visible.slice(0, 3), ['row-0', 'row-1', 'row-2'])
+    assert.ok(
+      visible.every(row => !row.includes(STALE)),
+      `the replayed screen survived the viewer attach:\n${visible.join('\n')}`,
+    )
+  } finally {
+    app?.unmount()
+    stdin.destroy()
+    stdout.destroy()
+    Object.defineProperty(process, 'stdout', { configurable: true, value: realStdout })
+    if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = savedGateway
+    if (savedFlicker === undefined) delete process.env.CLAUDE_CODE_NO_FLICKER
+    else process.env.CLAUDE_CODE_NO_FLICKER = savedFlicker
+    if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = savedStdinIsTTY
+    setIsInteractive(savedInteractive)
+  }
+})
+
+// The viewer repaint is rate-limited to ~1/s: a client that attaches, reattaches
+// and resyncs in quick succession must not thrash the renderer with an opaque
+// repaint per focus event.
+test('a burst of viewer FOCUS_IN events repaints the block only once', async () => {
+  const savedGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  const savedFlicker = process.env.CLAUDE_CODE_NO_FLICKER
+  const savedInteractive = getIsInteractive()
+  const savedStdinIsTTY = (process.stdin as { isTTY?: boolean } | undefined)?.isTTY
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  process.env.CLAUDE_CODE_NO_FLICKER = '0'
+  setIsInteractive(true)
+  if (process.stdin) (process.stdin as { isTTY?: boolean }).isTTY = true
+  const { stdout, stdin, take } = harness()
+  const realStdout = process.stdout
+  Object.defineProperty(process, 'stdout', { configurable: true, value: stdout })
+  let app: Awaited<ReturnType<typeof render>> | undefined
+  try {
+    app = await render(<InteractiveBody />, {
+      stdout: stdout as any, stderr: stdout as any, stdin: stdin as any,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    await sleep(300)
+    take()
+
+    stdin.write('\x1b[I')
+    await sleep(400)
+    assert.ok(take().includes('\x1b[2J'), 'the first FOCUS_IN did not repaint')
+
+    // A second FOCUS_IN inside the rate-limit window must be a no-op.
+    stdin.write('\x1b[I')
+    await sleep(400)
+    assert.ok(
+      !take().includes('\x1b[2J'),
+      'a second FOCUS_IN inside the window repainted again',
     )
   } finally {
     app?.unmount()
