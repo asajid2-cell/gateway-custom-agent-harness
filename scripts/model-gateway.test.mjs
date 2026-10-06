@@ -60,7 +60,7 @@ import {
   sanitizeStaleToolCapabilityContent,
 } from './gateway-contract.mjs'
 import { quotaKey, readSharedQuota } from './quota-cache.mjs'
-import { codexQuotaWindows } from './codex-quota.mjs'
+import { codexQuotaWindows, codexQuotaIsStale, CODEX_READ_INTERVAL_MS } from './codex-quota.mjs'
 
 test('OpenCode retries cycle numbered credentials and wrap to the original', async () => {
   const credentials = openCodeCredentialPool({
@@ -3041,6 +3041,16 @@ test('codex rate limits are keyed by window duration, not position', () => {
     { M: { usedPercent: 10, resetsAt: null } },
   )
   assert.deepEqual(codexQuotaWindows(null), {})
+})
+
+test('a Codex reading is not stale until it is two intervals old', () => {
+  // The backstop re-reads every interval, so a reading that is one interval old
+  // is simply due for its next read - not untrustworthy. Marking it stale at one
+  // interval made the footer flash `(stale)` once a minute on a healthy server.
+  const asof = 1_000_000
+  assert.equal(codexQuotaIsStale(asof, asof + CODEX_READ_INTERVAL_MS), false)
+  assert.equal(codexQuotaIsStale(asof, asof + CODEX_READ_INTERVAL_MS * 2 - 1), false)
+  assert.equal(codexQuotaIsStale(asof, asof + CODEX_READ_INTERVAL_MS * 2), true)
 })
 
 // A stand-in for `codex app-server --listen stdio://`: it answers the handshake

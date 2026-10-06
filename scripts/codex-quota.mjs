@@ -24,7 +24,12 @@ import path from 'node:path'
 
 // A backstop only: the app-server pushes `account/rateLimits/updated` when the
 // limits change, so a minute between re-reads is enough to catch a missed push.
-const CODEX_READ_INTERVAL_MS = 60_000
+export const CODEX_READ_INTERVAL_MS = 60_000
+// A reading is called stale only once it is two backstop intervals old. The
+// interval is when the next re-read is *due*, so a threshold equal to it would
+// mark a healthy reading stale in the gap before its scheduled re-read lands -
+// the 10s footer poll would then flash `(stale)` once a minute for no reason.
+const CODEX_STALE_MS = 2 * CODEX_READ_INTERVAL_MS
 // No request for this long and the child is stopped; the next request starts a
 // fresh one. Long enough that an idle session still shows a live figure.
 const CODEX_IDLE_MS = 5 * 60_000
@@ -52,6 +57,15 @@ function clampUsedPercent(value) {
 function resetToEpochMs(value) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null
   return Math.round(value < 1e12 ? value * 1000 : value)
+}
+
+/**
+ * Whether a reading is old enough to be marked stale: two backstop intervals,
+ * not one. The interval is when a re-read is due, so a reading is only
+ * untrustworthy once it has missed one and is into the next.
+ */
+export function codexQuotaIsStale(asof, now = Date.now()) {
+  return now - asof >= CODEX_STALE_MS
 }
 
 /**
@@ -311,7 +325,7 @@ export async function readCodexQuota() {
     return {
       windows: snapshot.windows,
       asof: snapshot.asof,
-      stale: Date.now() - snapshot.asof >= CODEX_READ_INTERVAL_MS,
+      stale: codexQuotaIsStale(snapshot.asof),
     }
   }
   return { windows: {}, asof: Date.now(), stale: true }
