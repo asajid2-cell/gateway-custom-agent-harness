@@ -498,10 +498,10 @@ test('an unmatched DA1 cannot let a stale reply land on the live probe', async (
 })
 
 // ---------------------------------------------------------------------------
-// (9) Fences are bounded while the session is unwatched: every probe times out
-//     and no client ever answers a fence, so without a bound the queue would
-//     grow by a fence per timeout forever and the oldest would swallow the live
-//     probe's reply. After such a period the live probe must arm on its OWN
+// (9) Fences are bounded by COUNT while the session is unwatched: every probe
+//     times out and no client ever answers a fence, so without a bound the queue
+//     would grow by a fence per timeout forever and the oldest would swallow the
+//     live probe's reply. After such a period the live probe must arm on its OWN
 //     reply, even with a burst of replayed (unmatched) DA1s first.
 // ---------------------------------------------------------------------------
 test('an unwatched session does not accumulate fences without bound', async () => {
@@ -524,17 +524,69 @@ test('an unwatched session does not accumulate fences without bound', async () =
       maxQueue = Math.max(maxQueue, queue.length)
     }
     // RED on HEAD: one tombstone+sentinel pair per timeout → ~400 entries.
+    // The count cap (MAX_FENCES) is what holds this bound now.
     expect(maxQueue).toBeLessThanOrEqual(2)
 
-    // A client attaches: a retry interval later the live probe goes out, which
-    // drops the now-stale fence, and a burst of replayed DA1s arrives (muxd
-    // replays fences but strips the CPR queries, so no stale CPR can come).
-    now += 3000
+    // A client attaches long after: the stale fence is retired by the age
+    // backstop (FENCE_MAX_AGE_MS), not by a short sweep — the count cap bounds
+    // it, the backstop retires it so it cannot swallow this probe's own reply.
+    // A burst of replayed DA1s then arrives (muxd replays fences but strips the
+    // CPR queries, so no stale CPR can come).
+    now += 31_000
     const live = querier.send(cursorPosition(false))
     querier.onResponse({ type: 'da1', params: [1] })
     querier.onResponse({ type: 'da1', params: [1] })
     querier.onResponse({ type: 'da1', params: [1] })
     // The live probe arms only on its own reply (nothing stale sits in front).
+    querier.onResponse({ type: 'cursorPosition', row: 3, col: 3, decPrivate: true })
+    expect(await racePending(live)).toEqual({
+      type: 'cursorPosition',
+      row: 3,
+      col: 3,
+      decPrivate: true,
+    })
+  } finally {
+    Date.now = realNow
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (10) A fence outlives the probe timeout. A probe is abandoned BECAUSE its
+//      reply is late, so a fence must not be retired near the timeout: the retry
+//      probe goes out more than one timeout after the fence was created, while
+//      the abandoned probe's reply is still in flight, and that reply must meet
+//      the fence — not the live probe. Bounded by count, not by a short age.
+// ---------------------------------------------------------------------------
+test('a fence outlives the probe timeout and still consumes its late reply', async () => {
+  const { TerminalQuerier, cursorPosition } = await import('../src/ink/terminal-querier.ts')
+  const stdout = new PassThrough() as unknown as NodeJS.WriteStream
+  const querier = new TerminalQuerier(stdout)
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    // t=0: probe T. Its 1s timeout abandons it -> fence F (createdAt t=1s).
+    const ac = new AbortController()
+    const abandoned = querier.send(cursorPosition(false), ac.signal)
+    now += 1000
+    ac.abort()
+    expect(await racePending(abandoned)).toBeUndefined()
+
+    // t=2.1s: the retry probe L goes out — 1.1s after F was created, i.e. more
+    // than one timeout. RED on 7edb69e: the 1s age sweep dropped F here, so the
+    // late reply below landed on L with a stale row.
+    now += 1100
+    const live = querier.send(cursorPosition(false))
+
+    // t=2.5s: T's late reply arrives (the slow client this lane exists for). It
+    // must be consumed by F, so L stays pending.
+    now += 400
+    querier.onResponse({ type: 'cursorPosition', row: 47, col: 33, decPrivate: true })
+    expect(await racePending(live)).toBe('PENDING')
+
+    // F's own DA1 (which follows its reply in stream order) drops the consumed
+    // fence; L then arms only on its OWN reply.
+    querier.onResponse({ type: 'da1', params: [1] })
     querier.onResponse({ type: 'cursorPosition', row: 3, col: 3, decPrivate: true })
     expect(await racePending(live)).toEqual({
       type: 'cursorPosition',
