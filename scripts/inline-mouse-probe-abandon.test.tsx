@@ -19,11 +19,11 @@ import { TerminalQuerier } from '../src/ink/terminal-querier.ts'
 // attaches).
 //
 // The fix pairs a reply with its own probe by ORDER: on abort the querier turns
-// the query into a tombstone IN PLACE and fences it with a DA1 sentinel written
+// the query into a fence IN PLACE and closes it with a DA1 sentinel written
 // right after it. The abandoned probe's reply (or the TWO replies a dual CPR
-// query draws from a client) is consumed and discarded by the tombstone, and
-// the fence's DA1 — always answered, always after any reply to this query —
-// clears the tombstone before a later probe's reply can arrive.
+// query draws from a client) is consumed and discarded by the fence, and the
+// fence's DA1 — always answered, always after any reply to this query — drops
+// the fence before a later probe's reply can arrive.
 //
 // Three contracts:
 //   1. an aborted send becomes a fenced tombstone: its stale reply is consumed
@@ -352,5 +352,94 @@ test('a genuinely wrong fresh reply is still rejected after the tombstone consum
     expect(ink.inlineTracking).toBe(false)
   } finally {
     cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (8) An unmatched DA1 (a replayed fence, or one that is not the abandoned
+//     query's own) must not drop a fence whose reply is still in flight. If it
+//     did, that reply would land on the live probe with a stale row.
+// ---------------------------------------------------------------------------
+test('an unmatched DA1 cannot let a stale reply land on the live probe', async () => {
+  const { TerminalQuerier, cursorPosition } = await import('../src/ink/terminal-querier.ts')
+  const stdout = new PassThrough() as unknown as NodeJS.WriteStream
+  const querier = new TerminalQuerier(stdout)
+
+  const ac = new AbortController()
+  const abandoned = querier.send(cursorPosition(false), ac.signal)
+  ac.abort()
+  expect(await racePending(abandoned)).toBeUndefined()
+
+  const live = querier.send(cursorPosition(false))
+  // An unmatched DA1 arrives BEFORE the abandoned probe's reply — a replayed
+  // fence, so not the fence this tombstone wrote. The reply is still travelling,
+  // so this DA1 must not drop the fence.
+  querier.onResponse({ type: 'da1', params: [1] })
+  // The abandoned probe's own late reply (row 47). It must be consumed by the
+  // fence, NOT resolve the live probe.
+  querier.onResponse({ type: 'cursorPosition', row: 47, col: 33, decPrivate: true })
+  // RED on HEAD: the unmatched DA1 cleared the fence, so the stale row 47
+  // resolved the live probe.
+  expect(await racePending(live)).toBe('PENDING')
+
+  // Its own fence's DA1 (after the reply) then clears the fence, and the live
+  // probe arms only on its OWN reply.
+  querier.onResponse({ type: 'da1', params: [1] })
+  querier.onResponse({ type: 'cursorPosition', row: 3, col: 3, decPrivate: true })
+  expect(await racePending(live)).toEqual({
+    type: 'cursorPosition',
+    row: 3,
+    col: 3,
+    decPrivate: true,
+  })
+})
+
+// ---------------------------------------------------------------------------
+// (9) Fences are bounded while the session is unwatched: every probe times out
+//     and no client ever answers a fence, so without a bound the queue would
+//     grow by a fence per timeout forever and the oldest would swallow the live
+//     probe's reply. After such a period the live probe must arm on its OWN
+//     reply, even with a burst of replayed (unmatched) DA1s first.
+// ---------------------------------------------------------------------------
+test('an unwatched session does not accumulate fences without bound', async () => {
+  const { TerminalQuerier, cursorPosition } = await import('../src/ink/terminal-querier.ts')
+  const stdout = new PassThrough() as unknown as NodeJS.WriteStream
+  const querier = new TerminalQuerier(stdout)
+  const realNow = Date.now
+  let now = realNow()
+  Date.now = () => now
+  try {
+    const queue = (querier as unknown as { queue: unknown[] }).queue
+    // A long unwatched period: probe, time out (abort), retry — no client, so no
+    // DA1 ever clears a fence.
+    let maxQueue = 0
+    for (let i = 0; i < 200; i++) {
+      const ac = new AbortController()
+      void querier.send(cursorPosition(false), ac.signal)
+      ac.abort()
+      now += 3000 // one retry interval: 1000ms timeout + 2000ms backoff
+      maxQueue = Math.max(maxQueue, queue.length)
+    }
+    // RED on HEAD: one tombstone+sentinel pair per timeout → ~400 entries.
+    expect(maxQueue).toBeLessThanOrEqual(2)
+
+    // A client attaches: a retry interval later the live probe goes out, which
+    // drops the now-stale fence, and a burst of replayed DA1s arrives (muxd
+    // replays fences but strips the CPR queries, so no stale CPR can come).
+    now += 3000
+    const live = querier.send(cursorPosition(false))
+    querier.onResponse({ type: 'da1', params: [1] })
+    querier.onResponse({ type: 'da1', params: [1] })
+    querier.onResponse({ type: 'da1', params: [1] })
+    // The live probe arms only on its own reply (nothing stale sits in front).
+    querier.onResponse({ type: 'cursorPosition', row: 3, col: 3, decPrivate: true })
+    expect(await racePending(live)).toEqual({
+      type: 'cursorPosition',
+      row: 3,
+      col: 3,
+      decPrivate: true,
+    })
+  } finally {
+    Date.now = realNow
   }
 })
