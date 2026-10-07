@@ -126,18 +126,36 @@ type ProbeInk = {
   inlineTracking: boolean
   inlineProbePending: boolean
   inlineProbeFailed: boolean
+  inlineEpoch: number
   displayCursor: { x: number; y: number } | null
   frontFrame: { cursor: { x: number; y: number }; screen: { height: number } }
   terminalRows: number
   calibrateInlineMouse(): void
   repaint(): void
+  getMouseRowOffset(): number
+  /** The inline lane's mouse entry (private field in ink.tsx). */
+  handleInlineMouse(mouse: {
+    button: number
+    action: 'press' | 'release'
+    col: number
+    row: number
+  }): boolean
 }
+
+// Clicks that reached the content, recorded by Body's onClick. A click that
+// lands during a probe gap must still be translated and delivered here; a
+// click the lane merely consumes (uncalibrated) never arrives.
+const clicks: Array<{ row: number }> = []
 
 function Body() {
   useInput(() => {})
   return (
     <BoundedMainScreen>
-      <Box flexDirection="column" width="100%">
+      <Box
+        flexDirection="column"
+        width="100%"
+        onClick={e => clicks.push({ row: e.localRow ?? -1 })}
+      >
         <Text>row-0</Text>
         <Text>row-1</Text>
       </Box>
@@ -210,6 +228,7 @@ async function setupProbe(opts: { realQuerier?: boolean } = {}): Promise<{
   else ink.app.querier = real as unknown as FakeQuerier
   ink.inlineOrigin = null
   ink.inlineTracking = false
+  clicks.length = 0
   return {
     ink,
     fake,
@@ -348,6 +367,90 @@ test('a genuinely wrong fresh reply is still rejected after the tombstone consum
     querier.onResponse({ type: 'cursorPosition', row: cursorY + 41, col: 3, decPrivate: true })
     await sleep(20)
 
+    expect(ink.inlineOrigin).toBeNull()
+    expect(ink.inlineTracking).toBe(false)
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (6) A probe timeout must not disarm an origin that is already armed against
+//     the CURRENT geometry. A viewer attach (FOCUS_IN) re-probes WITHOUT
+//     clearing the origin, so a client slow to answer must not kill a working
+//     mouse lane - the origin and tracking stay, and the abandoned probe's late
+//     reply is still consumed by its tombstone.
+// ---------------------------------------------------------------------------
+test('an armed origin survives a probe timeout; the late reply leaves it untouched', async () => {
+  const { ink, querier, cleanup } = await setupProbe({ realQuerier: true })
+  try {
+    // Arm: probe A, answer it -> origin 0, tracking on.
+    ink.calibrateInlineMouse()
+    const cursorY = (ink.displayCursor ?? ink.frontFrame.cursor).y
+    querier.onResponse({ type: 'cursorPosition', row: cursorY + 1, col: 3, decPrivate: true })
+    await sleep(0)
+    expect(ink.inlineOrigin).toBe(0)
+    expect(ink.inlineTracking).toBe(true)
+
+    // A viewer attach re-probes (the arm path at the post-frame probe) while the
+    // origin is armed. The client never answers.
+    ink.calibrateInlineMouse()
+    // The probe times out at 1000ms. RED on HEAD: origin null, tracking off.
+    expect(await waitFor(() => ink.inlineProbePending === false, 2000)).toBe(true)
+    await sleep(200)
+
+    // The confirmed origin and the tracking survive: clicks keep mapping.
+    expect(ink.inlineOrigin).toBe(0)
+    expect(ink.inlineTracking).toBe(true)
+    expect(ink.getMouseRowOffset()).toBe(0)
+    expect(ink.inlineProbeFailed).toBe(false)
+
+    // A click DURING the would-be gap (the window HEAD spends disarmed) still
+    // lands. origin is 0, so block row 0 is terminal row 1. RED on HEAD: the
+    // lane is uncalibrated there, so the click is consumed with no translation
+    // and Body's onClick never fires (clicks stays empty).
+    clicks.length = 0
+    expect(ink.handleInlineMouse({ button: 0, action: 'press', col: 5, row: 1 })).toBe(true)
+    expect(ink.handleInlineMouse({ button: 0, action: 'release', col: 5, row: 1 })).toBe(true)
+    await sleep(0)
+    expect(clicks).toEqual([{ row: 0 }])
+
+    // The abandoned probe's late reply (a stale pre-settle row) arrives, then its
+    // DA1 fence. It is consumed by the tombstone and must not move the origin.
+    querier.onResponse({ type: 'cursorPosition', row: 47, col: 33, decPrivate: true })
+    querier.onResponse({ type: 'da1', params: [1] })
+    await sleep(20)
+    expect(ink.inlineOrigin).toBe(0)
+    expect(ink.inlineTracking).toBe(true)
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (7) The no-disarm rule is bounded by geometry: a timeout whose geometry
+//     changed since the origin was measured still disarms. The epoch is the
+//     geometry generation; a mismatch must disarm even while an origin is held
+//     (no current public path bumps the epoch without clearing the origin, so
+//     the epoch clause is exercised directly here - it is what keeps the guard
+//     correct if such a path is ever added).
+// ---------------------------------------------------------------------------
+test('a timeout after a geometry change still disarms', async () => {
+  const { ink, fake, cleanup } = await setupProbe()
+  try {
+    ink.calibrateInlineMouse()
+    const cursorY = (ink.displayCursor ?? ink.frontFrame.cursor).y
+    fake.onResponse({ type: 'cursorPosition', row: cursorY + 1, col: 3, decPrivate: true })
+    await sleep(0)
+    expect(ink.inlineOrigin).toBe(0)
+    expect(ink.inlineTracking).toBe(true)
+
+    // The geometry changed since the origin was measured: the epoch moved on.
+    ink.inlineEpoch++
+    ink.calibrateInlineMouse()
+
+    // The probe times out: the origin is stale, so the lane disarms.
+    expect(await waitFor(() => ink.inlineProbeFailed, 2500)).toBe(true)
     expect(ink.inlineOrigin).toBeNull()
     expect(ink.inlineTracking).toBe(false)
   } finally {
