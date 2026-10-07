@@ -73,21 +73,27 @@ test('resolveInlineProbeArm rejects an origin that puts the block outside the vi
 // ---------------------------------------------------------------------------
 // Real-Ink scaffolding: a bounded inline session with a clickable Led.
 // ---------------------------------------------------------------------------
-type ProbeQuery = { match(r: unknown): boolean }
+type ProbeQuery = { match(r: unknown): boolean; request: string }
 type FakeQuerier = {
   sends: ProbeQuery[]
   pending: Array<{ query: ProbeQuery; resolve(v: unknown): void }>
   send(query: ProbeQuery, signal?: AbortSignal): Promise<unknown>
   flush(): Promise<void>
   onResponse(r: unknown): void
+  /** Mirror TerminalQuerier.send's `stdout.write(query.request)`. */
+  setWrite(fn: (request: string) => void): void
 }
 
 function makeFakeQuerier(): FakeQuerier {
   const sends: ProbeQuery[] = []
   const pending: FakeQuerier['pending'] = []
+  let writeFn: ((request: string) => void) | undefined
   return {
     sends,
     pending,
+    setWrite(fn) {
+      writeFn = fn
+    },
     send(query, signal) {
       sends.push(query)
       return new Promise(resolve => {
@@ -102,6 +108,10 @@ function makeFakeQuerier(): FakeQuerier {
           },
           { once: true },
         )
+        // Queued, then written — the same order as the real querier, so the
+        // request enters the one ordered output stream at its real position
+        // relative to frame writes.
+        writeFn?.(query.request)
       })
     },
     flush: () => Promise.resolve(),
@@ -120,6 +130,7 @@ type ProbeInk = {
   inlineOrigin: number | null
   inlineTracking: boolean
   inlineProbePending: boolean
+  inlineProbeAfterFrame: boolean
   displayCursor: { x: number; y: number } | null
   frontFrame: { cursor: { x: number; y: number }; screen: { height: number } }
   terminalRows: number
@@ -127,6 +138,7 @@ type ProbeInk = {
   requestViewerRepaint(): void
   handleInlineMouse(mouse: ParsedMouse): boolean
   repaint(): void
+  onRender(): void
 }
 
 let clicked = 0
@@ -159,6 +171,16 @@ function answerOne(ink: ProbeInk, fake: FakeQuerier, origin: number): boolean {
   if (fake.pending.length === 0) return false
   fake.onResponse({ type: 'cursorPosition', row: cursorY(ink) + 1 + origin, col: 1, decPrivate: true })
   return true
+}
+
+/** Wait until a probe is in flight (the lane has sent one and not been answered). */
+async function waitForProbe(fake: FakeQuerier, ms: number): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < ms) {
+    if (fake.pending.length > 0) return true
+    await sleep(25)
+  }
+  return fake.pending.length > 0
 }
 
 /**
@@ -194,6 +216,7 @@ const saved = {
 async function setupProbe(): Promise<{
   ink: ProbeInk
   fake: FakeQuerier
+  stdout: PassThrough & { columns: number; rows: number }
   cleanup: () => void
 }> {
   process.env.CLAUDE_CODE_USE_GATEWAY = '1'
@@ -225,6 +248,7 @@ async function setupProbe(): Promise<{
   return {
     ink,
     fake,
+    stdout,
     cleanup() {
       app.unmount()
       stdin.destroy()
@@ -261,8 +285,11 @@ test('a viewer FOCUS_IN re-probes without disarming, and the Led click hits', as
 
     const before = fake.sends.length
     // A viewer attaches/resyncs (muxd injects FOCUS_IN). The lane must re-probe
-    // so the origin tracks the new viewer's cursor truth.
+    // so the origin tracks the new viewer's cursor truth. The probe is deferred
+    // to AFTER the repaint frame (so the terminal answers with the cursor that
+    // frame parked), so it lands on the next render.
     ink.requestViewerRepaint()
+    await sleep(50)
     expect(fake.sends.length).toBe(before + 1) // RED on 0222bde: no re-probe
     // ...without disarming: clicks keep working with the current origin.
     expect(ink.inlineOrigin).toBe(0)
@@ -327,3 +354,159 @@ test('a settling reply never arms; the settled reply arms origin 0 and the Led c
     cleanup()
   }
 })
+
+// ---------------------------------------------------------------------------
+// (4) The attach re-probe is written AFTER the repaint frame it depends on.
+//
+// A terminal answers a CPR with the cursor it holds when it PARSES the probe.
+// A freshly attached mux client has replayed the session bytes but has not yet
+// parsed our repaint frame, so its cursor sits at the replayed buffer position
+// (the live attach reply: row 42 col 145, while our block parks at row 43 col
+// 3). A probe that is written BEFORE the repaint frame is therefore answered
+// with that stale cursor: origin = 42 - 1 - 42 = -1, rejected by the block-fit
+// rule, and the lane never arms from the first reply (the live "probe reply
+// rejected · ... backing off 1000ms" on essentially every attach).
+//
+// The fake querier now writes its request into stdout exactly as
+// TerminalQuerier.send does, and this test models the client's cursor: stale
+// until the repaint frame's erase+home is written, then the frame's own cursor.
+// So the assertion is behavioral: the FIRST reply must arm at origin 0 and the
+// Led click must hit, with no retry needed.
+// ---------------------------------------------------------------------------
+test('an attach re-probe follows the repaint frame, so the first reply arms', async () => {
+  const { ink, fake, stdout, cleanup } = await setupProbe()
+  try {
+    // The client's cursor: its replayed position (row 2 col 40) until it parses
+    // our repaint frame, after which it holds the cursor that frame parked.
+    let clientRow = 2
+    const realWrite = stdout.write.bind(stdout)
+    ;(stdout as unknown as { write: (c: unknown, ...r: unknown[]) => unknown }).write = (
+      chunk: unknown,
+      ...rest: unknown[]
+    ) => {
+      const s = String(chunk)
+      if (s.includes('\x1b[2J\x1b[H')) clientRow = ink.frontFrame.cursor.y + 1
+      if (s.includes('\x1b[?6n')) {
+        fake.onResponse({ type: 'cursorPosition', row: clientRow, col: 40, decPrivate: true })
+      }
+      return realWrite(chunk as never, ...(rest as never[]))
+    }
+    fake.setWrite(request => {
+      ;(stdout as unknown as { write: (s: string) => unknown }).write(request)
+    })
+
+    // A viewer attaches (muxd injects FOCUS_IN) into a never-armed lane.
+    ink.requestViewerRepaint()
+    // Let the repaint frame render and the (deferred) probe be answered.
+    await sleep(200)
+
+    // RED on 375e712: the probe is written before the frame, the client answers
+    // with its stale replayed cursor, the reply is rejected and origin stays
+    // null until the 1000ms retry.
+    expect(ink.inlineOrigin).toBe(0)
+    expect(ink.inlineTracking).toBe(true)
+    // The first reply armed — no retry was needed.
+    expect(fake.sends.length).toBe(1)
+
+    // The Led sits at app row 2; a click at its client row (row 2 + origin)
+    // must reach it.
+    clicked = 0
+    ink.handleInlineMouse(press(0, 2))
+    ink.handleInlineMouse(release(0, 2))
+    expect(clicked).toBe(1)
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (5) The deferred probe is not lost when a render has no diff to write.
+//
+// requestViewerRepaint blanks the block, so in practice its repaint always has
+// a diff — but the deferred probe must not DEPEND on that. If the flag could sit
+// unconsumed on a no-diff render (or one merged by the throttle), it would be a
+// brand-new way to never arm. Here the block content is unchanged, so the frame
+// writes no cells; the probe must still go out exactly once and the flag clear.
+// ---------------------------------------------------------------------------
+test('a deferred probe is sent even when the frame has no diff to write', async () => {
+  const { ink, fake, cleanup } = await setupProbe()
+  try {
+    // Arm and settle so the next render produces identical content.
+    ink.calibrateInlineMouse()
+    expect(answerOne(ink, fake, 0)).toBe(true)
+    await sleep(0)
+    expect(ink.inlineOrigin).toBe(0)
+
+    const before = fake.sends.length
+    // A deferred re-probe on a frame that changes nothing.
+    ink.inlineProbeAfterFrame = true
+    ink.onRender()
+    await sleep(0)
+    expect(fake.sends.length).toBe(before + 1)
+    // Consumed, not left set for some later frame.
+    expect(ink.inlineProbeAfterFrame).toBe(false)
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (6a) A rate-limited FOCUS_IN still drops the reject backoff.
+//
+// A burst of FOCUS_INs on one attach (attach + resync + paint-fault) is rate
+// limited to one repaint per second. The repaint is skipped, but the backoff a
+// rejection earned must not survive: a FOCUS_IN is the clearest signal someone
+// is looking, so the next frame must be free to re-probe at once.
+// ---------------------------------------------------------------------------
+test('a rate-limited FOCUS_IN drops the reject backoff, so the next frame re-probes', async () => {
+  const { ink, fake, cleanup } = await setupProbe()
+  try {
+    ink.requestViewerRepaint()
+    expect(await waitForProbe(fake, 1000)).toBe(true)
+    // A reply that cannot place the block earns a backoff.
+    expect(answerOne(ink, fake, 4)).toBe(true)
+    await sleep(0)
+    expect(ink.inlineOrigin).toBe(null)
+
+    // A second FOCUS_IN inside the rate-limit window: the repaint is skipped,
+    // but the wait must still be cleared.
+    ink.requestViewerRepaint()
+    // A render for any other reason (spinner, clock) now re-probes at once.
+    const before = fake.sends.length
+    ink.onRender()
+    await sleep(0)
+    expect(fake.sends.length).toBe(before + 1) // RED before the reset moved up
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// (6b) The reject backoff stays short, so the lane arms within ~2s.
+//
+// A rejection means a reply arrived, so a terminal is present and answering.
+// The old 30s cap let a burst of rejected probes on one attach (each doubling
+// the wait, and a rate-limited FOCUS_IN not resetting it) leave the lane unarmed
+// for the rest of the attach — the live "3 of 90 never armed". The cap is now
+// 2s, so even after several rejections the retry arms within ~2s.
+// ---------------------------------------------------------------------------
+test('the reject backoff stays short, so the lane arms within ~2s', async () => {
+  const { ink, fake, cleanup } = await setupProbe()
+  try {
+    ink.requestViewerRepaint()
+    expect(await waitForProbe(fake, 1000)).toBe(true)
+    // Three rejections. The old doubling would reach 4s on the third.
+    for (let i = 0; i < 3; i++) {
+      expect(answerOne(ink, fake, 4)).toBe(true)
+      await sleep(0)
+      expect(ink.inlineOrigin).toBe(null)
+      if (i < 2) expect(await waitForProbe(fake, 3000)).toBe(true)
+    }
+    // The next retry must arrive within the capped ~2s wait, not 4-8s.
+    const t = Date.now()
+    expect(await answerUntil(ink, fake, 0, 2600)).toBe(true)
+    expect(Date.now() - t).toBeLessThan(2600)
+  } finally {
+    cleanup()
+  }
+}, 20000)
