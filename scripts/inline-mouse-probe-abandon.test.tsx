@@ -111,6 +111,9 @@ type ProbeInk = {
   inlineTracking: boolean
   inlineProbePending: boolean
   inlineProbeFailed: boolean
+  displayCursor: { x: number; y: number } | null
+  frontFrame: { cursor: { x: number; y: number }; screen: { height: number } }
+  terminalRows: number
   calibrateInlineMouse(): void
   repaint(): void
 }
@@ -245,10 +248,13 @@ test('a timed-out probe leaves the querier, and the retry arms on the first repl
     // The retry timer clears the failure and re-probes.
     expect(await waitFor(() => fake.sends.length === 2, 3000)).toBe(true)
 
-    // The first reply after the retry arms the lane.
-    fake.onResponse({ type: 'cursorPosition', row: 5, col: 3, decPrivate: true })
+    // The first reply after the retry arms the lane. The row must place the
+    // block inside the viewport (a bounded block IS the viewport, so the reply
+    // row is the parked cursor's own row), or the plausibility rule rejects it.
+    const cursorY = (ink.displayCursor ?? ink.frontFrame.cursor).y
+    fake.onResponse({ type: 'cursorPosition', row: cursorY + 1, col: 3, decPrivate: true })
     await sleep(0)
-    expect(ink.inlineOrigin).not.toBeNull()
+    expect(ink.inlineOrigin).toBe(0)
     expect(ink.inlineTracking).toBe(true)
 
     // Bounded: the resolution did not itself send another probe.
