@@ -140,25 +140,6 @@ function harness() {
   return { stdout, stdin, take: () => { const seen = raw; raw = ''; return seen } }
 }
 
-/**
- * The replies a client sends when it attaches and replays the bytes the app has
- * written: one CPR reply per cursor-position query, one DA1 reply per DA1
- * sentinel (the fence that bounds each probe). Emitted in buffer order, so an
- * abandoned probe's stale reply precedes the fence DA1 that clears its
- * tombstone, which in turn precedes the next probe's reply.
- */
-function clientAttachReplies(output: string, cursor: { x: number; y: number }): string {
-  const privateCpr = `\x1b[?${cursor.y + 1};${cursor.x + 1}R`
-  const plainCpr = `\x1b[${cursor.y + 1};${cursor.x + 1}R`
-  let replies = ''
-  for (let i = 0; i < output.length; i++) {
-    if (output.startsWith('\x1b[?6n', i)) { replies += privateCpr; i += 4 }
-    else if (output.startsWith('\x1b[6n', i)) { replies += plainCpr; i += 3 }
-    else if (output.startsWith('\x1b[c', i)) { replies += '\x1b[?1;2c'; i += 2 }
-  }
-  return replies
-}
-
 function Body({ lines }: { lines: number }) {
   return (
     <BoundedMainScreen>
@@ -659,20 +640,14 @@ test('a probe that recovers after a miss repaints the block once, so a late atta
     }
     ink.resume()
     // Probe #1 misses (no client yet): 1s timeout, then the 2s backoff, then
-    // the retried probe goes out.
+    // the retried probe goes out. Discard everything up to now so the only
+    // bytes left to inspect are the ones the reply provokes.
     await sleep(3300)
-    // A client attaches now and replays the bytes the app has written, answering
-    // every query in them, in order: each CPR probe with the client's own
-    // cursor, each DA1 fence with device attributes. Order is what pairs a reply
-    // with its probe — probe #1's stale reply is consumed by its tombstone, then
-    // the fence DA1 that follows probe #1 clears that tombstone, and only then
-    // does the retried probe's own reply land. Answering the retried probe alone
-    // would model a client that never parsed the fence the app wrote before it,
-    // which no replaying client can be. Discard the replayed bytes so the only
-    // bytes left to inspect are the ones the replies provoke.
-    const replay = take()
+    take()
+    // A client is attached now: answer the in-flight retried probe with a
+    // reply built from the frame's own cursor, so it passes validation.
     const cursor = ink.displayCursor ?? ink.frontFrame.cursor
-    stdin.write(clientAttachReplies(replay, cursor))
+    stdin.write(`\x1b[?${cursor.y + 1};${cursor.x + 1}R`)
     await sleep(500)
     const stream = take()
     assert.ok(
