@@ -413,7 +413,7 @@ export async function familyLiveness(familyId: string): Promise<MemberLiveness[]
 
 /** What a `ledger` request carries: the subverb, and the fields it may need. */
 export type HeadLedgerRequest = {
-  /** show | liveness | note | decision | handoff | watch | unwatch | watchers | fired */
+  /** show | liveness | note | decision | handoff | watch | unwatch | watchers | fired | writers */
   subverb?: string
   /** The subject leaf for handoff and an idle watch. */
   leaf?: string
@@ -421,20 +421,25 @@ export type HeadLedgerRequest = {
   text?: string
   /** The watch mode for watch/unwatch: idle (a member) or new (new leaves). */
   mode?: string
+  /** For writers: the members the head delegates the ledger's pen to. */
+  writers?: string[]
 }
 
 /**
  * Run one ledger request for the current family.
  *
  * Reads are ungated - any member may read the record - while the writes that
- * extend it (note, decision, handoff, watch, unwatch) go through `requireHead`,
- * so the ledger is the head's account and everyone can see it.
+ * extend it (note, decision, handoff, watch, unwatch) go through
+ * `requireLedgerWriter`, so the ledger is the head's account and everyone the
+ * head has named can keep it. Delegating those writers (`writers`) is itself
+ * head-only: a delegate cannot pass the pen on.
  */
 export async function runHeadLedger(request: HeadLedgerRequest): Promise<string> {
   const { familyRootSessionId, resolveLeafRef } = await import('./leafWorkspace.js')
   const familyId = await familyRootSessionId()
   const subverb = (request.subverb ?? 'show').trim().toLowerCase()
-  if (!['show', 'liveness', 'watchers', 'fired'].includes(subverb)) await requireHead()
+  if (subverb === 'writers') await requireHead()
+  else if (!['show', 'liveness', 'watchers', 'fired'].includes(subverb)) await requireLedgerWriter()
   switch (subverb) {
     case 'show':
       return renderHeadLedger(familyId, await readHeadLedgerEvents(familyId))
@@ -479,12 +484,25 @@ export async function runHeadLedger(request: HeadLedgerRequest): Promise<string>
       const watches = currentWatches(await readHeadLedgerEvents(familyId))
       return watches.length ? watches.map(watch => `${watch.mode}: ${watch.to}`).join('\n') : 'No watchers set.'
     }
+    // The head names the writers in one write: the whole set is replaced, so
+    // naming them and revoking them are the same act and cannot drift apart, and
+    // an empty list clears it back to the head alone.
+    case 'writers': {
+      const { conferLedgerWriters } = await import('./leafWorkspace.js')
+      const ids: string[] = []
+      for (const reference of request.writers ?? []) {
+        const member = await resolveLeafRef(reference.trim())
+        if (!member) throw new Error(`Unknown or ambiguous leaf reference: ${reference.trim()}`)
+        ids.push(member.sessionId)
+      }
+      return conferLedgerWriters(ids)
+    }
     case 'fired': {
       const fires = (await readHeadLedgerEvents(familyId)).filter(event => event.kind === 'watch-fired')
       return fires.length ? fires.map(fire => `${fire.at} [${fire.mode}] ${fire.to}${fire.detail ? ` - ${fire.detail}` : ''}`).join('\n') : 'Nothing has fired.'
     }
     default:
-      throw new Error(`Unknown ledger subverb "${subverb}". Use show, liveness, note, decision, handoff, watch, unwatch, watchers or fired.`)
+      throw new Error(`Unknown ledger subverb "${subverb}". Use show, liveness, note, decision, handoff, watch, unwatch, watchers, fired or writers.`)
   }
 }
 
@@ -504,4 +522,25 @@ export async function requireHead(): Promise<string> {
     throw new Error(`Only the family head writes the ledger; the head is ${head}, and any member may read.`)
   }
   return head
+}
+
+/**
+ * The ledger-writes gate for the members the head has delegated to.
+ *
+ * The head writes the ledger, and so does any live member the head has named on
+ * the pointer's writer set - so the pen is not head-only, and a delegate keeps
+ * the account without holding the terminal or the head's title. The check is
+ * live: a delegate that has since been closed or archived is dropped rather than
+ * keeping a pen the head would not give it now. The refusal names the writers
+ * that can actually write, so a refused member knows who to ask.
+ */
+export async function requireLedgerWriter(): Promise<string> {
+  const { getLeafPatriarchSessionId, liveLedgerWriters } = await import('./leafWorkspace.js')
+  const head = getLeafPatriarchSessionId()
+  const self = getSessionId()
+  if (self === head) return head
+  const writers = await liveLedgerWriters()
+  if (writers.some(member => member.sessionId === self)) return self
+  const named = writers.map(member => `${member.name} (${member.sessionId})`)
+  throw new Error(`Only the family head and the writers it names write the ledger; the head is ${head}${named.length ? `, and the writers are ${named.join(', ')}` : ''}, and any member may read.`)
 }

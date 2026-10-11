@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { addLeafMember } from '../src/utils/leafFamily.ts'
+import { addLeafMember, updateLeafMember } from '../src/utils/leafFamily.ts'
 
 // Pinned like leaf-family.test.ts: launched by a leaf, the inherited identity
 // changes what the workspace calls mean, so the file says the same thing
@@ -131,6 +131,79 @@ test('only the head writes the ledger, but any member reads it', { timeout: 6000
     assert.equal(await stat(join(directory, 'leaf-families', 'ledger', root, 'ledger.jsonl')).then(() => true), true)
     const familyShape = JSON.parse(await readFile(family, 'utf8')) as Record<string, unknown>
     assert.deepEqual(Object.keys(familyShape).sort(), ['members', 'nextNumber', 'returnedContextIds', 'rootSessionId', 'version'], 'the family file gained no ledger field')
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the head delegates the ledger pen, and a revoked or closed writer loses it', { timeout: 60000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'head-ledger-writers-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId, getSessionProjectDir, getSessionResumeDirectory, switchSession } = await import('../src/bootstrap/state.ts')
+    const { asSessionId } = await import('../src/types/ids.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const ledger = await import('../src/utils/headLedger.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const scribe = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Scribe', transcriptPath: join(directory, 'scribe.jsonl'), forkMessageId: randomUUID() })
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+    await workspace.restoreLeafWorkspace()
+    const projectDir = getSessionProjectDir()
+    const resumeDirectory = getSessionResumeDirectory()
+    // Run as a member: switch the acting session, then hand the family back, the
+    // way the head/member test above does.
+    const asMember = async <T>(id: string, run: () => Promise<T>): Promise<T> => {
+      switchSession(asSessionId(id), null, directory)
+      workspace.forgetLeafFamilyRoot()
+      try { return await run() } finally {
+        switchSession(asSessionId(root), projectDir, resumeDirectory)
+        workspace.forgetLeafFamilyRoot()
+      }
+    }
+
+    // ONE write names the writers: the whole set is set at once, and the member
+    // the head named may then keep the ledger without holding the head's title.
+    assert.match(await ledger.runHeadLedger({ subverb: 'writers', writers: ['Scribe'] }), /Scribe may write the ledger/)
+    assert.deepEqual(workspace.getLeafLedgerWriterIds(), [scribe.sessionId], 'the writer set reads back from the pointer')
+    assert.deepEqual(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${root}.json`), 'utf8')).ledgerWriterIds, [scribe.sessionId], 'and lives in the family-id pointer')
+    await asMember(scribe.sessionId, async () => {
+      assert.match(await ledger.runHeadLedger({ subverb: 'note', text: 'From the scribe.' }), /Recorded a note/, 'a delegated writer writes')
+    })
+
+    // A member the head did NOT name is refused, and the refusal names the
+    // writers that can actually write - the head AND the delegate.
+    await asMember(other.sessionId, async () => {
+      await assert.rejects(ledger.runHeadLedger({ subverb: 'note', text: 'Not mine.' }), (error: Error) => {
+        assert.match(error.message, /Only the family head/)
+        assert.match(error.message, new RegExp(`the writers are Scribe \\(${scribe.sessionId}\\)`))
+        return true
+      }, 'a member the head did not name cannot write, and is told who can')
+    })
+
+    // Only the head delegates: a writer cannot pass the pen on.
+    await asMember(scribe.sessionId, async () => {
+      await assert.rejects(ledger.runHeadLedger({ subverb: 'writers', writers: ['Other'] }), /Only the family head/, 'a delegate cannot name writers')
+    })
+
+    // Revoking is the same write with an empty list: the set is replaced, and the
+    // pen goes with it. The empty set is written, not dropped.
+    assert.match(await ledger.runHeadLedger({ subverb: 'writers', writers: [] }), /Only the head writes the ledger/)
+    assert.deepEqual(workspace.getLeafLedgerWriterIds(), [], 'the empty set is written, not dropped')
+    await asMember(scribe.sessionId, async () => {
+      await assert.rejects(ledger.runHeadLedger({ subverb: 'note', text: 'Revoked.' }), /Only the family head/, 'a revoked writer cannot write')
+    })
+
+    // A closed delegate loses the pen: the check is live, so a name the head
+    // would not give the pen to now cannot keep it.
+    assert.match(await ledger.runHeadLedger({ subverb: 'writers', writers: ['Scribe'] }), /Scribe may write the ledger/)
+    await updateLeafMember(family, root, scribe.sessionId, { status: 'closed' })
+    await asMember(scribe.sessionId, async () => {
+      await assert.rejects(ledger.runHeadLedger({ subverb: 'note', text: 'Closed.' }), /Only the family head/, 'a closed delegate loses the pen')
+    })
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved

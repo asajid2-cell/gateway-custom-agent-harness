@@ -109,6 +109,22 @@ export function getLeafDriverSessionIds(): readonly string[] {
   return Object.keys(getLeafDriverScope())
 }
 
+/**
+ * The members the head has delegated the ledger's pen to, as last read.
+ *
+ * The head writes the ledger, but it can name others to write it too: a set of
+ * member ids on the same loose pointer the driver scope lives on, so an extra
+ * field an older reader ignores cannot break it. Cached and published for the
+ * same reason the designation is - the write gate is checked on the path that
+ * appends, and that path cannot await the disk to ask who may write.
+ */
+let ledgerWriterIds: readonly string[] = []
+
+/** Which members the head has delegated the ledger's pen to, as last read. */
+export function getLeafLedgerWriterIds(): readonly string[] {
+  return getLeafSnapshot()?.ledgerWriterIds ?? ledgerWriterIds
+}
+
 /** Which member the family's patriarch is right now: the designated one, else the creator. */
 export function getLeafPatriarchSessionId(): string {
   return getLeafSnapshot()?.patriarchSessionId ?? designatedPatriarch?.sessionId ?? familyRootSync()
@@ -606,7 +622,7 @@ function publish(): void {
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
   const root = familyRootSync()
-  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), driverScope: getLeafDriverScope(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), driverScope: getLeafDriverScope(), ledgerWriterIds: getLeafLedgerWriterIds(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
     if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
@@ -660,7 +676,7 @@ export function getLeafCarouselViews(): LeafView[] {
  * one that knows its transcript path and directory), so any member can find the
  * family and reopen the rest of it - including the patriarch.
  */
-type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; ledgerWriterIds?: string[]; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
 let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
 
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
@@ -1100,6 +1116,25 @@ export async function writeLeafDriverDesignation(familyId: string, scope: Readon
   driverScope = written
 }
 
+/**
+ * Write the members the head has delegated the ledger's pen to.
+ *
+ * The ledger is the head's account, but the head can name others to write it:
+ * the value is the set of member ids that may append, and it lives in the same
+ * loose pointer the driver scope does, keeping the pointer's other fields. Like
+ * the driver scope it survives an interruption because it is written beside the
+ * pointers the family reads, not in a second store. An empty set is written as
+ * the empty set - it means only the head writes - rather than dropped, so the
+ * head's revocation is a record, not an absence.
+ */
+export async function writeLeafLedgerWriters(familyId: string, ids: readonly string[]): Promise<void> {
+  const current = await readLeafFamilyPointer(familyId)
+  const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
+  const written = [...new Set(ids)]
+  await writeLeafFamilyPointer(familyId, { ...base, ledgerWriterIds: written })
+  ledgerWriterIds = written
+}
+
 /** Re-read the designation and keep it where sync render paths can name the family. */
 async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   const root = await familyRootSessionId()
@@ -1109,6 +1144,7 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   designatedHeir = await familyHeirSessionId(root)
   formerPatriarchIds = (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? []
   driverScope = (await readLeafFamilyPointer(root))?.driverScope ?? {}
+  ledgerWriterIds = (await readLeafFamilyPointer(root))?.ledgerWriterIds ?? []
   return member
 }
 
@@ -1207,7 +1243,7 @@ function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: 
     // succession record that the designation exists to keep. Only the copies get
     // the acting answer, which is the whole reason they exist: a member resumed on
     // its own must not be told to resolve to a session that cannot act.
-    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverScope: (await readLeafFamilyPointer(root))?.driverScope ?? {}, ...extra }
+    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverScope: (await readLeafFamilyPointer(root))?.driverScope ?? {}, ledgerWriterIds: (await readLeafFamilyPointer(root))?.ledgerWriterIds ?? [], ...extra }
     const acting = await familyPatriarchSessionId(root)
     const designated = await designatedPatriarchSessionId(root)
     await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: member.sessionId === root ? designated : acting }).catch(() => {})))
@@ -2457,6 +2493,9 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       // The driver and its scope arrive together: `id` is the driver, `value` the
       // leaf references resolved to session ids. One write for both.
       case 'driver': result = await conferDriver(String(id), Array.isArray(value) ? value.map(String) : []); break
+      // The whole writer set arrives in one write, resolved to session ids by
+      // the asker; an empty list clears it back to the head alone.
+      case 'ledger-writers': result = await conferLedgerWriters(Array.isArray(id) ? id.map(String) : []); break
       case 'file': result = await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
       // A leaf reporting its own model/effort only persists them. Applying
@@ -3356,6 +3395,54 @@ export async function conferDriver(driverSessionId: string, leafIds: readonly st
   return wanted.length
     ? `${memberLabel(driver)} now drives ${wanted.map(id => memberLabel(known.get(id)!)).join(', ')}.`
     : `${memberLabel(driver)} is a driver, driving no leaves yet.`
+}
+
+/**
+ * Name the members who may write the ledger beside the head.
+ *
+ * The ledger is the head's account, but writing it can be delegated: this sets
+ * the whole set in one write, so naming the writers and revoking them are the
+ * same act and cannot drift apart, and an empty list clears it back to the head
+ * alone. Only the head delegates - the gate is the head designation, the same
+ * authority that already writes the ledger - so a delegate cannot pass the pen
+ * on. Only live members hold it: a member that is closed or archived is refused
+ * rather than written, so a stale name cannot keep a pen it no longer has.
+ */
+export async function conferLedgerWriters(memberIds: readonly string[]): Promise<string> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('ledger-writers', [memberIds])
+  const { requireHead } = await import('./headLedger.js')
+  await requireHead()
+  const root = await familyRootSessionId()
+  const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
+  const known = new Map(members.map(member => [member.sessionId, member]))
+  const wanted = [...new Set(memberIds)]
+  for (const id of wanted) {
+    const member = known.get(id)
+    if (!member) throw new Error('Unknown leaf')
+    if (!memberCanHoldRole(member)) throw new Error(`${memberLabel(member)} is ${member.status}; only a live member writes the ledger`)
+  }
+  await writeLeafLedgerWriters(root, wanted)
+  await indexLeafMembers(root, members)
+  await refreshDesignatedPatriarch()
+  publish()
+  return wanted.length
+    ? `${wanted.map(id => memberLabel(known.get(id)!)).join(', ')} may write the ledger.`
+    : 'Only the head writes the ledger.'
+}
+
+/**
+ * The live members the head has delegated the ledger's pen to.
+ *
+ * Read fresh from the pointer and the family file on every check, so a delegate
+ * that has since been closed or archived is dropped here rather than holding a
+ * pen the head would not give it now. The head is not included: the gate adds it
+ * separately, since the head writes whether or not it is on this list.
+ */
+export async function liveLedgerWriters(): Promise<LeafMember[]> {
+  const root = await familyRootSessionId()
+  const members = (await readLeafFamily(familyPath(root), root)).members
+  const ids = (await readLeafFamilyPointer(root))?.ledgerWriterIds ?? []
+  return members.filter(member => memberCanHoldRole(member) && ids.includes(member.sessionId))
 }
 
 export async function setLeafGoal(sessionId: string, args: string): Promise<string> {

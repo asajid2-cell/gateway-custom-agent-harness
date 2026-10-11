@@ -370,6 +370,32 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   assert.match(workspace, /leafIds\[0\]!\.trim\(\)\.toLowerCase\(\) === 'clear'/)
 })
 
+test('the ledger pen is delegable, and the gate names the writers', async () => {
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  const ledger = await readFile(new URL('../src/utils/headLedger.ts', import.meta.url), 'utf8')
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+
+  // The tool carries the writer set in `leaves`, and the ledger subverb hands it
+  // to the workspace; the workspace stores it on the pointer, next to the driver
+  // scope, so it needs no migration.
+  assert.match(tool, /\.\.\.\(input\.leaves\?\.length \? \{ writers: input\.leaves \} : \{\}\)/)
+  assert.match(ledger, /case 'writers': \{/)
+  assert.match(ledger, /conferLedgerWriters\(ids\)/)
+  assert.match(workspace, /ledgerWriterIds\?: string\[\]/)
+  assert.match(workspace, /export async function writeLeafLedgerWriters/)
+  assert.match(workspace, /export async function conferLedgerWriters/)
+  assert.match(workspace, /export async function liveLedgerWriters/)
+  // The write subverbs gate on the delegated check, while delegating them stays
+  // head-only; the refusal names the writers that can actually write.
+  assert.match(ledger, /if \(subverb === 'writers'\) await requireHead\(\)/)
+  assert.match(ledger, /await requireLedgerWriter\(\)/)
+  assert.match(ledger, /export async function requireLedgerWriter/)
+  assert.match(ledger, /the writers are \$\{named\.join\(', '\)\}/)
+  assert.match(prompt, /\\`writers\\` \(\\`leaves\\` names the members the head delegates/)
+  assert.match(prompt, /only the head names them/)
+})
+
 test('a partner can be given an effort level, not only a model', async () => {
   const { partnerValueSpec } = await import('../src/tools/LeafTool/LeafTool.ts')
   // The gap this closes: `value` was read unconditionally as the partner's
@@ -716,7 +742,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // where the heir designation lives beside the patriarch's: the family file is
   // strict, so this loose per-session record is the only place an extra field can
   // go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; ledgerWriterIds?: string[]; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)

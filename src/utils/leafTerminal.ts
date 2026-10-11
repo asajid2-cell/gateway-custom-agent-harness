@@ -17,6 +17,8 @@ export type LeafSnapshot = {
   formerPatriarchIds?: readonly string[]
   /** Members the family has designated as drivers, each mapped to the leaves it drives. */
   driverScope?: Readonly<Record<string, readonly string[]>>
+  /** Members the head has delegated the ledger's pen to, as last read. */
+  ledgerWriterIds?: readonly string[]
   /** The session managing this family, so a leaf can tell when the family moved. */
   matriarchSessionId: string
   matriarchName: string

@@ -50,7 +50,7 @@ const inputSchema = lazySchema(() =>
     value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
     tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
     since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
-    leaves: z.array(z.string()).optional().describe('For driver: the leaf references the named driver is put in charge of. Empty or omitted clears the scope; the single word `clear` drops the role itself, leaving an ordinary leaf'),
+    leaves: z.array(z.string()).optional().describe('Leaf references. For driver: the leaves the named driver is put in charge of; empty or omitted clears the scope, and the single word `clear` drops the role itself. For ledger writers: the members the head delegates the ledger pen to; empty or omitted clears it back to the head alone'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -157,6 +157,7 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
         ...(input.leaf?.trim() ? { leaf: input.leaf.trim() } : {}),
         ...(input.message ? { text: input.message } : {}),
         ...(input.name?.trim() ? { mode: input.name.trim() } : {}),
+        ...(input.leaves?.length ? { writers: input.leaves } : {}),
       })
     }
     case 'read':
