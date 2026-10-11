@@ -983,14 +983,16 @@ test('the session on screen is addressable by its own names, and the prompt says
   const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
   assert.match(tool, /await workspace\.resolveOpenTarget\(requireLeaf\(\)\)/)
 
-  // A send reaches into another conversation, so the session on screen is not a
-  // target either - and it says so, rather than reporting itself as unknown.
+  // A send or an interrupt reaches into another conversation, so the session on
+  // screen is not a target either - and each says so, rather than reporting
+  // itself as unknown.
   assert.match(workspace, /is the session asking: a message to the conversation you are in is the turn you are already typing/)
+  assert.match(workspace, /is the session asking: the turn you would stop is the turn you are typing/)
 
   // The prompt has to disclose the exclusion, or a person reads "address a leaf
   // by number, numbered name, or name" as covering the row they are looking at.
   const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
   assert.match(prompt, /The session you are in is a member of its own family, and the verbs differ in how they treat it/)
-  assert.match(prompt, /The verbs that reach into another conversation - \\`send\\`, \\`open\\` and \\`reopen\\` - deliberately do not: naming your own session is refused with its own message/)
+  assert.match(prompt, /The verbs that reach into another conversation - \\`send\\`, \\`interrupt\\`, \\`open\\` and \\`reopen\\` - deliberately do not: naming your own session is refused with its own message/)
   assert.match(prompt, /The settings verbs \\`model\\` and \\`effort\\` do address your own row/)
 })

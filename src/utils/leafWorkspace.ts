@@ -1820,6 +1820,11 @@ export async function interruptLeaf(reference: string): Promise<string> {
     if (!member) throw new Error('Unknown or ambiguous leaf reference')
     return requestLeafWorkspace<string>('interrupt', [member.sessionId])
   }
+  // Like a send, an interrupt acts on another conversation: there is no separate
+  // turn here to stop, and the session on screen is refused as itself rather than
+  // as a leaf that does not exist.
+  const self = await selfMemberNamed(reference)
+  if (self) throw new Error(`${memberLabel(self)} is the session asking: the turn you would stop is the turn you are typing.`)
   const { member, view } = await requireLeafView(reference)
   await view.process.interrupt()
   return `Interrupted ${memberLabel(member)}.`

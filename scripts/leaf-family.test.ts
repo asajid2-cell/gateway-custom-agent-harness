@@ -1326,10 +1326,11 @@ test('the session on screen sets its own model and effort by any of its names, a
       return true
     }, 'opening your own session is refused as already running')
 
-    // A send reaches into another conversation, so the session on screen is not
-    // a target either - and it is refused as itself, not as a leaf that is not
-    // there. (Interrupt has the same shape but is out of this fix's scope.)
+    // A send or an interrupt reaches into another conversation, so the session on
+    // screen is not a target either - and each is refused as itself, not as a
+    // leaf that is not there.
     await assert.rejects(workspace.sendLeafMessage(String(self.number), 'hello'), /is the session asking: a message to the conversation you are in is the turn you are already typing/)
+    await assert.rejects(workspace.interruptLeaf(String(self.number)), /is the session asking: the turn you would stop is the turn you are typing/)
 
     // A reference that names no member at all keeps the ordinary message, for
     // both a control verb and a launch verb.
