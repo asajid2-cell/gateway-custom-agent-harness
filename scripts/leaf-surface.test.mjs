@@ -343,13 +343,24 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'head', 'ledger', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'head', 'heir', 'driver', 'ledger', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
   // A merge carries its fidelity in `value`, so the merge action is exercisable
   // without adding a field the strict schema would have to admit.
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'merge', leaf: 'Scout', value: 'ledger' }).success, true)
+  // The driver verb names the driver in `leaf` and its scope in `leaves`, and the
+  // tool, the command grammar and the workspace verb agree on the one write that
+  // sets the role and the scope together.
+  assert.equal(LeafTool.inputSchema.safeParse({ action: 'driver', leaf: 'Driver', leaves: ['Alpha'] }).success, true)
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  assert.match(tool, /case 'driver':/)
+  assert.match(tool, /conferDriver\(member\.sessionId, leafIds\)/)
+  const command = await readFile(new URL('../src/commands/leaf.tsx', import.meta.url), 'utf8')
+  assert.match(command, /\/\^driver\\s\+/)
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  assert.match(workspace, /export async function conferDriver/)
 })
 
 test('a partner can be given an effort level, not only a model', async () => {
@@ -694,7 +705,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // where the heir designation lives beside the patriarch's: the family file is
   // strict, so this loose per-session record is the only place an extra field can
   // go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverSessionIds?: string[]; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)

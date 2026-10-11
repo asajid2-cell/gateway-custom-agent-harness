@@ -1219,7 +1219,7 @@ test('the designated patriarch is the one patriarch and root name, and original 
   }
 })
 
-test('a member the head puts in charge of one team carries the driver tag', async () => {
+test('a member the head puts in charge of leaves carries the driver tag and its scope', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-driver-'))
   const saved = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = directory
@@ -1229,24 +1229,45 @@ test('a member the head puts in charge of one team carries the driver tag', asyn
     const root = getSessionId()
     const family = join(directory, 'leaf-families', `${root}.json`)
     const driver = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Driver', transcriptPath: join(directory, 'driver.jsonl'), forkMessageId: randomUUID() })
-    const bystander = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Bystander', transcriptPath: join(directory, 'bystander.jsonl'), forkMessageId: randomUUID() })
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+    const alpha = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Alpha', transcriptPath: join(directory, 'alpha.jsonl'), forkMessageId: randomUUID() })
+    const bravo = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Bravo', transcriptPath: join(directory, 'bravo.jsonl'), forkMessageId: randomUUID() })
     await workspace.restoreLeafWorkspace()
+    const pointer = () => readFile(join(directory, 'leaf-families', 'index', `${root}.json`), 'utf8')
 
     // Nothing is marked until the head names a driver: the role is a fact the
     // family file does not know, written into the loose pointer like the rest.
-    assert.doesNotMatch(await workspace.familyRoster(), /\[driver\]/, 'no member is a driver until one is named')
-    await workspace.writeLeafDriverDesignation(root, [driver.sessionId])
+    assert.doesNotMatch(await workspace.familyRoster(), /\[driver/, 'no member is a driver until one is named')
+
+    // ONE write names the driver and the leaves it drives - the role and its
+    // scope are set together, and the roster shows which leaves, not a bare tag.
+    assert.match(await workspace.conferDriver(driver.sessionId, [alpha.sessionId, bravo.sessionId]), /now drives Leaf #\d+ Alpha, Leaf #\d+ Bravo/)
     const roster = await workspace.familyRoster()
-    assert.match(roster, new RegExp(`^#${driver.number} Driver \\[open\\] \\[driver\\] ${driver.sessionId}$`, 'm'), 'the named member carries the driver tag')
-    assert.doesNotMatch(roster, new RegExp(`^#${bystander.number} Bystander .* \\[driver\\]`, 'm'), 'an unnamed member is not a driver')
-    // The role is id-keyed in the pointer, and reads back on the same path.
-    assert.deepEqual(workspace.getLeafDriverSessionIds(), [driver.sessionId], 'the driver ids are readable synchronously')
-    assert.deepEqual(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${root}.json`), 'utf8')).driverSessionIds, [driver.sessionId], 'the driver ids live in the family-id pointer')
-    // Naming a new driver replaces the set; the driver role has no team binding,
-    // so there is nothing else to a driver than the member it names.
-    await workspace.writeLeafDriverDesignation(root, [bystander.sessionId])
-    assert.deepEqual(workspace.getLeafDriverSessionIds(), [bystander.sessionId], 'the driver set is replaced, not appended')
-    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${driver.number} Driver .* \\[driver\\]`, 'm'), 'the displaced driver is no longer marked')
+    assert.match(roster, new RegExp(`^#${driver.number} Driver \\[open\\] \\[driver→#${alpha.number},#${bravo.number}\\] ${driver.sessionId}$`, 'm'), 'the driver tag carries the leaves it drives')
+    assert.doesNotMatch(roster, new RegExp(`^#${other.number} Other .* \\[driver`, 'm'), 'an unnamed member is not a driver')
+    assert.deepEqual(workspace.getLeafDriverScope(), { [driver.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'the scope reads back synchronously')
+    assert.deepEqual(JSON.parse(await pointer()).driverScope, { [driver.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'the scope lives in the family-id pointer')
+
+    // A leaf belongs to at most one driver: a second is REFUSED, naming the
+    // driver that holds it and the exact command that releases it. Nothing moves.
+    await assert.rejects(workspace.conferDriver(other.sessionId, [alpha.sessionId]), (error: Error) => {
+      assert.match(error.message, new RegExp(`Leaf #${alpha.number} Alpha is already driven by Leaf #${driver.number} Driver`))
+      assert.match(error.message, new RegExp(`/leaf driver ${driver.number} ${bravo.number}$`))
+      return true
+    }, 'a second driver for a leaf is refused, not silently transferred')
+    assert.deepEqual(workspace.getLeafDriverScope(), { [driver.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'the refused write changed nothing')
+
+    // A driver named before it has leaves drives nothing, and is still a driver:
+    // an empty list clears the scope rather than dropping the role.
+    assert.match(await workspace.conferDriver(other.sessionId, []), /driving no leaves yet/)
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[driver\\] ${other.sessionId}$`, 'm'), 'a zero-leaf driver is marked bare')
+
+    // A closed driver does not hold its leaves: the stale entry is pruned, so a
+    // leaf it drove can be re-designated instead of blocked forever.
+    await updateLeafMember(family, root, driver.sessionId, { status: 'closed' })
+    assert.match(await workspace.conferDriver(other.sessionId, [alpha.sessionId, bravo.sessionId]), /now drives/)
+    assert.deepEqual(workspace.getLeafDriverScope(), { [other.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'the closed driver no longer holds its leaves')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${driver.number} Driver .* \\[driver`, 'm'), 'the closed driver is no longer marked')
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
