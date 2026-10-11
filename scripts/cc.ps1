@@ -160,6 +160,14 @@ function Resolve-DefaultGatewayEffort {
   if ($levels.Count -eq 0) {
     return $null
   }
+  # A per-model pin (the picker's `e`) is the default for that model, so a fresh
+  # launch starts on the level the user chose rather than the ladder's built-in.
+  # A pin the model cannot take is ignored here, exactly as the harness ignores
+  # it, so a stale pin can never start a session on a level it rejects.
+  $pinned = $PinnedEffortDefaults[$Value]
+  if ($pinned -and ($levels -contains $pinned)) {
+    return [string]$pinned
+  }
   if ($levels -contains 'medium') {
     return 'medium'
   }
@@ -286,6 +294,30 @@ $CapabilityCatalog = Get-Content -Raw -LiteralPath $CapabilityCatalogPath |
 # Stage stamps make a slow launch tell us which step it stalled in, instead of
 # leaving a blank console and an unattributable multi-minute gap.
 Write-LaunchDiagnostic 'config-read'
+
+# The picker's `e` writes per-model default effort levels to this file. The
+# launch default for the starting model is read from it so a fresh session
+# starts on the level the user pinned, and the map is exported below so the
+# harness resolves `auto` to the same level without a relaunch.
+$GatewayEffortDefaultsPath = Join-Path $env:USERPROFILE '.claude\gateway-effort-defaults.json'
+$PinnedEffortDefaults = @{}
+if (Test-Path -LiteralPath $GatewayEffortDefaultsPath -PathType Leaf) {
+  try {
+    $StoredEffortDefaults = Get-Content -Raw -LiteralPath $GatewayEffortDefaultsPath |
+      ConvertFrom-Json
+    foreach ($entry in $StoredEffortDefaults.PSObject.Properties) {
+      if (
+        $entry.Value -is [string] -and
+        -not [string]::IsNullOrWhiteSpace([string]$entry.Value)
+      ) {
+        $PinnedEffortDefaults[[string]$entry.Name] = [string]$entry.Value
+      }
+    }
+  } catch {
+    # A malformed file must not break launch; it reads as no pins.
+    $PinnedEffortDefaults = @{}
+  }
+}
 
 $GatewayProcess = $null
 $GatewayJob = $null
@@ -1001,6 +1033,14 @@ if (Test-Path -LiteralPath $GatewayModelOrderPath -PathType Leaf) {
   }
 }
 $env:MODEL_GATEWAY_MODEL_OPTIONS = ($GatewayModelOptions | ConvertTo-Json -Compress)
+# The per-model effort pins the harness resolves `auto` against. Exported from
+# the file read above, so a pin made in one session reaches the next launch and
+# the harness and launcher cannot disagree about a model's default effort.
+$env:MODEL_GATEWAY_EFFORT_DEFAULTS = if ($PinnedEffortDefaults.Count -gt 0) {
+  $PinnedEffortDefaults | ConvertTo-Json -Compress
+} else {
+  '{}'
+}
 $env:CLAUDE_CODE_EFFORT_LEVEL = $null
 $env:CLAUDE_CODE_WORKFLOWS = 'true'
 $env:CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT = '1'

@@ -215,7 +215,7 @@ test('t sends the focused row to the top and saves that order', { timeout: 20000
     // together into one unreadable line.
     await waitFor('the footer hints to be separated', () =>
       text().includes(
-        'Enter to confirm · f to new-session default · t to move to top · r to reorder · Esc to exit',
+        'Enter to confirm · f to new-session default · e to pin effort · t to move to top · r to reorder · Esc to exit',
       ),
     )
     await press(DOWN)

@@ -461,6 +461,57 @@ test('an explicit --effort the model lacks fails at launch instead of at request
   )
 })
 
+test('the picker pins a per-model default effort the launcher and harness both read', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  const bindings = await readFile(
+    new URL('../src/keybindings/defaultBindings.ts', import.meta.url),
+    'utf8',
+  )
+  const schema = await readFile(
+    new URL('../src/keybindings/schema.ts', import.meta.url),
+    'utf8',
+  )
+  const picker = await readFile(
+    new URL('../src/components/ModelPicker.tsx', import.meta.url),
+    'utf8',
+  )
+  // The launcher reads the same file the picker's `e` writes, so a pin made in
+  // one session reaches the next launch.
+  assert.match(
+    script,
+    /Join-Path \$env:USERPROFILE '\.claude\\gateway-effort-defaults\.json'/,
+    'the pinned defaults must live in the location the picker writes',
+  )
+  // A pin the model cannot take is ignored, exactly as the harness ignores it,
+  // so a stale pin can never start a session on a level it rejects.
+  assert.match(
+    script,
+    /\$pinned = \$PinnedEffortDefaults\[\$Value\]\s*if \(\$pinned -and \(\$levels -contains \$pinned\)\) \{\s*return \[string\]\$pinned\s*\}/,
+    'a valid pin must be preferred over the ladder default',
+  )
+  // The map is exported so the harness resolves `auto` to the same level the
+  // launcher started the session on, without a relaunch.
+  assert.match(
+    script,
+    /\$env:MODEL_GATEWAY_EFFORT_DEFAULTS = if \(\$PinnedEffortDefaults\.Count -gt 0\) \{/,
+    'the pinned map must reach the harness through the environment',
+  )
+  // The pin key is the picker's `e`, declared as an action and bound in the
+  // ModelPicker context beside `f`.
+  assert.match(
+    bindings,
+    /f: 'modelPicker:setDefault',\s*e: 'modelPicker:pinEffort',/,
+    'e must sit beside f in the ModelPicker context',
+  )
+  assert.ok(
+    schema.includes("'modelPicker:pinEffort'"),
+    'modelPicker:pinEffort must be a declared action',
+  )
+  assert.match(picker, /"modelPicker:pinEffort": \(\) => \{/)
+  assert.match(picker, /await pinGatewayEffort\(model, target\)/)
+  assert.match(picker, /await pinGatewayEffort\(model, null\)/)
+})
+
 test('the Command Code provider gets its key injected through the same table', async () => {
   const script = await readFile(scriptPath, 'utf8')
   assert.match(
