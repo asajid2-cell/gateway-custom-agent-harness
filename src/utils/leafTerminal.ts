@@ -15,8 +15,8 @@ export type LeafSnapshot = {
   heirSessionId?: string
   /** Members that have held the patriarch role and given it up, in the order they held it. */
   formerPatriarchIds?: readonly string[]
-  /** Members the family has designated as drivers: a role, id-only and not bound to a team. */
-  driverSessionIds?: readonly string[]
+  /** Members the family has designated as drivers, each mapped to the leaves it drives. */
+  driverScope?: Readonly<Record<string, readonly string[]>>
   /** The session managing this family, so a leaf can tell when the family moved. */
   matriarchSessionId: string
   matriarchName: string

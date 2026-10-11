@@ -87,20 +87,26 @@ let designatedPatriarch: { sessionId: string; name: string } | undefined
 let formerPatriarchIds: readonly string[] = []
 
 /**
- * Members the family has designated as drivers, as last read.
+ * The leaves each driver the family has designated is in charge of, as last read.
  *
- * A role like the elder: a designation on the family rather than a way of
- * behaving, so it lives in the loose pointer where an extra field an older
- * reader ignores cannot break it. Cached and published for the same reason the
- * designation is - a roster is a render path and cannot await the disk. A driver
- * is pulled id-only: nothing binds it to a team, so the pointer is the whole of
- * what a driver is.
+ * A driver is a role like the elder: a designation on the family rather than a
+ * way of behaving, so it lives in the loose pointer where an extra field an
+ * older reader ignores cannot break it. Cached and published for the same reason
+ * the designation is - a roster is a render path and cannot await the disk. The
+ * value is what the driver is FOR: the member ids it drives, one driver to at
+ * most one owner per leaf. A driver named before any leaf is scoped carries an
+ * empty list and drives nothing, which is a legal state, not an absent one.
  */
-let driverSessionIds: readonly string[] = []
+let driverScope: Readonly<Record<string, readonly string[]>> = {}
+
+/** Which members the family has designated as drivers, and the leaves each drives. */
+export function getLeafDriverScope(): Readonly<Record<string, readonly string[]>> {
+  return getLeafSnapshot()?.driverScope ?? driverScope
+}
 
 /** Which members the family has designated as drivers. */
 export function getLeafDriverSessionIds(): readonly string[] {
-  return getLeafSnapshot()?.driverSessionIds ?? driverSessionIds
+  return Object.keys(getLeafDriverScope())
 }
 
 /** Which member the family's patriarch is right now: the designated one, else the creator. */
@@ -600,7 +606,7 @@ function publish(): void {
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
   const root = familyRootSync()
-  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), driverSessionIds: getLeafDriverSessionIds(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), driverScope: getLeafDriverScope(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
     if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
@@ -654,7 +660,7 @@ export function getLeafCarouselViews(): LeafView[] {
  * one that knows its transcript path and directory), so any member can find the
  * family and reopen the rest of it - including the patriarch.
  */
-type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverSessionIds?: string[]; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverScope?: Record<string, string[]>; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
 let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
 
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
@@ -1074,21 +1080,24 @@ export async function writePatriarchDesignation(familyId: string, patriarchSessi
 }
 
 /**
- * Write the drivers the family has designated, where every member reads them.
+ * Write the drivers the family has designated, and the leaves each drives.
  *
- * A driver is a member the head has put in charge of one team, id-only and
- * without a team binding, so this is the whole of the write: it names a set of
- * member ids in the same loose pointer the designation lives in, keeping the
- * pointer's other fields. Like the elder record it survives an interruption
- * because it is written beside the pointers the family reads, not in a second
- * store; and like the elder it is a fact about the family, not about a member's
- * behaviour, so writing it starts nothing and renames nothing.
+ * A driver is a member the head has put in charge of a set of leaves, so the
+ * value is the scope: driver id to the member ids it drives. This is the whole
+ * of the write - it names that mapping in the same loose pointer the designation
+ * lives in, keeping the pointer's other fields. Like the elder record it
+ * survives an interruption because it is written beside the pointers the family
+ * reads, not in a second store; and like the elder it is a fact about the
+ * family, not about a member's behaviour, so writing it starts nothing and
+ * renames nothing. A driver mapped to an empty list drives nothing yet, which is
+ * written as the driver it is rather than dropped.
  */
-export async function writeLeafDriverDesignation(familyId: string, drivers: readonly string[]): Promise<void> {
+export async function writeLeafDriverDesignation(familyId: string, scope: Readonly<Record<string, readonly string[]>>): Promise<void> {
   const current = await readLeafFamilyPointer(familyId)
   const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
-  await writeLeafFamilyPointer(familyId, { ...base, driverSessionIds: [...new Set(drivers)] })
-  driverSessionIds = [...new Set(drivers)]
+  const written = Object.fromEntries(Object.entries(scope).map(([driver, leaves]) => [driver, [...new Set(leaves)]]))
+  await writeLeafFamilyPointer(familyId, { ...base, driverScope: written })
+  driverScope = written
 }
 
 /** Re-read the designation and keep it where sync render paths can name the family. */
@@ -1099,7 +1108,7 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   designatedPatriarch = member ? { sessionId: member.sessionId, name: member.name } : undefined
   designatedHeir = await familyHeirSessionId(root)
   formerPatriarchIds = (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? []
-  driverSessionIds = (await readLeafFamilyPointer(root))?.driverSessionIds ?? []
+  driverScope = (await readLeafFamilyPointer(root))?.driverScope ?? {}
   return member
 }
 
@@ -1198,7 +1207,7 @@ function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: 
     // succession record that the designation exists to keep. Only the copies get
     // the acting answer, which is the whole reason they exist: a member resumed on
     // its own must not be told to resolve to a session that cannot act.
-    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverSessionIds: (await readLeafFamilyPointer(root))?.driverSessionIds ?? [], ...extra }
+    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverScope: (await readLeafFamilyPointer(root))?.driverScope ?? {}, ...extra }
     const acting = await familyPatriarchSessionId(root)
     const designated = await designatedPatriarchSessionId(root)
     await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: member.sessionId === root ? designated : acting }).catch(() => {})))
@@ -1495,13 +1504,19 @@ export async function familyRoster(): Promise<string> {
   // record is what makes the fact survive one; a member is an elder if either
   // says so, and neither is ever cleared.
   const elderIds = new Set(getLeafFormerPatriarchIds())
-  const driverIds = new Set(getLeafDriverSessionIds())
+  // A driver's mark carries its scope: which leaves it drives, by number. A
+  // driver named before any leaf is scoped drives nothing, so it is marked bare
+  // rather than made to look like it owns anything.
+  const driverScope = getLeafDriverScope()
+  const numbers = new Map(members.map(member => [member.sessionId, member.number]))
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
   const lines = [`family ${root}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
     const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
-    const role = `${member.sessionId === patriarchId ? ' [head]' : ''}${driverIds.has(member.sessionId) ? ' [driver]' : ''}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
+    const driven = driverScope[member.sessionId]
+    const driver = driven ? ` [driver${driven.length ? `→${driven.map(id => `#${numbers.get(id) ?? '?'}`).join(',')}` : ''}]` : ''
+    const role = `${member.sessionId === patriarchId ? ' [head]' : ''}${driver}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
     lines.push(`#${member.number} ${member.name} [${state}]${role} ${member.sessionId}${settings ? ` ${settings}` : ''}`)
   }
   return lines.join('\n')
@@ -2344,6 +2359,9 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       case 'change': result = await changeLeaf(id, value, sourceId); break
       case 'head': result = await conferPatriarch(String(id)); break
       case 'heir': result = await conferHeir(String(id)); break
+      // The driver and its scope arrive together: `id` is the driver, `value` the
+      // leaf references resolved to session ids. One write for both.
+      case 'driver': result = await conferDriver(String(id), Array.isArray(value) ? value.map(String) : []); break
       case 'file': result = await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
       // A leaf reporting its own model/effort only persists them. Applying
@@ -3161,6 +3179,65 @@ export async function conferHeir(sessionId: string): Promise<string> {
   await refreshDesignatedPatriarch()
   publish()
   return `${memberLabel(target)} is now the family heir.`
+}
+
+/**
+ * Put a member in charge of the leaves the head names.
+ *
+ * A driver is a head-appointed role over a set of leaves, so the write carries
+ * both the designation and its scope: one command names a driver and the leaves
+ * it drives rather than two that could drift apart. An empty leaf list is legal
+ * and clears the scope - a driver named before there is work for it drives
+ * nothing, which is still a driver.
+ *
+ * A leaf belongs to at most one driver. Assigning a leaf a second driver is
+ * REFUSED rather than silently moved: the refusal names the driver that holds it
+ * and the command that releases it, so the leaf is moved deliberately. Only live
+ * members hold a leaf - a driver that was closed or archived is pruned from the
+ * scope first, or a stale entry would block that leaf from ever being re-driven.
+ *
+ * The gate is the head designation, the same authority that writes the ledger,
+ * and deliberately not the matriarch lease: which window runs the family is a
+ * different question from who it answers to.
+ */
+export async function conferDriver(driverSessionId: string, leafIds: readonly string[]): Promise<string> {
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('driver', [driverSessionId, leafIds])
+  const { requireHead } = await import('./headLedger.js')
+  await requireHead()
+  const root = await familyRootSessionId()
+  const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
+  const known = new Map(members.map(member => [member.sessionId, member]))
+  const driver = known.get(driverSessionId)
+  if (!driver) throw new Error('Unknown leaf')
+  const wanted = [...new Set(leafIds)]
+  for (const id of wanted) if (!known.has(id)) throw new Error('Unknown leaf')
+  // The scope as it stands, minus any driver that can no longer hold one: a
+  // closed or archived driver does not keep its leaves, so a stale entry cannot
+  // block a leaf from being driven again.
+  const scope: Record<string, string[]> = {}
+  for (const [id, leaves] of Object.entries((await readLeafFamilyPointer(root))?.driverScope ?? {})) {
+    const holder = known.get(id)
+    if (!holder || !memberCanHoldRole(holder)) continue
+    scope[id] = [...new Set(leaves)].filter(leaf => known.has(leaf))
+  }
+  // A leaf belongs to at most one live driver. Refuse, naming who holds it and
+  // exactly how to release it, rather than moving it out from under that driver.
+  for (const leafId of wanted) {
+    const holderId = Object.keys(scope).find(id => id !== driverSessionId && scope[id]!.includes(leafId))
+    if (!holderId) continue
+    const holder = known.get(holderId)!
+    const leaf = known.get(leafId)!
+    const remaining = scope[holderId]!.filter(id => id !== leafId).map(id => String(known.get(id)?.number ?? '?'))
+    throw new Error(`${memberLabel(leaf)} is already driven by ${memberLabel(holder)}; move it with: /leaf driver ${holder.number}${remaining.length ? ` ${remaining.join(' ')}` : ''}`)
+  }
+  scope[driverSessionId] = wanted
+  await writeLeafDriverDesignation(root, scope)
+  await indexLeafMembers(root, members)
+  await refreshDesignatedPatriarch()
+  publish()
+  return wanted.length
+    ? `${memberLabel(driver)} now drives ${wanted.map(id => memberLabel(known.get(id)!)).join(', ')}.`
+    : `${memberLabel(driver)} is a driver, driving no leaves yet.`
 }
 
 export async function setLeafGoal(sessionId: string, args: string): Promise<string> {
