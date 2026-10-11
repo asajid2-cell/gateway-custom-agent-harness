@@ -242,7 +242,7 @@ test('every peer-delivered turn is marked as coming from a session, not the user
   const hook = await readFile(new URL('../src/hooks/useLeafTerminalSession.ts', import.meta.url), 'utf8')
   // The leaf fills in the label for any sender that omitted it, so the marker
   // is present on every peer turn regardless of which side dispatched it.
-  assert.match(hook, /import \{ PEER_PROMPT_PREFIX, peerAnswerFor, registerLeafContextNotify, registerLeafContextReturn, type PendingPeerQuestion \}/)
+  assert.match(hook, /import \{ [^}]*PEER_PROMPT_PREFIX[^}]*peerAnswerFor[^}]*registerLeafContextNotify[^}]*registerLeafContextReturn[^}]*type PendingPeerQuestion \}/)
   assert.match(hook, /const marked = prompt\.startsWith\(PEER_PROMPT_PREFIX\) \? prompt : `\$\{PEER_PROMPT_PREFIX\}\$\{prompt\}`/)
   // The label alone is not enough. A peer turn typed into the input reaches the
   // turn boundary with no origin, and that path opens "The user sent a new
@@ -261,6 +261,14 @@ test('every peer-delivered turn is marked as coming from a session, not the user
   // and the text is what separates them, so a report left unmarked would render
   // as something the operator typed.
   assert.match(hook, /const content = `\$\{PEER_PROMPT_PREFIX\}Message from Leaf /)
+  // The head's watch is a PUSH: the hook registers the sink the ledger fires
+  // into and starts the watch, and the sink surfaces the notice as a marked meta
+  // turn in the head's own conversation - so a flip reaches the head's UI, not
+  // only the ledger file.
+  assert.match(hook, /registerHeadWatchSink\(\(familyId, notice\) =>/)
+  assert.match(hook, /startHeadWatch\(root\)/)
+  assert.match(hook, /content: `\$\{PEER_PROMPT_PREFIX\}Leaf family notice: \$\{notice\}/)
+  assert.match(hook, /getLeafPatriarchSessionId\(\) !== getSessionId\(\)/)
 })
 
 test('session comms resolves leaf references before falling back to peers', async () => {

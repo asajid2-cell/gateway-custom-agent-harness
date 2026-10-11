@@ -7,8 +7,12 @@ import { useMainLoopModel } from './useMainLoopModel.js'
 import { isInteractiveLeaf, registerLeafTerminalControls, requestLeafWorkspace, sendLeafTerminal, wakeLeafInput } from '../utils/leafTerminal.js'
 import { flushSessionStorage, getTranscriptPath, recordTranscript, saveSessionName } from '../utils/sessionStorage.js'
 import { parseEffortValue } from '../utils/effort.js'
-import { PEER_PROMPT_PREFIX, peerAnswerFor, registerLeafContextNotify, registerLeafContextReturn, type PendingPeerQuestion } from '../utils/leafWorkspace.js'
+import { registerHeadWatchSink, startHeadWatch } from '../utils/headLedger.js'
+import { getLeafPatriarchSessionId, getLeafRootSessionId, PEER_PROMPT_PREFIX, peerAnswerFor, registerLeafContextNotify, registerLeafContextReturn, type PendingPeerQuestion } from '../utils/leafWorkspace.js'
 import { enqueue } from '../utils/messageQueueManager.js'
+
+/** How often the head re-checks that it still holds the family's designation. */
+const HEAD_WATCH_REFRESH_MS = 5000
 
 export function useLeafTerminalSession(messages: Message[], draft: string, status: 'idle' | 'busy' | 'waiting', interrupt: () => void, canCheckpoint: () => boolean, setMessages: (update: (previous: Message[]) => Message[]) => void): void {
   const latest = useRef({ messages, draft, status, interrupt, canCheckpoint, setMessages })
@@ -82,6 +86,42 @@ export function useLeafTerminalSession(messages: Message[], draft: string, statu
   useEffect(() => {
     if (isInteractiveLeaf()) void requestLeafWorkspace('identity', [sessionId, getTranscriptPath()]).catch(() => {})
   }, [sessionId])
+  // The head's own record is watched by the head: while this session holds the
+  // family's head designation it runs the family's watches, so a member that goes
+  // idle or a leaf that appears reaches this conversation instead of waiting to
+  // be read. The designation is re-checked on a slow beat because it can move - a
+  // head that gave it up stops driving, one that took it starts - but the notices
+  // themselves are PUSHED off the workspace signal, never polled: the beat only
+  // decides WHO is watching, never what fired. The watches outlive the process, so
+  // this start is also what resumes them for a head that was restarted.
+  useEffect(() => {
+    if (isInteractiveLeaf()) return
+    let active: { root: string; stop: () => void; remove: () => void } | undefined
+    const tearDown = (): void => { active?.remove(); active?.stop(); active = undefined }
+    const sync = (): void => {
+      const root = getLeafRootSessionId()
+      if (!root || getLeafPatriarchSessionId() !== getSessionId()) return tearDown()
+      if (active?.root === root) return
+      tearDown()
+      const stop = startHeadWatch(root)
+      const remove = registerHeadWatchSink((familyId, notice) => {
+        if (familyId !== root) return
+        void (async () => {
+          const { createUserMessage } = await import('../utils/messages.js')
+          const message = createUserMessage({
+            content: `${PEER_PROMPT_PREFIX}Leaf family notice: ${notice}. This is the head's own watch reporting a change in the family it keeps - a member of the family, not a person and not a message a leaf chose to send.`,
+            isMeta: true,
+            origin: { kind: 'task-notification' },
+          })
+          latest.current.setMessages(previous => previous.some(item => item.uuid === message.uuid) ? previous : [...previous, message])
+        })()
+      })
+      active = { root, stop, remove }
+    }
+    sync()
+    const interval = setInterval(sync, HEAD_WATCH_REFRESH_MS)
+    return () => { clearInterval(interval); tearDown() }
+  }, [])
   useEffect(() => {
     if (!isInteractiveLeaf()) return
     return registerLeafTerminalControls(async request => {

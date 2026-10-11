@@ -110,6 +110,16 @@ export async function readHeadLedgerEvents(familyId: string): Promise<HeadLedger
 }
 
 /**
+ * An event as it is handed to the append: the payload without the fields the
+ * ledger stamps, with those fields optional. The omit is DISTRIBUTED over the
+ * event union - a plain `Omit<HeadLedgerEvent, ...>` keeps only the keys the
+ * kinds share and rejects every kind-specific field, which is exactly the
+ * `to`/`mode`/`text` an append always carries.
+ */
+type WithoutStamp<E> = E extends HeadLedgerEvent ? Omit<E, 'version' | 'at' | 'by'> & Partial<Pick<E, 'at' | 'by'>> : never
+export type HeadLedgerInput = WithoutStamp<HeadLedgerEvent>
+
+/**
  * Append one event and re-render the Markdown view.
  *
  * Append-only is what makes the file a history rather than a snapshot: the fold
@@ -121,7 +131,7 @@ export async function readHeadLedgerEvents(familyId: string): Promise<HeadLedger
  */
 export async function appendHeadLedgerEvent(
   familyId: string,
-  event: Omit<HeadLedgerEvent, 'version' | 'at' | 'by'> & Partial<Pick<HeadLedgerEvent, 'at' | 'by'>>,
+  event: HeadLedgerInput,
 ): Promise<HeadLedgerEvent> {
   const record = headLedgerEventSchema.parse({
     version: 1,
@@ -246,6 +256,39 @@ export function registerHeadWatchSink(sink: (familyId: string, notice: string) =
 }
 
 /**
+ * Compare a family's members to how they last stood and record what changed.
+ *
+ * This is the whole of the push half, split from the subscription that feeds it
+ * so the two conditions the head asked about - a watched member that crossed
+ * into idle, and a member that was not there before - can be exercised without a
+ * live workspace. Each change is appended as a durable `watch-fired` event, so
+ * the fire outlives the process that noticed it, AND pushed to the registered
+ * sink, so a head that is up is told as it happens. The notices pushed are
+ * returned, which is what lets a caller watch the push rather than the file.
+ */
+export async function headWatchPass(
+  familyId: string,
+  previous: { states: ReadonlyMap<string, string>; ids: ReadonlySet<string> },
+  current: { states: ReadonlyMap<string, string>; ids: ReadonlySet<string> },
+): Promise<string[]> {
+  const watches = currentWatches(await readHeadLedgerEvents(familyId))
+  const idleWatched = watches.filter(watch => watch.mode === 'idle').map(watch => watch.to)
+  const notices: string[] = []
+  for (const id of idleFlips(previous.states, current.states, idleWatched)) {
+    await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'idle', detail: `${id} is idle` })
+    notices.push(`${id} went idle`)
+  }
+  if (watches.some(watch => watch.mode === 'new')) {
+    for (const id of newMembers(previous.ids, current.ids)) {
+      await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'new', detail: `new leaf ${id}` })
+      notices.push(`new leaf ${id}`)
+    }
+  }
+  for (const notice of notices) headWatchSink?.(familyId, notice)
+  return notices
+}
+
+/**
  * Watch the family and record the two conditions the head asked about.
  *
  * The idle-flip and the new-session watch are the SAME mechanism: on every
@@ -293,18 +336,7 @@ export function startHeadWatch(familyId: string): () => void {
       advance(currentStates, currentIds)
       return
     }
-    const watches = currentWatches(await readHeadLedgerEvents(familyId))
-    const idleWatched = watches.filter(watch => watch.mode === 'idle').map(watch => watch.to)
-    for (const id of idleFlips(states, currentStates, idleWatched)) {
-      await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'idle', detail: `${id} is idle` })
-      headWatchSink?.(familyId, `${id} went idle`)
-    }
-    if (watches.some(watch => watch.mode === 'new')) {
-      for (const id of newMembers(ids, currentIds)) {
-        await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'new', detail: `new leaf ${id}` })
-        headWatchSink?.(familyId, `new leaf ${id}`)
-      }
-    }
+    await headWatchPass(familyId, { states, ids }, { states: currentStates, ids: currentIds })
     advance(currentStates, currentIds)
   }
 
