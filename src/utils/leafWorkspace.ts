@@ -25,6 +25,7 @@ import { launchSessionInTerminal } from './deepLink/terminalLauncher.js'
 import { getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafSelfClose, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
+import { isLeafHeadReference, isLeafRootReference } from './leafAliases.js'
 import { readFileTail, readTranscriptSlice, renderTranscriptSlice, TRANSCRIPT_TAIL_WINDOW, type TranscriptReadOptions } from './transcriptRead.js'
 import {
   checkpointTranscriptPath, defaultCheckpointLabel, dropCheckpoint, findCheckpoint, listCheckpoints,
@@ -84,6 +85,23 @@ let designatedPatriarch: { sessionId: string; name: string } | undefined
  * member reads it from the snapshot the host publishes.
  */
 let formerPatriarchIds: readonly string[] = []
+
+/**
+ * Members the family has designated as drivers, as last read.
+ *
+ * A role like the elder: a designation on the family rather than a way of
+ * behaving, so it lives in the loose pointer where an extra field an older
+ * reader ignores cannot break it. Cached and published for the same reason the
+ * designation is - a roster is a render path and cannot await the disk. A driver
+ * is pulled id-only: nothing binds it to a team, so the pointer is the whole of
+ * what a driver is.
+ */
+let driverSessionIds: readonly string[] = []
+
+/** Which members the family has designated as drivers. */
+export function getLeafDriverSessionIds(): readonly string[] {
+  return getLeafSnapshot()?.driverSessionIds ?? driverSessionIds
+}
 
 /** Which member the family's patriarch is right now: the designated one, else the creator. */
 export function getLeafPatriarchSessionId(): string {
@@ -582,7 +600,7 @@ function publish(): void {
   for (const listener of listeners) listener()
   if (isInteractiveLeaf()) return
   const root = familyRootSync()
-  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
+  const snapshot = { rootSessionId: root, patriarchName: getLeafPatriarchName(), patriarchSessionId: getLeafPatriarchSessionId(), heirSessionId: getLeafHeirSessionId(), formerPatriarchIds: getLeafFormerPatriarchIds(), driverSessionIds: getLeafDriverSessionIds(), matriarchSessionId: getLeafMatriarchSessionId(), matriarchName: getLeafSelfName(), members: getLeafViews().map(view => ({ member: view.member, state: view.process.getState() })) }
   for (const view of views.values()) {
     if (view.rootSessionId === root && !['closed', 'failed'].includes(view.process.getState())) {
       try { view.process.snapshot(snapshot) } catch { /* The child may still be spawning. */ }
@@ -636,7 +654,7 @@ export function getLeafCarouselViews(): LeafView[] {
  * one that knows its transcript path and directory), so any member can find the
  * family and reopen the rest of it - including the patriarch.
  */
-type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
+type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverSessionIds?: string[]; fromCheckpointId?: string; role?: 'leaf' | 'seed' | 'seedling'; seedOf?: string }
 let resolvedRoot: { forSession: string; sessionId: string; pointer?: LeafFamilyPointer } | undefined
 
 function familyPath(root: string): string { return join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`) }
@@ -1055,6 +1073,24 @@ export async function writePatriarchDesignation(familyId: string, patriarchSessi
   if (previous !== patriarchSessionId) await markLeafElder(familyPath(familyId), familyId, previous)
 }
 
+/**
+ * Write the drivers the family has designated, where every member reads them.
+ *
+ * A driver is a member the head has put in charge of one team, id-only and
+ * without a team binding, so this is the whole of the write: it names a set of
+ * member ids in the same loose pointer the designation lives in, keeping the
+ * pointer's other fields. Like the elder record it survives an interruption
+ * because it is written beside the pointers the family reads, not in a second
+ * store; and like the elder it is a fact about the family, not about a member's
+ * behaviour, so writing it starts nothing and renames nothing.
+ */
+export async function writeLeafDriverDesignation(familyId: string, drivers: readonly string[]): Promise<void> {
+  const current = await readLeafFamilyPointer(familyId)
+  const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
+  await writeLeafFamilyPointer(familyId, { ...base, driverSessionIds: [...new Set(drivers)] })
+  driverSessionIds = [...new Set(drivers)]
+}
+
 /** Re-read the designation and keep it where sync render paths can name the family. */
 async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   const root = await familyRootSessionId()
@@ -1063,6 +1099,7 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   designatedPatriarch = member ? { sessionId: member.sessionId, name: member.name } : undefined
   designatedHeir = await familyHeirSessionId(root)
   formerPatriarchIds = (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? []
+  driverSessionIds = (await readLeafFamilyPointer(root))?.driverSessionIds ?? []
   return member
 }
 
@@ -1161,7 +1198,7 @@ function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: 
     // succession record that the designation exists to keep. Only the copies get
     // the acting answer, which is the whole reason they exist: a member resumed on
     // its own must not be told to resolve to a session that cannot act.
-    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], ...extra }
+    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverSessionIds: (await readLeafFamilyPointer(root))?.driverSessionIds ?? [], ...extra }
     const acting = await familyPatriarchSessionId(root)
     const designated = await designatedPatriarchSessionId(root)
     await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: member.sessionId === root ? designated : acting }).catch(() => {})))
@@ -1385,7 +1422,7 @@ export async function resolveLeafRef(reference: string): Promise<LeafMember | un
     return family.find(member => member.sessionId === getLeafMatriarchSessionId())
   }
   if (ref === 'original') return leafCreatorMember()
-  if (ref === 'patriarch' || ref === 'root') return leafPatriarchMember()
+  if (isLeafHeadReference(ref)) return leafPatriarchMember()
   return undefined
 }
 
@@ -1416,8 +1453,7 @@ export async function resolveCloseTarget(reference: string): Promise<LeafMember 
 
 /** Names every member can use for the conversation the family came from. */
 export function rootReference(reference: string): boolean {
-  const ref = reference.trim().toLowerCase()
-  return ref === 'original' || ref === 'root' || ref === 'patriarch'
+  return isLeafRootReference(reference)
 }
 
 /**
@@ -1459,12 +1495,13 @@ export async function familyRoster(): Promise<string> {
   // record is what makes the fact survive one; a member is an elder if either
   // says so, and neither is ever cleared.
   const elderIds = new Set(getLeafFormerPatriarchIds())
+  const driverIds = new Set(getLeafDriverSessionIds())
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
   const lines = [`family ${root}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
     const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
-    const role = `${member.sessionId === patriarchId ? ' [patriarch]' : ''}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
+    const role = `${member.sessionId === patriarchId ? ' [head]' : ''}${driverIds.has(member.sessionId) ? ' [driver]' : ''}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
     lines.push(`#${member.number} ${member.name} [${state}]${role} ${member.sessionId}${settings ? ` ${settings}` : ''}`)
   }
   return lines.join('\n')
@@ -1505,7 +1542,7 @@ function resolveReadTarget(members: readonly LeafMember[], reference: string): L
   if (direct) return direct
   const ref = reference.trim().toLowerCase()
   if (ref === 'original') return members.find(member => member.sessionId === familyRootSync())
-  if (ref === 'patriarch' || ref === 'root') return members.find(member => member.sessionId === designatedPatriarch?.sessionId)
+  if (isLeafHeadReference(ref)) return members.find(member => member.sessionId === designatedPatriarch?.sessionId)
   return undefined
 }
 
@@ -1525,7 +1562,7 @@ async function familyDigest(members: readonly LeafMember[]): Promise<string> {
   const lines = [`family ${familyRootSync()}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
-    const marks = [member.sessionId === self ? 'you' : '', member.sessionId === designatedPatriarch?.sessionId ? 'patriarch' : ''].filter(Boolean)
+    const marks = [member.sessionId === self ? 'you' : '', member.sessionId === designatedPatriarch?.sessionId ? 'head' : ''].filter(Boolean)
     const head = `#${member.number} ${member.name} [${state}]${marks.length ? ` (${marks.join(', ')})` : ''} ${member.sessionId}`
     try {
       const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, { tail: 1, maxChars: 1600 })
@@ -2305,7 +2342,7 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       // not - and the host holds a view for the asker, so the view alone cannot
       // tell those two cases apart.
       case 'change': result = await changeLeaf(id, value, sourceId); break
-      case 'patriarch': result = await conferPatriarch(String(id)); break
+      case 'head': result = await conferPatriarch(String(id)); break
       case 'heir': result = await conferHeir(String(id)); break
       case 'file': result = await fileLeaf(id, value); break
       case 'goal': result = await setLeafGoal(id, value); break
@@ -2397,7 +2434,7 @@ export function resolveLeafSource(explicit: string | undefined, family: { creato
   if (explicit) {
     const ref = explicit.trim().toLowerCase()
     if (ref === 'original') return family.creator
-    if (ref === 'patriarch' || ref === 'root') return family.patriarch
+    if (isLeafHeadReference(ref)) return family.patriarch
     return explicit
   }
   return selected ?? family.self
@@ -2850,7 +2887,7 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   const promoted = patch.status === 'closed' || patch.status === 'archived' ? await promoteNextPatriarch(root, sessionId) : undefined
   await refreshDesignatedPatriarch()
   publish()
-  return promoted ? `${memberLabel(promoted)} is now the family patriarch.` : undefined
+  return promoted ? `${memberLabel(promoted)} is now the family head.` : undefined
 }
 
 /**
@@ -3046,15 +3083,15 @@ export async function fileLeaf(sessionId: string, tag: string): Promise<string |
  * invalidates no dedupe.
  */
 export async function conferPatriarch(sessionId: string): Promise<string> {
-  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('patriarch', [sessionId])
+  if (isInteractiveLeaf()) return requestLeafWorkspace<string>('head', [sessionId])
   const root = await familyRootSessionId()
   await requireMatriarch(root)
   const members = await ensureCreatorRow(root, (await readLeafFamily(familyPath(root), root)).members)
   const target = members.find(member => member.sessionId === sessionId)
   if (!target) throw new Error('Unknown leaf')
   const current = await familyPatriarchMember(members, root)
-  if (!current) throw new Error('The family patriarch is unavailable')
-  if (current.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family patriarch`)
+  if (!current) throw new Error('The family head is unavailable')
+  if (current.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family head`)
   const view = views.get(target.sessionId)
   if (view && !['idle', 'closed', 'failed'].includes(view.process.getState())) throw new Error('Wait for the leaf turn before conferring the title')
   // Only the displayed titles move; the rows keep the names they were given.
@@ -3077,7 +3114,7 @@ export async function conferPatriarch(sessionId: string): Promise<string> {
   await indexLeafMembers(root, members)
   await refreshDesignatedPatriarch()
   publish()
-  return `${memberLabel(target)} is now the family patriarch; ${memberLabel(current)} is a leaf of it.`
+  return `${memberLabel(target)} is now the family head; ${memberLabel(current)} is a leaf of it.`
 }
 
 /**
@@ -3109,7 +3146,7 @@ export async function conferHeir(sessionId: string): Promise<string> {
   const target = members.find(member => member.sessionId === sessionId)
   if (!target) throw new Error('Unknown leaf')
   const patriarch = await familyPatriarchMember(members, root)
-  if (patriarch?.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family patriarch`)
+  if (patriarch?.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family head`)
   const current = await readLeafFamilyPointer(root)
   if (current?.heirSessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family heir`)
   const view = views.get(target.sessionId)

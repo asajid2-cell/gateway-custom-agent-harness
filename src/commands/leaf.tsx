@@ -1,9 +1,10 @@
 import React from 'react'
+import { LEAF_CREATOR_ALIASES, LEAF_HEAD_ALIASES } from '../utils/leafAliases.js'
 import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|patriarch <leaf>|heir <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|head <leaf>|heir <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -13,9 +14,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
  * and createLeaf then fills the absent source with the CURRENT session - so
  * `fork original` run from inside a leaf forked the leaf instead of the family's
  * head. `patriarch` is the same reference the workspace accepts, so the grammar
- * and the workspace agree on every name for it.
+ * and the workspace agree on every name for it. The set comes from the one
+ * exported alias constant rather than a second copy, so the grammar cannot drift
+ * from what the workspace resolves.
  */
-const ROOT_REFS = new Set(['original', 'root', 'patriarch'])
+const ROOT_REFS = new Set<string>([...LEAF_CREATOR_ALIASES, ...LEAF_HEAD_ALIASES])
 
 /** A leaf reference resolves inside the family; a UUID is also a session ref. */
 async function isLeafReference(token: string, resolveLeafRef: (ref: string) => Promise<unknown>): Promise<boolean> {
@@ -159,9 +162,9 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       return null
     }
 
-    const patriarch = input.match(/^patriarch\s+(\S+)$/)
-    if (patriarch) {
-      const member = await workspace.resolveLeafRef(patriarch[1]!)
+    const head = input.match(/^head\s+(\S+)$/)
+    if (head) {
+      const member = await workspace.resolveLeafRef(head[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       onDone(await workspace.conferPatriarch(member.sessionId), { display: 'system' })
       return null

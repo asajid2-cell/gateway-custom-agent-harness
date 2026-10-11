@@ -1456,8 +1456,8 @@ def probe_parentage():
     # Designate the member we are in as the patriarch. Nothing is created and no
     # number moves; what changes is which member the family is named after.
     before = s.family()
-    s.submit('/leaf patriarch ' + beta['sessionId'])
-    s.wait(lambda: 'is now the family patriarch' in s.text(), 'patriarch conferred', 30)
+    s.submit('/leaf head ' + beta['sessionId'])
+    s.wait(lambda: 'is now the family head' in s.text(), 'patriarch conferred', 30)
     after = s.family()
     assert after['nextNumber'] == before['nextNumber'], 'conferring the patriarch created a member'
     assert len(after['members']) == len(before['members']), 'conferring the patriarch changed the roster'
@@ -1477,8 +1477,8 @@ def probe_parentage():
     # that could be made the patriarch, and the member that is the patriarch is not.
     s.menu()
     s.pick('Leaves in this family')
-    s.wait(lambda: 'Make patriarch #%s ' % creator['number'] in s.text(), 'the old patriarch is offered as a patriarch again', 30)
-    assert 'Make patriarch #%s ' % beta['number'] not in s.text(), 'the patriarch is offered as its own replacement'
+    s.wait(lambda: 'Make head #%s ' % creator['number'] in s.text(), 'the old patriarch is offered as a patriarch again', 30)
+    assert 'Make head #%s ' % beta['number'] not in s.text(), 'the patriarch is offered as its own replacement'
     s.proc.write('\x1b'); s.pause(.5); s.proc.write('\x1b'); s.pause(.5)
 
     # The window that held the family before is told, rather than left to drive a
@@ -1493,7 +1493,7 @@ def probe_parentage():
     assert 'Open  #' not in t.text(), 'a displaced window still offers to open leaves'
     assert 'Close #' not in t.text(), 'a displaced window still offers to close leaves'
     assert 'Archive #' not in t.text(), 'a displaced window still offers to archive leaves'
-    assert 'Make patriarch #' not in t.text(), 'a displaced window still offers to confer the patriarch'
+    assert 'Make head #' not in t.text(), 'a displaced window still offers to confer the patriarch'
     # What a displaced window keeps is the address of every member: it is not the
     # manager any more, but every member is still an entry point.
     assert 'cc --resume ' + alpha['sessionId'] in t.text(), 'the displaced roster does not name how to enter a member'
@@ -1811,8 +1811,8 @@ def probe_creator_after_patriarch():
     t.assert_view(tokens['sessionId'], 'Tokens', 75)
     t.original()
     before = t.first_item_label()
-    t.submit('/leaf patriarch ' + tokens['sessionId'])
-    t.wait(lambda: 'is now the family patriarch' in t.text(), 'Tokens designated', 30)
+    t.submit('/leaf head ' + tokens['sessionId'])
+    t.wait(lambda: 'is now the family head' in t.text(), 'Tokens designated', 30)
     t.assert_view(t.id, 'creator remains the conversation on screen')
     t.leaf(0)
     leaf_host_label = t.first_item_label()
@@ -1875,8 +1875,8 @@ def probe_elder():
     # It takes the designation first: an elder is a member that HELD the role,
     # so holding it is the thing that has to be recorded before the park.
     t.original()
-    t.submit('/leaf patriarch ' + elder['sessionId'])
-    t.wait(lambda: 'is now the family patriarch' in t.text(), 'the elder holds the role', 30)
+    t.submit('/leaf head ' + elder['sessionId'])
+    t.wait(lambda: 'is now the family head' in t.text(), 'the elder holds the role', 30)
 
     # Park it. Archiving detaches and hides it while keeping its transcript. The
     # wait is for "no longer open", not for the word `archived`: the member is a
@@ -1973,8 +1973,8 @@ def probe_arc():
     # A holds the role. It is a leaf, not the window, so the window can park it
     # the way it parks any member - and so the member that reads it afterwards is
     # a different session again.
-    t.submit('/leaf patriarch ' + elder['sessionId'])
-    t.wait(lambda: 'is now the family patriarch' in t.after('/leaf patriarch ' + elder['sessionId']),
+    t.submit('/leaf head ' + elder['sessionId'])
+    t.wait(lambda: 'is now the family head' in t.after('/leaf head ' + elder['sessionId']),
            'the patriarch holds the role', 45)
     t.check(lambda: t.pointer(t.id).get('patriarchSessionId') == elder['sessionId'],
             'the designation did not move to the member the family was renamed after')
@@ -2020,8 +2020,8 @@ def probe_arc():
     # designation it just realized is cleared, and the member it displaced is
     # filed as an elder - and one read of the family shows all three together,
     # which is question 2: atomic, not three steps that could drift apart.
-    t.submit('/leaf patriarch ' + heir['sessionId'])
-    t.wait(lambda: 'is now the family patriarch' in t.after('/leaf patriarch ' + heir['sessionId']),
+    t.submit('/leaf head ' + heir['sessionId'])
+    t.wait(lambda: 'is now the family head' in t.after('/leaf head ' + heir['sessionId']),
            'the heir ascends', 45)
     pointer = t.pointer(t.id)
     members = {member['sessionId']: member for member in t.family().get('members', [])}
@@ -2124,10 +2124,10 @@ def probe_stress():
     # do, and a relay the matriarch runs on the member's behalf is a relay the
     # member asked for - so if this succeeds, the claim is false.
     t.leaf(0)
-    shown = answered('/leaf patriarch ' + alpha['sessionId'], ('is now the family patriarch', 'Leaf operation failed'))
+    shown = answered('/leaf head ' + alpha['sessionId'], ('is now the family head', 'Leaf operation failed'))
     t.original()
     results['heirSelfPromoted'] = t.pointer(t.id).get('patriarchSessionId') == alpha['sessionId']
-    results['heirSelfPromotionSaid'] = 'patriarch' if 'is now the family patriarch' in shown else (refusal_line(shown) or 'no output')
+    results['heirSelfPromotionSaid'] = 'head' if 'is now the family head' in shown else (refusal_line(shown) or 'no output')
 
     # A discarded successor. Raise Alpha, replace it with Bravo - the successor
     # that failed - then park Bravo. What does the designation say now? If it
@@ -2153,7 +2153,7 @@ def probe_stress():
     answered('/leaf reopen ' + bravo['sessionId'], ('reopened', 'Leaf operation failed'))
     t.wait(lambda: any(item['sessionId'] == bravo['sessionId'] and item['status'] == 'open' for item in t.leaves()),
            'the rival is back', 90)
-    answered('/leaf patriarch ' + alpha['sessionId'], ('is now the family patriarch', 'Leaf operation failed'))
+    answered('/leaf head ' + alpha['sessionId'], ('is now the family head', 'Leaf operation failed'))
     answered('/leaf heir ' + bravo['sessionId'], ('is now the family heir', 'Leaf operation failed'))
     results['heirBeforeDeath'] = t.pointer(t.id).get('heirSessionId') == bravo['sessionId']
     answered('/leaf close ' + alpha['sessionId'], ('closed', 'Leaf operation failed'))
@@ -2228,7 +2228,7 @@ def confer_patriarch(terminal, leaf_id, results, label):
             return
         terminal.proc.write('\x15')
         terminal.pause(.4)
-        terminal.submit('/leaf patriarch ' + leaf_id)
+        terminal.submit('/leaf head ' + leaf_id)
         terminal.pause(4)
         results[label + '_ask' + str(attempt)] = terminal.text()[-1200:]
 
@@ -2354,7 +2354,7 @@ def probe_crash_window():
     results['w3_rosterRows'] = rows
     alpha_row = next((row for row in rows if alpha['sessionId'] in row), None)
     results['w3_alphaRow'] = alpha_row
-    results['w3_resolvesToClosedMember'] = bool(alpha_row and '[patriarch]' in alpha_row)
+    results['w3_resolvesToClosedMember'] = bool(alpha_row and '[head]' in alpha_row)
     flush_results()
     r.close_leaves(90)
     r.exit(family_survives=True)
@@ -2441,7 +2441,7 @@ def probe_designation_residue():
 
     The pointer names a member whose process was killed, so the family filed it
     away; another member is still open, so the family is not dormant. What is
-    asserted is POSITIVE: the member that can act must carry [patriarch], read
+    asserted is POSITIVE: the member that can act must carry [head], read
     from a session that is not it. The window-3 residue in `probe_crash_window`
     could only show the mark coming OFF the closed member, and a resolver that
     returned no patriarch at all satisfies that reading just as well - it is one
@@ -2525,8 +2525,8 @@ def probe_designation_residue():
     acting_line = next((row for row in rows if t.id in row), None)
     results['r1_closedPatriarchLine'] = alpha_line
     results['r1_actingLine'] = acting_line
-    results['r1_closedPatriarchStillMarked'] = bool(alpha_line and '[patriarch]' in alpha_line)
-    results['r1_successorMarked'] = bool(acting_line and '[patriarch]' in acting_line)
+    results['r1_closedPatriarchStillMarked'] = bool(alpha_line and '[head]' in alpha_line)
+    results['r1_successorMarked'] = bool(acting_line and '[head]' in acting_line)
     flush_results()
     r.pause(1)
     r.exit(family_survives=True)
@@ -2604,7 +2604,7 @@ def probe_dormant_residue():
     w.wait(lambda: 'All ' in w.text(), 'the dormant family resumed', 180)
     rows = ask_roster(w, results, 'r2_roster')
     results['r2_rosterRows'] = rows
-    results['r2_rowsMarkingPatriarch'] = [row for row in rows if '[patriarch]' in row]
+    results['r2_rowsMarkingPatriarch'] = [row for row in rows if '[head]' in row]
     results['r2_familyId'] = u.id
     # The reading session's own row is filtered out of its roster, so the file is
     # read too: it says whether entering the family put the reader back among the

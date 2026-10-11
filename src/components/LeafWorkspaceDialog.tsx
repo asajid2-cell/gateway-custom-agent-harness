@@ -201,14 +201,14 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
           description: 'Detach it from this family and hide it from this menu; the transcript is kept',
         })),
         ...open.filter(member => member.sessionId !== patriarchId).map(member => ({
-          value: `patriarch:${member.sessionId}`,
-          label: `Make patriarch #${member.number} ${member.name}`,
-          description: 'The family takes this member’s name; the member that is the patriarch now becomes an ordinary leaf',
+          value: `head:${member.sessionId}`,
+          label: `Make head #${member.number} ${member.name}`,
+          description: 'The family takes this member’s name; the member that is the head now becomes an ordinary leaf',
         })),
         ...open.filter(member => member.sessionId !== patriarchId && member.sessionId !== heirId).map(member => ({
           value: `heir:${member.sessionId}`,
           label: `Raise heir #${member.number} ${member.name}`,
-          description: 'Name the member being trained to succeed the patriarch; it stays an ordinary leaf',
+          description: 'Name the member being trained to succeed the head; it stays an ordinary leaf',
         })),
       ]),
       // Every member is an entry point, so every member gets the command that
@@ -241,7 +241,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)
-          if (action === 'patriarch') return workspace.conferPatriarch(id)
+          if (action === 'head') return workspace.conferPatriarch(id)
           if (action === 'heir') return workspace.conferHeir(id)
           // Closing the session you are in is the same call as closing any other
           // member; what it does is decided by which session is asking, not by
@@ -452,7 +452,7 @@ export function LeafCreateWizard({ members, selectedId, patriarchName, defaultMo
   // is a member now, and its own row would otherwise sit beside this one.
   const patriarchId = getLeafPatriarchSessionId()
   const sources = [
-    { value: 'root', label: patriarchName, description: 'The member designated as this family’s patriarch' },
+    { value: 'root', label: patriarchName, description: 'The member designated as this family’s head' },
     ...(members ?? []).filter(member => member.status !== 'archived' && member.sessionId !== patriarchId).map(member => ({
       value: member.sessionId,
       label: `#${member.number} ${member.name}`,

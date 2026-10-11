@@ -335,7 +335,7 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'patriarch', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'head', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
@@ -422,7 +422,7 @@ test('a leaf can reach its matriarch, not only its siblings', async () => {
   // The root is a nameable target inside a leaf, so `send original ...` reports
   // up instead of failing to resolve a member that is not in the family list.
   assert.match(workspace, /export function rootReference\(reference: string\)/)
-  assert.match(workspace, /ref === 'patriarch'/)
+  assert.match(workspace, /isLeafRootReference\(reference\)/)
   assert.match(workspace, /if \(isInteractiveLeaf\(\) && rootReference\(reference\)\) return notifyLeafMatriarch\(message\)/)
   assert.match(workspace, /export async function notifyLeafMatriarch/)
   assert.match(workspace, /case 'notify': \{/)
@@ -461,7 +461,8 @@ test('roster is the verb that names the patriarch, and the prompt says so', asyn
     // verb is documented as the family view, that it is named as the way to
     // reach the parent, and that it is told apart from `list`.
     assert.match(prompt, /roster: the family view/)
-    assert.match(prompt, /\[patriarch\]/)
+    assert.match(prompt, /\[head\]/)
+    assert.match(prompt, /\[driver\]/)
     assert.match(prompt, /roster.*shows it the matriarch|\\`roster\\` shows it the matriarch/)
     assert.match(prompt, /\\`list\\` shows the same members/)
   } finally {
@@ -685,7 +686,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // where the heir designation lives beside the patriarch's: the family file is
   // strict, so this loose per-session record is the only place an extra field can
   // go without an older reader having to know.
-  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
+  assert.ok(workspace.includes('type LeafFamilyPointer = { rootSessionId: string; rootName?: string; rootTranscriptPath?: string; rootCwd?: string; patriarchSessionId?: string; heirSessionId?: string; formerPatriarchIds?: string[]; driverSessionIds?: string[]; fromCheckpointId?: string; role?: \'leaf\' | \'seed\' | \'seedling\'; seedOf?: string }'))
   assert.match(workspace, /export async function familyRootSessionId\(\): Promise<string>/)
   assert.match(workspace, /await access\(familyPath\(pointer\.rootSessionId\)\)/)
   assert.match(workspace, /export function familyRootSync\(\): string/)
@@ -705,7 +706,7 @@ test('the family outlives its patriarch: any member can find and reopen the rest
   // family's creator is not necessarily the member designated as its patriarch.
   assert.match(workspace, /const direct = resolveLeafMember\(members, reference\)/)
   assert.match(workspace, /if \(ref === 'original'\) return leafCreatorMember\(\)/)
-  assert.match(workspace, /if \(ref === 'patriarch' \|\| ref === 'root'\) return leafPatriarchMember\(\)/)
+  assert.match(workspace, /if \(isLeafHeadReference\(ref\)\) return leafPatriarchMember\(\)/)
   // The other role has a name of its own: `matriarch` is the session holding
   // the family's terminal, which is not necessarily the designated member.
   assert.match(workspace, /if \(ref === 'matriarch'\)/)
@@ -769,10 +770,10 @@ test('every member is an entry point, and the doctrine says so', async () => {
   // is a designation that can move, and any member opens on its own.
   assert.doesNotMatch(prompt, /forked from this one/)
   assert.match(prompt, /cc --resume <session id>/)
-  assert.match(prompt, /patriarch: confer the title of patriarch on another member/)
+  assert.match(prompt, /head: confer the title of head on another member/)
   assert.match(prompt, /The family id is the session the family was created from/)
   assert.match(prompt, /\\`original\\` names the member the family was created from/)
-  assert.match(prompt, /\\`patriarch\\` and \\`root\\` name the member designated as its head/)
+  assert.match(prompt, /\\`head\\` and \\`root\\` name the member designated as its head/)
   assert.match(prompt, /DESCRIPTION = 'See, talk to, and drive the leaf sessions in this family\.'/)
 
   // The menu hands out the command that opens each member from anywhere. It is
@@ -789,7 +790,7 @@ test('every member is an entry point, and the doctrine says so', async () => {
   // The peer skill carries the same model: a member is addressable by its own
   // session id, and the parent is a designation rather than an address.
   const peers = await readFile(new URL('../src/skills/bundled/gatewayPeers.ts', import.meta.url), 'utf8')
-  assert.match(peers, /which member is the patriarch is a designation that can move/)
+  assert.match(peers, /which member is the head is a designation that can move/)
   assert.match(peers, /never assume the session a family was created from is the one that owns the rest/)
 })
 

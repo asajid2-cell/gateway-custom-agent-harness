@@ -751,7 +751,7 @@ test('naming an heir records a designation the family reads, and ascending clear
     // (it cannot succeed itself), the member that is already the heir, and a
     // target whose turn is in flight.
     await assert.rejects(workspace.conferHeir(randomUUID()), /Unknown leaf/)
-    await assert.rejects(workspace.conferHeir(root), /already the family patriarch/)
+    await assert.rejects(workspace.conferHeir(root), /already the family head/)
     await assert.rejects(workspace.conferHeir(heir.sessionId), /already the family heir/)
     const { leaf } = parkedLeaf()
     leaf.setState('running')
@@ -816,7 +816,7 @@ test('the patriarch is read from the family pointer, never from a member copy', 
     const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
     // Conferring is what writes the member copies, so it is also what makes the
     // disagreement real rather than hypothetical: one copy is then made to lie.
-    assert.match(await workspace.conferPatriarch(designated.sessionId), /now the family patriarch/)
+    assert.match(await workspace.conferPatriarch(designated.sessionId), /now the family head/)
     const copyPath = join(directory, 'leaf-families', 'index', `${other.sessionId}.json`)
     const copy = JSON.parse(await readFile(copyPath, 'utf8')) as { patriarchSessionId?: string; formerPatriarchIds?: string[] }
     assert.equal(copy.patriarchSessionId, designated.sessionId, 'the copy is published from the designation')
@@ -832,8 +832,8 @@ test('the patriarch is read from the family pointer, never from a member copy', 
     // The copy is now wrong; the pointers on disk disagree. Every reading must
     // still answer with the family pointer's member, which is only visible if
     // the read goes back to that pointer rather than trusting a copy.
-    assert.match(await workspace.familyRoster(), new RegExp(`^#${designated.number} Designated \\[open\\] \\[patriarch\\] ${designated.sessionId}$`, 'm'), 'the roster marks the family pointer’s member')
-    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[patriarch\\]`, 'm'), 'the roster must not follow a member copy')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${designated.number} Designated \\[open\\] \\[head\\] ${designated.sessionId}$`, 'm'), 'the roster marks the family pointer’s member')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[head\\]`, 'm'), 'the roster must not follow a member copy')
     assert.equal(workspace.getLeafPatriarchSessionId(), designated.sessionId, 'the session-wide answer follows the family pointer')
     assert.equal((await workspace.resolveLeafRef('patriarch'))?.sessionId, designated.sessionId, 'the patriarch reference follows the family pointer')
     assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[elder\\]`, 'm'), 'the roster must not follow a member copy’s elder record')
@@ -879,7 +879,7 @@ test('a stale designation records the member the move displaced, not the one the
     const pointerPath = join(directory, 'leaf-families', 'index', `${root}.json`)
     assert.equal(JSON.parse(await readFile(pointerPath, 'utf8')).patriarchSessionId, gone.sessionId, 'the pointer still names the filed-away member')
     assert.equal(workspace.getLeafPatriarchSessionId(), root, 'every reader resolves the role to the member that can act')
-    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${gone.number} Gone \\[closed\\] \\[patriarch\\]`, 'm'), 'the stale name is not marked as the patriarch')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${gone.number} Gone \\[closed\\] \\[head\\]`, 'm'), 'the stale name is not marked as the patriarch')
 
     // An ordinary mount re-indexes the family. The family pointer is the root's
     // own entry, so it must keep the designation as written - the filed-away
@@ -891,7 +891,7 @@ test('a stale designation records the member the move displaced, not the one the
     assert.equal(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${target.sessionId}.json`), 'utf8')).patriarchSessionId, root, 'the member copy names the member that can act')
 
     // The acting patriarch is the creator, so conferring displaces the creator.
-    assert.match(await workspace.conferPatriarch(target.sessionId), /now the family patriarch/)
+    assert.match(await workspace.conferPatriarch(target.sessionId), /now the family head/)
     const after = JSON.parse(await readFile(pointerPath, 'utf8')) as { formerPatriarchIds?: string[] }
     assert.deepEqual(after.formerPatriarchIds, [root], 'the elder record names the member the move displaced')
     assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${gone.number} Gone \\[closed\\] \\[elder\\]`, 'm'), 'the stale name is not recorded as an elder')
@@ -1134,7 +1134,7 @@ test('a member resumed on its own finds its family, its siblings, and its parent
       )
       const roster = await workspace.familyRoster()
       assert.match(roster, new RegExp(`^family ${root}$`, 'm'))
-      assert.match(roster, new RegExp(`^#${creator.number} \\S.* \\[patriarch\\] ${root}$`, 'm'))
+      assert.match(roster, new RegExp(`^#${creator.number} \\S.* \\[head\\] ${root}$`, 'm'))
       // The creator is an ordinary member now: a member can close it, rename it
       // and archive it. Only the session doing the asking is still refused.
       await workspace.changeLeaf(root, { status: 'closed' })
@@ -1196,7 +1196,7 @@ test('the designated patriarch is the one patriarch and root name, and original 
       const creatorNumber = (await readLeafFamily(family, root)).members.find(item => item.sessionId === root)!.number
       const roster = await workspace.familyRoster()
       assert.match(roster, new RegExp(`^family ${root}$`, 'm'), 'the family is still named by its id, which never moves')
-      assert.match(roster, new RegExp(`^#${sibling.number} Sibling \\[open\\] \\[patriarch\\] ${sibling.sessionId}$`, 'm'), 'the mark follows the designation')
+      assert.match(roster, new RegExp(`^#${sibling.number} Sibling \\[open\\] \\[head\\] ${sibling.sessionId}$`, 'm'), 'the mark follows the designation')
       // The creator held the role until this designation took it away, so it is
       // filed as an elder now: that is exactly the fact eldership records.
       assert.match(roster, new RegExp(`^#${creatorNumber} \\S.* \\[open\\] \\[elder\\] ${root}$`, 'm'), 'the member the designation moved away from is an elder')
@@ -1212,6 +1212,41 @@ test('the designated patriarch is the one patriarch and root name, and original 
       switchSession(asSessionId(root), projectDir, resumeDirectory)
       workspace.forgetLeafFamilyRoot()
     }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a member the head puts in charge of one team carries the driver tag', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-driver-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const driver = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Driver', transcriptPath: join(directory, 'driver.jsonl'), forkMessageId: randomUUID() })
+    const bystander = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Bystander', transcriptPath: join(directory, 'bystander.jsonl'), forkMessageId: randomUUID() })
+    await workspace.restoreLeafWorkspace()
+
+    // Nothing is marked until the head names a driver: the role is a fact the
+    // family file does not know, written into the loose pointer like the rest.
+    assert.doesNotMatch(await workspace.familyRoster(), /\[driver\]/, 'no member is a driver until one is named')
+    await workspace.writeLeafDriverDesignation(root, [driver.sessionId])
+    const roster = await workspace.familyRoster()
+    assert.match(roster, new RegExp(`^#${driver.number} Driver \\[open\\] \\[driver\\] ${driver.sessionId}$`, 'm'), 'the named member carries the driver tag')
+    assert.doesNotMatch(roster, new RegExp(`^#${bystander.number} Bystander .* \\[driver\\]`, 'm'), 'an unnamed member is not a driver')
+    // The role is id-keyed in the pointer, and reads back on the same path.
+    assert.deepEqual(workspace.getLeafDriverSessionIds(), [driver.sessionId], 'the driver ids are readable synchronously')
+    assert.deepEqual(JSON.parse(await readFile(join(directory, 'leaf-families', 'index', `${root}.json`), 'utf8')).driverSessionIds, [driver.sessionId], 'the driver ids live in the family-id pointer')
+    // Naming a new driver replaces the set; the driver role has no team binding,
+    // so there is nothing else to a driver than the member it names.
+    await workspace.writeLeafDriverDesignation(root, [bystander.sessionId])
+    assert.deepEqual(workspace.getLeafDriverSessionIds(), [bystander.sessionId], 'the driver set is replaced, not appended')
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${driver.number} Driver .* \\[driver\\]`, 'm'), 'the displaced driver is no longer marked')
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
@@ -1276,7 +1311,7 @@ test('conferring the patriarch moves the name and the aliases without touching n
     await mkdir(join(directory, 'gateway-writers'), { recursive: true })
     const writer = await lock(join(directory, 'gateway-writers', member.sessionId), { realpath: false, stale: 30000, retries: 0 })
     try {
-      assert.match(await workspace.conferPatriarch(member.sessionId), /^Leaf #2 Member is now the family patriarch/)
+      assert.match(await workspace.conferPatriarch(member.sessionId), /^Leaf #2 Member is now the family head/)
     } finally {
       await writer()
       if (savedGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
@@ -1297,7 +1332,7 @@ test('conferring the patriarch moves the name and the aliases without touching n
     // Refusals: a reference outside the family, the member that already holds
     // the designation, and a target whose turn is in flight.
     await assert.rejects(workspace.conferPatriarch(randomUUID()), /Unknown leaf/)
-    await assert.rejects(workspace.conferPatriarch(member.sessionId), /already the family patriarch/)
+    await assert.rejects(workspace.conferPatriarch(member.sessionId), /already the family head/)
     const { leaf } = parkedLeaf()
     leaf.setState('running')
     const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: sibling as never, process: leaf as never, draft: '' })
