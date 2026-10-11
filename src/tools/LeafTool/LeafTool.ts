@@ -50,7 +50,7 @@ const inputSchema = lazySchema(() =>
     value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
     tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
     since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
-    leaves: z.array(z.string()).optional().describe('For driver: the leaf references the named driver is put in charge of. Empty or omitted clears the scope'),
+    leaves: z.array(z.string()).optional().describe('For driver: the leaf references the named driver is put in charge of. Empty or omitted clears the scope; the single word `clear` drops the role itself, leaving an ordinary leaf'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -179,10 +179,14 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'driver': {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const words = (input.leaves ?? []).map(reference => reference.trim()).filter(Boolean)
+      // `clear` in the scope position drops the role, so it is passed through as
+      // the reserved word rather than resolved as a leaf to drive.
+      if (words.length === 1 && words[0]!.toLowerCase() === 'clear') return workspace.conferDriver(member.sessionId, ['clear'])
       const leafIds: string[] = []
-      for (const reference of input.leaves ?? []) {
-        const driven = await workspace.resolveLeafRef(reference.trim())
-        if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference.trim()}`)
+      for (const reference of words) {
+        const driven = await workspace.resolveLeafRef(reference)
+        if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference}`)
         leafIds.push(driven.sessionId)
       }
       return workspace.conferDriver(member.sessionId, leafIds)

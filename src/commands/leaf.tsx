@@ -181,13 +181,19 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
     // `driver <driver-leaf> [leaf...]`: one command names the driver and the
     // leaves it drives, so the role and its scope are written together. A bare
     // `driver <driver-leaf>` clears the scope, leaving a driver that drives
-    // nothing yet.
+    // nothing yet; `driver <driver-leaf> clear` drops the role itself, leaving
+    // an ordinary leaf, so the word is passed through rather than resolved.
     const driver = input.match(/^driver\s+(\S+)((?:\s+\S+)*)$/)
     if (driver) {
       const member = await workspace.resolveLeafRef(driver[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const words = driver[2]!.trim().split(/\s+/).filter(Boolean)
+      if (words.length === 1 && words[0]!.toLowerCase() === 'clear') {
+        onDone(await workspace.conferDriver(member.sessionId, ['clear']), { display: 'system' })
+        return null
+      }
       const leafIds: string[] = []
-      for (const reference of driver[2]!.trim().split(/\s+/).filter(Boolean)) {
+      for (const reference of words) {
         const driven = await workspace.resolveLeafRef(reference)
         if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference}`)
         leafIds.push(driven.sessionId)

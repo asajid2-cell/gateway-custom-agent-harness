@@ -357,10 +357,17 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
   assert.match(tool, /case 'driver':/)
   assert.match(tool, /conferDriver\(member\.sessionId, leafIds\)/)
+  // `driver <leaf> clear` drops the role itself: the reserved word is passed
+  // through unresolved at the tool and the command, and conferDriver is the one
+  // place that reads it, so the role and its scope are dropped together.
+  assert.equal(LeafTool.inputSchema.safeParse({ action: 'driver', leaf: 'Driver', leaves: ['clear'] }).success, true)
+  assert.match(tool, /words\[0\]!\.toLowerCase\(\) === 'clear'\) return workspace\.conferDriver\(member\.sessionId, \['clear'\]\)/)
   const command = await readFile(new URL('../src/commands/leaf.tsx', import.meta.url), 'utf8')
   assert.match(command, /\/\^driver\\s\+/)
+  assert.match(command, /words\[0\]!\.toLowerCase\(\) === 'clear'/)
   const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
   assert.match(workspace, /export async function conferDriver/)
+  assert.match(workspace, /leafIds\[0\]!\.trim\(\)\.toLowerCase\(\) === 'clear'/)
 })
 
 test('a partner can be given an effort level, not only a model', async () => {
@@ -482,6 +489,7 @@ test('roster is the verb that names the patriarch, and the prompt says so', asyn
     assert.match(prompt, /roster: the family view/)
     assert.match(prompt, /\[head\]/)
     assert.match(prompt, /\[driver\]/)
+    assert.match(prompt, /drops the role itself/)
     assert.match(prompt, /roster.*shows it the matriarch|\\`roster\\` shows it the matriarch/)
     assert.match(prompt, /\\`list\\` shows the same members/)
   } finally {

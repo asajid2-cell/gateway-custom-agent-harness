@@ -1262,6 +1262,20 @@ test('a member the head puts in charge of leaves carries the driver tag and its 
     assert.match(await workspace.conferDriver(other.sessionId, []), /driving no leaves yet/)
     assert.match(await workspace.familyRoster(), new RegExp(`^#${other.number} Other \\[open\\] \\[driver\\] ${other.sessionId}$`, 'm'), 'a zero-leaf driver is marked bare')
 
+    // `driver <leaf> clear` is the explicit way back: the reserved word in the
+    // scope position drops the role AND its scope together, so the member is an
+    // ordinary leaf again rather than a driver that drives nothing. The scope
+    // entry is removed, not emptied - there is nothing left marking it a driver.
+    assert.match(await workspace.conferDriver(other.sessionId, ['clear']), /is an ordinary leaf again/)
+    assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${other.number} Other .* \\[driver`, 'm'), 'the cleared member is no longer marked a driver')
+    assert.equal(workspace.getLeafDriverScope()[other.sessionId], undefined, 'the cleared role leaves no entry, not an empty one')
+    assert.equal(JSON.parse(await pointer()).driverScope[other.sessionId], undefined, 'the pointer no longer names it a driver')
+    assert.match(await workspace.familyRoster(), new RegExp(`^#${driver.number} Driver .* \\[driver→#${alpha.number},#${bravo.number}\\]`, 'm'), 'the clear touched only the member it named')
+
+    // Clearing a member that is not a driver says so and writes nothing new.
+    assert.match(await workspace.conferDriver(other.sessionId, ['clear']), /is not a driver/)
+    assert.deepEqual(workspace.getLeafDriverScope(), { [driver.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'clearing a non-driver changed nothing')
+
     // A closed driver does not hold its leaves: the stale entry is pruned, so a
     // leaf it drove can be re-designated instead of blocked forever.
     await updateLeafMember(family, root, driver.sessionId, { status: 'closed' })

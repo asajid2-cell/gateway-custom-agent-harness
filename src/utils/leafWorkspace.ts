@@ -3274,6 +3274,12 @@ export async function conferHeir(sessionId: string): Promise<string> {
  * and clears the scope - a driver named before there is work for it drives
  * nothing, which is still a driver.
  *
+ * `driver <leaf> clear` is the explicit way back: the word `clear` in the scope
+ * position drops the role itself, not just its scope, so the member becomes an
+ * ordinary leaf again rather than a driver that drives nothing. `clear` is
+ * reserved in that position the way `head` and `root` are reserved as
+ * references, so it is never read as a leaf to drive.
+ *
  * A leaf belongs to at most one driver. Assigning a leaf a second driver is
  * REFUSED rather than silently moved: the refusal names the driver that holds it
  * and the command that releases it, so the leaf is moved deliberately. Only live
@@ -3293,16 +3299,32 @@ export async function conferDriver(driverSessionId: string, leafIds: readonly st
   const known = new Map(members.map(member => [member.sessionId, member]))
   const driver = known.get(driverSessionId)
   if (!driver) throw new Error('Unknown leaf')
-  const wanted = [...new Set(leafIds)]
+  // `driver <leaf> clear` drops the role itself: the word in the scope position
+  // is the explicit way to make a driver an ordinary leaf again, so it is read
+  // here rather than resolved as a leaf to drive.
+  const clearing = leafIds.length === 1 && leafIds[0]!.trim().toLowerCase() === 'clear'
+  const wanted = clearing ? [] : [...new Set(leafIds)]
   for (const id of wanted) if (!known.has(id)) throw new Error('Unknown leaf')
   // The scope as it stands, minus any driver that can no longer hold one: a
   // closed or archived driver does not keep its leaves, so a stale entry cannot
   // block a leaf from being driven again.
+  const stored = (await readLeafFamilyPointer(root))?.driverScope ?? {}
   const scope: Record<string, string[]> = {}
-  for (const [id, leaves] of Object.entries((await readLeafFamilyPointer(root))?.driverScope ?? {})) {
+  for (const [id, leaves] of Object.entries(stored)) {
     const holder = known.get(id)
     if (!holder || !memberCanHoldRole(holder)) continue
     scope[id] = [...new Set(leaves)].filter(leaf => known.has(leaf))
+  }
+  // The role and its scope go together, so `clear` removes the member's entry
+  // whole: nothing is left of it to keep it a driver that drives nothing.
+  if (clearing) {
+    const wasDriver = driverSessionId in stored
+    delete scope[driverSessionId]
+    await writeLeafDriverDesignation(root, scope)
+    await indexLeafMembers(root, members)
+    await refreshDesignatedPatriarch()
+    publish()
+    return wasDriver ? `${memberLabel(driver)} is an ordinary leaf again.` : `${memberLabel(driver)} is not a driver.`
   }
   // A leaf belongs to at most one live driver. Refuse, naming who holds it and
   // exactly how to release it, rather than moving it out from under that driver.
