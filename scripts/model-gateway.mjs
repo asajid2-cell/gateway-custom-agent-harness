@@ -26,7 +26,7 @@ import {
   openCodeZenHeaders,
   isOpenCodeZenProtocol,
 } from './opencode-zen.mjs'
-import { GATEWAY_RELOAD_EXIT_CODE } from './gateway-keysafe.mjs'
+import { GATEWAY_RELOAD_EXIT_CODE, isGatewayKeyEnvVar } from './gateway-keysafe.mjs'
 import {
   QUOTA_TTL_MS,
   quotaKey,
@@ -2246,23 +2246,50 @@ async function waitForRetry(delayMs, signal) {
   })
 }
 
-export function openCodeCredentialPool(env = process.env) {
-  // Resolve the key set on every access rather than freezing it at construction.
-  // The gateway still only reads env; this lets the live set follow a change in
-  // that env (the supervisor re-injects the vault on reload) and keeps the pool
-  // honest in tests that add a key after the pool exists.
-  const namesFor = () => Object.keys(env)
-    .filter(name => /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) && env[name])
-    .sort((a, b) => Number(a.slice('OPENCODE_API_KEY'.length) || 1) - Number(b.slice('OPENCODE_API_KEY'.length) || 1))
-  const numberOf = name => Number(name.slice('OPENCODE_API_KEY'.length) || 1)
-  // Selection follows the current key's number, so a key added or removed
-  // between accesses does not silently slide the selection to a different key.
+/**
+ * A numbered credential pool over one environment prefix.
+ *
+ * Keys are resolved on every access rather than being frozen at construction,
+ * from `env` and an optional transient `overlay` that is consulted first. The
+ * gateway's real environment is what the keysafe chain injects at spawn; the
+ * overlay is how a key that appears mid-session reaches the live process
+ * without a restart (see the /gateway/keys route). Selection follows the
+ * current key's NUMBER, so a key added or removed between accesses does not
+ * silently slide the selection to a different key.
+ *
+ * A number that was not present on the first read is a mid-cycle add: it is
+ * promoted to the front of the rotation, tried twice, and then the rotation
+ * resumes from the number that was selected before it appeared.
+ */
+export function credentialPool({
+  env = process.env,
+  prefix,
+  overlay = null,
+  onPromote = null,
+} = {}) {
+  const namePattern = new RegExp(`^${prefix}(?:[2-9]|[1-9][0-9]+)?$`)
+  const numberOf = name => Number(name.slice(prefix.length) || 1)
+  const lookup = name => (overlay && name in overlay ? overlay[name] : env[name])
+  const namesFor = () => {
+    const names = new Set(Object.keys(env))
+    if (overlay) for (const name of Object.keys(overlay)) names.add(name)
+    return [...names]
+      .filter(name => namePattern.test(name) && lookup(name))
+      .sort((a, b) => numberOf(a) - numberOf(b))
+  }
   let preferred = 1
   // The number that actually served the last upstream reply, which is not
   // always the selected one: the preference file can re-select on the next
   // access, and a failover advances the pool past the key that just answered.
   // The usage read follows this so it reports the account that is really in use.
   let lastServedNumber = null
+  // The numbers present when the pool was built. A number that first appears
+  // after that is a mid-cycle key add and is promoted. Snapshotting here rather
+  // than on the first read matters: a pool whose first read already sees the new
+  // key must not mistake it for one that was always there.
+  let observed = new Set(namesFor().map(numberOf))
+  // The promoted key: tried next, twice, then the rotation resumes from `resume`.
+  let pending = null
   const indexFor = names => {
     const at = names.findIndex(name => numberOf(name) === preferred)
     return at < 0 ? 0 : at
@@ -2271,17 +2298,46 @@ export function openCodeCredentialPool(env = process.env) {
     const names = namesFor()
     return numberOf(names[indexFor(names)] ?? '') || 1
   }
+  const emit = () => onPromote?.(pending ? { ...pending } : null)
+  const promote = number => {
+    // The pre-promotion selection is recorded before it is overwritten, so the
+    // rotation can resume from exactly where the detour began.
+    const resume = currentNumber()
+    pending = { number, attemptsLeft: 2, resume }
+    preferred = number
+    emit()
+  }
+  // Diff the live numbers against the previous read, promoting a number that has
+  // just appeared. Returns true when a promotion was made during this call.
+  const observe = names => {
+    const numbers = names.map(numberOf)
+    const fresh = numbers.filter(number => !observed.has(number))
+    observed = new Set(numbers)
+    if (fresh.length === 0 || pending) return false
+    // Several keys added at once promote the newest (highest) one.
+    promote(fresh[fresh.length - 1])
+    return true
+  }
   return {
-    get key() { const names = namesFor(); return env[names[indexFor(names)]] },
+    get key() {
+      const names = namesFor()
+      observe(names)
+      return lookup(names[indexFor(names)])
+    },
     get size() { return namesFor().length },
     get number() { return currentNumber() },
-    get numbers() { return namesFor().map(numberOf) },
+    get numbers() {
+      const names = namesFor()
+      observe(names)
+      return names.map(numberOf)
+    },
     get lastServed() { return lastServedNumber },
+    get pending() { return pending ? { ...pending } : null },
     // The key for a specific number, so a read can target an account without
     // moving the pool's own selection.
     keyFor(number) {
       const name = namesFor().find(name => numberOf(name) === number)
-      return name ? env[name] : undefined
+      return name ? lookup(name) : undefined
     },
     // Called when an upstream reply is 2xx, to record which key answered.
     markServed() { lastServedNumber = currentNumber() },
@@ -2290,24 +2346,112 @@ export function openCodeCredentialPool(env = process.env) {
       preferred = number
       return true
     },
+    // Adopt a promotion decided by another pool (or restored from the
+    // preference file). Silent, so adopting cannot re-broadcast.
+    adoptPending(record) {
+      if (!record || !Number.isSafeInteger(record.number)) { pending = null; return }
+      pending = {
+        number: record.number,
+        attemptsLeft: Number.isSafeInteger(record.attemptsLeft) && record.attemptsLeft > 0
+          ? record.attemptsLeft
+          : 2,
+        resume: currentNumber(),
+      }
+      preferred = record.number
+    },
     advance() {
       const names = namesFor()
       if (names.length === 0) return
-      preferred = numberOf(names[(indexFor(names) + 1) % names.length])
+      // A key that appeared during this call is the next attempt; the promotion
+      // itself does not consume a bonus try.
+      if (observe(names)) return
+      if (pending) {
+        if (pending.attemptsLeft > 1) {
+          pending.attemptsLeft -= 1
+          preferred = pending.number
+          return
+        }
+        // Both tries on the new key are spent: resume the rotation from the
+        // number that was selected before the promotion.
+        preferred = pending.resume
+        pending = null
+        emit()
+        return
+      }
+      const order = namesFor()
+      if (order.length === 0) return
+      preferred = numberOf(order[(indexFor(order) + 1) % order.length])
     },
-    redact(message) { return namesFor().reduce((text, name) => redactSecret(text, env[name]), message) },
+    redact(message) {
+      return namesFor().reduce((text, name) => redactSecret(text, lookup(name)), message)
+    },
   }
 }
 
-const openCodeCredentials = openCodeCredentialPool()
-const openCodeSessionCredentials = new Map()
+// The OpenCode-Go multi-account pool: OPENCODE_API_KEY, __KEY2, __KEY3 ...
+export function openCodeCredentialPool(env = process.env, overlay = null, onPromote = null) {
+  return credentialPool({ env, prefix: 'OPENCODE_API_KEY', overlay, onPromote })
+}
+
+// Transient, per-process overlay for a key that appears mid-session. It is
+// never written to the real environment and never persisted; the ordinary
+// keysafe chain supplies the key on the next spawn. Every pool consults it
+// first, so an injected key is visible immediately without a restart.
+const gatewayKeyOverlay = Object.create(null)
+
 const openCodePreferencePath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'opencode-account.json')
 let openCodeGlobalNumber = 1
 
+function openCodePoolList() {
+  return [openCodeCredentials, ...[...openCodeSessionCredentials.values()].map(entry => entry.pool)]
+}
+
+// Record a promotion in the preference file so a respawn re-promotes the key
+// rather than silently dropping the priority. Only the promoted number is kept;
+// the try count restarts when it is adopted.
+async function persistOpenCodePromotion(record) {
+  const temp = `${openCodePreferencePath}.${randomUUID()}.tmp`
+  try {
+    let saved = {}
+    try { saved = JSON.parse(await fs.readFile(openCodePreferencePath, 'utf8')) } catch {}
+    const next = {}
+    if (Number.isSafeInteger(saved?.number) && saved.number > 0) next.number = saved.number
+    if (record && Number.isSafeInteger(record.number)) next.pendingNew = { number: record.number }
+    await fs.mkdir(path.dirname(openCodePreferencePath), { recursive: true })
+    await fs.writeFile(temp, JSON.stringify(next))
+    await fs.rename(temp, openCodePreferencePath)
+  } catch {
+    await fs.unlink(temp).catch(() => {})
+  }
+}
+
+// A pool that promotes a new key tells every other opencode pool, so a session
+// pool created before the key existed promotes it too.
+function openCodePromotion(record) {
+  if (record) {
+    for (const pool of openCodePoolList()) {
+      if (pool.pending?.number !== record.number) pool.adoptPending(record)
+    }
+  }
+  void persistOpenCodePromotion(record)
+}
+
+const openCodeCredentials = openCodeCredentialPool(process.env, gatewayKeyOverlay, openCodePromotion)
+const openCodeSessionCredentials = new Map()
+
+// The CommandCode pool: COMMANDCODE_API_KEY, __KEY2, __KEY3 ... It shares the
+// transient overlay and the same rotation/priority behaviour as OpenCode-Go.
+const commandCodeCredentials = credentialPool({
+  env: process.env,
+  prefix: 'COMMANDCODE_API_KEY',
+  overlay: gatewayKeyOverlay,
+})
+
 async function sessionOpenCodeCredentials(sessionId) {
   let number = 1
+  let saved = null
   try {
-    const saved = JSON.parse(await fs.readFile(openCodePreferencePath, 'utf8'))
+    saved = JSON.parse(await fs.readFile(openCodePreferencePath, 'utf8'))
     if (Number.isSafeInteger(saved.number) && saved.number > 0) number = saved.number
   } catch {}
   if (number !== openCodeGlobalNumber) {
@@ -2317,14 +2461,42 @@ async function sessionOpenCodeCredentials(sessionId) {
       if (!entry.explicit) entry.pool.select(number)
     }
   }
+  // A promotion recorded before a respawn is re-applied to any pool that has
+  // not already adopted it.
+  const carried = saved?.pendingNew
+  if (carried && Number.isSafeInteger(carried.number) && number !== carried.number) {
+    for (const pool of openCodePoolList()) {
+      if (pool.pending?.number !== carried.number && pool.numbers.includes(carried.number)) {
+        pool.adoptPending(carried)
+      }
+    }
+  }
   if (!sessionId) return openCodeCredentials
   let entry = openCodeSessionCredentials.get(sessionId)
   if (!entry) {
-    entry = { pool: openCodeCredentialPool(), explicit: false }
+    entry = { pool: openCodeCredentialPool(process.env, gatewayKeyOverlay, openCodePromotion), explicit: false }
     entry.pool.select(openCodeGlobalNumber)
     openCodeSessionCredentials.set(sessionId, entry)
   }
   return entry.pool
+}
+
+// A key just landed in the overlay: touch the owning pool so the new number is
+// detected and promoted now, rather than on whichever request reads it next.
+function noteGatewayKeyInjected(name) {
+  if (name.startsWith('OPENCODE_API_KEY')) {
+    for (const pool of openCodePoolList()) void pool.numbers
+  } else if (name.startsWith('COMMANDCODE_API_KEY')) {
+    void commandCodeCredentials.numbers
+  }
+}
+
+// Only the numbered pools consult the overlay, so only their variables can be
+// live-injected. A single-key provider (DeepSeek, AMD) would be a silent no-op.
+const POOLED_KEY_PATTERN = /^(?:OPENCODE|COMMANDCODE)_API_KEY(?:[2-9]|[1-9][0-9]+)?$/
+
+function isPooledKeyEnvVar(name) {
+  return typeof name === 'string' && POOLED_KEY_PATTERN.test(name)
 }
 
 export async function fetchWithRetry({
@@ -3352,7 +3524,8 @@ async function handleCommandCode(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'commandcode', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const apiKey = process.env.COMMANDCODE_API_KEY
+  const credentials = commandCodeCredentials
+  let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'Command Code API key is not configured')
     trace.finish('auth-error', null, 401)
@@ -3384,45 +3557,91 @@ async function handleCommandCode(body, req, res, modelName, route) {
   }
 
   try {
-    control.startUpstream()
-    const upstream = await fetchWithRetry({
-      provider: 'Command Code',
-      url: commandCodeEndpoint(),
-      options: {
-        method: 'POST',
-        headers: commandCodeHeaders(apiKey, wantsStream),
-        body: JSON.stringify(request),
-        signal: control.signal,
-      },
-      control,
-      trace,
-    })
-    if (!upstream.ok) {
-      const detail = await safeUpstreamResponseError(
-        upstream,
-        'Command Code',
-        apiKey,
-        { signal: control.signal, timeoutMs: RETRY_RESPONSE_TIMEOUT_MS },
-      )
-      await upstream.body?.cancel().catch(() => {})
-      const status = upstream.status >= 500 ? 502 : upstream.status
-      anthropicError(res, status, detail)
-      trace.finish('upstream-http-error', null, status)
-      return
-    }
+    let relayAttempt = 0
+    while (true) {
+      let upstream
+      control.startUpstream()
+      try {
+        upstream = await fetchWithRetry({
+          provider: 'Command Code',
+          url: commandCodeEndpoint(),
+          options: () => {
+            apiKey = credentials.key
+            return {
+              method: 'POST',
+              headers: commandCodeHeaders(apiKey, wantsStream),
+              body: JSON.stringify(request),
+              signal: control.signal,
+            }
+          },
+          control,
+          trace,
+          credentials,
+        })
+      } catch (error) {
+        trace.markError(error)
+        const status = control.signal.aborted ? control.statusFor(error) : 502
+        anthropicError(res, status, control.signal.aborted ? 'Command Code upstream request timed out' : 'Command Code connection failed')
+        trace.finish('upstream-error', error, status)
+        return
+      }
 
-    const relayOptions = { signal: control.signal, throwPreOutput: true }
-    if (wantsStream) {
-      await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
-    } else {
-      await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+      if (!upstream.ok) {
+        const detail = await safeUpstreamResponseError(
+          upstream,
+          'Command Code',
+          apiKey,
+          {
+            signal: control.signal,
+            timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+            onTimeout: error => control.abortUpstream(error),
+          },
+        )
+        await upstream.body?.cancel().catch(() => {})
+        const status = upstream.status >= 500 ? 502 : upstream.status
+        anthropicError(res, status, detail)
+        trace.finish('upstream-http-error', null, status)
+        return
+      }
+
+      try {
+        const relayOptions = { signal: control.signal, throwPreOutput: true }
+        if (wantsStream) {
+          await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
+        } else {
+          await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+        }
+        break
+      } catch (error) {
+        if (
+          !res.headersSent &&
+          !control.signal.aborted &&
+          retryablePreOutputRelayError(error) &&
+          relayAttempt < UPSTREAM_RETRIES
+        ) {
+          relayAttempt += 1
+          credentials.advance()
+          const delay = retryDelayMs(relayAttempt, null)
+          trace.clearError?.()
+          process.stderr.write(
+            `model-gateway retry provider=Command-Code error=pre-output-${safeLogValue(classifyGatewayError(error))} attempt=${relayAttempt} delay_ms=${delay}\n`,
+          )
+          await waitForRetry(delay, control.signal)
+          continue
+        }
+        if (!res.headersSent) {
+          anthropicError(res, 502, credentials.redact(errorMessage(error)))
+        } else if (wantsStream) {
+          finishAnthropicStreamWithError(res, error)
+        }
+        break
+      }
     }
     trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
   } catch (error) {
     trace.markError(error)
     if (!res.headersSent) {
-      const status = control.signal.aborted ? control.statusFor(error) : 502
-      anthropicError(res, status, control.signal.aborted ? 'Command Code upstream request timed out' : redactSecret(errorMessage(error), apiKey))
+      anthropicError(res, 502, credentials.redact(error instanceof Error ? error.message : 'Command Code request failed'))
     } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
     }
@@ -4441,6 +4660,29 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ reloading: true, available: pool.numbers }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })
+    return
+  }
+
+  // Heal a running gateway with a key that appeared in the vault after it
+  // started. A short-lived keysafe child posts the record here; the value lands
+  // in the transient overlay for this process only and is never written to the
+  // real environment, logged, or persisted. The ordinary keysafe chain supplies
+  // the key on the next spawn.
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/keys') {
+    let injection
+    try { injection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid key injection' })
+      return
+    }
+    const { name, value } = injection ?? {}
+    if (!isGatewayKeyEnvVar(name) || !isPooledKeyEnvVar(name) || typeof value !== 'string' || value.length === 0) {
+      json(res, 400, { error: 'Use a numbered pool key name and a non-empty value' })
+      return
+    }
+    gatewayKeyOverlay[name] = value
+    process.stderr.write(`model-gateway route path=/gateway/keys backend=keys name=${safeLogValue(name)}\n`)
+    noteGatewayKeyInjected(name)
+    json(res, 200, { name, injected: true })
     return
   }
 

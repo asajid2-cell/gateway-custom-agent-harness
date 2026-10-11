@@ -25,6 +25,7 @@ import {
   stripUnsupportedOpenCodeToolChoice,
   safeUpstreamResponseError,
   gatewayRequestShape,
+  credentialPool,
   openCodeCredentialPool,
   readOpenCodeSubscriptionUsage,
   fetchWithRetry,
@@ -96,29 +97,220 @@ test('OpenCode retries cycle numbered credentials and wrap to the original', asy
   }
 })
 
-test('OpenCode credential pool follows keys added to the environment after it is built', () => {
+test('a key added mid-cycle is tried twice before the prior rotation resumes', async () => {
+  const env = {
+    OPENCODE_API_KEY: 'k1',
+    OPENCODE_API_KEY2: 'k2',
+    OPENCODE_API_KEY3: 'k3',
+    OPENCODE_API_KEY4: 'k4',
+  }
+  const credentials = openCodeCredentialPool(env)
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    // A new key appears while the first attempt is in flight, as if the temp
+    // keysafe had just posted it.
+    if (seen.length === 1) env.OPENCODE_API_KEY6 = 'k6'
+    res.writeHead(seen.length < 5 ? 429 : 200, { 'retry-after': '0' })
+    res.end('{}')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'OpenCode Go',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: credentials.key } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 200)
+    await response.text()
+    // The new key is tried twice, then the rotation resumes from the number that
+    // was selected when it appeared (1) and carries on.
+    assert.deepEqual(seen, ['k1', 'k6', 'k6', 'k1', 'k2'])
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('Command Code retries cycle numbered credentials through the shared pool', async () => {
+  const credentials = credentialPool({
+    env: { COMMANDCODE_API_KEY: 'cc-original', COMMANDCODE_API_KEY2: 'cc-second' },
+    prefix: 'COMMANDCODE_API_KEY',
+  })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead([401, 200][seen.length - 1] ?? 200, { 'retry-after': '0' })
+    res.end('{}')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'Command Code',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: `Bearer ${credentials.key}` } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 200)
+    await response.text()
+    // A 401 on the first key advances to the second; the successful reply is the
+    // second key, recorded as the one that served.
+    assert.deepEqual(seen, ['Bearer cc-original', 'Bearer cc-second'])
+    assert.equal(credentials.lastServed, 2)
+    assert.equal(credentials.redact('cc-original cc-second'), '[REDACTED] [REDACTED]')
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('a key posted to a running gateway is used at once, with no restart and no plaintext in the log', async () => {
+  const firstKey = randomUUID()
+  const secondKey = randomUUID()
+  const injectedKey = randomUUID()
+  const reads = []
+  const usage = await fakeCodexServer((req, res) => {
+    reads.push(req.headers.authorization)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ usage: { monthly: { percent: 7, resetsAt: '2026-10-30T00:00:00Z' } } }))
+  })
+  const configDir = await mkdtemp(path.join(os.tmpdir(), 'gateway-live-key-'))
+  let gateway
+  try {
+    gateway = await startGatewayForTest({
+      CLAUDE_CONFIG_DIR: configDir,
+      MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
+      MODEL_GATEWAY_OPENCODE_USAGE_URL: `http://127.0.0.1:${usage.port}/usage`,
+      OPENCODE_API_KEY: firstKey,
+      OPENCODE_API_KEY2: secondKey,
+    })
+    const before = JSON.parse((await getGatewayJson(gateway.port, '/gateway/opencode-usage?sessionId=s')).body)
+    assert.equal(before.account, 1)
+    assert.deepEqual(reads, [`Bearer ${firstKey}`])
+
+    // The temp keysafe posts the new record to the running gateway. It lands in
+    // the transient overlay and is promoted, so the very next read uses it - and
+    // the gateway process is the same one, never restarted.
+    const injected = await fetch(`http://127.0.0.1:${gateway.port}/gateway/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'OPENCODE_API_KEY6', value: injectedKey }),
+    })
+    assert.equal(injected.status, 200)
+    assert.equal(gateway.child.exitCode, null)
+
+    const after = JSON.parse((await getGatewayJson(gateway.port, '/gateway/opencode-usage?sessionId=s')).body)
+    assert.equal(after.account, 6)
+    assert.deepEqual(reads, [`Bearer ${firstKey}`, `Bearer ${injectedKey}`])
+
+    // Only the numbered pools consult the overlay, so a single-key provider is
+    // refused rather than parked where nothing would ever read it.
+    const refused = await fetch(`http://127.0.0.1:${gateway.port}/gateway/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'DEEPSEEK_API_KEY', value: injectedKey }),
+    })
+    assert.equal(refused.status, 400)
+
+    // No restart was asked for, and no key value ever reaches the log.
+    const log = gateway.getStderr()
+    assert.doesNotMatch(log, /reload-keys requested/)
+    for (const secret of [firstKey, secondKey, injectedKey]) {
+      assert.equal(log.includes(secret), false, 'no key plaintext in the gateway log')
+    }
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+    await new Promise(resolve => usage.server.close(resolve))
+    await rm(configDir, { recursive: true, force: true })
+  }
+})
+
+test('the temp keysafe inject script hands one key to a running gateway without printing it', async () => {
+  const existingKey = randomUUID()
+  const newKey = randomUUID()
+  const injectScript = path.resolve(path.dirname(gatewayScript), 'gateway-key-inject.mjs')
+  let gateway
+  try {
+    gateway = await startGatewayForTest({ OPENCODE_API_KEY: existingKey })
+    // This is what the keysafe child runs: the key arrives as an env var it was
+    // injected with, and leaves only as the body of one loopback POST.
+    const child = spawn(process.execPath, [injectScript, 'OPENCODE_API_KEY6', String(gateway.port)], {
+      env: { ...process.env, OPENCODE_API_KEY6: newKey },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', chunk => { output += chunk })
+    child.stderr.on('data', chunk => { output += chunk })
+    const [code] = await once(child, 'exit')
+    assert.equal(code, 0)
+    assert.equal(output.includes(newKey), false, 'the inject script never prints the key')
+    const account = JSON.parse((await getGatewayJson(gateway.port, '/gateway/opencode-account?sessionId=s')).body)
+    assert.deepEqual(account.available, [1, 6])
+  } finally {
+    if (gateway) await stopChild(gateway.child)
+  }
+})
+
+test('OpenCode credential pool promotes a key added after it is built, tries it twice, then resumes', () => {
   const env = { OPENCODE_API_KEY: 'one', OPENCODE_API_KEY2: 'two' }
   const credentials = openCodeCredentialPool(env)
+  // The first read only records what is already there; nothing is promoted.
   assert.deepEqual(credentials.numbers, [1, 2])
   assert.equal(credentials.key, 'one')
   credentials.advance()
   assert.equal(credentials.key, 'two')
 
-  // A key that appears after the pool exists is picked up on the next access,
-  // and the current selection keeps following its own number.
+  // A key that appears after the pool exists is picked up on the next access and
+  // promoted to the front of the rotation, so it is tried next.
   env.OPENCODE_API_KEY4 = 'four'
   assert.deepEqual(credentials.numbers, [1, 2, 4])
-  assert.equal(credentials.number, 2)
+  assert.equal(credentials.number, 4)
+  assert.equal(credentials.pending.attemptsLeft, 2)
+
+  // It is tried a second time, then the rotation resumes from the number that
+  // was selected before the promotion (2), and the new key joins the rotation.
   credentials.advance()
   assert.equal(credentials.number, 4)
   credentials.advance()
-  assert.equal(credentials.number, 1)
+  assert.equal(credentials.number, 2)
+  assert.equal(credentials.pending, null)
+  credentials.advance()
+  assert.equal(credentials.number, 4)
+
   assert.equal(credentials.redact('one two four'), '[REDACTED] [REDACTED] [REDACTED]')
 
   // A key that disappears is dropped, and the selection falls back cleanly.
   delete env.OPENCODE_API_KEY2
   assert.deepEqual(credentials.numbers, [1, 4])
+  assert.equal(credentials.number, 4)
+  delete env.OPENCODE_API_KEY4
+  assert.deepEqual(credentials.numbers, [1])
   assert.equal(credentials.number, 1)
+})
+
+test('key injected into the pool overlay is promoted with no restart', () => {
+  // The overlay is what /gateway/keys writes; the pool consults it over the
+  // real environment, so a key added after the process started is used at once.
+  const overlay = Object.create(null)
+  const env = { OPENCODE_API_KEY: 'one', OPENCODE_API_KEY2: 'two' }
+  const credentials = openCodeCredentialPool(env, overlay)
+  assert.deepEqual(credentials.numbers, [1, 2])
+  credentials.advance()
+
+  overlay.OPENCODE_API_KEY6 = 'six'
+  assert.deepEqual(credentials.numbers, [1, 2, 6])
+  assert.equal(credentials.key, 'six')
+  assert.equal(credentials.pending.attemptsLeft, 2)
+  assert.equal(credentials.redact('one two six'), '[REDACTED] [REDACTED] [REDACTED]')
 })
 
 test('OpenCode usage follows credential rotation and caches each workspace separately', async () => {
