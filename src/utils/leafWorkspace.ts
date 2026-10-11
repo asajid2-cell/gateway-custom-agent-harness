@@ -1460,6 +1460,61 @@ export async function resolveCloseTarget(reference: string): Promise<LeafMember 
   } catch { return undefined }
 }
 
+/**
+ * The session on screen as a member row, when a reference names it.
+ *
+ * `listLeafMembers` drops this session so no verb starts a second copy of it,
+ * which also means a reference that *does* name it resolves to nothing and is
+ * reported as a leaf that does not exist. A control verb - one that writes the
+ * row and lets the next launch read it, rather than starting a process - needs
+ * to tell those two apart, so this answers the one question they have: does the
+ * reference name the conversation on screen? It accepts the same four forms as
+ * any member, plus the aliases this session holds (head, original, matriarch).
+ */
+async function selfMemberNamed(reference: string): Promise<LeafMember | undefined> {
+  const self = getSessionId()
+  try {
+    const family = await currentFamily()
+    const own = family.members.find(member => member.sessionId === self)
+    if (!own) return undefined
+    if (resolveLeafMember([own], reference)) return own
+    const ref = reference.trim().toLowerCase()
+    if (isLeafHeadReference(ref) && designatedPatriarch?.sessionId === self) return own
+    if (ref === 'matriarch' && getLeafMatriarchSessionId() === self) return own
+    if (ref === 'original' && family.rootSessionId === self) return own
+    return undefined
+  } catch { return undefined }
+}
+
+/**
+ * A member a control verb may act on, including the session on screen.
+ *
+ * The family is resolved first, so a real member always wins and the aliases
+ * mean what they mean everywhere else; only a reference that names nothing
+ * else is offered to this session. `undefined` means the reference names no
+ * member at all, which is the caller's cue to report the ordinary "unknown".
+ */
+async function resolveControlMember(reference: string): Promise<LeafMember | undefined> {
+  return (await resolveLeafRef(reference)) ?? (await selfMemberNamed(reference))
+}
+
+/**
+ * Resolve the target of `open`/`reopen`, which start a leaf's process.
+ *
+ * A reference that names the session on screen is a leaf that is already
+ * running, not a leaf that does not exist, and the two are refused differently:
+ * opening it would start a second copy of the conversation you are typing into,
+ * which is its own fault with its own message. Only a reference that names
+ * nothing at all keeps the ordinary "unknown" one.
+ */
+export async function resolveOpenTarget(reference: string): Promise<LeafMember> {
+  const member = await resolveLeafRef(reference)
+  if (member) return member
+  const self = await selfMemberNamed(reference)
+  if (self) throw new Error(`${memberLabel(self)} is the session asking: it is already running, so opening it here would start a second copy of the conversation you are in.`)
+  throw new Error('Unknown or ambiguous leaf reference')
+}
+
 /** Names every member can use for the conversation the family came from. */
 export function rootReference(reference: string): boolean {
   return isLeafRootReference(reference)
@@ -1628,9 +1683,7 @@ export async function readLeafTranscript(reference?: string, options: LeafReadOp
 
 export const LEAF_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode'] as const
 
-async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
-  const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+async function viewForMember(member: LeafMember): Promise<OwnedLeafView> {
   const root = familyRootSync()
   let view = views.get(member.sessionId)
   if (view && view.rootSessionId !== root) view = undefined
@@ -1641,7 +1694,13 @@ async function requireLeafView(reference: string): Promise<{ member: LeafMember;
     await launched.started
     view = await launched.view
   }
-  return { member, view }
+  return view
+}
+
+async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
+  const member = await resolveLeafRef(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  return { member, view: await viewForMember(member) }
 }
 
 /**
@@ -1726,6 +1785,12 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
     if (!member) throw new Error('Unknown or ambiguous leaf reference')
     return requestLeafWorkspace<string>('send', [member.sessionId, message])
   }
+  // A send hands a turn to a leaf's own process and reads the reply. The session
+  // on screen is not a leaf this can reach that way - a message to the
+  // conversation you are typing into is the turn you are already in - so it is
+  // refused as itself rather than as a leaf that does not exist.
+  const self = await selfMemberNamed(reference)
+  if (self) throw new Error(`${memberLabel(self)} is the session asking: a message to the conversation you are in is the turn you are already typing.`)
   const { member, view } = await requireLeafView(reference)
   const state = view.process.getState()
   const busy = state === 'running' || state === 'awaiting-approval'
@@ -1865,12 +1930,25 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
     return requestLeafWorkspace<string>('configure', [member.sessionId, patch])
   }
   await requireMatriarch(await familyRootSessionId())
-  const { member, view } = await requireLeafView(reference)
+  const applied = patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`
+  const setting = patch.model !== undefined ? { model: patch.model } : { effort: patch.effort as LeafMember['effort'] }
+  const member = await resolveControlMember(reference)
+  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  // The session on screen is a member of its own family, but it has no view: a
+  // view is a second process, and this is the conversation itself. A setting is
+  // a row write that the next launch reads, so naming this session changes its
+  // row and leaves this conversation running on the route it already has - there
+  // is nothing here that needs a second copy of the conversation, and reaching
+  // for a view would start one and write the setting into that duplicate.
+  if (member.sessionId === getSessionId()) {
+    await saveLeafSettings(member.sessionId, setting)
+    return `${memberLabel(member)} ${applied} saved for restart; this session keeps its current route until it is relaunched.`
+  }
+  const view = await viewForMember(member)
   if (view.process.getState() !== 'idle') throw new Error('Leaf must be idle before its settings change')
   if (patch.model !== undefined) await view.process.setModel(patch.model)
   if (patch.effort !== undefined) await view.process.setEffort(patch.effort)
-  await saveLeafSettings(member.sessionId, patch.model !== undefined ? { model: patch.model } : { effort: patch.effort as LeafMember['effort'] })
-  const applied = patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`
+  await saveLeafSettings(member.sessionId, setting)
   return `${memberLabel(member)} ${applied} updated and saved for restart.`
 }
 
@@ -2343,7 +2421,7 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
         result = await contextReturn(id, value)
         break
       case 'restore': await restoreLeafWorkspace(); break
-      case 'open': result = await openLeaf(String(id)); break
+      case 'open': result = await openLeaf(String(id), sourceId); break
       case 'open-once': result = await openLeafOnce(String(id)); break
       // Read here rather than through `listLeafMembers`, which inside a leaf
       // asks the host - and the host is this process, or the session that hosts
@@ -2760,9 +2838,11 @@ export async function restoreLeafWorkspace(): Promise<void> {
  * Start a saved leaf on purpose. The only path that creates a leaf process for
  * a member that already exists; requires an explicit reference.
  */
-export async function openLeaf(reference: string): Promise<string> {
-  const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+export async function openLeaf(reference: string, requester?: string): Promise<string> {
+  const member = await resolveOpenTarget(reference)
+  // A leaf naming itself resolves - its own row is in the roster it reads - but
+  // it is already running, so opening it is the same second copy refused above.
+  if (requester && member.sessionId === requester) throw new Error(`${memberLabel(member)} is the session asking: it is already running, so opening it here would start a second copy of the conversation you are in.`)
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('open', [member.sessionId])
   // `changeLeaf` already launches on `status: 'open'`, so asking it to set the
   // status covers both cases: a closed leaf reopens, and an already-open leaf
@@ -2782,8 +2862,7 @@ export async function openLeaf(reference: string): Promise<string> {
  * rather than a side effect of having opened something once.
  */
 export async function openLeafOnce(reference: string): Promise<string> {
-  const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  const member = await resolveOpenTarget(reference)
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('open-once', [member.sessionId])
   const root = familyRootSync()
   await requireMatriarch(root)
@@ -3285,8 +3364,18 @@ export async function setLeafGoal(sessionId: string, args: string): Promise<stri
 export async function saveLeafSettings(sessionId: string, patch: Pick<Partial<LeafMember>, 'model' | 'effort'>): Promise<void> {
   if (isInteractiveLeaf()) return requestLeafWorkspace('settings', [sessionId, patch])
   const view = views.get(sessionId)
-  if (!view) throw new Error('Unknown leaf')
-  view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, sessionId, patch)
+  if (view) {
+    view.member = await updateLeafMember(familyPath(view.rootSessionId), view.rootSessionId, sessionId, patch)
+    publish()
+    return
+  }
+  // No view is not the same as no member: the session on screen has no view -
+  // a view is a second process, and this is the conversation itself - yet its
+  // row is in the family file, and the next launch reads the row. Writing there
+  // saves the setting without starting a duplicate; `updateLeafMember` is what
+  // refuses a session that is not in the family at all.
+  const root = await familyRootSessionId()
+  await updateLeafMember(familyPath(root), root, sessionId, patch)
   publish()
 }
 

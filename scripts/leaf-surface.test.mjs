@@ -950,3 +950,47 @@ test('a member that dies on its way up is named, not guessed at, and tried again
   assert.match(source, /if \(!attempt\.connected && attempt\.died\) \{/)
   assert.doesNotMatch(source, /it may have failed to start/)
 })
+
+test('the session on screen is addressable by its own names, and the prompt says which verbs treat it how', async () => {
+  const workspace = await readFile(new URL('../src/utils/leafWorkspace.ts', import.meta.url), 'utf8')
+  // The session on screen is a member of its own family, but `listLeafMembers`
+  // drops it so no verb starts a second copy - which also made every one of its
+  // own names resolve to nothing. The self-aware resolver answers that case for
+  // the verbs that write the row rather than starting a process.
+  assert.match(workspace, /async function selfMemberNamed\(reference: string\)/)
+  assert.match(workspace, /async function resolveControlMember\(reference: string\)/)
+  assert.match(workspace, /return \(await resolveLeafRef\(reference\)\) \?\? \(await selfMemberNamed\(reference\)\)/)
+  // A setting is a row the next launch reads, so the settings path writes the
+  // row and returns BEFORE reaching for a view - reaching for one would launch a
+  // second copy of the conversation and write the setting into that duplicate.
+  const configure = workspace.slice(workspace.indexOf('export async function configureLeaf'), workspace.indexOf('export async function compactLeaf'))
+  assert.match(configure, /if \(member\.sessionId === getSessionId\(\)\) \{/)
+  assert.match(configure, /await saveLeafSettings\(member\.sessionId, setting\)/)
+  assert.match(configure, /saved for restart; this session keeps its current route until it is relaunched/)
+  assert.ok(configure.indexOf('await saveLeafSettings(member.sessionId, setting)') < configure.indexOf('await viewForMember(member)'), 'the self case returns before a view is required')
+  // Saving without a view writes the row; a session that is not in the family is
+  // still refused by `updateLeafMember`, so the guard is not lost.
+  const save = workspace.slice(workspace.indexOf('export async function saveLeafSettings'), workspace.indexOf('export async function saveLeafDraft'))
+  assert.match(save, /if \(view\) \{/)
+  assert.match(save, /await updateLeafMember\(familyPath\(root\), root, sessionId, patch\)/)
+
+  // Opening the session on screen is still refused - it is already running - but
+  // with its own message, distinct from a reference that names no leaf.
+  assert.match(workspace, /export async function resolveOpenTarget\(reference: string\): Promise<LeafMember>/)
+  assert.match(workspace, /is the session asking: it is already running, so opening it here would start a second copy of the conversation you are in/)
+  const open = workspace.slice(workspace.indexOf('export async function openLeaf'), workspace.indexOf('export async function openLeafOnce'))
+  assert.match(open, /await resolveOpenTarget\(reference\)/)
+  const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
+  assert.match(tool, /await workspace\.resolveOpenTarget\(requireLeaf\(\)\)/)
+
+  // A send reaches into another conversation, so the session on screen is not a
+  // target either - and it says so, rather than reporting itself as unknown.
+  assert.match(workspace, /is the session asking: a message to the conversation you are in is the turn you are already typing/)
+
+  // The prompt has to disclose the exclusion, or a person reads "address a leaf
+  // by number, numbered name, or name" as covering the row they are looking at.
+  const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')
+  assert.match(prompt, /The session you are in is a member of its own family, and the verbs differ in how they treat it/)
+  assert.match(prompt, /The verbs that reach into another conversation - \\`send\\`, \\`open\\` and \\`reopen\\` - deliberately do not: naming your own session is refused with its own message/)
+  assert.match(prompt, /The settings verbs \\`model\\` and \\`effort\\` do address your own row/)
+})

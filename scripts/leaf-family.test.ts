@@ -1275,6 +1275,73 @@ test('a member the head puts in charge of leaves carries the driver tag and its 
   }
 })
 
+test('the session on screen sets its own model and effort by any of its names, and opening it is refused as already running', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-self-row-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Alpha', transcriptPath: join(directory, 'alpha.jsonl'), forkMessageId: randomUUID() })
+    // Opening the family writes the creator's own row, so the session on screen
+    // has an address like every other member.
+    await workspace.restoreLeafWorkspace()
+    const row = async () => (await readLeafFamily(family, root)).members.find(member => member.sessionId === root)!
+    const self = await row()
+    // The session on screen writes its own transcript in life; in a test it has
+    // none, so give the read something to open.
+    await mkdir(dirname(self.transcriptPath), { recursive: true })
+    await writeFile(self.transcriptPath, '')
+
+    // Every spelling the roster accepts resolves to this session and writes its
+    // row. A setting is a row the next launch reads, not a second process, so
+    // naming the session on screen is answered rather than refused - and before
+    // this fix each of these answered "Unknown or ambiguous leaf reference".
+    const spellings = [String(self.number), self.name, `${self.number}:${self.name}`, self.sessionId, 'head', 'root', 'original', 'matriarch']
+    for (const reference of spellings) {
+      const result = await workspace.configureLeaf(reference, { model: `model-${reference}` })
+      assert.match(result, /saved for restart; this session keeps its current route until it is relaunched/, `${reference} resolves to the session on screen`)
+      // The old wording claimed the change was applied; a row write is only a
+      // route for the next launch, so the honest message says so.
+      assert.doesNotMatch(result, /updated and saved for restart/, `${reference} does not claim the live route changed`)
+      assert.equal((await row()).model, `model-${reference}`, `${reference} wrote the row`)
+    }
+    assert.match(await workspace.configureLeaf(String(self.number), { effort: 'high' }), /effort high saved for restart/)
+    assert.equal((await row()).effort, 'high', 'effort is written the same way')
+
+    // Nothing was launched: the settings path writes the row and stops, so there
+    // is no second copy of the conversation on screen.
+    assert.deepEqual(workspace.getLeafViews(), [], 'setting your own row starts no leaf process')
+
+    // A read of this session still works - it always did, on its own resolver.
+    assert.match(await workspace.readLeafTranscript(self.sessionId), new RegExp(`Leaf #${self.number} ${self.name} \\(${self.sessionId}\\)`), 'a read of the session on screen resolves')
+
+    // Opening the session on screen is still refused - it is already running -
+    // but with its own message, distinct from a reference that names no leaf.
+    await assert.rejects(workspace.resolveOpenTarget(String(self.number)), (error: Error) => {
+      assert.match(error.message, /is the session asking: it is already running/)
+      assert.doesNotMatch(error.message, /Unknown or ambiguous/)
+      return true
+    }, 'opening your own session is refused as already running')
+
+    // A send reaches into another conversation, so the session on screen is not
+    // a target either - and it is refused as itself, not as a leaf that is not
+    // there. (Interrupt has the same shape but is out of this fix's scope.)
+    await assert.rejects(workspace.sendLeafMessage(String(self.number), 'hello'), /is the session asking: a message to the conversation you are in is the turn you are already typing/)
+
+    // A reference that names no member at all keeps the ordinary message, for
+    // both a control verb and a launch verb.
+    await assert.rejects(workspace.resolveOpenTarget('Nonexistent'), /Unknown or ambiguous leaf reference/)
+    await assert.rejects(workspace.configureLeaf('Nonexistent', { model: 'x' }), /Unknown or ambiguous leaf reference/)
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('the creator hosted from a member is an ordinary entry, not a root line', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-hosted-parent-'))
   const saved = process.env.CLAUDE_CONFIG_DIR

@@ -124,10 +124,11 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'close':
     case 'reopen': {
       // Closing may name the session you are in; reopening may not, because the
-      // session on screen is already running.
+      // session on screen is already running - and that is refused with its own
+      // message rather than being reported as a leaf that does not exist.
       const member = input.action === 'close'
         ? await workspace.resolveCloseTarget(requireLeaf())
-        : await workspace.resolveLeafRef(requireLeaf())
+        : await workspace.resolveOpenTarget(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       const promoted = await workspace.changeLeaf(member.sessionId, { status: input.action === 'close' ? 'closed' : 'open' })
       return `Leaf #${member.number} ${member.name} ${input.action === 'close' ? 'closed' : 'reopened'}; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`
