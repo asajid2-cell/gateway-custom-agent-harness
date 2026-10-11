@@ -479,7 +479,10 @@ test('roster is the verb that names the patriarch, and the prompt says so', asyn
     })
     // The prompt promises a leaf can reach its parent. Only `roster` names the
     // family - so the promise is only true if the prompt points at `roster`.
-    assert.match(await familyRoster(), new RegExp(`^family ${root}$`, 'm'))
+    // The head is the family id here, and the asker IS that id, so its row is
+    // left out of the roster; the head mark is on the family line, which is
+    // always present, rather than on the row that is not.
+    assert.match(await familyRoster(), new RegExp(`^family ${root} \\[head\\]$`, 'm'))
     assert.doesNotMatch(await listLeaves(), /^family /m)
 
     const prompt = await readFile(new URL('../src/tools/LeafTool/prompt.ts', import.meta.url), 'utf8')

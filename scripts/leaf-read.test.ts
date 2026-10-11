@@ -183,7 +183,7 @@ test('a family member is readable by reference, and the family by none', async (
     assert.match(chat, /^cursor a2$/m)
 
     const digest = await readLeafTranscript()
-    assert.match(digest, new RegExp(`^family ${root}$`, 'm'))
+    assert.match(digest, new RegExp(`^family ${root} \\[head\\]$`, 'm'))
     assert.match(digest, /#1 Probe \[open\]/)
     assert.match(digest, /#2 Api \[closed\]/)
     assert.match(digest, /probe answer/)

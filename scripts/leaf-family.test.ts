@@ -1133,8 +1133,10 @@ test('a member resumed on its own finds its family, its siblings, and its parent
         'a leaf created without a source named copies the conversation on screen, not the parent behind it',
       )
       const roster = await workspace.familyRoster()
-      assert.match(roster, new RegExp(`^family ${root}$`, 'm'))
-      assert.match(roster, new RegExp(`^#${creator.number} \\S.* \\[head\\] ${root}$`, 'm'))
+      // The creator is the head here, and the head IS the family id, so the head
+      // mark is on the family line rather than on the creator's row.
+      assert.match(roster, new RegExp(`^family ${root} \\[head\\]$`, 'm'))
+      assert.doesNotMatch(roster, new RegExp(`^#${creator.number} \\S.* \\[head\\]`, 'm'), 'the head mark is not on a row when the head is the family id')
       // The creator is an ordinary member now: a member can close it, rename it
       // and archive it. Only the session doing the asking is still refused.
       await workspace.changeLeaf(root, { status: 'closed' })
@@ -1282,6 +1284,39 @@ test('a member the head puts in charge of leaves carries the driver tag and its 
     assert.match(await workspace.conferDriver(other.sessionId, [alpha.sessionId, bravo.sessionId]), /now drives/)
     assert.deepEqual(workspace.getLeafDriverScope(), { [other.sessionId]: [alpha.sessionId, bravo.sessionId] }, 'the closed driver no longer holds its leaves')
     assert.doesNotMatch(await workspace.familyRoster(), new RegExp(`^#${driver.number} Driver .* \\[driver`, 'm'), 'the closed driver is no longer marked')
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('the head mark rides the family line when the head is the session on screen', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-head-line-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const root = getSessionId()
+    const family = join(directory, 'leaf-families', `${root}.json`)
+    const other = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Other', transcriptPath: join(directory, 'other.jsonl'), forkMessageId: randomUUID() })
+    await workspace.restoreLeafWorkspace()
+
+    // The family id is the head until one is designated, and the roster leaves
+    // the asking session out - so when the asker IS the head its row is gone and
+    // the mark used to vanish with it. It rides the family line instead, which is
+    // always present, so the head is never unmarked to the session running it.
+    const roster = await workspace.familyRoster()
+    assert.match(roster, new RegExp(`^family ${root} \\[head\\]$`, 'm'), 'the head mark is on the family line')
+    assert.doesNotMatch(roster, /^#\d+ \S.* \[head\]/m, 'no row carries the head mark while the head is the family id')
+
+    // Naming a different member as head moves the mark to that member's row: the
+    // family line names the id, which is no longer the head.
+    await workspace.conferPatriarch(other.sessionId)
+    const moved = await workspace.familyRoster()
+    assert.match(moved, new RegExp(`^family ${root}$`, 'm'), 'the family line is unmarked once the head is another member')
+    assert.match(moved, new RegExp(`^#${other.number} Other \\[open\\] \\[head\\] ${other.sessionId}$`, 'm'), 'the head mark follows to the member row')
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
@@ -1526,7 +1561,7 @@ test('a displaced matriarch refuses management but keeps the terminals it alread
       assert.equal(workspace.getLeafMatriarchSessionId(), second, 'and names the window that manages the family now')
       // Reading the family is not managing it, so a displaced window still renders.
       assert.match(await workspace.listLeaves(), /Sibling/)
-      assert.match(await workspace.familyRoster(), new RegExp(`^family ${root}$`, 'm'))
+      assert.match(await workspace.familyRoster(), new RegExp(`^family ${root} \\[head\\]$`, 'm'))
 
       // The terminals already attached are not taken away by the handoff: the
       // view survives and the leaf still takes a message from this window.

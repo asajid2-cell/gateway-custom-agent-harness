@@ -1565,13 +1565,21 @@ export async function familyRoster(): Promise<string> {
   const driverScope = getLeafDriverScope()
   const numbers = new Map(members.map(member => [member.sessionId, member.number]))
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
-  const lines = [`family ${root}`]
+  // The head mark sits on the line that names the head's session. The family
+  // line names the family id, and the head is that id until one is designated,
+  // so a head that is the family id is marked on the family line - which is
+  // always present, so the mark survives the roster leaving the asker out,
+  // exactly the row it used to be lost from. A head that is a different member
+  // is marked on that member's row.
+  const headOnFamilyLine = patriarchId === root
+  const lines = [`family ${root}${headOnFamilyLine ? ' [head]' : ''}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
     const settings = [member.model ? `model ${member.model}` : '', member.effort ? `effort ${member.effort}` : ''].filter(Boolean).join(' ')
     const driven = driverScope[member.sessionId]
     const driver = driven ? ` [driver${driven.length ? `→${driven.map(id => `#${numbers.get(id) ?? '?'}`).join(',')}` : ''}]` : ''
-    const role = `${member.sessionId === patriarchId ? ' [head]' : ''}${driver}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
+    const head = !headOnFamilyLine && member.sessionId === patriarchId ? ' [head]' : ''
+    const role = `${head}${driver}${member.sessionId === heirId ? ' [heir]' : ''}${member.eldership || elderIds.has(member.sessionId) ? ' [elder]' : ''}${member.sessionId === getLeafMatriarchSessionId() ? ' [matriarch]' : ''}`
     lines.push(`#${member.number} ${member.name} [${state}]${role} ${member.sessionId}${settings ? ` ${settings}` : ''}`)
   }
   return lines.join('\n')
@@ -1628,11 +1636,15 @@ function resolveReadTarget(members: readonly LeafMember[], reference: string): L
  */
 async function familyDigest(members: readonly LeafMember[]): Promise<string> {
   const self = getSessionId()
+  const root = familyRootSync()
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
-  const lines = [`family ${familyRootSync()}`]
+  // The head mark follows the same rule as the roster: on the family line when
+  // the head is the family id, on the member's row otherwise.
+  const headOnFamilyLine = designatedPatriarch?.sessionId === root
+  const lines = [`family ${root}${headOnFamilyLine ? ' [head]' : ''}`]
   for (const member of members) {
     const state = states.get(member.sessionId) ?? member.status
-    const marks = [member.sessionId === self ? 'you' : '', member.sessionId === designatedPatriarch?.sessionId ? 'head' : ''].filter(Boolean)
+    const marks = [member.sessionId === self ? 'you' : '', !headOnFamilyLine && member.sessionId === designatedPatriarch?.sessionId ? 'head' : ''].filter(Boolean)
     const head = `#${member.number} ${member.name} [${state}]${marks.length ? ` (${marks.join(', ')})` : ''} ${member.sessionId}`
     try {
       const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, { tail: 1, maxChars: 1600 })
