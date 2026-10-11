@@ -25,6 +25,7 @@ const inputSchema = lazySchema(() =>
         'roster',
         'head',
         'heir',
+        'driver',
         'ledger',
         'read',
         'checkpoints',
@@ -49,6 +50,7 @@ const inputSchema = lazySchema(() =>
     value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
     tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
     since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
+    leaves: z.array(z.string()).optional().describe('For driver: the leaf references the named driver is put in charge of. Empty or omitted clears the scope'),
   }),
 )
 type InputSchema = ReturnType<typeof inputSchema>
@@ -170,6 +172,19 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       const member = await workspace.resolveLeafRef(requireLeaf())
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       return workspace.conferHeir(member.sessionId)
+    }
+    // The driver is `leaf`; the leaves it is put in charge of are `leaves`. Both
+    // are resolved here so the designation is written once, against member ids.
+    case 'driver': {
+      const member = await workspace.resolveLeafRef(requireLeaf())
+      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const leafIds: string[] = []
+      for (const reference of input.leaves ?? []) {
+        const driven = await workspace.resolveLeafRef(reference.trim())
+        if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference.trim()}`)
+        leafIds.push(driven.sessionId)
+      }
+      return workspace.conferDriver(member.sessionId, leafIds)
     }
     case 'checkpoints':
       return workspace.listLeafCheckpoints(input.leaf?.trim() || undefined)

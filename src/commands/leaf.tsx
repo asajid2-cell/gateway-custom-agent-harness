@@ -4,7 +4,7 @@ import type { Command } from '../commands.js'
 import type { ToolUseContext } from '../Tool.js'
 import type { LocalJSXCommandContext, LocalJSXCommandOnDone } from '../types/command.js'
 
-const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|head <leaf>|heir <leaf>|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
+const USAGE = '[list|status|new [name]|new fork <session-or-leaf> [name]|fork [session-or-leaf] [name]|send <leaf> <message>|interrupt <leaf>|read [leaf] [tail=N] [since=<cursor>]|checkpoint <leaf> [label]|checkpoints [leaf]|checkpoint-drop <#n|label>|checkpoint-purge <#n|label>|seed [source] [name]|seedling <leaf> [name]|merge <seedling> [full|ledger]|compact <leaf>|model <leaf> <model>|effort <leaf> <level>|return <leaf> <selected context>|rename <leaf> <name>|head <leaf>|heir <leaf>|driver <leaf> [leaf...]|close [leaf|me]|reopen|archive <leaf>|promote <leaf>|file <leaf> <tag>|goal <leaf> [task|status|pause|resume|complete|clear]|worktree <JSON path,name,parentSessionId>]'
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
@@ -175,6 +175,24 @@ export async function call(onDone: LocalJSXCommandOnDone, context: ToolUseContex
       const member = await workspace.resolveLeafRef(heir[1]!)
       if (!member) throw new Error('Unknown or ambiguous leaf reference')
       onDone(await workspace.conferHeir(member.sessionId), { display: 'system' })
+      return null
+    }
+
+    // `driver <driver-leaf> [leaf...]`: one command names the driver and the
+    // leaves it drives, so the role and its scope are written together. A bare
+    // `driver <driver-leaf>` clears the scope, leaving a driver that drives
+    // nothing yet.
+    const driver = input.match(/^driver\s+(\S+)((?:\s+\S+)*)$/)
+    if (driver) {
+      const member = await workspace.resolveLeafRef(driver[1]!)
+      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const leafIds: string[] = []
+      for (const reference of driver[2]!.trim().split(/\s+/).filter(Boolean)) {
+        const driven = await workspace.resolveLeafRef(reference)
+        if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference}`)
+        leafIds.push(driven.sessionId)
+      }
+      onDone(await workspace.conferDriver(member.sessionId, leafIds), { display: 'system' })
       return null
     }
 
