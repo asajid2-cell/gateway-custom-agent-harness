@@ -186,7 +186,7 @@ test('catalog drift verifier is discriminating', () => {
 
 test('Anthropic routes sit below the GPT block and carry the subscription ladders', () => {
   const anthropic = optionIds.filter(id => id.startsWith('gateway-claude-'))
-  assert.equal(anthropic.length, 13)
+  assert.equal(anthropic.length, 14)
   // The subscription models were deliberately left at the bottom of the picker.
   assert.deepEqual(optionIds.slice(-anthropic.length), anthropic)
 
@@ -196,6 +196,7 @@ test('Anthropic routes sit below the GPT block and carry the subscription ladder
   const ladderByRoute = {
     'gateway-claude-opus-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
     'gateway-claude-sonnet-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'gateway-claude-haiku-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
     'gateway-claude-fable-5-1': ['low', 'medium', 'high'],
     'gateway-claude-opus-5': ['low', 'medium', 'high', 'xhigh', 'max'],
     'gateway-claude-sonnet-5': ['low', 'medium', 'high', 'xhigh', 'max'],

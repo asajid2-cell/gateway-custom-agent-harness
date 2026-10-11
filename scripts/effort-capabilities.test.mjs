@@ -61,6 +61,7 @@ test('Anthropic routes declare the subscription ladders', () => {
   const expectedByRoute = {
     'gateway-claude-opus-5-5': FULL,
     'gateway-claude-sonnet-5-5': FULL,
+    'gateway-claude-haiku-5-5': FULL,
     'gateway-claude-opus-5': FULL,
     'gateway-claude-sonnet-5': FULL,
     'gateway-claude-opus-4-8': FULL,
@@ -82,7 +83,7 @@ test('Anthropic routes declare the subscription ladders', () => {
   const routes = Object.keys(catalog.gatewayAliases).filter(id =>
     id.startsWith('gateway-claude-'),
   )
-  assert.equal(routes.length, 13)
+  assert.equal(routes.length, 14)
   for (const id of routes) {
     const expected = expectedByRoute[id]
     assert.ok(expected, `${id} has a recorded ladder`)

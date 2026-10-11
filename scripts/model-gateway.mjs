@@ -205,6 +205,7 @@ function integerEnvironment(name, fallback) {
 const ANTHROPIC_GATEWAY_MODELS = [
   ['gateway-claude-opus-5-5', 'claude-opus-5-5'],
   ['gateway-claude-sonnet-5-5', 'claude-sonnet-5-5'],
+  ['gateway-claude-haiku-5-5', 'claude-haiku-5-5'],
   ['gateway-claude-fable-5-1', 'claude-fable-5-1'],
   ['gateway-claude-opus-5', 'claude-opus-5'],
   ['gateway-claude-sonnet-5', 'claude-sonnet-5'],
