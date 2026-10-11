@@ -112,6 +112,9 @@
       "webSearch": true,
       "imageDetail": "original",
       "defaultVerbosity": "low"
+    },
+    "gateway-claude-haiku-5-5": {
+      "contextWindow": 100000
     }
   },
   "gatewayWebSearch": {

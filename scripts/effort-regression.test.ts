@@ -41,6 +41,10 @@ import {
 import type { SessionHooksState } from '../src/utils/hooks/sessionHooks.ts'
 import { getContextWindowForModel } from '../src/utils/context.ts'
 import {
+  getAutoCompactThreshold,
+  getEffectiveContextWindowSize,
+} from '../src/services/compact/autoCompact.ts'
+import {
   getPersistSessionPath,
   readPersistSessionRecord,
   writePersistSessionRecord,
@@ -619,6 +623,31 @@ test('every GPT route spelling reports the same client accounting window', () =>
       getContextWindowForModel(spelling),
       272_000,
       `${spelling} must report the route's accounting window`,
+    )
+  }
+})
+
+test('the Haiku 5.5 route accounts for a 100k window and compacts below it', () => {
+  // Without a catalog contextWindow the route inherits the 200k default, which
+  // would let a session grow well past 100k before compaction. The route pins
+  // 100k. The autocompact trigger is derived rather than a per-route dial:
+  // effective = window − the 20k summary reserve, and the trigger fires 13k
+  // below that, so both land under the ceiling. Both spellings must agree.
+  for (const spelling of ['gateway-claude-haiku-5-5', 'claude-haiku-5-5']) {
+    assert.equal(
+      getContextWindowForModel(spelling),
+      100_000,
+      `${spelling} must not fall back to the 200k default`,
+    )
+    assert.equal(
+      getEffectiveContextWindowSize(spelling),
+      80_000,
+      `${spelling} effective window`,
+    )
+    assert.equal(
+      getAutoCompactThreshold(spelling),
+      67_000,
+      `${spelling} autocompact trigger`,
     )
   }
 })
