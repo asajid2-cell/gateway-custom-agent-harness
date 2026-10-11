@@ -25,6 +25,7 @@ const inputSchema = lazySchema(() =>
         'roster',
         'head',
         'heir',
+        'ledger',
         'read',
         'checkpoints',
         'checkpoint-drop',
@@ -43,9 +44,9 @@ const inputSchema = lazySchema(() =>
       .string()
       .optional()
       .describe('Leaf reference: session ID, number, N:name, or name. A checkpoint reference is #number, or a label'),
-    name: z.string().optional().describe('Name for a new leaf, or a label for a checkpoint'),
-    message: z.string().optional().describe('Text for send or for a context return'),
-    value: z.string().optional().describe('Model name, effort level, or merge fidelity (full or ledger)'),
+    name: z.string().optional().describe('Name for a new leaf, a label for a checkpoint, or a watch mode (idle or new)'),
+    message: z.string().optional().describe('Text for send, a context return, or a ledger entry'),
+    value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
     tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
     since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
   }),
@@ -142,6 +143,19 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       return workspace.notifyLeafMatriarch(input.message)
     case 'roster':
       return workspace.familyRoster()
+    // The head's ledger lives beside the family, not in it: the head records its
+    // own account of the work, any member may read it, and the write gate is the
+    // head designation rather than the matriarch lease. `value` is the subverb,
+    // `message` the text, `leaf` the subject, and `name` the watch mode.
+    case 'ledger': {
+      const ledger = await import('../../utils/headLedger.js')
+      return ledger.runHeadLedger({
+        ...(input.value?.trim() ? { subverb: input.value.trim() } : {}),
+        ...(input.leaf?.trim() ? { leaf: input.leaf.trim() } : {}),
+        ...(input.message ? { text: input.message } : {}),
+        ...(input.name?.trim() ? { mode: input.name.trim() } : {}),
+      })
+    }
     case 'read':
       return workspace.readLeafTranscript(input.leaf?.trim() || undefined, {
         ...(input.tail !== undefined ? { tail: input.tail } : {}),

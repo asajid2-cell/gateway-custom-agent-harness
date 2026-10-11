@@ -335,7 +335,7 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   const { LeafTool } = await import('../src/tools/LeafTool/LeafTool.ts')
   assert.equal(LeafTool.name, 'Leaf')
   const actions = LeafTool.inputSchema.shape.action.options
-  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'head', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
+  for (const action of ['list', 'fork', 'new', 'send', 'interrupt', 'checkpoint', 'close', 'model', 'effort', 'return', 'notify', 'roster', 'head', 'ledger', 'read', 'seed', 'seedling', 'merge', 'compact', 'partner', 'partners', 'partner-watch', 'partner-close']) {
     assert.ok(actions.includes(action), `the Leaf tool must expose ${action}`)
   }
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'shutdown' }).success, false)
