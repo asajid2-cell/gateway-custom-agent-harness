@@ -268,18 +268,31 @@ export function registerHeadWatchSink(sink: (familyId: string, notice: string) =
  */
 export async function headWatchPass(
   familyId: string,
-  previous: { states: ReadonlyMap<string, string>; ids: ReadonlySet<string> },
+  previous: { states: Map<string, string>; ids: Set<string> },
   current: { states: ReadonlyMap<string, string>; ids: ReadonlySet<string> },
 ): Promise<string[]> {
+  // Claim the change before anything awaits. `previous` is the caller's own
+  // baseline, advanced to `current` here in one synchronous step, so a second
+  // pass that starts in the same turn - two publishes landing together - finds
+  // the member already taken and does not fire it again. Firing is what awaits
+  // (the ledger append), so without this the two passes both read the same
+  // "before" and both append the same watch-fired event: that is how one new
+  // leaf produced two events, 1ms apart. The readers are not idempotent - `fired`
+  // lists every event and the sink is pushed each time - so the claim belongs
+  // here, where the change is noticed, not at each reader.
+  const before = { states: new Map(previous.states), ids: new Set(previous.ids) }
+  previous.states.clear(); for (const [id, state] of current.states) previous.states.set(id, state)
+  previous.ids.clear(); for (const id of current.ids) previous.ids.add(id)
+
   const watches = currentWatches(await readHeadLedgerEvents(familyId))
   const idleWatched = watches.filter(watch => watch.mode === 'idle').map(watch => watch.to)
   const notices: string[] = []
-  for (const id of idleFlips(previous.states, current.states, idleWatched)) {
+  for (const id of idleFlips(before.states, current.states, idleWatched)) {
     await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'idle', detail: `${id} is idle` })
     notices.push(`${id} went idle`)
   }
   if (watches.some(watch => watch.mode === 'new')) {
-    for (const id of newMembers(previous.ids, current.ids)) {
+    for (const id of newMembers(before.ids, current.ids)) {
       await appendHeadLedgerEvent(familyId, { kind: 'watch-fired', to: id, mode: 'new', detail: `new leaf ${id}` })
       notices.push(`new leaf ${id}`)
     }
@@ -321,6 +334,7 @@ export function startHeadWatch(familyId: string): () => void {
   }
 
   const tick = async (): Promise<void> => {
+    if (stopped) return
     const { getLeafViews } = await import('./leafWorkspace.js')
     const currentStates = new Map<string, string>()
     const currentIds = new Set<string>()
@@ -336,8 +350,10 @@ export function startHeadWatch(familyId: string): () => void {
       advance(currentStates, currentIds)
       return
     }
+    // `headWatchPass` advances the shared baseline itself, and does so before it
+    // awaits, so a pass that lands while this one is still appending cannot fire
+    // the same change a second time.
     await headWatchPass(familyId, { states, ids }, { states: currentStates, ids: currentIds })
-    advance(currentStates, currentIds)
   }
 
   const stop = (): void => {

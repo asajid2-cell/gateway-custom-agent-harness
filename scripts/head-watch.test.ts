@@ -76,3 +76,46 @@ test('the head is pushed a notice on an idle flip and on a new leaf', { timeout:
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('one new leaf fires the watcher once, even when two passes land together', { timeout: 60000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'head-watch-dup-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const ledger = await import('../src/utils/headLedger.ts')
+    const root = getSessionId()
+    await ledger.appendHeadLedgerEvent(root, { kind: 'watch', to: root, mode: 'new', on: true })
+
+    const pushed: string[] = []
+    const remove = ledger.registerHeadWatchSink((_familyId, notice) => { pushed.push(notice) })
+    try {
+      // Two passes that both start from the same "before": two publishes landing
+      // in one turn, each running a pass. Both used to read the member as new
+      // and both append a watch-fired event for it - the duplicate the head saw,
+      // 1ms apart. The first pass advances the shared baseline before it awaits,
+      // so the second finds the member already taken and says nothing.
+      const appearing = randomUUID()
+      const previous = { states: new Map<string, string>(), ids: new Set<string>([root]) }
+      const current = { states: new Map<string, string>(), ids: new Set<string>([root, appearing]) }
+      const [first, second] = await Promise.all([
+        ledger.headWatchPass(root, previous, current),
+        ledger.headWatchPass(root, previous, current),
+      ])
+
+      assert.equal(first.length + second.length, 1, 'the two passes fire the change once between them')
+      assert.deepEqual([...first, ...second], [`new leaf ${appearing}`])
+      assert.deepEqual(pushed, [`new leaf ${appearing}`], 'the sink is pushed once')
+
+      // And the fire is durable, recorded once.
+      const fired = (await ledger.runHeadLedger({ subverb: 'fired' })).split('\n').filter(line => line.includes(appearing) && line.includes('[new]'))
+      assert.equal(fired.length, 1, `one new leaf fires once, not ${fired.length}`)
+    } finally {
+      remove()
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
