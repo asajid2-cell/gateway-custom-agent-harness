@@ -529,6 +529,13 @@ function cleanup() {
 }
 process.on('SIGINT', () => { cleanup(); process.exit(130) })
 process.on('SIGTERM', () => { cleanup(); process.exit(143) })
+// A terminal that goes away - the window closed, the ssh dropped, screen or
+// tmux quit - sends SIGHUP, and on Windows the job object reaped the gateway on
+// exactly that event. Without this trap the launcher outlives its terminal and
+// leaves the gateway holding its port, which is what a closed screen session was
+// observed doing. A session that really must outlive its terminal can setsid or
+// launch from a detached context (no controlling terminal, no SIGHUP).
+process.on('SIGHUP', () => { cleanup(); process.exit(129) })
 
 try {
   process.stderr.write(`cc: starting the model gateway on port ${port}${keysLoaded ? ` (${keysLoaded} key(s) from gateway.env)` : ''}...\n`)
