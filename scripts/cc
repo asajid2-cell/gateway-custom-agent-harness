@@ -9,7 +9,19 @@
 # session - do not all carry the same PATH.
 set -euo pipefail
 
-here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's real location, following symlinks. The natural way to put
+# `cc` on PATH is a symlink into ~/.local/bin, and dirname of that symlink is not
+# where the launcher lives - so follow the chain first.
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  src_dir="$(cd -P -- "$(dirname -- "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in
+    /*) ;;
+    *) src="$src_dir/$src" ;;
+  esac
+done
+here="$(cd -P -- "$(dirname -- "$src")" && pwd)"
 
 node_bin="${CC_NODE:-}"
 if [ -z "$node_bin" ]; then
