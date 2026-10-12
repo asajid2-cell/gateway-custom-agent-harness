@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# The POSIX entry point for the gateway launcher; scripts/cc.ps1 is the Windows
+# one. This is a thin shim so the launcher itself can be plain node: the harness
+# spawns this file directly to prewarm or start a partner, and an executable
+# script with a shebang is what spawn() can run without being told the runtime.
+#
+# node is resolved defensively rather than assumed on PATH, because the places
+# this is launched from - a login shell, a launchd job, a partner spawned by a
+# session - do not all carry the same PATH.
+set -euo pipefail
+
+here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+node_bin="${CC_NODE:-}"
+if [ -z "$node_bin" ]; then
+  node_bin="$(command -v node 2>/dev/null || true)"
+fi
+if [ -z "$node_bin" ]; then
+  for candidate in "$HOME/.local/bin/node" /usr/local/bin/node /opt/homebrew/bin/node; do
+    if [ -x "$candidate" ]; then node_bin="$candidate"; break; fi
+  done
+fi
+if [ -z "$node_bin" ]; then
+  echo "cc: node is required for the model gateway and was not found on PATH." >&2
+  exit 1
+fi
+
+exec "$node_bin" "$here/cc-launcher.mjs" "$@"

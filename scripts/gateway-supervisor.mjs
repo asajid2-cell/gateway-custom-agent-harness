@@ -73,6 +73,19 @@ function shutdown(signal) {
 process.once('SIGINT', () => shutdown('SIGINT'))
 process.once('SIGTERM', () => shutdown('SIGTERM'))
 
+// Parent-death detection, the POSIX stand-in for the Windows job object's
+// KILL_ON_JOB_CLOSE. On POSIX the launcher holds our stdin open as a pipe, so
+// when the launcher dies - including a SIGKILL it cannot trap - the write end
+// closes, we see EOF, and we take the gateway down with us. Windows is
+// deliberately excluded: the job object already guarantees this there, and a
+// Windows supervisor's stdin is NUL, which is an immediate EOF that would shut
+// every session down the instant it started.
+if (process.platform !== 'win32') {
+  process.stdin.on('end', () => shutdown('stdin-close'))
+  process.stdin.on('close', () => shutdown('stdin-close'))
+  process.stdin.resume()
+}
+
 function startChild() {
   childStartedAt = Date.now()
   // Rebuild the keysafe chain from the vault on every spawn, so a key added or

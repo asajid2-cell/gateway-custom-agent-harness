@@ -34,17 +34,41 @@ import { dirname, join } from 'node:path'
  */
 
 /**
- * Where `cc.ps1` lives.
+ * Where the launcher lives.
  *
  * Resolved the same way the interactive leaf launcher resolves this CLI - from
  * `process.argv[1]` - so there is one rule for "where is this install" rather
  * than a second one that can disagree. `GATEWAY_CC_SCRIPT` overrides it for a
  * layout that does not put the script beside the bundle.
+ *
+ * Windows uses `cc.ps1`; POSIX uses `cc`, its bash shim over `cc-launcher.mjs`.
+ * The two are the same launcher for two platforms, and this is the one place
+ * that decides which, so a partner launch on macOS does not reach for a
+ * PowerShell that is not there.
  */
 function ccScriptPath(): string {
   const override = process.env.GATEWAY_CC_SCRIPT
   if (override) return override
-  return join(dirname(process.argv[1] ?? process.execPath), '..', 'scripts', 'cc.ps1')
+  const name = process.platform === 'win32' ? 'cc.ps1' : 'cc'
+  return join(dirname(process.argv[1] ?? process.execPath), '..', 'scripts', name)
+}
+
+/**
+ * How to invoke the launcher with the given extra arguments.
+ *
+ * Windows runs it through PowerShell; POSIX runs the script itself, which is
+ * executable and carries its own shebang. Stated once so prewarm and the partner
+ * spawn cannot drift into two different invocations of the same launcher.
+ */
+function launcherInvocation(extra: string[]): { file: string; args: string[] } {
+  const script = ccScriptPath()
+  if (process.platform === 'win32') {
+    return {
+      file: process.env.ComSpec ? 'powershell.exe' : 'pwsh',
+      args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, ...extra],
+    }
+  }
+  return { file: script, args: extra }
 }
 
 /**
@@ -279,9 +303,10 @@ export async function killTree(pid: number | undefined): Promise<void> {
 export async function prewarm(options: { cwd: string; timeoutMs?: number; env?: NodeJS.ProcessEnv }): Promise<void> {
   const timeoutMs = options.timeoutMs ?? prewarmTimeoutMs()
   await new Promise<void>((resolve, reject) => {
+    const invocation = launcherInvocation(['--prewarm'])
     const child = spawn(
-      process.env.ComSpec ? 'powershell.exe' : 'pwsh',
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ccScriptPath(), '--prewarm'],
+      invocation.file,
+      invocation.args,
       { cwd: options.cwd, env: options.env ?? process.env, stdio: ['ignore', 'ignore', 'ignore'], windowsHide: true },
     )
     let settled = false
@@ -333,8 +358,7 @@ export async function launchPartner(spec: PartnerSpec, owner: PartnerOwner): Pro
   try {
     await prewarm({ cwd: spec.cwd })
 
-    const args = [
-      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ccScriptPath(),
+    const partnerArgs = [
       '--print', '--verbose',
       // Framed input, stated rather than inferred: the sender writes stream-json
       // user records, which is a different input mode from a bare prompt argument.
@@ -342,12 +366,13 @@ export async function launchPartner(spec: PartnerSpec, owner: PartnerOwner): Pro
       '--output-format', 'stream-json',
       '--session-id', spec.sessionId,
     ]
-    if (spec.model) args.push('--model', spec.model)
-    if (spec.effort) args.push('--effort', spec.effort)
+    if (spec.model) partnerArgs.push('--model', spec.model)
+    if (spec.effort) partnerArgs.push('--effort', spec.effort)
 
+    const invocation = launcherInvocation(partnerArgs)
     child = spawn(
-      process.env.ComSpec ? 'powershell.exe' : 'pwsh',
-      args,
+      invocation.file,
+      invocation.args,
       {
         cwd: spec.cwd,
         env: {
