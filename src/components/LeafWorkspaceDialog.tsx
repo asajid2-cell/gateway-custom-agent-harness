@@ -4,7 +4,7 @@ import { Select } from './CustomSelect/select.js'
 import { SessionPreview } from './SessionPreview.js'
 import { useTerminalSize } from '../hooks/useTerminalSize.js'
 import { useRegisterOverlay } from '../context/overlayContext.js'
-import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafHeirSessionId, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, getTandemViews, isFamilyMatriarch, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView, type TandemView } from '../utils/leafWorkspace.js'
+import { LEAF_EFFORT_LEVELS, externallyHeldLeafIds, getLeafCarouselViews, getLeafHeirSessionId, getLeafMatriarchName, getLeafMatriarchSessionId, getLeafPatriarchName, getLeafPatriarchSessionId, getLeafSelfName, getLeafViews, getTandemViews, isFamilyMatriarch, leafResumeCommand, listLeafMenuMembers, refreshLeafMatriarch, requestLeafMenu, selectedLeafId, selectLeaf, subscribeLeafWorkspace, leafWorkspaceRevision, type LeafView, type TandemView } from '../utils/leafWorkspace.js'
 import type { LeafMember } from '../utils/leafFamily.js'
 import type { LogOption } from '../types/logs.js'
 import { isLeafProcessAlive } from '../utils/leafProcess.js'
@@ -217,7 +217,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
       ...open.map(member => ({
         value: `resume:${member.sessionId}`,
         label: `Enter #${member.number} ${member.name} from a terminal`,
-        description: `cc --resume ${member.sessionId}`,
+        description: leafResumeCommand(member),
       })),
       ...(open.length === 0 ? [{ value: 'empty', label: 'No saved leaves yet', description: 'Go back and create one' }] : []),
       { value: 'archives', label: 'Archived leaves', description: describeArchives(members, 'revive, view or open one') },
@@ -237,7 +237,7 @@ export function LeafMenu({ onDone, model, effort }: { onDone: (result?: string) 
         if (action === 'member') { setNotice(`${describeSession(member)} is managed in the window the family moved to.`); return }
         // Nothing is started here: the command is the answer, and running it in
         // another terminal is the person's to do.
-        if (action === 'resume') { setNotice(`To enter ${describeSession(member)} from another terminal, run: cc --resume ${id}`); return }
+        if (action === 'resume') { setNotice(`To enter ${describeSession(member)} from another terminal, run: ${member ? leafResumeCommand(member) : `cc --resume ${id}`}`); return }
         void run('', async () => {
           const workspace = await import('../utils/leafWorkspace.js')
           if (action === 'open') return workspace.openLeaf(id)

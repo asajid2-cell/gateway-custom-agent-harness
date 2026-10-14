@@ -12,6 +12,7 @@ import { checkHasTrustDialogAccepted } from './config.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { createFork } from '../commands/branch/branch.js'
 import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscriptPath, getTranscriptPathForSession, saveSessionName } from './sessionStorage.js'
+import { formatSessionResumeCommand } from './bottomBarUsage.js'
 import { addLeafMember, ensureCreatorMember, markLeafElder, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
 import { LeafProcess, isLeafProcessAlive } from './leafProcess.js'
 import { LeafTakenError } from './leafChannel.js'
@@ -1393,6 +1394,23 @@ export async function leafPatriarchMember(): Promise<LeafMember | undefined> {
 /** How a member is named in a result or an error. */
 function memberLabel(member: LeafMember): string {
   return `Leaf #${member.number} ${member.name}`
+}
+
+/**
+ * The command a person runs to open a member from another terminal.
+ *
+ * A member's transcript lives under the project folder of the directory the
+ * member was started in, and resuming by id searches only that folder, so the
+ * command must be run from the member's own directory: a bare `cc --resume <id>`
+ * typed into an unrelated cwd finds nothing. The directory is the member's stored
+ * `cwd`, which is that member's own resume directory - the same value the
+ * resume-cwd fix makes authoritative for the session it names - rather than a
+ * re-derivation that could disagree with it.
+ */
+export function leafResumeCommand(member: Pick<LeafMember, 'sessionId' | 'cwd'>): string {
+  return member.cwd
+    ? formatSessionResumeCommand(member.cwd, member.sessionId)
+    : `cc --resume ${member.sessionId}`
 }
 
 async function currentFamily(): Promise<LeafFamily> {

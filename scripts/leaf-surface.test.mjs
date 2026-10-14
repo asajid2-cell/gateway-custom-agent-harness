@@ -833,11 +833,13 @@ test('every member is an entry point, and the doctrine says so', async () => {
   assert.match(prompt, /DESCRIPTION = 'See, talk to, and drive the leaf sessions in this family\.'/)
 
   // The menu hands out the command that opens each member from anywhere. It is
-  // a read, not management, so a window that was displaced still offers it.
+  // a read, not management, so a window that was displaced still offers it. The
+  // command carries the member's own directory, because a transcript is found
+  // only under the project folder of the directory the member was started in.
   const dialog = await readFile(new URL('../src/components/LeafWorkspaceDialog.tsx', import.meta.url), 'utf8')
   assert.match(dialog, /label: `Enter #\$\{member\.number\} \$\{member\.name\} from a terminal`/)
-  assert.match(dialog, /description: `cc --resume \$\{member\.sessionId\}`/)
-  assert.match(dialog, /if \(action === 'resume'\) \{ setNotice\(`To enter \$\{describeSession\(member\)\} from another terminal, run: cc --resume \$\{id\}`\); return \}/)
+  assert.match(dialog, /description: leafResumeCommand\(member\)/)
+  assert.match(dialog, /if \(action === 'resume'\) \{ setNotice\(`To enter \$\{describeSession\(member\)\} from another terminal, run: \$\{member \? leafResumeCommand\(member\)/)
   // Asking for the address starts nothing: running it elsewhere is the person's
   // to do, and a session that opened on its own has no terminal to give.
   const resumeBranch = dialog.slice(dialog.indexOf("if (action === 'resume')"), dialog.indexOf('void run(', dialog.indexOf("if (action === 'resume')")))

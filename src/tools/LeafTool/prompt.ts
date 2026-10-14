@@ -1,7 +1,7 @@
 export const DESCRIPTION = 'See, talk to, and drive the leaf sessions in this family.'
 
 export function getPrompt(): string {
-  return `Leaf sessions are one family of independent conversations. Each runs in its own process with its own transcript, so work continues in parallel without leaving this session. Every member is an entry point in its own right: \`cc --resume <session id>\` opens any of them directly, and from there it can reopen the rest, open new leaves and reopen existing ones. No member, the head included, is the only way in, so a family can run deep without ever going back to where it started.
+  return `Leaf sessions are one family of independent conversations. Each runs in its own process with its own transcript, so work continues in parallel without leaving this session. Every member is an entry point in its own right: the command the leaf menu prints for it - \`cd <the member's directory>; & cc --resume <session id>\` - opens any of them directly. It carries the member's own directory because a transcript is found only under the project folder of the directory the member was started in, so a bare \`cc --resume <id>\` run elsewhere finds nothing. From there a member can reopen the rest, open new leaves and reopen existing ones. No member, the head included, is the only way in, so a family can run deep without ever going back to where it started.
 
 Everyone in the family sees everyone else. A leaf you forked can list and message its siblings, \`roster\` shows it the matriarch, and \`notify\` sends a report back here. Awareness is symmetric, so a leaf that needs something can ask for it instead of working blind.
 

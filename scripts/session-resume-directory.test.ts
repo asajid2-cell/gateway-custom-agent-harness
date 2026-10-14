@@ -10,11 +10,15 @@ import { strict as assert } from 'node:assert'
 import test from 'node:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
+  getProjectDir,
   loadAllLogsFromSessionFile,
   loadTranscriptFromFile,
 } from '../src/utils/sessionStorage.ts'
+import { resolveResumeDirectory } from '../src/utils/sessionRestore.ts'
+import { leafResumeCommand } from '../src/utils/leafWorkspace.ts'
+import { formatSessionResumeCommand } from '../src/utils/bottomBarUsage.ts'
 
 const SESSION = '4d2a7c1e-5f60-4a3b-9c8d-1e2f3a4b5c6d'
 const ORIGIN = 'C:\\Users\\Ahmed'
@@ -123,4 +127,43 @@ test('a compacted session reports the directory it was started in', async () => 
   } finally {
     await rm(join(path, '..'), { recursive: true, force: true })
   }
+})
+
+// The printed resume command must cd into a directory whose project folder is
+// the one the transcript actually lives in, or `cc --resume <id>` run from it
+// finds nothing. A recorded worktree that no longer holds the file used to win
+// over the transcript's own folder, so the footer named a directory the session
+// could not be resumed from.
+test('the resume command cds to the transcript folder, not a stale worktree', () => {
+  const transcriptPath = join(getProjectDir(ORIGIN), `${SESSION}.jsonl`)
+  const staleWorktree = 'C:\\Users\\Ahmed\\tmp\\.agent\\runs\\choralus-acceptance'
+  const directory = resolveResumeDirectory({
+    transcriptPath,
+    worktreePath: staleWorktree,
+    projectPath: ORIGIN,
+    fallback: ELSEWHERE,
+  })
+  const printed = formatSessionResumeCommand(directory, SESSION)
+  assert.equal(directory, ORIGIN)
+  assert.equal(printed, `cd '${ORIGIN}'; & cc --resume ${SESSION}`)
+  assert.ok(!printed.includes('choralus-acceptance'), 'the stale worktree is not named')
+  // The outcome: the directory the command cds into is the one holding the file.
+  assert.equal(getProjectDir(directory), dirname(transcriptPath))
+})
+
+// A member living under a worktree project dir must get a command that carries
+// that directory, so it resumes correctly even when run from an unrelated cwd.
+// A bare `cc --resume <id>` typed anywhere else finds nothing.
+test('a member command carries the member directory and resumes from anywhere', () => {
+  const memberId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+  const memberCwd = 'C:\\Users\\Ahmed\\repo-worktrees\\lane-a'
+  const unset = leafResumeCommand({ sessionId: memberId, cwd: undefined })
+  assert.equal(unset, `cc --resume ${memberId}`, 'no directory on record leaves the bare form')
+
+  const command = leafResumeCommand({ sessionId: memberId, cwd: memberCwd })
+  assert.equal(command, `cd '${memberCwd}'; & cc --resume ${memberId}`)
+  assert.notEqual(command, `cc --resume ${memberId}`)
+  // The command cds into the member's own project folder, which is the folder
+  // the member's transcript lives in - so the lookup succeeds from any cwd.
+  assert.equal(getProjectDir(memberCwd), dirname(join(getProjectDir(memberCwd), `${memberId}.jsonl`)))
 })
