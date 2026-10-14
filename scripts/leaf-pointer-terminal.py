@@ -272,6 +272,31 @@ class Screen(pyte.Screen):
     def report_device_attributes(self, mode=0, **kwargs):
         self.reply('\x1b[?1;2c')
 
+def git_bash_path():
+    """The git-bash the spawned CLI needs, as a Windows path.
+
+    On Windows the compiled CLI refuses to boot unless it can find git-bash,
+    and it derives that from whichever `git` it finds on PATH: it assumes `git`
+    sits in `<Git>/cmd`, so it looks for `<Git>/bin/bash.exe`. Launched from a
+    git-bash shell the inherited PATH puts `Git/mingw64/bin` and `Git/usr/bin`
+    first, so `git` resolves there instead, the derived `bash.exe` does not
+    exist, and the CLI comes up to a blank screen - alive, having written its
+    config, printing nothing. Naming the bash outright removes the guesswork,
+    so the harness boots whether cmd or git-bash launched it.
+    """
+    if os.name != 'nt': return None
+    candidates = []
+    git = shutil.which('git')
+    if git:
+        root = os.path.dirname(os.path.abspath(git))
+        for _ in range(4):
+            root = os.path.dirname(root)
+            candidates.append(os.path.join(root, 'bin', 'bash.exe'))
+    candidates.append(r'C:\Program Files\Git\bin\bash.exe')
+    for candidate in candidates:
+        if os.path.exists(candidate): return candidate
+    return None
+
 class Terminal:
     def __init__(self, session_id=None, permission_mode=None, env_extra=None):
         self.id = session_id or str(uuid.uuid4())
@@ -282,6 +307,8 @@ class Terminal:
         env = {key: os.environ[key] for key in ('PATH', 'SystemRoot', 'TEMP', 'TMP', 'COMSPEC') if key in os.environ}
         url = f'http://127.0.0.1:{server.server_port}'
         env.update(HOME=str(root), USERPROFILE=str(root), CLAUDE_CONFIG_DIR=str(root), ANTHROPIC_AUTH_TOKEN='local-fixture-only', ANTHROPIC_BASE_URL=url, CLAUDE_CODE_GATEWAY_BASE_URL=url, CLAUDE_CODE_USE_GATEWAY='1', CLAUDE_CODE_NO_FLICKER='1' if args.fullscreen else '0', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC='1', DISABLE_TELEMETRY='1', DISABLE_ERROR_REPORTING='1', NODE_ENV='production')
+        git_bash = git_bash_path()
+        if git_bash: env['CLAUDE_CODE_GIT_BASH_PATH'] = git_bash
         env.update(env_extra or {})
         cli_args = [shutil.which('bun'), str(args.cli.resolve()), '--resume' if session_id else '--session-id', self.id, '--model', 'claude-sonnet-4-6']
         if permission_mode: cli_args += ['--permission-mode', permission_mode]
