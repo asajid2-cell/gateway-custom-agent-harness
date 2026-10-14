@@ -5940,3 +5940,180 @@ test('refuses an unsupported native max instead of forwarding a false enum', () 
 
 // This sentinel prevents a passing suite that silently exercises no OpenCode tests.
 assert.ok(true)
+
+// --- model fallback chains --------------------------------------------------
+//
+// One gateway, two upstreams: a Command Code route that the fixture can fail and
+// a DeepSeek route that answers a normal message. A chain lets the first route's
+// retryable failure be abandoned for the second without the caller seeing it.
+
+const FALLBACK_PRIMARY = 'gateway-commandcode-longcat-2.0-free'
+const FALLBACK_TARGET = 'gateway-ds-flash'
+
+function anthropicJsonMessage(text) {
+  return {
+    id: 'msg-fallback',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text }],
+    stop_reason: 'end_turn',
+  }
+}
+
+function primary429Handler(req, res, requests) {
+  return requestJson(req).then(body => {
+    requests.push(body)
+    res.writeHead(429, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { message: 'rate limited' } }))
+  })
+}
+
+function fallbackMessageHandler(text) {
+  return async (req, res, requests) => {
+    requests.push(await requestJson(req))
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify(anthropicJsonMessage(text)))
+  }
+}
+
+function fallback429Handler(req, res, requests) {
+  return requestJson(req).then(body => {
+    requests.push(body)
+    res.writeHead(429, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'error', error: { message: 'rate limited' } }))
+  })
+}
+
+async function withFallbackGateway({ primaryHandler, fallbackHandler, gatewayEnv = {}, run }) {
+  const state = { primary: [], fallback: [] }
+  const primary = await fakeCodexServer((req, res) => primaryHandler(req, res, state.primary))
+  const fallback = await fakeCodexServer((req, res) => fallbackHandler(req, res, state.fallback))
+  const gateway = await startGatewayForTest({
+    COMMANDCODE_API_KEY: randomUUID(),
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${primary.port}/provider/v1`,
+    DEEPSEEK_API_KEY: randomUUID(),
+    DEEPSEEK_API_URL: `http://127.0.0.1:${fallback.port}/messages`,
+    MODEL_GATEWAY_LOG_TIMING: '1',
+    // The route's own retry would otherwise answer the fixture's 429 before the
+    // fallback chain is reached, hiding the layer under test.
+    MODEL_GATEWAY_UPSTREAM_RETRIES: '0',
+    MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS: '0',
+    MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '2000',
+    MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '5000',
+    ...gatewayEnv,
+  })
+  try {
+    return await run({ gateway, state })
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => primary.server.close(resolve))
+    await new Promise(resolve => fallback.server.close(resolve))
+  }
+}
+
+function fallbackProbeBody(model = FALLBACK_PRIMARY) {
+  return {
+    model,
+    stream: false,
+    max_tokens: 8,
+    messages: [{ role: 'user', content: 'hello' }],
+  }
+}
+
+test('a retryable route failure falls back to the next model in the chain', async () => {
+  // The failure this covers: the primary route answers 429 and the caller gets
+  // an error even though a healthy model was configured behind it. The 429 is
+  // swallowed, the same request is re-issued on the fallback route, and the
+  // caller sees only the fallback's answer.
+  await withFallbackGateway({
+    primaryHandler: primary429Handler,
+    fallbackHandler: fallbackMessageHandler('served-by-fallback'),
+    gatewayEnv: {
+      MODEL_GATEWAY_FALLBACKS: JSON.stringify({
+        [FALLBACK_PRIMARY]: [FALLBACK_TARGET],
+      }),
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, fallbackProbeBody())
+      assert.equal(result.status, 200)
+      assert.equal(JSON.parse(result.body).content[0].text, 'served-by-fallback')
+      assert.equal(
+        result.headers.get('x-gateway-fallback-from'),
+        FALLBACK_PRIMARY,
+        'the response names the route it fell back from',
+      )
+      // The primary was reached once and its 429 never surfaced...
+      assert.equal(state.primary.length, 1)
+      // ...and the same request was re-issued on the fallback route under the id
+      // DeepSeek knows, not the Gateway alias.
+      assert.equal(state.fallback.length, 1)
+      assert.equal(state.fallback[0].model, 'deepseek-v4-flash')
+      assert.match(
+        gateway.getStderr(),
+        new RegExp(`model-gateway fallback from=${FALLBACK_PRIMARY} to=${FALLBACK_TARGET} status=429`),
+      )
+    },
+  })
+})
+
+test('a MODEL_GATEWAY_MODELS entry can name its own fallback chain', async () => {
+  await withFallbackGateway({
+    primaryHandler: primary429Handler,
+    fallbackHandler: fallbackMessageHandler('entry-chain-served'),
+    gatewayEnv: {
+      MODEL_GATEWAY_MODELS: JSON.stringify({
+        'fixture-entry-chain': {
+          backend: 'commandcode',
+          upstream: 'meituan/LongCat-2.0:free',
+          fallback: [FALLBACK_TARGET],
+        },
+      }),
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, fallbackProbeBody('fixture-entry-chain'))
+      assert.equal(result.status, 200)
+      assert.equal(JSON.parse(result.body).content[0].text, 'entry-chain-served')
+      assert.equal(result.headers.get('x-gateway-fallback-from'), 'fixture-entry-chain')
+      assert.equal(state.fallback.length, 1)
+    },
+  })
+})
+
+test('without a chain a retryable route failure reaches the caller unchanged', async () => {
+  // The fallback layer must not touch a route that has no chain: the same 429
+  // that a chain would swallow has to arrive as a 429.
+  await withFallbackGateway({
+    primaryHandler: primary429Handler,
+    fallbackHandler: fallbackMessageHandler('should-not-be-used'),
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, fallbackProbeBody())
+      assert.equal(result.status, 429)
+      assert.match(result.body, /rate limited/)
+      assert.equal(result.headers.get('x-gateway-fallback-from'), null)
+      assert.equal(state.primary.length, 1)
+      assert.equal(state.fallback.length, 0)
+    },
+  })
+})
+
+test('a chain whose last hop also fails surfaces that hop failure verbatim', async () => {
+  // Once the chain is exhausted there is nothing left to try, so the last
+  // route's own error is the honest answer - not a generic chain error.
+  await withFallbackGateway({
+    primaryHandler: primary429Handler,
+    fallbackHandler: fallback429Handler,
+    gatewayEnv: {
+      MODEL_GATEWAY_FALLBACKS: JSON.stringify({
+        [FALLBACK_PRIMARY]: [FALLBACK_TARGET],
+      }),
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, fallbackProbeBody())
+      assert.equal(result.status, 429)
+      assert.match(result.body, /DeepSeek returned HTTP 429/)
+      assert.equal(result.headers.get('x-gateway-fallback-from'), FALLBACK_PRIMARY)
+      assert.equal(state.primary.length, 1)
+      assert.equal(state.fallback.length, 1)
+    },
+  })
+})

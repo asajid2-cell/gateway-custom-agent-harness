@@ -477,6 +477,9 @@ function loadModels() {
         : typeof previous?.hidden === 'boolean'
           ? { hidden: previous.hidden }
           : {}),
+      ...(Array.isArray(value.fallback)
+        ? { fallback: value.fallback.filter(hop => typeof hop === 'string' && hop.length > 0) }
+        : {}),
     }
   }
   return models
@@ -487,6 +490,71 @@ const MODEL_NAMES = Object.keys(MODELS)
 const DISCOVERABLE_MODEL_NAMES = MODEL_NAMES.filter(
   model => MODELS[model].hidden !== true,
 )
+
+// Ordered fallback chains. When a route fails before it has produced any output,
+// the same request is re-issued against the next model in its chain. A chain is
+// a plain array of registered Gateway model ids - the first hop that produces
+// output wins - and it is bounded by its own length because the walk is a single
+// pass over the list. Two ways to declare one: a global env map, or a `fallback`
+// array on the model's own MODEL_GATEWAY_MODELS entry. The env map wins for any
+// id it names. Everything is validated at startup so a typo fails the gateway
+// rather than hiding until a request needs it.
+function loadFallbacks(models) {
+  const chains = new Map()
+  const raw = process.env.MODEL_GATEWAY_FALLBACKS
+  if (raw) {
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      throw new Error(
+        `MODEL_GATEWAY_FALLBACKS must be valid JSON: ${error instanceof Error ? error.message : 'parse failed'}`,
+      )
+    }
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+      throw new Error('MODEL_GATEWAY_FALLBACKS must be a JSON object')
+    }
+    for (const [name, value] of Object.entries(parsed)) {
+      if (!Array.isArray(value)) {
+        throw new Error(`MODEL_GATEWAY_FALLBACKS entry ${name} must be an array of model ids`)
+      }
+      chains.set(name, value)
+    }
+  }
+  for (const [name, model] of Object.entries(models)) {
+    if (Array.isArray(model.fallback) && !chains.has(name)) chains.set(name, model.fallback)
+  }
+
+  for (const [name, chain] of chains) {
+    if (!models[name]) {
+      throw new Error(`MODEL_GATEWAY_FALLBACKS references unknown model ${name}`)
+    }
+    // The primary counts as already seen, so a chain can never name itself and
+    // no hop can repeat - the guarantee a per-request visited-set would give,
+    // enforced once instead of on every request.
+    const seen = new Set([name])
+    for (const hop of chain) {
+      if (typeof hop !== 'string' || hop.length === 0) {
+        throw new Error(`MODEL_GATEWAY_FALLBACKS entry ${name} must name model ids`)
+      }
+      if (!models[hop]) {
+        throw new Error(`MODEL_GATEWAY_FALLBACKS entry ${name} references unknown model ${hop}`)
+      }
+      if (seen.has(hop)) {
+        throw new Error(`MODEL_GATEWAY_FALLBACKS entry ${name} repeats model ${hop}`)
+      }
+      seen.add(hop)
+    }
+  }
+  return chains
+}
+
+const MODEL_FALLBACKS = loadFallbacks(MODELS)
+
+function fallbackChainFor(modelName) {
+  const chain = MODEL_FALLBACKS.get(modelName)
+  return Array.isArray(chain) ? chain : []
+}
 
 function validateGatewayCatalog() {
   const routedModelIds = Object.entries(DEFAULT_MODELS)
@@ -1561,6 +1629,65 @@ function anthropicError(res, status, message) {
     type: 'error',
     error: { type: 'api_error', message },
   })
+}
+
+// A route that a fallback chain may leave behind. Every backend reports a route
+// failure the same way - an `anthropicError` write, which is `writeHead` followed
+// by `end` - so a response that has not sent headers and is asked to write a
+// retryable status is holding exactly the failure a fallback exists for. This
+// wrapper swallows that one write and records it; every other property and
+// method delegates to the real response, and a 2xx (or any non-retryable status)
+// passes straight through. Because nothing is written until the chain settles,
+// the client still sees a single, normal response.
+const FALLBACK_RETRYABLE = status => status === 429 || status >= 500
+
+function createFallbackAttempt(res) {
+  const state = { committed: false, suppressed: false, failure: null }
+  const commit = () => { state.committed = true }
+  const proxy = new Proxy(res, {
+    get(target, property) {
+      if (property === 'headersSent') return state.committed || target.headersSent
+      if (property === 'writableEnded') return state.committed || target.writableEnded
+      if (property === 'writeHead') {
+        return (status, headers) => {
+          const numeric = Number(status)
+          if (!state.committed && FALLBACK_RETRYABLE(numeric)) {
+            state.suppressed = true
+            state.failure = { status: numeric, message: `upstream responded ${numeric}` }
+            return proxy
+          }
+          commit()
+          return target.writeHead(status, headers)
+        }
+      }
+      if (property === 'write') {
+        return (...args) => {
+          commit()
+          return target.write(...args)
+        }
+      }
+      if (property === 'end') {
+        return (...args) => {
+          if (state.suppressed) return proxy
+          commit()
+          return target.end(...args)
+        }
+      }
+      if (property === 'flushHeaders') {
+        return (...args) => {
+          commit()
+          return target.flushHeaders(...args)
+        }
+      }
+      const value = Reflect.get(target, property, target)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+    set(target, property, value) {
+      target[property] = value
+      return true
+    },
+  })
+  return { res: proxy, state }
 }
 
 function nonNegativeInteger(value) {
@@ -4735,7 +4862,58 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  const chain = fallbackChainFor(modelName)
   logRoute(requestUrl, modelName, route.backend, body)
+  let lastFailure = null
+  for (let index = 0; index <= chain.length; index += 1) {
+    const hopName = index === 0 ? modelName : chain[index - 1]
+    const hopRoute = index === 0 ? route : MODELS[hopName]
+    if (!hopRoute) break
+    // Only a hop with a successor can be abandoned. The last hop writes to the
+    // real response, so a chain that runs out surfaces its own error verbatim.
+    const canFallback = index < chain.length
+    const hopRawBody = requestBodyForRoute(rawBody, hopName, hopRoute)
+    if (index > 0) {
+      logRoute(requestUrl, hopName, hopRoute.backend, body)
+      res.setHeader('x-gateway-fallback-from', safeLogValue(modelName))
+    }
+    const attempt = canFallback ? createFallbackAttempt(res) : null
+    await dispatchRoute({
+      body,
+      rawBody: hopRawBody,
+      req,
+      res: attempt ? attempt.res : res,
+      requestUrl,
+      modelName: hopName,
+      route: hopRoute,
+    })
+    if (!attempt) return
+    if (attempt.state.committed) return
+    // Nothing reached the client. A swallowed retryable status is the failure a
+    // fallback is for; a handler that simply returned leaves a dead upstream.
+    lastFailure = attempt.state.failure ?? { status: 502, message: 'No response from upstream' }
+    if (res.destroyed || res.writableEnded) return
+    if (!FALLBACK_RETRYABLE(lastFailure.status)) return
+    const delay = retryDelayMs(index + 1, null)
+    process.stderr.write(
+      `model-gateway fallback from=${safeLogValue(hopName)} to=${safeLogValue(chain[index])}` +
+      ` status=${safeLogValue(lastFailure.status)} delay_ms=${delay}\n`,
+    )
+    await waitForRetry(delay, null)
+  }
+  anthropicError(
+    res,
+    lastFailure?.status ?? 502,
+    lastFailure?.message ?? 'All model fallbacks failed',
+  )
+})
+
+// The per-backend dispatch, lifted out of the request handler so a fallback hop
+// can re-issue the same request against another route. The translating backends
+// build their own provider request from `body`; the passthrough backends forward
+// `rawBody` verbatim, which is why the caller has already named the provider's
+// own model id inside it.
+async function dispatchRoute({ body, rawBody, req, res, requestUrl, modelName, route }) {
   if (route.backend === 'codex') {
     await handleCodex(body, req, res, modelName, route)
     return
@@ -4753,41 +4931,41 @@ const server = http.createServer(async (req, res) => {
     return
   }
   if (route.backend === 'amd-radeon') {
-    if (typeof route.upstream === 'string' && route.upstream !== modelName) {
-      try {
-        const obj = JSON.parse(rawBody.toString('utf8'))
-        obj.model = route.upstream
-        rawBody = Buffer.from(JSON.stringify(obj))
-      } catch { /* malformed body: let the handler surface the real error */ }
-    }
     await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'amd-radeon')
     return
   }
   // The Anthropic body is forwarded as-is, so a hidden native alias has to
   // reach the provider under the id it knows.
   if (route.backend === 'anthropic') {
-    if (typeof route.upstream === 'string' && route.upstream !== modelName) {
-      try {
-        const obj = JSON.parse(rawBody.toString('utf8'))
-        obj.model = route.upstream
-        rawBody = Buffer.from(JSON.stringify(obj))
-      } catch { /* malformed body: let the handler surface the real error */ }
-    }
     await handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelName, 'anthropic')
     return
   }
-
-  // A claude-* deepseek alias must reach DeepSeek under its REAL model name — the deepseek
-  // route forwards the body as-is, so rewrite body.model when the alias differs from upstream.
-  if (typeof route.upstream === 'string' && route.upstream !== modelName) {
-    try {
-      const obj = JSON.parse(rawBody.toString('utf8'))
-      obj.model = route.upstream
-      rawBody = Buffer.from(JSON.stringify(obj))
-    } catch { /* malformed body: let handleDeepSeek surface the real error */ }
-  }
   await handleDeepSeek(req, res, requestUrl, rawBody, modelName)
-})
+}
+
+// The passthrough backends forward the Anthropic body as-is, so a route whose
+// provider model differs from the Gateway id - a claude-* deepseek alias, a
+// hidden native duplicate - has to carry the provider's name in `model`. The
+// translating backends ignore body.model entirely and need no rewrite.
+function requestBodyForRoute(rawBody, modelName, route) {
+  if (
+    route.backend !== 'amd-radeon' &&
+    route.backend !== 'anthropic' &&
+    route.backend !== 'deepseek'
+  ) {
+    return rawBody
+  }
+  const upstream = typeof route.upstream === 'string' && route.upstream ? route.upstream : modelName
+  if (upstream === modelName) return rawBody
+  try {
+    const body = JSON.parse(rawBody.toString('utf8'))
+    body.model = upstream
+    return Buffer.from(JSON.stringify(body))
+  } catch {
+    // Malformed body: let the handler surface the real error.
+    return rawBody
+  }
+}
 
 server.on('error', error => {
   process.stderr.write(
