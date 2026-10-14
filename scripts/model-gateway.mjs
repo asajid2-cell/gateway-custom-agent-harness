@@ -2566,13 +2566,57 @@ function openCodePromotion(record) {
 const openCodeCredentials = openCodeCredentialPool(process.env, gatewayKeyOverlay, openCodePromotion)
 const openCodeSessionCredentials = new Map()
 
+// CommandCode runs one process-wide pool, so a promotion has no sibling pool to
+// hear about it - only the preference needs saving, so a numbered key that
+// appeared mid-session keeps its priority if the gateway respawns. The file has
+// the same shape as the OpenCode preference so both are read the same way.
+const commandCodePreferencePath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'commandcode-account.json')
+
+async function persistCommandCodePromotion(record) {
+  const temp = `${commandCodePreferencePath}.${randomUUID()}.tmp`
+  try {
+    let saved = {}
+    try { saved = JSON.parse(await fs.readFile(commandCodePreferencePath, 'utf8')) } catch {}
+    const next = {}
+    if (Number.isSafeInteger(saved?.number) && saved.number > 0) next.number = saved.number
+    if (record && Number.isSafeInteger(record.number)) next.pendingNew = { number: record.number }
+    await fs.mkdir(path.dirname(commandCodePreferencePath), { recursive: true })
+    await fs.writeFile(temp, JSON.stringify(next))
+    await fs.rename(temp, commandCodePreferencePath)
+  } catch {
+    await fs.unlink(temp).catch(() => {})
+  }
+}
+
+function commandCodePromotion(record) {
+  void persistCommandCodePromotion(record)
+}
+
 // The CommandCode pool: COMMANDCODE_API_KEY, __KEY2, __KEY3 ... It shares the
 // transient overlay and the same rotation/priority behaviour as OpenCode-Go.
 const commandCodeCredentials = credentialPool({
   env: process.env,
   prefix: 'COMMANDCODE_API_KEY',
   overlay: gatewayKeyOverlay,
+  onPromote: commandCodePromotion,
 })
+
+// Re-apply a promotion recorded before a respawn. Read once, on the first
+// CommandCode request, so the file is not consulted on every turn.
+let commandCodePreferenceLoaded = false
+async function ensureCommandCodePreference() {
+  if (commandCodePreferenceLoaded) return commandCodeCredentials
+  commandCodePreferenceLoaded = true
+  let saved = null
+  try { saved = JSON.parse(await fs.readFile(commandCodePreferencePath, 'utf8')) } catch {}
+  const carried = saved?.pendingNew
+  if (carried && Number.isSafeInteger(carried.number) &&
+      commandCodeCredentials.pending?.number !== carried.number &&
+      commandCodeCredentials.numbers.includes(carried.number)) {
+    commandCodeCredentials.adoptPending({ number: carried.number })
+  }
+  return commandCodeCredentials
+}
 
 async function sessionOpenCodeCredentials(sessionId) {
   let number = 1
@@ -3651,7 +3695,7 @@ async function handleCommandCode(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'commandcode', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const credentials = commandCodeCredentials
+  const credentials = await ensureCommandCodePreference()
   let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'Command Code API key is not configured')

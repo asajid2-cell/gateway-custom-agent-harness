@@ -171,6 +171,86 @@ test('Command Code retries cycle numbered credentials through the shared pool', 
   }
 })
 
+test('a CommandCode pool promotes a key added after it is built, like OpenCode', () => {
+  // Same pool engine as OpenCode-Go over the CommandCode prefix: a numbered key
+  // that appears after the pool exists is enumerated and promoted to the front,
+  // so CommandCode retries reach it too.
+  const promoted = []
+  const env = { COMMANDCODE_API_KEY: 'cc-one', COMMANDCODE_API_KEY2: 'cc-two' }
+  const credentials = credentialPool({
+    env,
+    prefix: 'COMMANDCODE_API_KEY',
+    onPromote: record => promoted.push(record?.number ?? null),
+  })
+  assert.deepEqual(credentials.numbers, [1, 2])
+  assert.equal(credentials.key, 'cc-one')
+  credentials.advance()
+  assert.equal(credentials.number, 2)
+  env.COMMANDCODE_API_KEY4 = 'cc-four'
+  assert.deepEqual(credentials.numbers, [1, 2, 4])
+  assert.equal(credentials.number, 4)
+  assert.equal(credentials.pending.attemptsLeft, 2)
+  assert.deepEqual(promoted, [4], 'the pool reports the promotion')
+})
+
+test('a CommandCode key added mid-session is persisted and re-promoted after a restart', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'commandcode-promotion-'))
+  const firstKey = 'cc-first'
+  const secondKey = 'cc-second'
+  // The upstream records the Authorization header, so the restarted gateway's
+  // first request names the key the pool actually selected.
+  const seen = []
+  const upstream = await fakeCodexServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    }))
+  })
+  const baseEnv = {
+    CLAUDE_CONFIG_DIR: dir,
+    COMMANDCODE_API_KEY: firstKey,
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/provider/v1`,
+  }
+  let gateway = await startGatewayForTest(baseEnv)
+  try {
+    // A numbered key lands while the gateway runs, exactly as the temp keysafe
+    // child posts it. It is promoted - and that promotion is written down.
+    const inject = await fetch(`http://127.0.0.1:${gateway.port}/gateway/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'COMMANDCODE_API_KEY2', value: secondKey }),
+    })
+    assert.equal(inject.status, 200)
+    const preference = path.join(dir, 'commandcode-account.json')
+    assert.ok(await waitFor(async () => {
+      try {
+        return JSON.parse(await readFile(preference, 'utf8')).pendingNew?.number === 2
+      } catch {
+        return false
+      }
+    }), 'the promotion is written to the preference file')
+
+    // Restart: the key is in the environment again (the keysafe chain
+    // re-injects it) and the recorded preference must re-promote it, so the
+    // first request goes out on the second key rather than the first.
+    await stopChild(gateway.child)
+    gateway = await startGatewayForTest({ ...baseEnv, COMMANDCODE_API_KEY2: secondKey })
+    const result = await postGateway(gateway.port, {
+      model: 'gateway-commandcode-longcat-2.0-free',
+      stream: false,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.equal(result.status, 200)
+    assert.equal(seen[0], `Bearer ${secondKey}`, 'the restarted gateway re-promoted the recorded key')
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => upstream.server.close(resolve))
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('a key posted to a running gateway is used at once, with no restart and no plaintext in the log', async () => {
   const firstKey = randomUUID()
   const secondKey = randomUUID()
