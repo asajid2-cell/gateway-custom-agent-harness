@@ -267,6 +267,86 @@ test('a sibling leaf send records the asking leaf as the sender, not the root', 
   }
 })
 
+test('a relayed answer books no sender, so the matriarch is not handed a report it never asked for', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-relay-no-booking-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  try {
+    const { getSessionId } = await import('../src/bootstrap/state.ts')
+    const { getClaudeConfigHomeDir } = await import('../src/utils/envUtils.ts')
+    const workspace = await import('../src/utils/leafWorkspace.ts')
+    const {
+      pendingLeafSendSources, registerLeafViewForTesting, dispatchLeafRequestForTesting,
+      deliverLeafAnswerForTesting, registerLeafContextNotify, forgetLeafFamilyRoot, familyRootSessionId,
+    } = workspace
+    const matriarch = getSessionId()
+    // The family root is a DIFFERENT session that is no longer running: this
+    // process is the matriarch standing in for a closed patriarch. That is the
+    // shape the misroute was reported in - a matriarch that is not the root.
+    const root = randomUUID()
+    const familyPath = join(getClaudeConfigHomeDir(), 'leaf-families', `${root}.json`)
+    const askerId = randomUUID()
+    const askerTranscript = join(directory, 'asker.jsonl')
+    const targetTranscript = join(directory, 'target.jsonl')
+    await writeFile(askerTranscript, '')
+    await writeFile(targetTranscript, '')
+    const asker = await addLeafMember(familyPath, root, { sessionId: askerId, parentSessionId: root, name: 'Asker', transcriptPath: askerTranscript, forkMessageId: randomUUID() })
+    const target = await addLeafMember(familyPath, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Target', transcriptPath: targetTranscript, forkMessageId: randomUUID() })
+    // The matriarch's own pointer names the closed root, so it resolves a family
+    // that is not itself.
+    const indexDir = join(getClaudeConfigHomeDir(), 'leaf-families', 'index')
+    await mkdir(indexDir, { recursive: true })
+    await writeFile(join(indexDir, `${matriarch}.json`), JSON.stringify({ rootSessionId: root }))
+    forgetLeafFamilyRoot()
+    assert.equal(await familyRootSessionId(), root, 'the host resolves a root other than itself')
+
+    const { LeafProcess: RealLeafProcess } = await import('../src/utils/leafProcess.ts')
+    const makeLeaf = () => {
+      const leaf = new RealLeafProcess({ executable: process.execPath, args: [], cwd: getCwd(), env: {}, onEvent: () => {}, onState: () => {}, interactive: true }) as any
+      leaf.child = { connected: true, send: (_message: unknown, callback?: (error?: Error) => void) => { callback?.() } }
+      leaf.control = () => Promise.resolve()
+      leaf.setState('idle')
+      return leaf
+    }
+    const askerLeaf = makeLeaf()
+    const targetLeaf = makeLeaf()
+
+    const unregisterAsker = registerLeafViewForTesting({ rootSessionId: root, member: asker, process: askerLeaf, draft: '' })
+    const unregisterTarget = registerLeafViewForTesting({ rootSessionId: root, member: target, process: targetLeaf, draft: '' })
+    const notices: { id: string; text: string }[] = []
+    const unregisterNotify = registerLeafContextNotify(async (id, text) => { notices.push({ id, text }); return 'ok' })
+    try {
+      // The asker asks its sibling. That IS a question, so it books the asker.
+      await dispatchLeafRequestForTesting(askerId, root, 'send', [target.sessionId, 'SIBLING_QUESTION'])
+      assert.deepEqual(pendingLeafSendSources(target.sessionId), [{ source: askerId, message: 'SIBLING_QUESTION' }])
+
+      // The sibling answers, and the matriarch hands the answer back to the
+      // asker. That hand-off is a delivery, not a new question, so it must book
+      // nothing for the asker.
+      targetLeaf.setState('running')
+      await deliverLeafAnswerForTesting(target.sessionId, 'SIBLING_QUESTION', 'THE ANSWER')
+      assert.deepEqual(pendingLeafSendSources(askerId), [], 'a relayed answer must not book the asker')
+
+      // The asker then reports a turn of its own - the same reportLeafReply the
+      // end-of-turn report funnels into. When the relay had booked a phantom
+      // sender - the matriarch itself - this report was appended to the
+      // matriarch's own conversation as "Message from Leaf ?: <matriarch>", a
+      // crossed wire about a conversation it is not part of.
+      await deliverLeafAnswerForTesting(askerId, 'SIBLING_QUESTION', 'ASKER TURN TEXT')
+      assert.deepEqual(notices, [], 'the matriarch must not be handed a report it never asked for')
+    } finally {
+      unregisterNotify()
+      unregisterAsker()
+      unregisterTarget()
+      forgetLeafFamilyRoot()
+    }
+  } finally {
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('closing a leaf takes its entry out of the bar and keeps the text typed into it', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-close-entry-'))
   const saved = process.env.CLAUDE_CONFIG_DIR

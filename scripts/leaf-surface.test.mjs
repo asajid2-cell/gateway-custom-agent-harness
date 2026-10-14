@@ -190,17 +190,20 @@ test('a reply is routed back to whoever asked, not left in the leaf', async () =
   // The send is recorded at dispatch and reported when the turn ends; without
   // the record a reply is only visible to whoever opens the leaf next. The
   // origin is explicit because a sibling's send is relayed by the root, so the
-  // process handling it is not the session that asked.
+  // process handling it is not the session that asked. A relayed reply is a
+  // delivery, not a new question, so the dispatch also carries the mode that
+  // keeps it off the books.
   assert.match(workspace, /function expectLeafReply\(view: LeafView, message: string, origin\?: string\)/)
-  assert.match(workspace, /case 'send': result = await sendLeafMessage\(id, value, \{ sessionId: sourceId \}\)/)
+  assert.match(workspace, /case 'send': result = await sendLeafMessage\(id, value, \{ sessionId: sourceId \}/)
   assert.match(workspace, /function forgetExpectedReply\(sessionId: string, message: string\)/)
   assert.match(workspace, /async function reportLeafReplies\(view: OwnedLeafView, child: LeafProcess\)/)
   assert.match(workspace, /await reportLeafReply\(item, view, answer\)/)
   assert.match(workspace, /if \(current && child\.getState\(\) === 'idle'\) void reportLeafReplies\(current, child\)/)
   // The answer is read from the turn that just ended, not guessed.
   assert.match(workspace, /async function lastLeafTurnText/)
-  // A sibling's reply goes back through the send path, so it is labelled too.
-  assert.match(workspace, /await sendLeafMessage\(item\.source, text\)/)
+  // A sibling's reply goes back through the send path, so it is labelled too -
+  // but it is an answer being delivered, not a question, so it books no sender.
+  assert.match(workspace, /await sendLeafMessage\(item\.source, text, \{ sessionId: item\.source \}, \{ expectReply: false \}\)/)
 })
 
 test('an answer reported mid-turn is routed now, and not sent again at turn end', async () => {

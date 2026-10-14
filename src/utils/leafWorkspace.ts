@@ -1839,8 +1839,17 @@ export function peerAnswerFor(
  */
 export type LeafSendOrigin = { sessionId: string }
 
-/** Hand a leaf a turn. Runs in the leaf's own REPL; the matriarch stays put. */
-export async function sendLeafMessage(reference: string, text: string, origin?: LeafSendOrigin): Promise<string> {
+/**
+ * Hand a leaf a turn. Runs in the leaf's own REPL; the matriarch stays put.
+ *
+ * `expectReply` is false when the turn being handed over is itself a peer's
+ * answer rather than a fresh question. A relayed reply is a delivery, not an
+ * ask, so it must not go on the books: booking it had the receiving leaf's next
+ * turn reported back to whoever the relay recorded - the relaying process -
+ * which, when that process is a matriarch standing in for a closed patriarch,
+ * appended the report to its own conversation as a message from itself.
+ */
+export async function sendLeafMessage(reference: string, text: string, origin?: LeafSendOrigin, options?: { expectReply?: boolean }): Promise<string> {
   const message = text.trim()
   if (!message) throw new Error('Message required')
   if (message.length > 64000) throw new Error('Message too large')
@@ -1862,7 +1871,7 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
   const busy = state === 'running' || state === 'awaiting-approval'
   // The record of what was asked stays the sender's own text; only the turn the
   // leaf receives is labelled, so the reply can quote the question as asked.
-  expectLeafReply(view, message, origin?.sessionId)
+  if (options?.expectReply !== false) expectLeafReply(view, message, origin?.sessionId)
   const delivered = await view.process.deliver(`${PEER_PROMPT_PREFIX}${message}`)
   if (!delivered) {
     forgetExpectedReply(view.member.sessionId, message)
@@ -2423,7 +2432,7 @@ async function reportLeafReply(item: { source: string; root: string; message: st
   if (isInteractiveLeaf()) {
     if (item.source === getSessionId()) return
     if (rootReference(item.source) || item.source === getLeafRootSessionId()) return void await notifyLeafMatriarch(text)
-    await requestLeafWorkspace<string>('send', [item.source, text])
+    await requestLeafWorkspace<string>('send', [item.source, text, { expectReply: false }])
     return
   }
   if (item.source === getSessionId()) {
@@ -2434,8 +2443,9 @@ async function reportLeafReply(item: { source: string; root: string; message: st
   }
   if (item.root !== familyRootSync()) return
   // A sibling reads this as a turn in its own REPL, so it goes back through the
-  // same send path - which labels it, since the reply is a peer message too.
-  await sendLeafMessage(item.source, text)
+  // same send path - which labels it, since the reply is a peer message too. It
+  // is a delivery of an answer, not a new question, so it books no sender.
+  await sendLeafMessage(item.source, text, { sessionId: item.source }, { expectReply: false })
 }
 
 const requestQueues = new WeakMap<LeafProcess, Promise<void>>()
@@ -2523,7 +2533,9 @@ async function executeLeafRequest(child: LeafProcess, sourceId: string, root: st
       case 'configure': result = await configureLeaf(id, value); break
       // `sourceId` is the requesting leaf, not this process. Passing it is what
       // routes the answer back to the leaf that asked instead of to the root.
-      case 'send': result = await sendLeafMessage(id, value, { sessionId: sourceId }); break
+      // `third` carries the delivery mode a leaf-side relay sets: a reply handed
+      // to the asker is a delivery, so it books no sender for the receiving leaf.
+      case 'send': result = await sendLeafMessage(id, value, { sessionId: sourceId }, third as { expectReply?: boolean } | undefined); break
       case 'roster': result = await familyRoster(); break
       // A leaf addressing the root hands it a turn on the message channel the
       // root already uses for its leaves, so awareness runs both directions:
