@@ -143,6 +143,26 @@ test('interactive cc launches the harness without a PowerShell output pipeline',
   assert.equal(script.includes('Tee-Object -FilePath $ClaudeCrashLog'), false)
 })
 
+test('a fresh launch mints a session id its retry can resume, in both mirrors', async () => {
+  const script = await readFile(scriptPath, 'utf8')
+  // A fresh interactive session is given an id at launch, so an unexpected exit
+  // is recovered by resuming the very session that crashed rather than opening
+  // a second, unrelated conversation. The retry rewrites that id to --resume;
+  // print and prompt-carrying launches are left alone.
+  assert.match(script, /\$MintedSessionId = \[Guid\]::NewGuid\(\)\.ToString\(\)/)
+  assert.match(script, /\$ClaudeArgs \+= @\('--session-id', \$MintedSessionId\)/)
+  assert.match(script, /\$AutoRestartAttempts = if \(\$IsResume -or \$MintedSessionId\) \{ 1 \} else \{ 0 \}/)
+  assert.match(script, /if \(\$argument -eq '--session-id'\) \{ '--resume' \}/)
+  assert.match(script, /\$AttemptArgs = if \(\$attempt -eq 0\) \{ \$ClaudeArgs \} else \{ \$RetryArgs \}/)
+
+  // The POSIX mirror must make the same decision with the same guards.
+  const posix = await readFile(new URL('./cc-launcher.mjs', import.meta.url), 'utf8')
+  assert.match(posix, /mintedSessionId = randomUUID\(\)/)
+  assert.match(posix, /ClaudeArgs\.push\('--session-id', mintedSessionId\)/)
+  assert.match(posix, /const attempts = isResume \|\| mintedSessionId \? 1 : 0/)
+  assert.match(posix, /finalArgs\.map\(a => \(a === '--session-id' \? '--resume' : a\)\)/)
+})
+
 test('launcher answers the workspace-trust question per process, and can be opted out', async () => {
   const script = await readFile(scriptPath, 'utf8')
   // Defaulted only when unset, so CLAUDE_CODE_TRUST_CWD=0 restores the prompt.

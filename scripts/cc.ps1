@@ -752,6 +752,7 @@ $ClaudeArgs += '--dangerously-skip-permissions'
 
 $HasEffortArgument = $false
 $IsResume = $false
+$HasSessionIdArgument = $false
 foreach ($argument in $ClaudeArgs) {
   if ($argument -eq '--') {
     break
@@ -768,8 +769,27 @@ foreach ($argument in $ClaudeArgs) {
   ) {
     $IsResume = $true
   }
+  if ($argument -eq '--session-id' -or $argument -like '--session-id=*') {
+    $HasSessionIdArgument = $true
+  }
 }
-$AutoRestartAttempts = if ($IsResume) { 1 } else { 0 }
+
+# A fresh interactive session is minted an id before the harness starts, so a
+# crash can be recovered: the retry relaunches with --resume <id> instead of
+# opening a second, unrelated conversation. Print launches and launches that
+# carry a positional prompt are left alone - print is a single turn, and
+# resuming a prompt-carrying launch would replay the prompt.
+$MintedSessionId = $null
+if (
+  -not $IsResume -and
+  -not $HasSessionIdArgument -and
+  -not $PrintRequested -and
+  -not (Test-HasPrintInput -Arguments $ClaudeArgs)
+) {
+  $MintedSessionId = [Guid]::NewGuid().ToString()
+  $ClaudeArgs += @('--session-id', $MintedSessionId)
+}
+$AutoRestartAttempts = if ($IsResume -or $MintedSessionId) { 1 } else { 0 }
 $SettingsEnableUltracode = $CallerSettings.ultracode -eq $true
 if (
   -not $HasEffortArgument -and
@@ -778,6 +798,20 @@ if (
   ($EffortWasExplicit -or -not $SettingsEnableUltracode)
 ) {
   $ClaudeArgs += @('--effort', $Effort)
+}
+
+# The retry resumes the very session that crashed. For a fresh launch the minted
+# --session-id is rewritten to --resume in place; a resumed launch already
+# carries --resume and retries with the same arguments.
+$RetryArgs = $ClaudeArgs
+if ($MintedSessionId) {
+  $RetryArgs = @(
+    foreach ($argument in $ClaudeArgs) {
+      if ($argument -eq '--session-id') { '--resume' }
+      elseif ($argument -eq "--session-id=$MintedSessionId") { "--resume=$MintedSessionId" }
+      else { $argument }
+    }
+  )
 }
 
 function Get-FreeLoopbackPort {
@@ -1184,7 +1218,8 @@ try {
     Write-LaunchProgress 'launching the session...'
     for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
       Write-LaunchDiagnostic 'harness-start' @{ attempt = $attempt; port = $Port }
-      & $ClaudeRunner $ClaudeScript @ClaudeArgs
+      $AttemptArgs = if ($attempt -eq 0) { $ClaudeArgs } else { $RetryArgs }
+      & $ClaudeRunner $ClaudeScript @AttemptArgs
       $ExitCode = $LASTEXITCODE
       Write-LaunchDiagnostic 'harness-exit' @{ attempt = $attempt; exitCode = $ExitCode }
       if ($ExitCode -ne 0 -and $ExitCode -ne 130) {

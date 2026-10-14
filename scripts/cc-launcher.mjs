@@ -35,6 +35,7 @@ import { homedir, tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import net from 'node:net'
+import { randomUUID } from 'node:crypto'
 
 const ScriptsDir = dirname(fileURLToPath(import.meta.url))
 const Root = dirname(ScriptsDir)
@@ -290,19 +291,20 @@ if (EffortWasExplicit && Effort) {
 }
 
 // A `--print` with no prompt argument and no redirected stdin is refused rather
-// than left to hang on an empty pipe, matching the launcher on Windows.
+// than left to hang on an empty pipe, matching the launcher on Windows. The same
+// positional scan decides whether a fresh launch is bare-interactive below.
+const ValueOptions = new Set(['--model', '--output-format', '--input-format', '--settings', '--effort', '--max-turns', '--fallback-model', '--agent', '--append-system-prompt', '--system-prompt', '--mcp-config'])
+function hasPositionalArgument(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = String(args[i])
+    if (ValueOptions.has(arg) && i + 1 < args.length) { i++; continue }
+    if (arg && !arg.startsWith('-')) return true
+  }
+  return false
+}
 const PrintRequested = ClaudeArgs.some(a => a === '--print' || a === '-p' || a.startsWith('--print='))
-if (PrintRequested) {
-  const valueOptions = new Set(['--model', '--output-format', '--input-format', '--settings', '--effort', '--max-turns', '--fallback-model', '--agent', '--append-system-prompt', '--system-prompt', '--mcp-config'])
-  let hasPrompt = false
-  for (let i = 0; i < ClaudeArgs.length; i++) {
-    const arg = String(ClaudeArgs[i])
-    if (valueOptions.has(arg) && i + 1 < ClaudeArgs.length) { i++; continue }
-    if (arg && !arg.startsWith('-')) { hasPrompt = true; break }
-  }
-  if (!hasPrompt && process.stdin.isTTY) {
-    throw new Error('cc: --print requires a prompt argument or redirected stdin. Invoke cc without --print for the interactive REPL.')
-  }
+if (PrintRequested && !hasPositionalArgument(ClaudeArgs) && process.stdin.isTTY) {
+  throw new Error('cc: --print requires a prompt argument or redirected stdin. Invoke cc without --print for the interactive REPL.')
 }
 
 // ---------------------------------------------------------------------------
@@ -631,16 +633,35 @@ try {
 
   const isResume = ClaudeArgs.some(a => a === '--resume' || a === '-r' || a === '--continue' || a === '-c' || a.startsWith('--resume='))
   const hasEffortArg = ClaudeArgs.some(a => a === '--effort' || a.startsWith('--effort='))
+
+  // A fresh interactive session is minted an id before the harness starts, so a
+  // crash can be recovered: the retry relaunches with --resume <id> instead of
+  // opening a second, unrelated conversation. Print launches and launches that
+  // carry a positional prompt are left alone - print is a single turn, and
+  // resuming a prompt-carrying launch would replay the prompt.
+  const hasSessionIdArg = ClaudeArgs.some(a => a === '--session-id' || a.startsWith('--session-id='))
+  let mintedSessionId = null
+  if (!isResume && !hasSessionIdArg && !PrintRequested && !hasPositionalArgument(ClaudeArgs)) {
+    mintedSessionId = randomUUID()
+    ClaudeArgs.push('--session-id', mintedSessionId)
+  }
+
   const finalArgs = [...ClaudeArgs, '--dangerously-skip-permissions']
   if (!hasEffortArg && Effort && (EffortWasExplicit || !isResume) && (EffortWasExplicit || CallerSettings.ultracode !== true)) {
     finalArgs.push('--effort', Effort)
   }
   finalArgs.push('--settings', settingsPath)
 
-  const attempts = isResume ? 1 : 0
+  // The retry resumes the very session that crashed: the minted --session-id is
+  // rewritten to --resume in place. A resumed launch already carries --resume.
+  const retryArgs = mintedSessionId
+    ? finalArgs.map(a => (a === '--session-id' ? '--resume' : a))
+    : finalArgs
+
+  const attempts = isResume || mintedSessionId ? 1 : 0
   process.stderr.write('cc: launching the session...\n')
   for (let attempt = 0; attempt <= attempts; attempt++) {
-    const result = spawnSync(ClaudeRunner, [ClaudeScript, ...finalArgs], {
+    const result = spawnSync(ClaudeRunner, [ClaudeScript, ...(attempt === 0 ? finalArgs : retryArgs)], {
       cwd: LaunchDirectory,
       stdio: 'inherit',
       env: harnessEnv,

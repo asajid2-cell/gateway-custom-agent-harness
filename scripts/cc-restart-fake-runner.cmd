@@ -2,6 +2,7 @@
 if not defined CC_FAKE_RUNNER_STATE exit /b 42
 if not exist "%CC_FAKE_RUNNER_STATE%" (
   >"%CC_FAKE_RUNNER_STATE%" echo first-attempt
+  >>"%CC_FAKE_RUNNER_STATE%" echo args=%*
   >>"%CC_FAKE_RUNNER_STATE%" echo codex-home=%CODEX_HOME%
   >>"%CC_FAKE_RUNNER_STATE%" echo model=%MODEL_GATEWAY_MODEL%
   >>"%CC_FAKE_RUNNER_STATE%" echo gateway-base=%CLAUDE_CODE_GATEWAY_BASE_URL%
@@ -24,5 +25,6 @@ if not exist "%CC_FAKE_RUNNER_STATE%" (
   exit /b 42
 )
 >>"%CC_FAKE_RUNNER_STATE%" echo second-attempt
+>>"%CC_FAKE_RUNNER_STATE%" echo args=%*
 >>"%CC_FAKE_RUNNER_STATE%" echo disable-sm=%DISABLE_CLAUDE_CODE_SM_COMPACT%
 exit /b 0

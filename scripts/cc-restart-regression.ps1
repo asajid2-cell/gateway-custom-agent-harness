@@ -99,15 +99,36 @@ try {
   $freshExit = $freshRun.ExitCode
   $freshRestarted = $freshOutput -match 'restarting the resumed session once'
   $freshState = Test-Path -LiteralPath $state -PathType Leaf
+  $freshStateText = if ($freshState) {
+    Get-Content -Raw -LiteralPath $state
+  } else {
+    ''
+  }
+  $freshStateLines = @($freshStateText -split "`r?`n")
+  # A fresh launch is minted a session id, and its retry resumes that very id:
+  # the first attempt carries --session-id <id>, the second --resume <id>.
+  $freshArgLines = @($freshStateLines | Where-Object { $_ -like 'args=*' })
+  $freshFirstArgs = if ($freshArgLines.Count -ge 1) { [string]$freshArgLines[0] } else { '' }
+  $freshSecondArgs = if ($freshArgLines.Count -ge 2) { [string]$freshArgLines[1] } else { '' }
+  $freshMintedId = $null
+  if ($freshFirstArgs -match '--session-id\s+([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+    $freshMintedId = $Matches[1]
+  }
+  $freshRetryResumed = (
+    $null -ne $freshMintedId -and
+    $freshSecondArgs -match ('--resume\s+' + [regex]::Escape($freshMintedId)) -and
+    $freshSecondArgs -notmatch '--session-id'
+  )
 
   $report = [ordered]@{
     result = if (
       $resumeExit -eq 0 -and
       $resumeRestarted -and
       $resumeState -and
-      $freshExit -eq 42 -and
-      -not $freshRestarted -and
+      $freshExit -eq 0 -and
+      $freshRestarted -and
       $freshState -and
+      $freshRetryResumed -and
       $nativeCompactDisabled -and
       $gatewayIdentity
     ) { 'pass' } else { 'fail' }
@@ -115,6 +136,7 @@ try {
     resumeRestarted = [bool]$resumeRestarted
     freshExit = $freshExit
     freshRestarted = [bool]$freshRestarted
+    freshRetryResumed = [bool]$freshRetryResumed
     runnerStateCreated = [bool]($resumeState -and $freshState)
     nativeHarnessCompactionOnly = [bool]$nativeCompactDisabled
     gatewayIdentity = [bool]$gatewayIdentity
