@@ -7,6 +7,7 @@ import { StringDecoder } from 'node:string_decoder'
 import killTree from 'tree-kill'
 import type { LeafTerminalMessage, LeafSnapshot } from './leafTerminal.js'
 import { connectLeafChannel, LeafTakenError, type LeafChannel, type LeafChannelHandlers } from './leafChannel.js'
+import { startBreakawayMember } from './leafBreakaway.js'
 
 export type LeafPermission = { id: string; tool: string; input: Record<string, unknown> }
 export type LeafProcessState = 'starting' | 'idle' | 'running' | 'awaiting-approval' | 'closed' | 'failed'
@@ -338,32 +339,50 @@ export class LeafProcess {
     // detached spawn does nothing, because `DETACHED_PROCESS` wins over
     // `CREATE_NO_WINDOW`. Outliving the session is the contract; the console
     // is a Windows side effect, so it is the side effect that gives way.
+    //
+    // On Windows the spawn below is the containment helper rather than `spawn`:
+    // a member is born into the launcher's KILL_ON_JOB_CLOSE job and killed with
+    // it, and `CREATE_BREAKAWAY_FROM_JOB` - the one flag that leaves a job - is
+    // not something node's `spawn` can ask for. The helper asks for it with the
+    // same detached, console-less shape, so the member leaves the job while the
+    // console behaviour above is unchanged. POSIX has no job object to leave.
     const started = Date.now()
-    const child = spawn(this.options.executable, this.options.args, {
-      cwd: this.options.cwd, env: this.options.env, detached: true, windowsHide: true, stdio: 'ignore',
-    })
-    // Neither process keeps the other alive: this handle does not wait on the
-    // member and does not hold the loop open for it.
-    child.unref()
-    // A start that never becomes a process - a missing interpreter - is known
-    // the moment it happens, so it is not worth waiting out the deadline for.
-    // Neither is a member that exits on its way up, and that is the same
-    // knowledge the caller needs to decide whether a second attempt is worth
-    // taking: one that died left nothing behind to collide with.
     let died = false
     let reason = ''
-    child.on('error', (error: Error) => { died = true; reason = `it could not be started (${error.message})` })
-    child.on('exit', (code, signal) => {
-      died = true
-      // A start that never became a process is already explained by its spawn
-      // error, which names the interpreter and says more than a status would.
-      if (!reason) {
-        const record = memberLastRecord(child.pid, started)
-        reason = `the member process exited (${describeExit(code, signal)})${record ? `; ${record}` : ''}`
-      }
-    })
-    this.child = child
-    this.pid = child.pid
+    if (process.platform === 'win32') {
+      // No child handle comes back on this path: the helper creates the member
+      // and exits. A member that never comes up is caught by the endpoint wait
+      // below rather than by a process handle that died on the way.
+      const launched = await startBreakawayMember({
+        executable: this.options.executable, args: this.options.args, cwd: this.options.cwd, env: this.options.env,
+      })
+      if ('error' in launched) { died = true; reason = `it could not be started (${launched.error})` }
+      else this.pid = launched.pid
+    } else {
+      const child = spawn(this.options.executable, this.options.args, {
+        cwd: this.options.cwd, env: this.options.env, detached: true, windowsHide: true, stdio: 'ignore',
+      })
+      // Neither process keeps the other alive: this handle does not wait on the
+      // member and does not hold the loop open for it.
+      child.unref()
+      // A start that never becomes a process - a missing interpreter - is known
+      // the moment it happens, so it is not worth waiting out the deadline for.
+      // Neither is a member that exits on its way up, and that is the same
+      // knowledge the caller needs to decide whether a second attempt is worth
+      // taking: one that died left nothing behind to collide with.
+      child.on('error', (error: Error) => { died = true; reason = `it could not be started (${error.message})` })
+      child.on('exit', (code, signal) => {
+        died = true
+        // A start that never became a process is already explained by its spawn
+        // error, which names the interpreter and says more than a status would.
+        if (!reason) {
+          const record = memberLastRecord(child.pid, started)
+          reason = `the member process exited (${describeExit(code, signal)})${record ? `; ${record}` : ''}`
+        }
+      })
+      this.child = child
+      this.pid = child.pid
+    }
     let connected = await connectLeafChannel(sessionId, handlers)
     const deadline = Date.now() + MEMBER_START_TIMEOUT_MS
     while (!connected && !died && Date.now() < deadline) {

@@ -198,8 +198,8 @@ test('a job that cannot accept the process fails closed and starts no child', { 
     );
     assert.notEqual(withConst, source, 'the job-limit constant must exist to extend the variant');
     const quotaHelper = withConst.replace(
-      'limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;',
-      'limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS;\n        limits.BasicLimitInformation.ActiveProcessLimit = 0;',
+      'limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;',
+      'limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_BREAKAWAY_OK;\n        limits.BasicLimitInformation.ActiveProcessLimit = 0;',
     );
     assert.notEqual(quotaHelper, withConst, 'the job-creation flags must exist to extend the variant');
 
@@ -224,6 +224,67 @@ test('a job that cannot accept the process fails closed and starts no child', { 
   } finally {
     for (const pid of commandLineHits(needle)) killFixtureProcessTree(pid);
     await cleanup(fixture);
+  }
+});
+
+test('a durable leaf started through the helper outlives the job that started it', { timeout: 20000 }, async () => {
+  // The custody contract: a member has to outlive the session that started it,
+  // but a process born into the launcher's KILL_ON_JOB_CLOSE job is killed with
+  // it. Start-BreakawayLeaf is the one spawner that leaves the job, so a leaf it
+  // starts must survive host teardown while an ordinary child in the same job
+  // does not. Both are observed after the job is disposed, not by reading flags.
+  const directory = await mkdtemp(join(tmpdir(), 'owned-leaf-'))
+  const child = join(directory, 'child.mjs')
+  const root = join(directory, 'leafroot.ps1')
+  const holder = join(directory, 'leafholder.ps1')
+  const out = join(directory, 'leafpids.txt')
+  const stdout = join(directory, 'leaf.out.log')
+  const stderr = join(directory, 'leaf.err.log')
+  const launched = [];
+  try {
+    await writeFile(child, 'setInterval(() => {}, 1000);\n', 'utf8');
+    await writeFile(root, [
+      'param([string]$Helper, [string]$Child, [string]$OutFile)',
+      "$ErrorActionPreference = 'Stop'",
+      '. $Helper',
+      "$leafPid = Start-BreakawayLeaf -FilePath (Get-Command node).Source -ArgumentList @($Child) -WorkingDirectory (Split-Path -Parent $Child)",
+      "$plain = Start-Process -FilePath node -ArgumentList $Child -WindowStyle Hidden -PassThru",
+      'Start-Sleep -Milliseconds 300',
+      'Set-Content -LiteralPath $OutFile -Value ("$leafPid,$([int]$plain.Id)") -Encoding ascii',
+      'while ($true) { Start-Sleep -Seconds 60 }',
+      '',
+    ].join('\n'), 'utf8');
+    await writeFile(holder, [
+      'param([string]$Helper, [string]$Root, [string]$Child, [string]$OutFile, [string]$Stdout, [string]$Stderr)',
+      "$ErrorActionPreference = 'Stop'",
+      '. $Helper',
+      "$owned = Start-OwnedGatewayProcess -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('\"' + $Root + '\"'), '-Helper', $Helper, '-Child', $Child, '-OutFile', $OutFile) -WorkingDirectory (Split-Path -Parent $Root) -StdoutPath $Stdout -StderrPath $Stderr",
+      'while (-not (Test-Path -LiteralPath $OutFile)) { Start-Sleep -Milliseconds 25 }',
+      'Start-Sleep -Milliseconds 300',
+      '$owned.Job.Dispose()',
+      '',
+    ].join('\n'), 'utf8');
+
+    const holderChild = spawn(powershell, [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', holder,
+      '-Helper', helper, '-Root', root, '-Child', child, '-OutFile', out, '-Stdout', stdout, '-Stderr', stderr,
+    ], { stdio: 'ignore', windowsHide: true });
+    launched.push(holderChild.pid);
+
+    await waitFor(async () => {
+      try { return (await readFile(out, 'utf8')).trim().length > 0; } catch { return false; }
+    }, 'the leaf root to report its pids');
+    const [leafPid, plainPid] = (await readFile(out, 'utf8')).trim().split(',').map(Number);
+    launched.push(leafPid, plainPid);
+
+    // The job is disposed once the root has reported, so the plain child dying
+    // is the signal that teardown has run - and then the leaf is still there.
+    await waitFor(() => !isAlive(plainPid), 'the contained child to die with the job');
+    assert.equal(isAlive(plainPid), false, 'a child born the ordinary way is killed with the job');
+    assert.equal(isAlive(leafPid), true, 'a leaf started through the helper leaves the job and survives it');
+  } finally {
+    for (const pid of launched.reverse()) killFixtureProcessTree(pid);
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
