@@ -200,7 +200,7 @@ test('session resume command can target the session by name instead of its ID', 
 
 test('bottom bar identifies Gateway providers without inventing quota data', () => {
   assert.equal(getGatewayProviderLabel('gateway-gpt-luna'), 'Codex')
-  assert.equal(getGatewayProviderLabel('gateway-opencode-mimo-v2.5-free'), 'OpenCode')
+  assert.equal(getGatewayProviderLabel('gateway-opencode-big-pickle'), 'OpenCode')
   assert.equal(getGatewayProviderLabel('gateway-claude-opus-5-5'), 'Anthropic')
   // A model that routes through no subscription provider has no label to show.
   assert.equal(getGatewayProviderLabel('gateway-ds-flash'), 'Gateway')

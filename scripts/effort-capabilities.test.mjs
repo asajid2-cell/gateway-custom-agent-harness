@@ -142,20 +142,20 @@ test('gateway aliases mirror the provider capability contract', () => {
     catalog.opencodeGo['glm-5.3-flash'],
   )
   assert.deepEqual(
-    catalog.gatewayAliases['gateway-opencode-mimo-v2.5-free'],
-    catalog.opencodeZen['mimo-v2.5-free'],
+    catalog.gatewayAliases['gateway-opencode-deepseek-v4.1-flash-free'],
+    catalog.opencodeZen['deepseek-v4.1-flash-free'],
   )
   assert.deepEqual(
     catalog.gatewayModelAliases['gateway-opencode-glm-5.3-flash'],
     ['opencode-go/glm-5.3-flash', 'claude-opencode-glm-5.3-flash'],
   )
   assert.deepEqual(
-    catalog.gatewayModelAliases['gateway-opencode-mimo-v2.5-free'],
-    ['opencode-zen/mimo-v2.5-free', 'claude-opencode-mimo-v2.5-free'],
+    catalog.gatewayModelAliases['gateway-opencode-deepseek-v4.1-flash-free'],
+    ['opencode-zen/deepseek-v4.1-flash-free', 'claude-opencode-deepseek-v4.1-flash-free'],
   )
   assert.deepEqual(
-    catalog.legacyAliases['claude-opencode-mimo-v2.5-free'],
-    ['opencode-zen/mimo-v2.5-free'],
+    catalog.legacyAliases['claude-opencode-deepseek-v4.1-flash-free'],
+    ['opencode-zen/deepseek-v4.1-flash-free'],
   )
   assert.deepEqual(
     catalog.legacyAliases['claude-opencode-deepseek-v4-pro'],

@@ -35,8 +35,8 @@ async function inTempLedger(
 test('a backend is resolved from the catalog, not from the model name', () => {
   // Same Gateway prefix, two different providers: a prefix heuristic has to get
   // one of these wrong, and the catalog does not.
-  assert.equal(resolveModelBackend('gateway-opencode-mimo-v2.5'), 'opencode-go')
-  assert.equal(resolveModelBackend('gateway-opencode-mimo-v2.5-free'), 'opencode-zen')
+  assert.equal(resolveModelBackend('gateway-opencode-glm-5.3-flash'), 'opencode-go')
+  assert.equal(resolveModelBackend('gateway-opencode-glm-5.3-flash-free'), 'opencode-zen')
   assert.equal(resolveModelBackend('gateway-opencode-big-pickle'), 'opencode-zen')
   assert.equal(
     resolveModelBackend('gateway-opencode-deepseek-v4.1-flash'),
@@ -61,7 +61,7 @@ test('a backend is resolved from the catalog, not from the model name', () => {
   assert.equal(resolveModelBackend('claude-gpt-sol'), 'codex')
   assert.equal(resolveModelBackend('deepseek-v4-flash'), 'deepseek')
   assert.equal(resolveModelBackend('opencode-go/hy3'), 'opencode-go')
-  assert.equal(resolveModelBackend('opencode-zen/hy3-free'), 'opencode-zen')
+  assert.equal(resolveModelBackend('opencode-zen/space-bunny-free'), 'opencode-zen')
   assert.equal(resolveModelBackend('claude-opencode-glm-5.3'), 'opencode-go')
 
   // The subscription's own models, visible route and provider-native spelling

@@ -35,10 +35,10 @@ test('gateway model options parse and deduplicate provider-qualified entries', a
 
 test('gateway model options normalize OpenCode Zen aliases', async () => {
   const options = await loadWithEnv(JSON.stringify([
-    { value: 'opencode-zen/mimo-v2.5-free', label: 'Mimo Free' },
+    { value: 'opencode-zen/beam-free', label: 'Beam Free' },
   ]))
   assert.deepEqual(options, [
-    { value: 'gateway-opencode-mimo-v2.5-free', label: 'Mimo Free', description: 'Gateway model' },
+    { value: 'gateway-opencode-beam-free', label: 'Beam Free', description: 'Gateway model' },
   ])
 })
 
@@ -70,8 +70,8 @@ test('gateway display labels preserve Gateway identities and normalize provider 
     'OpenCode GLM 5.3 Flash',
   )
   assert.equal(
-    getGatewayModelDisplayName('opencode-zen/mimo-v2.5-free'),
-    'OpenCode Mimo v2.5 Free',
+    getGatewayModelDisplayName('opencode-zen/glm-5.3-flash-free'),
+    'OpenCode GLM 5.3 Flash Free',
   )
   // The Anthropic subscription routes resolve under both spellings, like the
   // GPT routes above.

@@ -8,14 +8,26 @@ import {
 export const OPENCODE_ZEN_BASE_URL =
   process.env.OPENCODE_ZEN_BASE_URL || 'https://opencode.ai/zen/v1'
 
+// The live free set as probed on 2026-10-16 against
+// https://opencode.ai/zen/v1/models. Free is every id ending in `-free` plus
+// `big-pickle`, which is free despite carrying no suffix. Each route's protocol
+// is the one the endpoint answered 200 on: the two muse-spark models refuse
+// chat-completions with ModelProtocolUnsupported and serve `responses`, and
+// `jev-1.13-free` is live but answers 400 on both protocols, so it is
+// deliberately absent.
 export const OPENCODE_ZEN_ROUTES = {
   'big-pickle': 'chat-completions',
-  'mimo-v2.5-free': 'chat-completions',
-  'hy3-free': 'chat-completions',
-  'nemotron-3-ultra-free': 'chat-completions',
-  'nemotron-3.5-lightning-free': 'chat-completions',
+  'beam-free': 'chat-completions',
+  'll-alpha-free': 'chat-completions',
+  'mimo-v2.6-flash-free': 'chat-completions',
   'muse-spark-1.2-contributor-free': 'responses',
+  'muse-spark-1.3-contributor-free': 'responses',
+  'nemotron-3.5-super-vl-free': 'chat-completions',
+  'nemotron-3.5-lightning-free': 'chat-completions',
+  'longcat-2.5-preview-free': 'chat-completions',
   'deepseek-v4.1-flash-free': 'chat-completions',
+  'glm-5.3-flash-free': 'chat-completions',
+  'space-bunny-free': 'chat-completions',
 }
 
 // The Zen endpoint fingerprints its own client, and the free tier enforces it

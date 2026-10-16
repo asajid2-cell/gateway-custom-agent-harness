@@ -17,12 +17,17 @@ test('OpenCode Zen routes use the separate free-model endpoint', () => {
   assert.equal(openCodeZenEndpoint('responses'), 'https://opencode.ai/zen/v1/responses')
   assert.deepEqual(Object.keys(OPENCODE_ZEN_ROUTES), [
     'big-pickle',
-    'mimo-v2.5-free',
-    'hy3-free',
-    'nemotron-3-ultra-free',
-    'nemotron-3.5-lightning-free',
+    'beam-free',
+    'll-alpha-free',
+    'mimo-v2.6-flash-free',
     'muse-spark-1.2-contributor-free',
+    'muse-spark-1.3-contributor-free',
+    'nemotron-3.5-super-vl-free',
+    'nemotron-3.5-lightning-free',
+    'longcat-2.5-preview-free',
     'deepseek-v4.1-flash-free',
+    'glm-5.3-flash-free',
+    'space-bunny-free',
   ])
 })
 
