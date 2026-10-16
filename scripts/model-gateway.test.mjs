@@ -36,6 +36,8 @@ import {
   anthropicToOpenCodeRequest,
   openCodeGoHeaders,
   openCodeUsageToAnthropic,
+  anthropicUsage,
+  usageForTrace,
   relayOpenCodeChatStream,
   relayOpenCodeResponsesStream,
   relayOpenCodeAnthropicStream,
@@ -640,6 +642,7 @@ function traceCapture() {
     markError(error) { marks.error = error?.message || String(error) },
     addBytes(value) { marks.bytes = (marks.bytes || 0) + value },
     addEvent() { marks.events = (marks.events || 0) + 1 },
+    setUsage(value) { marks.usage = value },
   }
 }
 
@@ -5917,6 +5920,76 @@ test('maps OpenCode usage and never logs or embeds a key in a conversion', () =>
     protocol: 'chat-completions',
   })
   assert.equal(JSON.stringify(request).includes('synthetic-key'), false)
+})
+
+test('anthropicUsage passes an Anthropic-shaped usage through without dropping its cache read', () => {
+  // A relay's message_delta already carries the four Anthropic fields. Running
+  // it back through openCodeUsageToAnthropic would look for the provider's
+  // `cached_tokens` on a shape that spells the same thing `cache_read_input_tokens`
+  // and silently fold the cache-read count to zero - the exact misreport this
+  // guards against.
+  assert.deepEqual(anthropicUsage({
+    input_tokens: 65,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 256,
+    output_tokens: 15,
+  }), {
+    input_tokens: 65,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 256,
+    output_tokens: 15,
+  })
+  // A raw provider usage (no Anthropic fields) still converts as before.
+  assert.deepEqual(anthropicUsage({ prompt_tokens: 12, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 4 } }), {
+    input_tokens: 8,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 4,
+    output_tokens: 5,
+  })
+  assert.deepEqual(anthropicUsage(null), {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+  })
+})
+
+test('usageForTrace re-inflates Anthropic usage to the inclusive convention the timing log reads', () => {
+  // The timing log reads a usage through codexUsageTokenCounts, where
+  // input_tokens is the whole prompt and a detail says how much of it was a
+  // cache read. Handed the wire shape (input EXCLUDES the cache), it would
+  // report the exclusive input as the entire prompt and clamp the cache-read
+  // count to that same small number. The adapter makes the four counts add up.
+  const traced = usageForTrace({ input_tokens: 65, cache_creation_input_tokens: 0, cache_read_input_tokens: 256, output_tokens: 15 })
+  assert.deepEqual(traced, {
+    input_tokens: 321,
+    output_tokens: 15,
+    input_tokens_details: { cached_tokens: 256 },
+  })
+  assert.deepEqual(usageForTrace({ input_tokens: 10, cache_creation_input_tokens: 5, cache_read_input_tokens: 85, output_tokens: 7 }), {
+    input_tokens: 100,
+    output_tokens: 7,
+    input_tokens_details: { cached_tokens: 85 },
+  })
+  assert.equal(usageForTrace(null), null)
+})
+
+test('a chat-completions relay reports the provider cache read to the timing log', async () => {
+  const response = new CaptureResponse()
+  const trace = traceCapture()
+  await relayOpenCodeChatStream(response, openCodeUpstream([
+    { choices: [{ delta: { content: 'OK' }, finish_reason: 'stop' }] },
+    { choices: [], usage: { prompt_tokens: 321, completion_tokens: 15, prompt_tokens_details: { cached_tokens: 256 } } },
+    '[DONE]',
+  ]), 'deepseek-v4.1-flash-free', trace)
+  assert.equal(trace.marks.usage.input_tokens, 321)
+  assert.equal(trace.marks.usage.input_tokens_details.cached_tokens, 256)
+  assert.equal(trace.marks.usage.output_tokens, 15)
+  // The wire still carries the Anthropic split, so input + cache read sums to
+  // the same prompt the timing line counted.
+  const delta = responseEvents(response).find(event => event.type === 'message_delta')
+  assert.equal(delta.usage.input_tokens + delta.usage.cache_read_input_tokens, 321)
+  assert.equal(delta.usage.cache_read_input_tokens, 256)
 })
 
 test('fails cleanly on an OpenCode provider failure after output', async () => {

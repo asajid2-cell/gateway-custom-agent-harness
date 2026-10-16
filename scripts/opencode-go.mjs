@@ -546,6 +546,45 @@ export function openCodeUsageToAnthropic(usage) {
   }
 }
 
+// Normalize a usage to the Anthropic four-field shape. The relays already emit
+// Anthropic usage on `message_delta`, so a value arriving with those fields is
+// passed through untouched - re-running openCodeUsageToAnthropic over it would
+// look for the provider's `cached_tokens` on a shape that spells the same thing
+// `cache_read_input_tokens`, and silently drop the cache-read count to zero. A
+// raw provider usage (no Anthropic fields) is converted as before.
+export function anthropicUsage(usage) {
+  if (!usage || (usage.input_tokens === undefined && usage.cache_read_input_tokens === undefined)) {
+    return openCodeUsageToAnthropic(usage)
+  }
+  return {
+    input_tokens: nonNegative(usage.input_tokens),
+    cache_creation_input_tokens: nonNegative(usage.cache_creation_input_tokens),
+    cache_read_input_tokens: nonNegative(usage.cache_read_input_tokens),
+    output_tokens: nonNegative(usage.output_tokens),
+  }
+}
+
+// The relays put Anthropic-shaped usage on the wire, where input_tokens is what
+// was sent *minus* anything the provider served from its cache. The gateway's
+// timing log does not read that shape: it reads a usage through
+// codexUsageTokenCounts, which is the Codex/OpenAI convention - input_tokens is
+// the whole prompt and a detail field says how much of it was a cache read.
+// Handing the log the wire shape directly would report the exclusive input as
+// the entire prompt and clamp the cache-read count to that same small number,
+// so the breakdown would not sum. This re-inflates to the inclusive convention
+// so every route's timing line adds up the same way.
+export function usageForTrace(usage) {
+  if (!usage) return null
+  const input = nonNegative(usage.input_tokens)
+  const cacheRead = nonNegative(usage.cache_read_input_tokens)
+  const cacheWrite = nonNegative(usage.cache_creation_input_tokens)
+  return {
+    input_tokens: input + cacheRead + cacheWrite,
+    output_tokens: nonNegative(usage.output_tokens),
+    input_tokens_details: { cached_tokens: cacheRead },
+  }
+}
+
 function eventLine(res, event) {
   const type = event?.type
   if (!type) throw new Error('OpenCode returned an SSE event without a type')
@@ -910,7 +949,7 @@ export function foldAnthropicStream(text, model) {
     content,
     stop_reason: stopReason || 'end_turn',
     stop_sequence: null,
-    usage: openCodeUsageToAnthropic(usage),
+    usage: anthropicUsage(usage),
   }
 }
 
@@ -1037,6 +1076,7 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
     trace?.markCompletion()
     start()
     close()
+    trace?.setUsage?.(usageForTrace(openCodeUsageToAnthropic(usage)))
     eventLine(res, { type: 'message_delta', delta: { stop_reason: toolCallSeen ? 'tool_use' : 'end_turn', stop_sequence: null }, usage: openCodeUsageToAnthropic(usage) })
     eventLine(res, { type: 'message_stop' })
     res.end()
@@ -1154,6 +1194,7 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
     trace?.markCompletion()
     start()
     close()
+    trace?.setUsage?.(usageForTrace(openCodeUsageToAnthropic(usage)))
     eventLine(res, { type: 'message_delta', delta: { stop_reason: toolCallSeen ? 'tool_use' : finishReason === 'length' ? 'max_tokens' : 'end_turn', stop_sequence: null }, usage: openCodeUsageToAnthropic(usage) })
     eventLine(res, { type: 'message_stop' })
     res.end()
