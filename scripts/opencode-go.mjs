@@ -843,6 +843,96 @@ export async function relayOpenCodeResponseByProtocol(res, upstream, model, prot
   throw new Error(`Unsupported OpenCode Go protocol: ${String(protocol)}`)
 }
 
+// Some routes must be driven with an SSE upstream request even when the caller
+// asked for a single JSON body - OpenCode's free tier requires `stream: true`.
+// This stands in for the response while the ordinary stream relay builds its
+// Anthropic event sequence, then folds that sequence back into the single
+// message the caller asked for. No writes reach the network: the capture only
+// records what a streaming caller would have received.
+class CapturedResponse {
+  constructor() {
+    this.headersSent = false
+    this.statusCode = 200
+    this.writableEnded = false
+    this.destroyed = false
+    this.chunks = []
+  }
+  writeHead(status) { this.headersSent = true; this.statusCode = status }
+  write(chunk) { this.chunks.push(String(chunk)); return true }
+  end() { this.writableEnded = true }
+  destroy() { this.destroyed = true }
+}
+
+export function foldAnthropicStream(text, model) {
+  const events = []
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data:')) continue
+    const payload = line.slice(5).trim()
+    if (!payload) continue
+    try { events.push(JSON.parse(payload)) } catch {}
+  }
+  const blocks = []
+  let message = null
+  let stopReason = null
+  let usage = null
+  for (const event of events) {
+    if (event.type === 'message_start') {
+      message = event.message
+    } else if (event.type === 'content_block_start') {
+      blocks[event.index] = { ...event.content_block }
+    } else if (event.type === 'content_block_delta') {
+      const block = blocks[event.index]
+      if (!block) continue
+      const delta = event.delta || {}
+      if (delta.type === 'text_delta') block.text = (block.text || '') + (delta.text || '')
+      else if (delta.type === 'thinking_delta') block.thinking = (block.thinking || '') + (delta.thinking || '')
+      else if (delta.type === 'input_json_delta') block.partial = (block.partial || '') + (delta.partial_json || '')
+    } else if (event.type === 'message_delta') {
+      if (event.delta?.stop_reason) stopReason = event.delta.stop_reason
+      if (event.usage) usage = event.usage
+    } else if (event.type === 'error') {
+      throw new Error(event.error?.message ? String(event.error.message) : 'OpenCode request failed')
+    }
+  }
+  const content = []
+  for (const block of blocks) {
+    if (!block) continue
+    if (block.type === 'text') content.push({ type: 'text', text: block.text || '' })
+    else if (block.type === 'thinking') content.push({ type: 'thinking', thinking: block.thinking || '' })
+    else if (block.type === 'tool_use') content.push({ type: 'tool_use', id: block.id, name: block.name, input: parseFunctionArguments(block.partial) })
+  }
+  if (!content.length) throw new Error('OpenCode returned an empty or malformed response')
+  return {
+    id: message?.id || `msg_${randomUUID().replaceAll('-', '')}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: stopReason || 'end_turn',
+    stop_sequence: null,
+    usage: openCodeUsageToAnthropic(usage),
+  }
+}
+
+export async function relayOpenCodeCollectedResponse(res, upstream, model, protocol, trace = null, options = {}) {
+  const capture = new CapturedResponse()
+  try {
+    // A failure before any output throws out of the stream relay rather than
+    // being folded, so it reaches the caller as the same error a streaming
+    // caller would have seen.
+    await relayOpenCodeStream(capture, upstream, model, protocol, trace, { ...options, throwPreOutput: true })
+    const message = foldAnthropicStream(capture.chunks.join(''), model)
+    trace?.markOutput()
+    trace?.markCompletion()
+    if (!res.headersSent) res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(message))
+  } catch (error) {
+    trace?.markError(error)
+    if (options.throwPreOutput && !res.headersSent) throw error
+    finishError(res, error)
+  }
+}
+
 // The JSON response relays are exported for the HTTP-boundary tests and for
 // consumers that need to prove the fallback never receives SSE framing.
 

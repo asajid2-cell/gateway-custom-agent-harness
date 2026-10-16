@@ -162,7 +162,8 @@
     "hy3-free": ["none", "low", "high"],
     "nemotron-3-ultra-free": [],
     "nemotron-3.5-lightning-free": [],
-    "muse-spark-1.2-contributor-free": []
+    "muse-spark-1.2-contributor-free": [],
+    "deepseek-v4.1-flash-free": ["low", "high", "max"]
   },
   "commandcode": {
     "deepseek/deepseek-v4.1-flash": ["low", "medium", "high", "xhigh", "max"],
@@ -232,7 +233,8 @@
     "gateway-opencode-hy3-free": ["none", "low", "high"],
     "gateway-opencode-nemotron-3-ultra-free": [],
     "gateway-opencode-nemotron-3.5-lightning-free": [],
-    "gateway-opencode-muse-spark-1.2-contributor-free": []
+    "gateway-opencode-muse-spark-1.2-contributor-free": [],
+    "gateway-opencode-deepseek-v4.1-flash-free": ["low", "high", "max"]
   },
   "legacyAliases": {
     "claude-gpt-luna": ["none", "low", "medium", "high", "xhigh", "max"],
@@ -283,7 +285,8 @@
     "claude-opencode-hy3-free": ["opencode-zen/hy3-free"],
     "claude-opencode-nemotron-3-ultra-free": ["opencode-zen/nemotron-3-ultra-free"],
     "claude-opencode-nemotron-3.5-lightning-free": ["opencode-zen/nemotron-3.5-lightning-free"],
-    "claude-opencode-muse-spark-1.2-contributor-free": ["opencode-zen/muse-spark-1.2-contributor-free"]
+    "claude-opencode-muse-spark-1.2-contributor-free": ["opencode-zen/muse-spark-1.2-contributor-free"],
+    "claude-opencode-deepseek-v4.1-flash-free": ["opencode-zen/deepseek-v4.1-flash-free"]
   },
   "gatewayModelOptions": [
     {
@@ -465,6 +468,11 @@
       "value": "gateway-opencode-muse-spark-1.2-contributor-free",
       "label": "OpenCode Muse Spark Free",
       "description": "OpenCode Zen - Muse Spark 1.2 Contributor (free)"
+    },
+    {
+      "value": "gateway-opencode-deepseek-v4.1-flash-free",
+      "label": "OpenCode DeepSeek v4.1 Flash Free",
+      "description": "OpenCode Zen - DeepSeek v4.1 Flash (free)"
     },
     {
       "value": "gateway-opencode-glm-5.3",
@@ -754,6 +762,10 @@
     "gateway-opencode-muse-spark-1.2-contributor-free": [
       "opencode-zen/muse-spark-1.2-contributor-free",
       "claude-opencode-muse-spark-1.2-contributor-free"
+    ],
+    "gateway-opencode-deepseek-v4.1-flash-free": [
+      "opencode-zen/deepseek-v4.1-flash-free",
+      "claude-opencode-deepseek-v4.1-flash-free"
     ]
   }
 }

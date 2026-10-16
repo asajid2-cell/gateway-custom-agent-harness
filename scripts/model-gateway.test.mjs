@@ -43,6 +43,8 @@ import {
   relayOpenCodeChatResponse,
   relayOpenCodeAnthropicResponse,
   relayOpenCodeResponseByProtocol,
+  relayOpenCodeCollectedResponse,
+  foldAnthropicStream,
   openCodeGoEffortLevels,
 } from './opencode-go.mjs'
 import {
@@ -958,6 +960,7 @@ async function withGatewayAndFakeOpenCode({ handler, run, gatewayEnv = {} }) {
     OPENCODE_GO_RESPONSES_URL: `http://127.0.0.1:${fake.port}/responses`,
     OPENCODE_GO_CHAT_COMPLETIONS_URL: `http://127.0.0.1:${fake.port}/chat/completions`,
     OPENCODE_GO_MESSAGES_URL: `http://127.0.0.1:${fake.port}/messages`,
+    OPENCODE_ZEN_BASE_URL: `http://127.0.0.1:${fake.port}/zen/v1`,
     MODEL_GATEWAY_LOG_TIMING: '1',
     MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '1000',
     MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '1000',
@@ -5360,18 +5363,31 @@ test('OpenCode Go and Zen session headers preserve auth and reject CRLF', () => 
     openCodeGoHeaders('responses', 'synthetic-key', false, 'session-ok'),
     openCodeGoHeaders('chat-completions', 'synthetic-key', false, 'session-ok'),
     openCodeGoHeaders('anthropic-messages', 'synthetic-key', false, 'session-ok'),
-    openCodeZenHeaders('synthetic-key', false, 'session-ok'),
   ]) {
     assert.equal(headers['x-opencode-session'], 'session-ok')
     assert.equal(headers['user-agent'], 'gateway-model-gateway/0.1')
   }
   assert.equal(openCodeGoHeaders('responses', 'synthetic-key', false, 'bad\r\nX-Leak: yes')['x-opencode-session'], undefined)
-  assert.equal(openCodeZenHeaders('synthetic-key', false, 'bad\r\nX-Leak: yes')['x-opencode-session'], undefined)
   assert.equal(openCodeGoHeaders('responses', 'synthetic-key').authorization, 'Bearer synthetic-key')
   assert.equal(openCodeGoHeaders('chat-completions', 'synthetic-key').authorization, 'Bearer synthetic-key')
   assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['x-api-key'], 'synthetic-key')
   assert.equal(openCodeGoHeaders('anthropic-messages', 'synthetic-key')['anthropic-version'], '2023-06-01')
   assert.equal(JSON.stringify(openCodeGoHeaders('responses', 'synthetic-key')).includes('synthetic-key'), true)
+})
+
+test('the Zen session header always carries a Zen session id, never a foreign one', () => {
+  // Unlike Go, the Zen free tier refuses anything but a well-formed Zen session
+  // id, so the header is always one. A real Zen session is passed through, and
+  // any other value - a plain name, or a CRLF injection attempt - is replaced
+  // by a minted id rather than forwarded (which would 403) or dropped.
+  const real = 'ses_eba07c2f6ffehMsa2VeZgaZmlr'
+  assert.equal(openCodeZenHeaders('synthetic-key', false, real)['x-opencode-session'], real)
+  for (const seeded of ['session-ok', 'bad\r\nX-Leak: yes', '']) {
+    const value = openCodeZenHeaders('synthetic-key', false, seeded)['x-opencode-session']
+    assert.match(value, /^ses_[0-9a-f]{9}f[c-f][0-9a-f][0-9A-Za-z]{14}$/)
+    assert.equal(/[\r\n]/.test(value), false)
+  }
+  assert.equal(openCodeZenHeaders('synthetic-key').authorization, 'Bearer synthetic-key')
 })
 
 test('forwards OpenCode session identity by precedence and keeps it across retries', async () => {
@@ -5685,6 +5701,97 @@ test('translates OpenCode Chat Completions tool calls', async () => {
   assert.equal(events.find(event => event.type === 'content_block_start').content_block.type, 'tool_use')
   assert.equal(events.filter(event => event.type === 'content_block_delta').map(event => event.delta.partial_json).join(''), '{"path":"x"}')
   assert.equal(events.find(event => event.type === 'message_delta').delta.stop_reason, 'tool_use')
+})
+
+test('a collected stream folds back into one JSON message', async () => {
+  const response = new CaptureResponse()
+  await relayOpenCodeCollectedResponse(response, openCodeUpstream([
+    { choices: [{ delta: { content: 'OK' } }] },
+    { choices: [], usage: { prompt_tokens: 4, completion_tokens: 2 } },
+    '[DONE]',
+  ]), 'opencode-zen/deepseek-v4.1-flash-free', 'chat-completions')
+  assert.equal(response.headers.status, 200)
+  assert.equal(response.headers['content-type'], 'application/json')
+  assert.equal(response.text().includes('event:'), false)
+  const message = JSON.parse(response.text())
+  assert.equal(message.type, 'message')
+  assert.equal(message.role, 'assistant')
+  assert.equal(message.content[0].text, 'OK')
+  assert.equal(message.stop_reason, 'end_turn')
+  assert.equal(message.usage.input_tokens, 4)
+  assert.equal(message.usage.output_tokens, 2)
+})
+
+test('a collected stream folds thinking and tool calls, not just text', async () => {
+  const response = new CaptureResponse()
+  await relayOpenCodeCollectedResponse(response, openCodeUpstream([
+    { choices: [{ delta: { reasoning_content: 'hmm' } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', function: { name: 'read', arguments: '{"p":1}' } }] }, finish_reason: 'tool_calls' }] },
+    '[DONE]',
+  ]), 'opencode-zen/big-pickle', 'chat-completions')
+  const message = JSON.parse(response.text())
+  assert.deepEqual(message.content[0], { type: 'thinking', thinking: 'hmm' })
+  assert.equal(message.content[1].type, 'tool_use')
+  assert.equal(message.content[1].id, 'call-1')
+  assert.equal(message.content[1].name, 'read')
+  assert.deepEqual(message.content[1].input, { p: 1 })
+  assert.equal(message.stop_reason, 'tool_use')
+})
+
+test('a collected stream that carries nothing is an error, not an empty message', async () => {
+  const response = new CaptureResponse()
+  await relayOpenCodeCollectedResponse(response, openCodeUpstream(['[DONE]']), 'opencode-zen/big-pickle', 'chat-completions')
+  assert.equal(response.headers.status, 502)
+  assert.equal(JSON.parse(response.text()).type, 'error')
+})
+
+test('foldAnthropicStream surfaces an in-stream error event as a failure', () => {
+  const stream = 'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"boom"}}\n\n'
+  assert.throws(() => foldAnthropicStream(stream, 'opencode-zen/big-pickle'), /boom/)
+})
+
+test('a non-streaming OpenCode Zen caller still drives an SSE upstream request', async () => {
+  await withGatewayAndFakeOpenCode({
+    handler: async (req, res, state) => {
+      const body = await requestJson(req)
+      state.requests.push({
+        path: req.url,
+        stream: body.stream,
+        accept: req.headers.accept,
+        agent: req.headers['user-agent'],
+        session: req.headers['x-opencode-session'],
+      })
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end([
+        { choices: [{ delta: { content: 'OK' }, finish_reason: 'stop' }] },
+        { choices: [], usage: { prompt_tokens: 3, completion_tokens: 1 } },
+        '[DONE]',
+      ].map(event => typeof event === 'string' ? `data: ${event}\n\n` : `data: ${JSON.stringify(event)}\n\n`).join(''))
+    },
+    run: async ({ gateway, state }) => {
+      const result = await postGateway(gateway.port, {
+        model: 'opencode-zen/deepseek-v4.1-flash-free',
+        stream: false,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [{ name: 'Read', description: 'x', input_schema: { type: 'object' } }],
+      })
+
+      // The caller asked for one JSON body and gets one.
+      assert.equal(result.status, 200)
+      assert.equal(JSON.parse(result.body).content[0].text, 'OK')
+      assert.equal(result.body.includes('event:'), false)
+
+      // The free tier's fingerprint is satisfied even though the caller was
+      // not streaming: an SSE request, the harness agent, a conforming session,
+      // and a lowercase `read` tool alongside the caller's own `Read`.
+      const upstream = state.requests.at(0)
+      assert.equal(upstream.stream, true)
+      assert.equal(upstream.accept, 'text/event-stream')
+      assert.equal(upstream.agent, 'opencode/1.18.31')
+      assert.match(upstream.session, /^ses_[0-9a-f]{9}f[c-f][0-9a-f][0-9A-Za-z]{14}$/)
+    },
+  })
 })
 
 test('keeps one OpenCode Chat tool call when continuation omits index and id', async () => {

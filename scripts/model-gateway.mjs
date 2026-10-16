@@ -15,6 +15,7 @@ import {
   openCodeGoHeaders,
   redactSecret,
   relayOpenCodeStream,
+  relayOpenCodeCollectedResponse,
   relayOpenCodeResponseByProtocol,
 } from './opencode-go.mjs'
 import {
@@ -25,6 +26,7 @@ import {
   openCodeZenEndpoint,
   openCodeZenHeaders,
   isOpenCodeZenProtocol,
+  ensureOpenCodeZenReadTool,
 } from './opencode-zen.mjs'
 import { GATEWAY_RELOAD_EXIT_CODE, isGatewayKeyEnvVar } from './gateway-keysafe.mjs'
 import {
@@ -3845,6 +3847,13 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
     )
     const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
     request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    request = ensureOpenCodeZenReadTool(request, route.protocol, route.supportsTools !== false)
+    // `stream: true` is one of the four factors the free-tier fingerprint
+    // checks, and it is a property of the request we send upstream rather than
+    // of what the caller asked for: a caller that wanted a single JSON body
+    // still has an SSE request made on its behalf, and the collector relay
+    // folds the stream back into that single body.
+    request = { ...request, stream: true }
     logRequestShape({
       body: normalizedBody,
       providerRequest: request,
@@ -3869,7 +3878,10 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
         apiKey = credentials.key
         return {
           method: 'POST',
-          headers: openCodeZenHeaders(apiKey, wantsStream, sessionId),
+          // The upstream request is always an SSE one (see `request.stream`
+          // above), so the response type announced to the provider is always
+          // the event stream.
+          headers: openCodeZenHeaders(apiKey, true, sessionId),
           body: JSON.stringify(request),
           signal: control.signal,
         }
@@ -3896,7 +3908,7 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
     if (wantsStream) {
       await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
     } else {
-      await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+      await relayOpenCodeCollectedResponse(res, upstream, modelName, route.protocol, trace, relayOptions)
     }
     trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
   } catch (error) {
