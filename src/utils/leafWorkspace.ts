@@ -691,6 +691,36 @@ async function readLeafFamilyPointer(sessionId: string): Promise<LeafFamilyPoint
   } catch { return undefined }
 }
 
+/**
+ * Serialize the read-modify-write of a family's own pointer.
+ *
+ * `index/<root>.json` is two things at once: the creator's member pointer, and
+ * the family's authority for the succession record (`patriarchSessionId`,
+ * `formerPatriarchIds`, `heirSessionId`). Every write of it keeps the fields it
+ * does not own, which means every write is a read-modify-write - the move
+ * (`writePatriarchDesignation`), the republish (`indexLeafMembers`), and the
+ * driver, ledger and heir designations. Read apart and written apart, an older
+ * read can land after a later write and undo it: the republish that read the
+ * record before a move puts the family back on a member that has left - the
+ * closed matriarch reads as the patriarch and `formerPatriarchIds` comes back
+ * empty - which is a lost update and not a convergence.
+ *
+ * Every writer of a family's own pointer is the session hosting that family
+ * (a leaf only ever rewrites its own copy, never the root's), so the interleave
+ * is within one process and a queue per family is enough to close it: the read
+ * and the write of each operation run as one section, one at a time. What a
+ * write keeps, it re-reads inside its section rather than carrying a snapshot
+ * taken before it, so a write that lands while it is queued is kept by the one
+ * queued behind it, and one that lands after simply supersedes the earlier write.
+ */
+const pointerSections = new Map<string, Promise<unknown>>()
+function inPointerSection<T>(key: string, body: () => Promise<T>): Promise<T> {
+  const previous = pointerSections.get(key) ?? Promise.resolve()
+  const next = previous.catch(() => {}).then(body)
+  pointerSections.set(key, next.catch(() => {}))
+  return next
+}
+
 async function writeLeafFamilyPointer(sessionId: string, pointer: LeafFamilyPointer): Promise<void> {
   await writeIndexFile(familyPointerPath(sessionId), pointer)
 }
@@ -1069,30 +1099,37 @@ async function familyPatriarchMember(members: readonly LeafMember[], familyId: s
  * family has before anyone could designate one.
  */
 export async function writePatriarchDesignation(familyId: string, patriarchSessionId: string, displacedSessionId?: string): Promise<void> {
-  const current = await readLeafFamilyPointer(familyId)
-  const previous = displacedSessionId ?? current?.patriarchSessionId ?? familyId
-  const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
-  // The heir designation describes a raise that is in progress UNDER THE CURRENT
-  // patriarch: the member was being trained by whoever holds the role. When the
-  // role moves - to the heir itself, to a third member, or nowhere but away - the
-  // raise is over, because the member that was training it has left the chair. So
-  // the designation is cleared in the same write that moves the role, which is
-  // the same rule as the elder: it belongs to the patriarch moving, and ascension
-  // is one instance of it rather than a special case. A write that does not move
-  // the role leaves the raise in place.
-  const heirSessionId = previous === patriarchSessionId ? current?.heirSessionId : undefined
-  // The elder fact is recorded in THIS write rather than in the mark that
-  // follows it. The mark is a second write, and an interruption between the two
-  // loses the fact for good: nothing on disk would name the member that held the
-  // role, and no read can invent a fact that was never written. The pointer is
-  // the write that cannot be skipped, because it is the one that moves the role,
-  // so the outgoing holder is named here. Whoever the role moved away from has
-  // held it, which is the whole of the elder concept - the mark still runs, and
-  // is what a reader that only knows the row field goes on reading.
-  const formerPatriarchIds = previous === patriarchSessionId
-    ? current?.formerPatriarchIds ?? []
-    : [...new Set([...(current?.formerPatriarchIds ?? []), previous])]
-  await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId, heirSessionId, formerPatriarchIds })
+  // The read and the write are one section: a republish of this same pointer
+  // (`indexLeafMembers`) reads the record as well, and read apart from the write
+  // its older read can land after this move and undo it. The section keeps this
+  // operation's read and write together and orders it against that one.
+  const previous = await inPointerSection(familyPointerPath(familyId), async () => {
+    const current = await readLeafFamilyPointer(familyId)
+    const previous = displacedSessionId ?? current?.patriarchSessionId ?? familyId
+    const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
+    // The heir designation describes a raise that is in progress UNDER THE CURRENT
+    // patriarch: the member was being trained by whoever holds the role. When the
+    // role moves - to the heir itself, to a third member, or nowhere but away - the
+    // raise is over, because the member that was training it has left the chair. So
+    // the designation is cleared in the same write that moves the role, which is
+    // the same rule as the elder: it belongs to the patriarch moving, and ascension
+    // is one instance of it rather than a special case. A write that does not move
+    // the role leaves the raise in place.
+    const heirSessionId = previous === patriarchSessionId ? current?.heirSessionId : undefined
+    // The elder fact is recorded in THIS write rather than in the mark that
+    // follows it. The mark is a second write, and an interruption between the two
+    // loses the fact for good: nothing on disk would name the member that held the
+    // role, and no read can invent a fact that was never written. The pointer is
+    // the write that cannot be skipped, because it is the one that moves the role,
+    // so the outgoing holder is named here. Whoever the role moved away from has
+    // held it, which is the whole of the elder concept - the mark still runs, and
+    // is what a reader that only knows the row field goes on reading.
+    const formerPatriarchIds = previous === patriarchSessionId
+      ? current?.formerPatriarchIds ?? []
+      : [...new Set([...(current?.formerPatriarchIds ?? []), previous])]
+    await writeLeafFamilyPointer(familyId, { ...base, patriarchSessionId, heirSessionId, formerPatriarchIds })
+    return previous
+  })
   if (previous !== patriarchSessionId) await markLeafElder(familyPath(familyId), familyId, previous)
 }
 
@@ -1110,10 +1147,14 @@ export async function writePatriarchDesignation(familyId: string, patriarchSessi
  * written as the driver it is rather than dropped.
  */
 export async function writeLeafDriverDesignation(familyId: string, scope: Readonly<Record<string, readonly string[]>>): Promise<void> {
-  const current = await readLeafFamilyPointer(familyId)
-  const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
   const written = Object.fromEntries(Object.entries(scope).map(([driver, leaves]) => [driver, [...new Set(leaves)]]))
-  await writeLeafFamilyPointer(familyId, { ...base, driverScope: written })
+  // In the section with the record it carries: this write keeps the pointer's
+  // other fields, so its read has to be as close to its write as the move's is.
+  await inPointerSection(familyPointerPath(familyId), async () => {
+    const current = await readLeafFamilyPointer(familyId)
+    const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
+    await writeLeafFamilyPointer(familyId, { ...base, driverScope: written })
+  })
   driverScope = written
 }
 
@@ -1129,10 +1170,15 @@ export async function writeLeafDriverDesignation(familyId: string, scope: Readon
  * head's revocation is a record, not an absence.
  */
 export async function writeLeafLedgerWriters(familyId: string, ids: readonly string[]): Promise<void> {
-  const current = await readLeafFamilyPointer(familyId)
-  const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
   const written = [...new Set(ids)]
-  await writeLeafFamilyPointer(familyId, { ...base, ledgerWriterIds: written })
+  // In the section with the record it carries, for the same reason the driver
+  // scope is: it keeps the pointer's other fields, so its read belongs with its
+  // write rather than before it.
+  await inPointerSection(familyPointerPath(familyId), async () => {
+    const current = await readLeafFamilyPointer(familyId)
+    const base = current?.rootSessionId === familyId ? current : rootPointerInfo(familyId)
+    await writeLeafFamilyPointer(familyId, { ...base, ledgerWriterIds: written })
+  })
   ledgerWriterIds = written
 }
 
@@ -1224,8 +1270,12 @@ function rootPointerInfo(root: string): LeafFamilyPointer {
  * process that created it. Failures are swallowed: a pointer that cannot be
  * written costs a member its standalone discovery, never the family it is
  * already in.
+ *
+ * Exported for the succession test, which has to drive this republish against a
+ * move of the designation to hold the two writes apart (see
+ * `scripts/leaf-pointer-succession.test.ts`).
  */
-function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: Partial<LeafFamilyPointer>): Promise<void> {
+export function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: Partial<LeafFamilyPointer>): Promise<void> {
   return (async () => {
     // The designation is read before it is written: the family-id pointer is
     // the authority, and re-indexing must republish it rather than drop it.
@@ -1244,10 +1294,31 @@ function indexLeafMembers(root: string, members: readonly LeafMember[], extra?: 
     // succession record that the designation exists to keep. Only the copies get
     // the acting answer, which is the whole reason they exist: a member resumed on
     // its own must not be told to resolve to a session that cannot act.
-    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? [], driverScope: (await readLeafFamilyPointer(root))?.driverScope ?? {}, ledgerWriterIds: (await readLeafFamilyPointer(root))?.ledgerWriterIds ?? [], ...extra }
+    const snapshot = await readLeafFamilyPointer(root)
+    const base = { ...rootPointerInfo(root), heirSessionId: await familyHeirSessionId(root), formerPatriarchIds: snapshot?.formerPatriarchIds ?? [], driverScope: snapshot?.driverScope ?? {}, ledgerWriterIds: snapshot?.ledgerWriterIds ?? [], ...extra }
     const acting = await familyPatriarchSessionId(root)
-    const designated = await designatedPatriarchSessionId(root)
-    await Promise.all(members.map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: member.sessionId === root ? designated : acting }).catch(() => {})))
+    await Promise.all(members
+      .filter(member => member.sessionId !== root)
+      .map(member => writeLeafFamilyPointer(member.sessionId, { ...base, patriarchSessionId: acting }).catch(() => {})))
+    // The root's entry is written inside the same section a move writes it in,
+    // and every field this republish does not own is re-read there rather than
+    // carried over from the snapshot above. A write that landed while this
+    // republish was queued must be kept, not overwritten with the pre-move read;
+    // a write that lands after this section simply supersedes this one. The
+    // fields it does own - the root's own name, transcript path and directory -
+    // are what this republish is for, and those come from the snapshot.
+    if (!members.some(member => member.sessionId === root)) return
+    await inPointerSection(familyPointerPath(root), async () => {
+      const current = await readLeafFamilyPointer(root)
+      await writeLeafFamilyPointer(root, {
+        ...base,
+        patriarchSessionId: current?.patriarchSessionId ?? base.patriarchSessionId ?? root,
+        heirSessionId: current?.heirSessionId ?? base.heirSessionId,
+        formerPatriarchIds: current?.formerPatriarchIds ?? base.formerPatriarchIds ?? [],
+        driverScope: current?.driverScope ?? base.driverScope ?? {},
+        ledgerWriterIds: current?.ledgerWriterIds ?? base.ledgerWriterIds ?? [],
+      }).catch(() => {})
+    })
   })()
 }
 
@@ -3330,14 +3401,19 @@ export async function conferHeir(sessionId: string): Promise<string> {
   if (!target) throw new Error('Unknown leaf')
   const patriarch = await familyPatriarchMember(members, root)
   if (patriarch?.sessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family head`)
-  const current = await readLeafFamilyPointer(root)
-  if (current?.heirSessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family heir`)
   const view = views.get(target.sessionId)
   if (view && !['idle', 'closed', 'failed'].includes(view.process.getState())) throw new Error('Wait for the leaf turn before naming it the heir')
   // The title is not rewritten: raising an heir is not renaming the family. Only
-  // the designation moves, in the same pointer the patriarch's lives in.
-  const base = current?.rootSessionId === root ? current : rootPointerInfo(root)
-  await writeLeafFamilyPointer(root, { ...base, heirSessionId: target.sessionId })
+  // the designation moves, in the same pointer the patriarch's lives in - and the
+  // read that decides whether it is already the heir belongs in the section with
+  // the write, because the pointer it keeps the other fields of is the same one a
+  // move of the patriarch rewrites.
+  await inPointerSection(familyPointerPath(root), async () => {
+    const current = await readLeafFamilyPointer(root)
+    if (current?.heirSessionId === target.sessionId) throw new Error(`${memberLabel(target)} is already the family heir`)
+    const base = current?.rootSessionId === root ? current : rootPointerInfo(root)
+    await writeLeafFamilyPointer(root, { ...base, heirSessionId: target.sessionId })
+  })
   // Every pointer is rewritten with the heir the family has now, so a leaf
   // resumed on its own later reads the family it actually belongs to.
   await indexLeafMembers(root, members)
