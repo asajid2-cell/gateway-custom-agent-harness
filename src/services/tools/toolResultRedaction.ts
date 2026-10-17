@@ -22,6 +22,10 @@
  * Redaction is conservative: unquoted name/value pairs require a whitespace-free
  * value, and values that are obviously references (`${VAR}`, `<...>`, `$(...)`)
  * are left alone, so ordinary prose is not mangled.
+ *
+ * Residual scope of pass 1: it covers every secret this process holds in its
+ * environment. A secret that is only pasted or read from a file — never in the
+ * CLI's env — is left to passes 2 and 3, which match on name and shape.
  */
 
 import { redactSecrets } from '../teamMemorySync/secretScanner.js'
@@ -29,9 +33,38 @@ import { redactSecrets } from '../teamMemorySync/secretScanner.js'
 const MARKER_OPEN = '[REDACTED:'
 const MARKER_CLOSE = ']'
 
-/** Env-var names whose value is treated as a known secret. */
-const SECRET_NAME_RE =
-  /KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD|SEED|PREIMAGE|PRIVATE|CREDENTIAL|AUTH/i
+/**
+ * Names whose value is unambiguously a secret. Matched as a substring so
+ * camelCase and unsplit forms (`mySecretToken`) are still caught.
+ */
+const STRONG_NAME_RE =
+  /KEY|SECRET|TOKEN|PASSWORD|PASSWD|SEED|PREIMAGE|PRIVATE|CREDENTIAL/i
+
+/**
+ * Ambiguous words: `PWD` is a directory and `AUTH` shows up in benign names
+ * (`AUTHORS`, the ssh-agent's socket). These match only as their own
+ * separator-delimited segment — so `DB_PWD` counts but `OLDPWD` does not.
+ */
+const SEGMENT_WORDS = new Set(['PWD', 'AUTH', 'AUTHORIZATION'])
+
+/**
+ * Exact names that are benign even though they carry a segment word: the
+ * working directory and the ssh-agent socket path are ordinary output, not
+ * secrets, and treating them as known values mangles every tool result.
+ */
+const BENIGN_NAMES = new Set(['PWD', 'OLDPWD', 'SSH_AUTH_SOCK'])
+
+/**
+ * Whether an env-var name (or a `KEY=value` key in tool output) names a
+ * secret. Shared by the known-value pass and the name-based pass so the two
+ * agree on what a secret name looks like.
+ */
+export function isSecretName(name: string): boolean {
+  if (BENIGN_NAMES.has(name.toUpperCase())) return false
+  if (STRONG_NAME_RE.test(name)) return true
+  const segments = name.toUpperCase().split(/[_.\-]+/)
+  return segments.some(segment => SEGMENT_WORDS.has(segment.replace(/\d+$/, '')))
+}
 
 /** Values shorter than this are too likely to be innocent to replace. */
 const MIN_KNOWN_VALUE_LEN = 8
@@ -75,7 +108,7 @@ function getKnownSecrets(): KnownSecret[] {
   const found: KnownSecret[] = []
   for (const [name, raw] of Object.entries(process.env)) {
     if (typeof raw !== 'string') continue
-    if (!SECRET_NAME_RE.test(name)) continue
+    if (!isSecretName(name)) continue
     const value = raw.trim()
     if (value.length < MIN_KNOWN_VALUE_LEN) continue
     if (REFERENCE_VALUE_RE.test(value)) continue
@@ -123,11 +156,10 @@ function redactKnownValues(content: string): string {
 
 // ─── Pass 2: name-based ─────────────────────────────────────────
 
-const STRONG_WORD =
-  'KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD|SEED|PREIMAGE|PRIVATE|CREDENTIAL'
-// A name is one delimited token. Strong words match anywhere in the token;
-// bare AUTH/AUTHORIZATION must stand as their own segment so "AUTHORS" is safe.
-const NAME = `(?:[A-Za-z0-9_.-]*(?:${STRONG_WORD})[A-Za-z0-9_.-]*|(?<![A-Za-z0-9_.-])(?:AUTHORIZATION|AUTH)(?![A-Za-z0-9_.-]))`
+// Any key-shaped token is considered; `isSecretName` decides which ones are
+// secrets, so the two passes share one notion of a secret name (and the benign
+// names PWD/OLDPWD/SSH_AUTH_SOCK stay out of both).
+const NAME = '[A-Za-z0-9_.-]+'
 const SEP = '\\s*(?:=>|:|=)\\s*'
 const VALUE = `(?:"([^"\\r\\n]{6,})"|'([^'\\r\\n]{6,})'|\`([^\`\\r\\n]{6,})\`|([^\\s"'\\r\\n,;{}]{6,}))`
 const NAME_VALUE_RE = new RegExp(
@@ -139,7 +171,7 @@ const AUTHORIZATION_RE = new RegExp(
   'gi',
 )
 const PLIST_SECRET_RE = new RegExp(
-  `<key>([^<]*(?:${STRONG_WORD})[^<]*)<\\/key>\\s*<string>([\\s\\S]*?)<\\/string>`,
+  '<key>([^<]+)<\\/key>\\s*<string>([\\s\\S]*?)<\\/string>',
   'gi',
 )
 
@@ -160,12 +192,12 @@ function redactNameValuePairs(content: string): string {
   content = content.replace(
     PLIST_SECRET_RE,
     (match, key: string, value: string) =>
-      isReferenceValue(value.trim())
-        ? match
-        : match.replace(
+      isSecretName(key.trim()) && !isReferenceValue(value.trim())
+        ? match.replace(
             `<string>${value}</string>`,
             `<string>${marker(key.trim())}</string>`,
-          ),
+          )
+        : match,
   )
   content = content.replace(
     NAME_VALUE_RE,
@@ -181,7 +213,12 @@ function redactNameValuePairs(content: string): string {
     ) => {
       const quoted = dq ?? sq ?? bq
       const value = quoted ?? uq
-      if (value === undefined || value === '' || isReferenceValue(value)) {
+      if (
+        value === undefined ||
+        value === '' ||
+        !isSecretName(name) ||
+        isReferenceValue(value)
+      ) {
         return match
       }
       const replacement = marker(name.toUpperCase())

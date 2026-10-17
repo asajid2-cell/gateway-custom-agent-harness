@@ -4,6 +4,7 @@ import {
   redactToolResultValue,
   redactToolResultBlock,
   resetKnownSecretsForTests,
+  isSecretName,
 } from '../src/services/tools/toolResultRedaction.js'
 
 /**
@@ -91,6 +92,35 @@ test('ordinary prose is not mangled', () => {
   const prose =
     'The API key is documented in the README; see the token section for how to rotate it.'
   expect(redactToolResultText(prose)).toBe(prose)
+})
+
+test('benign names are not secret names; ambiguous words need a segment', () => {
+  // Benign: a directory and the ssh-agent socket are ordinary output.
+  expect(isSecretName('PWD')).toBe(false)
+  expect(isSecretName('OLDPWD')).toBe(false)
+  expect(isSecretName('SSH_AUTH_SOCK')).toBe(false)
+  expect(isSecretName('AUTHORS')).toBe(false)
+  // Real: the ambiguous word as its own segment, and unambiguous words anywhere.
+  expect(isSecretName('DB_PWD')).toBe(true)
+  expect(isSecretName('ANTHROPIC_AUTH_TOKEN')).toBe(true)
+  expect(isSecretName('LEAK_TOKEN')).toBe(true)
+  expect(isSecretName('CLAUDE_CODE_GATEWAY_TOKEN')).toBe(true)
+  expect(isSecretName('DEEPSEEK_API_KEY2')).toBe(true)
+  // Unrelated environment names must not look like secrets.
+  expect(isSecretName('SYSTEMROOT')).toBe(false)
+  expect(isSecretName('PATH')).toBe(false)
+  expect(isSecretName('MODEL_GATEWAY_EFFORT_CAPABILITIES')).toBe(false)
+})
+
+test('a working directory in tool output is not redacted', () => {
+  const cwd = 'PWD=/home/ahmed/projects/gateway/src'
+  const sock = 'SSH_AUTH_SOCK=/tmp/ssh-agent/agent-1234.sock'
+  expect(redactToolResultText(cwd)).toBe(cwd)
+  expect(redactToolResultText(sock)).toBe(sock)
+  // ...but a password-shaped key still is.
+  expect(redactToolResultText('DB_PWD=hunter2hunter2')).toBe(
+    'DB_PWD=[REDACTED:DB_PWD]',
+  )
 })
 
 test('redaction is idempotent', () => {
