@@ -1616,6 +1616,15 @@ def probe_close_matriarch():
             except (OSError, ValueError): stale.append(session_id + '=missing'); continue
             if pointer.get('patriarchSessionId') != alpha['sessionId']:
                 stale.append(session_id + '=' + str(pointer.get('patriarchSessionId')))
+            # The creator's own pointer IS the succession record, and the move is
+            # only half of it: the member the role left has to be named there, or
+            # a run that converged on the new patriarch has still lost the fact
+            # that the closed matriarch held it. Those two fields are the pair a
+            # republish racing the move got wrong - the closed matriarch back at
+            # the head AND this list emptied - so both are waited for, and both
+            # are reported.
+            if session_id == t.id and t.id not in (pointer.get('formerPatriarchIds') or []):
+                stale.append(session_id + '=formerPatriarchIds ' + repr(pointer.get('formerPatriarchIds')))
         designated.stale = stale
         return not stale
     try:
@@ -1638,7 +1647,11 @@ def probe_close_matriarch():
     # its leaves and its files.
     t.submit('/leaf close ' + alpha['sessionId'])
     t.wait(lambda: not t.proc.isalive(), 'a session that closes itself leaves', 60)
-    print(json.dumps(dict(leafClosesMatriarch=True, selfCloseLeaves=True, matriarchSurvivesClose=True, closePromotes=True, sessionOwnerTransferred=True)), flush=True)
+    # The successors are printed raw as well as asserted: they are the two fields
+    # a republish racing the move was seen to get wrong, so the evidence a run
+    # leaves behind names them rather than only the booleans they are folded into.
+    successor = json.loads((root / 'leaf-families' / 'index' / (t.id + '.json')).read_text(encoding='utf-8'))
+    print(json.dumps(dict(leafClosesMatriarch=True, selfCloseLeaves=True, matriarchSurvivesClose=True, closePromotes=True, sessionOwnerTransferred=True, successionRecorded=True, rootPointerPatriarchSessionId=successor.get('patriarchSessionId'), rootPointerFormerPatriarchIds=successor.get('formerPatriarchIds'))), flush=True)
 
 def leaf_process(session_id):
     """The process running a member's own conversation, found by the id it runs under.
