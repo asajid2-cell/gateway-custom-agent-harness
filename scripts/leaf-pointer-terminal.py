@@ -64,6 +64,7 @@ parser.add_argument('--probe-dormant-residue', action='store_true')
 parser.add_argument('--probe-close-promotion', action='store_true')
 parser.add_argument('--probe-goal-reopen', action='store_true')
 parser.add_argument('--probe-model-picker', action='store_true')
+parser.add_argument('--probe-redact', action='store_true')
 parser.add_argument('--probe-boot', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -147,7 +148,7 @@ class Handler(BaseHTTPRequestHandler):
         view = view_tag(messages[-1].get('content', '') if messages else '')
         answered = tool_result_text(messages[-1].get('content', '') if messages else '')
         tool_results.append(answered)
-        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK', 'OWNERSHIP_MARKER_ALPHA', 'SCROLL_TOP_SENTINEL') if value in latest), 'BACKGROUND')
+        marker = next((value for value in ('FRESH_ONLY_TASK', 'FORK_ONLY_TASK', 'ROOT_CONTEXT_CAFE_', 'LEAF_BLOCKED_TASK', 'ROOT_BLOCKED_TASK', 'PERMISSION_TASK', 'PLAN_TASK', 'MONITOR_TASK', 'QUEUE_', 'ALPHA_FIRST_TURN', 'ALPHA_LATER_TURN', 'ELDER_SECRET_', 'PATRIARCH_SECRET_', 'GAMMA_TURN', 'GAMMA_LATER_TURN', 'DELTA_TURN', 'OTHER_TURN_MARKER', 'BLOT_STEP_', 'BLOT_REPORT_', 'SEEDLING_FINDING_', 'SEED_ACK_', 'BULK_TURN_', 'SOLO_REPORT_', 'ROSTER_TASK', 'OWNERSHIP_MARKER_ALPHA', 'SCROLL_TOP_SENTINEL', 'REDACT_TASK') if value in latest), 'BACKGROUND')
         if marker != 'BACKGROUND': requests.append(body)
         if os.environ.get('LEAF_POINTER_LOG'):
             # What the app actually asked for. A probe that fails on a reply it
@@ -204,6 +205,20 @@ class Handler(BaseHTTPRequestHandler):
             if tool_name:
                 frames[1] = dict(type='content_block_start', index=0, content_block=dict(type='tool_use', id='tool_monitor_fixture', name=tool_name, input={}))
                 frames[2] = dict(type='content_block_delta', index=0, delta=dict(type='input_json_delta', partial_json=json.dumps(dict(command='sleep 90', description='Local fixture background task', run_in_background=True))))
+                frames[4]['delta']['stop_reason'] = 'tool_use'
+        if marker == 'REDACT_TASK':
+            # A real leak, produced the way a real one happens: the process
+            # holds a secret in its environment (a known value the redaction
+            # pass sources exactly like the live gateway token) and a tool
+            # result carries it. The Read tool's output is the file, so the
+            # result text is the secret - no child-env inheritance to depend on.
+            # Guarded to a real turn the same way ROSTER_TASK is, since an
+            # auxiliary request replays the last message with a reduced tool set.
+            tools = {tool['name'] for tool in body.get('tools', [])}
+            tool_name = next((name for name in ('Read', 'read') if name in tools), None)
+            if tool_name and ('Write' in tools or 'write' in tools):
+                frames[1] = dict(type='content_block_start', index=0, content_block=dict(type='tool_use', id='tool_redact_fixture', name=tool_name, input={}))
+                frames[2] = dict(type='content_block_delta', index=0, delta=dict(type='input_json_delta', partial_json=json.dumps(dict(file_path=str(root / 'leak.txt')))))
                 frames[4]['delta']['stop_reason'] = 'tool_use'
         if marker == 'ROSTER_TASK':
             tools = {tool['name'] for tool in body.get('tools', [])}
@@ -3943,6 +3958,80 @@ def probe_model_picker():
     t.exit()
     print(json.dumps(results, indent=1, sort_keys=True), flush=True)
 
+def probe_redact():
+    """Secrets in a tool result never reach the transcript.
+
+    The leak is produced the way a real one is: the process holds a secret in
+    its environment - a known value, sourced exactly as the live gateway token
+    is - and a tool result carries it. The Read tool returns the file's bytes,
+    so the result text IS the secret.
+
+    The answer is read from the transcript on disk, named as the file, not from
+    a return value: the raw value must be GONE from every transcript and the
+    `[REDACTED:<NAME>]` marker must be there instead. A shape-only token is put
+    in the same file, so one read covers the known-value pass and the shape
+    pass. Against a pre-change bundle the same probe finds the raw value and no
+    marker - that is the red control, and it is why the assertion names the file
+    rather than trusting the run.
+    """
+    leak_value = 'sk-leak-REAL-9f8e7d6c5b4a3210'
+    leak_pat = 'ghp_' + 'A' * 36
+    results = {'leakValue': leak_value, 'leakPat': leak_pat}
+
+    def flush_results():
+        print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
+    (root / 'leak.txt').write_text(
+        leak_value + '\npat=' + leak_pat + '\n', encoding='utf-8')
+
+    t = Terminal(env_extra={'LEAK_TOKEN': leak_value})
+    t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
+    t.proc.write('\x15'); t.pause(.4)
+    t.submit('REDACT_TASK')
+
+    def transcripts():
+        return {p: p.read_text(encoding='utf-8', errors='replace')
+                for p in root.rglob('*.jsonl')}
+
+    # The tool ran when its input path (leak.txt) is on the transcript; that
+    # signal is present whether or not the result was redacted, so the probe
+    # does not wait for the very thing it is testing.
+    def read_landed():
+        return any('leak.txt' in text for text in transcripts().values())
+
+    landed = True
+    try:
+        t.wait(read_landed, 'the Read tool result landed in a transcript', 120)
+    except AssertionError:
+        landed = False
+
+    t.pause(1.0)
+    blobs = transcripts()
+    results['transcripts'] = sorted(str(p) for p in blobs)
+    raw_hits = sorted(str(p) for p, text in blobs.items() if leak_value in text)
+    pat_hits = sorted(str(p) for p, text in blobs.items() if leak_pat in text)
+    marker_hits = sorted(str(p) for p, text in blobs.items()
+                        if '[REDACTED:LEAK_TOKEN]' in text)
+    results['readLanded'] = landed
+    results['filesWithRawSecret'] = raw_hits
+    results['filesWithRawPat'] = pat_hits
+    results['filesWithMarker'] = marker_hits
+    results['secretRedacted'] = landed and not raw_hits and not pat_hits
+    flush_results()
+
+    t.check(lambda: landed,
+            'the Read tool result never reached a transcript, so nothing was exercised')
+    t.check(lambda: not raw_hits,
+            'the raw secret survived into the transcript: ' + json.dumps(raw_hits))
+    t.check(lambda: not pat_hits,
+            'the raw token shape survived into the transcript: ' + json.dumps(pat_hits))
+    t.check(lambda: marker_hits,
+            'no [REDACTED:LEAK_TOKEN] marker in any transcript')
+
+    t.close_leaves(90)
+    t.exit(family_survives=True)
+
+
 def probe_boot():
     """Does this build paint a first frame at all?
 
@@ -3995,6 +4084,7 @@ try:
         (args.probe_close_promotion, probe_close_promotion),
         (args.probe_goal_reopen, probe_goal_reopen),
         (args.probe_model_picker, probe_model_picker),
+        (args.probe_redact, probe_redact),
         (args.probe_boot, probe_boot),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
