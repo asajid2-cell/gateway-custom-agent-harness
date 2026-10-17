@@ -63,6 +63,7 @@ parser.add_argument('--probe-designation-residue', action='store_true')
 parser.add_argument('--probe-dormant-residue', action='store_true')
 parser.add_argument('--probe-close-promotion', action='store_true')
 parser.add_argument('--probe-goal-reopen', action='store_true')
+parser.add_argument('--probe-model-picker', action='store_true')
 parser.add_argument('--probe-boot', action='store_true')
 parser.add_argument('--columns', type=int, default=120)
 parser.add_argument('--rows', type=int, default=40)
@@ -414,7 +415,21 @@ class Terminal:
             self.dump()
             raise AssertionError(label + ' (screen saved locally)')
     def submit(self, text):
+        """Send `text` as one message, from an empty composer.
+
+        A message is only read as a command - `/leaf reopen <id>`, say - when
+        it is the first thing in the composer. A keystroke that arrives while
+        the pane is repainting can have its Enter dropped by the app and be
+        left behind as a fragment, and the next message is then pasted onto
+        that fragment: the app receives `VIEW_TAG_xxx/leaf reopen <id>`, reads
+        it as prose and answers it, so the command never runs and the probe
+        waits on a member that never came back. Clearing the line first makes
+        the message the message; every caller here sends a whole one, and the
+        probes that mean to leave a draft type it with `proc.write`, never
+        through this.
+        """
         self.capture_owned()
+        self.proc.write('\x15'); self.pause(.4)
         self.proc.write('\x1b[200~' + text + '\x1b[201~'); self.pause(.5); self.proc.write('\r')
     def typed_in(self, tag, wait=10):
         """Type a unique marker once and see which session took it.
@@ -1523,7 +1538,11 @@ def probe_parentage():
     assert 'Make head #' not in t.text(), 'a displaced window still offers to confer the patriarch'
     # What a displaced window keeps is the address of every member: it is not the
     # manager any more, but every member is still an entry point.
-    assert 'cc --resume ' + alpha['sessionId'] in t.text(), 'the displaced roster does not name how to enter a member'
+    # The command is drawn in a description column, so a long resume directory
+    # wraps the session id onto the next screen row. The fact being read is that
+    # the roster names how to enter a member, not where the line happens to
+    # break, so the rows are compared as one run of text.
+    assert 'cc --resume ' + alpha['sessionId'] in re.sub(r'\s+', ' ', t.text()), 'the displaced roster does not name how to enter a member'
     t.pick('Back')
     t.proc.write('\x1b'); t.pause(.5)
     # And it keeps the terminals it already attached, which is the other half of
@@ -1590,13 +1609,23 @@ def probe_close_matriarch():
     # they agree, which is what is waited for - the creator's pointer alone
     # would pass a moment before the members' do.
     def designated():
+        stale = []
         for session_id in [t.id, *(member['sessionId'] for member in t.family()['members'])]:
             path = root / 'leaf-families' / 'index' / (session_id + '.json')
             try: pointer = json.loads(path.read_text(encoding='utf-8'))
-            except (OSError, ValueError): return False
-            if pointer.get('patriarchSessionId') != alpha['sessionId']: return False
-        return True
-    t.wait(designated, 'the designation moved to the closing leaf, in every member pointer', 30)
+            except (OSError, ValueError): stale.append(session_id + '=missing'); continue
+            if pointer.get('patriarchSessionId') != alpha['sessionId']:
+                stale.append(session_id + '=' + str(pointer.get('patriarchSessionId')))
+        designated.stale = stale
+        return not stale
+    try:
+        t.wait(designated, 'the designation moved to the closing leaf, in every member pointer', 30)
+    except AssertionError:
+        # Which pointer lagged is the whole diagnosis of a red run, and the wait
+        # that gives up does not say - it prints the label and stops. This names
+        # the member whose pointer still holds the old designation, so a failure
+        # here is read rather than re-run until it goes green.
+        raise AssertionError('the designation moved to the closing leaf, in every member pointer; stale: ' + repr(designated.stale))
     # And the move is said out loud where the close was asked for, so the person
     # watching the leaf is told the family they are still in has a new patriarch.
     t.assert_view(alpha['sessionId'], 'promoted conversation owns the terminal', 75)
@@ -3850,6 +3879,57 @@ def probe_merge_roles():
     t.exit()
     print(json.dumps(results, indent=1, sort_keys=True), flush=True)
 
+def probe_model_picker():
+    """The model picker's hotkey must open the picker on whichever member is
+    on screen.
+
+    `/model` reaches the picker through the command path, which is why the
+    picker has always looked fine on a leaf; the Alt+P hotkey is resolved
+    against the Chat context's keybindings instead, and can be dead for a
+    member the command path never touches. This asks both members the same
+    question with the same keystroke and reports what each screen did with it.
+    """
+    t = Terminal()
+    t.wait(lambda: 'All 1' in t.text(), 'initial normal session', 60)
+    results = {}
+
+    def alt_p(label):
+        t.pump()
+        t.proc.write('\x1bp'); t.pause(1.5)
+        screen = t.text()
+        opened = 'Select model' in screen or 'Choose model' in screen
+        results[label] = dict(opened=opened, snippet=' '.join(screen.split())[-240:])
+        return opened
+
+    alt_p('rootAltP')
+    t.proc.write('\x1b'); t.pause(.8)
+    t.submit('/leaf new ModelLeaf')
+    t.wait(lambda: len(t.leaves()) == 1 and 'All 2' in t.text(), 'leaf created', 75)
+    leaf_id = t.leaves()[0]['sessionId']
+    t.assert_view(leaf_id, 'the new leaf', 75)
+    t.pause(.5)
+    opened = alt_p('leafAltP')
+    # Confirm the focused option, which is the whole point of the picker: the
+    # leaf must be able to land a choice on itself, not just paint the list.
+    if opened:
+        t.proc.write('\r'); t.pause(1.2)
+        after = t.text()
+        results['leafApplies'] = dict(
+            pickerClosed=('Select model' not in after and 'Choose model' not in after),
+            modelSetNotice='Model set to' in after,
+            snippet=' '.join(after.split())[-240:],
+        )
+        t.proc.write('\x1b'); t.pause(.5)
+    t.original()
+    # The parent's own hotkey, with a family already on the bar - the state the
+    # session is in for the rest of its life once it has leaves.
+    t.pause(.5)
+    alt_p('rootAltPWithFamily')
+    t.proc.write('\x1b'); t.pause(.5)
+    t.close_leaves(90)
+    t.exit()
+    print(json.dumps(results, indent=1, sort_keys=True), flush=True)
+
 def probe_boot():
     """Does this build paint a first frame at all?
 
@@ -3868,6 +3948,16 @@ def probe_boot():
 
 try:
     (root / '.claude.json').write_text(json.dumps(dict(theme='dark', hasCompletedOnboarding=True, projects={root.as_posix(): dict(hasTrustDialogAccepted=True, hasCompletedProjectOnboarding=True)})), encoding='utf-8')
+    # Every leaf is spawned with `--allow-dangerously-skip-permissions`, and that
+    # flag raises the bypass-permissions dialog inside the LEAF's own startup. A
+    # leaf has no keyboard until the parent focuses it, so the dialog never
+    # answers: the REPL never mounts, the member never registers its controls,
+    # and the parent's start handshake times out at 60s and closes the row - which
+    # is what "the created leaf never appears" was. The prompt is a one-time
+    # acknowledgement the operator gives once in their own session, and the CLI
+    # then keeps it in user settings; the fixture has to record the same thing it
+    # already records about trust, or a leaf starts untrusted in exactly one way.
+    (root / 'settings.json').write_text(json.dumps(dict(skipDangerousModePermissionPrompt=True)), encoding='utf-8')
     probes = [
         (args.probe_full_tui, probe_full_tui), (args.probe_lifecycle, probe_lifecycle),
         (args.probe_selection, probe_selection), (args.probe_scroll, probe_scroll),
@@ -3891,6 +3981,7 @@ try:
         (args.probe_dormant_residue, probe_dormant_residue),
         (args.probe_close_promotion, probe_close_promotion),
         (args.probe_goal_reopen, probe_goal_reopen),
+        (args.probe_model_picker, probe_model_picker),
         (args.probe_boot, probe_boot),
     ]
     chosen = next((probe for wanted, probe in probes if wanted), None)
