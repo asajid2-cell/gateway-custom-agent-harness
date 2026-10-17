@@ -580,6 +580,21 @@ function deepSeekEmptyEvents() {
   ]
 }
 
+// A web-search turn whose output is *only* the server-tool frames: no text,
+// no thinking, no `input_json_delta`. This is the shape that used to be
+// invisible to the relay's "usable output" gate.
+function deepSeekWebSearchEvents() {
+  return [
+    { type: 'message_start', message: { id: 'msg-ds-search', type: 'message', role: 'assistant', content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'call_search', name: 'web_search', input: {} } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'content_block_start', index: 1, content_block: { type: 'web_search_tool_result', tool_use_id: 'call_search', content: [{ type: 'web_search_result', title: 'Result', url: 'https://example.com' }] } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+    { type: 'message_stop' },
+  ]
+}
+
 function deepSeekContextFailureEvents() {
   return [
     { type: 'error', error: { type: 'invalid_request_error', message: 'Prompt is too long: context window exceeded' } },
@@ -2900,6 +2915,35 @@ test('DeepSeek rejects an empty stream before committing HTTP 200', async () => 
   await relayDeepSeekStream(response, deepSeekResponse(deepSeekEmptyEvents()), traceCapture())
   assert.equal(response.headers.status, 502)
   assert.equal(JSON.parse(response.text()).error.message, 'DeepSeek returned an empty or malformed response')
+})
+
+test('DeepSeek streams a web-search turn carried by server-tool frames', async () => {
+  // A search turn needs no text of its own: the `server_tool_use` call and its
+  // `web_search_tool_result` are the output. They must count as stream progress
+  // so the relay flushes them, instead of buffering the whole turn and calling
+  // it an empty response.
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(response, deepSeekResponse(deepSeekWebSearchEvents()), traceCapture())
+  assert.equal(response.headers.status, 200)
+  assert.match(response.text(), /server_tool_use/)
+  assert.match(response.text(), /web_search_tool_result/)
+  assert.match(response.text(), /message_stop/)
+})
+
+test('DeepSeek streams a truncated web-search turn instead of rejecting it', async () => {
+  // No message_stop means the provider cut the stream. The relay cannot invent
+  // the missing frames, but once the search frames count as output it streams
+  // them and reports the truncation in-band rather than discarding everything
+  // as a pre-output 502.
+  const response = new CaptureResponse()
+  await relayDeepSeekStream(
+    response,
+    deepSeekResponse(deepSeekWebSearchEvents().filter(event => event.type !== 'message_stop')),
+    traceCapture(),
+  )
+  assert.equal(response.headers.status, 200)
+  assert.match(response.text(), /server_tool_use/)
+  assert.match(response.text(), /web_search_tool_result/)
 })
 
 test('DeepSeek maps a pre-output context failure to HTTP 400', async () => {

@@ -3129,7 +3129,17 @@ function copyResponseHeaders(upstream, includeStreamHeaders = false) {
 
 function deepSeekEventHasUsableOutput(event) {
   if (event?.type === 'content_block_start') {
-    return event.content_block?.type === 'tool_use'
+    // A web-search turn is carried by server-tool frames: the call
+    // (`server_tool_use`) and its results (`web_search_tool_result`). They are
+    // real output to the client, so the search counts as stream progress and
+    // its frames flush live instead of being buffered and discarded as "no
+    // usable output".
+    const blockType = event.content_block?.type
+    return (
+      blockType === 'tool_use' ||
+      blockType === 'server_tool_use' ||
+      blockType === 'web_search_tool_result'
+    )
   }
   if (event?.type !== 'content_block_delta') return false
   const delta = event.delta || {}
