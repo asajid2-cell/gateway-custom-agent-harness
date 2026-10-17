@@ -3976,15 +3976,29 @@ def probe_redact():
     """
     leak_value = 'sk-leak-REAL-9f8e7d6c5b4a3210'
     leak_pat = 'ghp_' + 'A' * 36
-    results = {'leakValue': leak_value, 'leakPat': leak_pat}
+    # Benign names a naive known-value pass would scrub: the working directory
+    # and the ssh-agent socket are ordinary output, not secrets. They are held
+    # in the env under names that carry an ambiguous word (PWD/AUTH), so a pass
+    # without segment discipline mangles them out of every tool result.
+    # Forward slashes, not backslashes: a JSON transcript escapes a backslash,
+    # so a `C:\...` marker would never appear verbatim in the file text and the
+    # assertion would fail on the escaping rather than on the redaction.
+    pwd_marker = 'C:/cwd-marker-' + 'x' * 60
+    sock_marker = 'C:/sock-marker-' + 'y' * 60
+    results = {'leakValue': leak_value, 'leakPat': leak_pat,
+               'pwdMarker': pwd_marker, 'sockMarker': sock_marker}
 
     def flush_results():
         print(json.dumps(results, indent=1, sort_keys=True), flush=True)
 
     (root / 'leak.txt').write_text(
-        leak_value + '\npat=' + leak_pat + '\n', encoding='utf-8')
+        leak_value + '\n'
+        + 'pat=' + leak_pat + '\n'
+        + 'PWD=' + pwd_marker + '\n'
+        + 'SSH_AUTH_SOCK=' + sock_marker + '\n', encoding='utf-8')
 
-    t = Terminal(env_extra={'LEAK_TOKEN': leak_value})
+    t = Terminal(env_extra={'LEAK_TOKEN': leak_value, 'PWD': pwd_marker,
+                            'SSH_AUTH_SOCK': sock_marker})
     t.wait(lambda: 'All 1' in t.text(), 'initial session', 240)
     t.proc.write('\x15'); t.pause(.4)
     t.submit('REDACT_TASK')
@@ -4012,11 +4026,16 @@ def probe_redact():
     pat_hits = sorted(str(p) for p, text in blobs.items() if leak_pat in text)
     marker_hits = sorted(str(p) for p, text in blobs.items()
                         if '[REDACTED:LEAK_TOKEN]' in text)
+    cwd_hits = sorted(str(p) for p, text in blobs.items() if pwd_marker in text)
+    sock_hits = sorted(str(p) for p, text in blobs.items() if sock_marker in text)
     results['readLanded'] = landed
     results['filesWithRawSecret'] = raw_hits
     results['filesWithRawPat'] = pat_hits
     results['filesWithMarker'] = marker_hits
+    results['filesWithCwd'] = cwd_hits
+    results['filesWithSock'] = sock_hits
     results['secretRedacted'] = landed and not raw_hits and not pat_hits
+    results['benignNotRedacted'] = bool(cwd_hits) and bool(sock_hits)
     flush_results()
 
     t.check(lambda: landed,
@@ -4027,6 +4046,13 @@ def probe_redact():
             'the raw token shape survived into the transcript: ' + json.dumps(pat_hits))
     t.check(lambda: marker_hits,
             'no [REDACTED:LEAK_TOKEN] marker in any transcript')
+    # The benign names must survive: a cwd or socket path in a tool result is
+    # ordinary output, and scrubbing it would mangle every result that mentions
+    # where it ran.
+    t.check(lambda: cwd_hits,
+            'the working directory was redacted out of the transcript: ' + json.dumps(results))
+    t.check(lambda: sock_hits,
+            'the ssh-agent socket was redacted out of the transcript: ' + json.dumps(results))
 
     t.close_leaves(90)
     t.exit(family_survives=True)
