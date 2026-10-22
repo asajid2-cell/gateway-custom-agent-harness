@@ -115,28 +115,38 @@ test('only a loopback gateway URL is probed; anything else is unknown', () => {
   }
 })
 
-test('a peer message is gated on the recipient route and held, not lost, when it cannot serve', { timeout: 120_000 }, async () => {
+test('a peer message is gated on the recipient route FLEET and held, not lost, when the whole pool cannot serve', { timeout: 180_000 }, async () => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'gateway-route-gate-'))
   const directory = path.join(dir, 'gateway-sessions')
   const keys = ['cc-first', 'cc-second', 'cc-third']
   const seen: string[] = []
   // Weak (lifetime-bound) self-signed upstream is not needed: the gateway is
   // pointed at this server explicitly for the CommandCode backend.
-  let keyOneServes = false
+  //
+  // Each key answers for itself, so the ordinary state is "a pool with one dead
+  // credential and two usable" - the shape that refused live sessions. The mode
+  // switch drives the WHOLE pool into one verdict on the same gateway, which is
+  // the only way to earn a refusal: a route gate that refuses on one dead key is
+  // the defect, not the test.
+  let mode: 'mixed' | 'all-exhausted' | 'all-unauthorized' = 'mixed'
   const upstream = await fakeUpstream((req, res) => {
     const authorization = String(req.headers.authorization ?? '')
     seen.push(authorization)
-    if (authorization === `Bearer ${keys[2]}`) {
+    const key = keys.findIndex(candidate => authorization === `Bearer ${candidate}`)
+    const answer = mode === 'all-exhausted' ? 'exhausted'
+      : mode === 'all-unauthorized' ? 'unauthorized'
+      : key === 0 ? 'exhausted' : key === 2 ? 'unauthorized' : 'serving'
+    if (answer === 'exhausted') {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { type: 'api_error', message: 'You have insufficient credits to make this request' } }))
+      return
+    }
+    if (answer === 'unauthorized') {
       // A key the provider rejects outright. A 401 is the gateway's own
       // `unauthorized` verdict, which is a different fact from exhaustion: no
       // amount of waiting makes it serve, only a new credential does.
       res.writeHead(401, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: { type: 'authentication_error', message: 'Invalid API key' } }))
-      return
-    }
-    if (authorization === `Bearer ${keys[0]}` && !keyOneServes) {
-      res.writeHead(400, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: { type: 'api_error', message: 'You have insufficient credits to make this request' } }))
       return
     }
     res.writeHead(200, { 'content-type': 'application/json' })
@@ -179,12 +189,32 @@ test('a peer message is gated on the recipient route and held, not lost, when it
     assert.equal((await getJson(gateway.port, '/gateway/route-health?provider=commandcode&number=3')).state, 'unknown')
     assert.equal((await getJson(gateway.port, '/gateway/route-health?provider=commandcode&number=4')).state, 'unknown')
 
+    // Naming no credential asks about the POOL, which is what a sender acts on:
+    // #1 is exhausted and #2 serves, so the route the gateway would spend can
+    // serve, and that is the verdict - not #1's.
+    const fleet = await getJson(gateway.port, '/gateway/route-health?provider=commandcode')
+    assert.deepEqual(Object.keys(fleet).sort(), ['fleet', 'numbers', 'provider', 'size'])
+    assert.equal(fleet.provider, 'commandcode')
+    assert.equal(fleet.fleet, 'serving')
+    assert.equal(fleet.size, 3, 'the configured pool, never an invented key')
+    assert.deepEqual(
+      fleet.numbers.map((entry: any) => [entry.number, entry.state]),
+      [[1, 'exhausted'], [2, 'serving'], [3, 'unknown']],
+    )
+    assert.equal(fleet.numbers[0].reason, 'http_400_insufficient_credits', 'each credential keeps its own evidence')
+
     // The session-side env is what a launched session has: the launcher's
     // gateway URL and the model it was started on.
     process.env.CLAUDE_CODE_USE_GATEWAY = '1'
     process.env.CLAUDE_CONFIG_DIR = dir
     process.env.CLAUDE_CODE_GATEWAY_BASE_URL = `http://127.0.0.1:${gateway.port}`
     process.env.MODEL_GATEWAY_MODEL = MODEL
+
+    /** One real inference request, which is how a health bit is earned. */
+    const drive = (content: string) => postGateway(gateway!.port, {
+      model: MODEL, stream: false, max_tokens: 8,
+      messages: [{ role: 'user', content }],
+    })
 
     const preference = path.join(dir, 'commandcode-account.json')
     const makePeer = async (number: number, name: string): Promise<GatewaySessionTransport> => {
@@ -198,106 +228,83 @@ test('a peer message is gated on the recipient route and held, not lost, when it
     await sender.start()
     transports.push(sender)
 
-    // (a) exhausted: the sender is refused, and the message is stored as owed.
-    const blocked = await makePeer(1, 'route-gate-exhausted') as GatewaySessionTransport
+    // (a) TODAY'S FIELD CASE, and the reason the gate changed: the recipient
+    // advertises #1, which really is exhausted (HTTP 400 insufficient credits),
+    // while #2 serves. The pool answers, so the message must be delivered - not
+    // withheld, which is what refused three sessions that were answering.
+    const advertisesDead = await makePeer(1, 'route-gate-advertises-exhausted') as GatewaySessionTransport
     assert.deepEqual(
-      { provider: blocked.peer.route?.provider, number: blocked.peer.route?.number, baseUrl: blocked.peer.route?.baseUrl },
+      { provider: advertisesDead.peer.route?.provider, number: advertisesDead.peer.route?.number, baseUrl: advertisesDead.peer.route?.baseUrl },
       { provider: 'commandcode', number: 1, baseUrl: `http://127.0.0.1:${gateway.port}` },
       'the registration advertises the credential number the session would spend',
     )
-    const registration = JSON.parse(await readFile(path.join(directory, `${blocked.peer.sessionId}.json`), 'utf8'))
+    const registration = JSON.parse(await readFile(path.join(directory, `${advertisesDead.peer.sessionId}.json`), 'utf8'))
     assert.equal(registration.peer.route.model, MODEL, 'the advertised route names the model the refusal reports')
 
-    const refusal: any = await sender.send(
-      blocked.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true,
+    const outage: any = await sender.send(
+      advertisesDead.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true,
     )
-    assert.equal(refusal.ok, false)
-    assert.equal(refusal.alive, true, 'the session is alive; its credential is what cannot serve')
-    assert.equal(refusal.delivered, false)
-    assert.equal(refusal.reason, 'route_unavailable')
-    assert.equal(refusal.routeState, 'exhausted')
-    assert.equal(refusal.state, 'held')
-    assert.equal(refusal.provider, 'commandcode')
-    assert.equal(refusal.number, 1)
-    assert.equal(refusal.http, 400)
-    assert.equal(refusal.detail, 'http_400_insufficient_credits')
-    assert.equal(refusal.recipient, blocked.peer.sessionId)
+    assert.equal(outage.ok, true, 'the pool serves on #2 even though the advertised #1 is exhausted')
+    assert.equal(outage.alive, true)
+    assert.equal(outage.delivered, true)
+    assert.equal(outage.routeState, 'serving', 'the verdict was the pool serving, not #1 being dead')
+    assert.equal(outage.state, 'queued', 'queued, not held: the recipient can answer')
+    assert.equal(advertisesDead.inbox()[0]!.state, 'queued')
+    // The outage is only real if the message then reaches a model. This is the
+    // adapter a session's Stop hook uses.
+    const outageToModel: string[] = []
+    const outageDelivery = new GatewaySessionDelivery(advertisesDead, id => outageToModel.push(id))
+    outageDelivery.drain()
+    assert.deepEqual(outageToModel, [outage.id], 'the message is handed to the model, not stranded')
+    outageDelivery.close()
 
-    const heldInbox = blocked.inbox()
-    assert.equal(heldInbox.length, 1)
-    assert.equal(heldInbox[0]!.state, 'held')
-    assert.deepEqual(
-      blocked.outstandingReplies().map(reply => reply.toMessageId),
-      [heldInbox[0]!.message.id],
-      'the refused message is still counted as owed',
-    )
-    // A held record is not injected, so no model that cannot answer is asked.
-    const deliveredToModel: string[] = []
-    const delivery = new GatewaySessionDelivery(blocked, id => deliveredToModel.push(id))
-    delivery.drain()
-    assert.deepEqual(deliveredToModel, [])
-    delivery.close()
-
-    // (c) unknown: a credential nothing has exercised delivers, and the receipt
-    // says so rather than implying health.
-    const unknown = await makePeer(4, 'route-gate-unknown')
-    const unverified: any = await sender.send(unknown.peer.sessionId, 'Status?', 'Status', undefined, 'inquiry', true)
+    // (c) a registration that advertises a credential the pool does not even
+    // contain still gets the POOL's verdict: the gateway would select from what
+    // it has, so #4 being absent says nothing about whether the route serves.
+    const absentNumber = await makePeer(4, 'route-gate-absent-credential')
+    const unverified: any = await sender.send(absentNumber.peer.sessionId, 'Status?', 'Status', undefined, 'inquiry', true)
     assert.equal(unverified.ok, true)
     assert.equal(unverified.alive, true)
     assert.equal(unverified.delivered, true)
-    assert.equal(unverified.routeState, 'unknown')
+    assert.equal(unverified.routeState, 'serving')
     assert.equal(unverified.state, 'queued')
-    assert.equal(unknown.inbox()[0]!.state, 'queued')
+    assert.equal(absentNumber.inbox()[0]!.state, 'queued')
 
     // An older build advertises no route at all. That reads as `unknown` - never
     // healthy - and must deliver rather than shut the peer out of the bus.
-    const legacyPath = path.join(directory, `${unknown.peer.sessionId}.json`)
+    const legacyPath = path.join(directory, `${absentNumber.peer.sessionId}.json`)
     const legacyRegistration = JSON.parse(await readFile(legacyPath, 'utf8'))
     delete legacyRegistration.peer.route
     await writeFile(legacyPath, JSON.stringify(legacyRegistration))
-    const legacy: any = await sender.send(unknown.peer.sessionId, 'No route advertised', 'No route', undefined, 'inquiry', true)
+    const legacy: any = await sender.send(absentNumber.peer.sessionId, 'No route advertised', 'No route', undefined, 'inquiry', true)
     assert.equal(legacy.ok, true)
     assert.equal(legacy.alive, true)
     assert.equal(legacy.delivered, true)
     assert.equal(legacy.routeState, 'unknown')
 
-    // (e) unauthorized: a credential the provider rejects is withheld on the same
-    // path as exhaustion, but reported as its own state - waiting changes nothing,
-    // so the move is the credential, not a retry.
+    // (e) an advertised credential the provider rejects, while the pool serves:
+    // delivered. Waiting would not fix a 401, but the gateway rotates past it on
+    // that very reply, so the credential the next call spends is not the rejected
+    // one. Only a pool with nothing left to try is a refusal.
     await selectGlobalAccount(gateway.port, 3)
-    const rejected = await postGateway(gateway.port, {
-      model: MODEL, stream: false, max_tokens: 8,
-      messages: [{ role: 'user', content: 'who am i' }],
-    })
+    const rejected = await drive('who am I')
     assert.equal(rejected.status, 200, rejected.body)
     const rejectedHealth = await getJson(gateway.port, '/gateway/route-health?provider=commandcode&number=3')
     assert.equal(rejectedHealth.state, 'unauthorized')
     assert.equal(rejectedHealth.reason, 'http_401')
 
-    const unauthorized = await makePeer(3, 'route-gate-unauthorized')
-    assert.equal(unauthorized.peer.route?.number, 3, 'the advertisement follows the account the pool would select')
-    const denied: any = await sender.send(unauthorized.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true)
-    assert.equal(denied.ok, false)
-    assert.equal(denied.alive, true, 'the recipient answered; only its credential is unusable')
-    assert.equal(denied.delivered, false)
-    assert.equal(denied.reason, 'route_unavailable')
-    assert.equal(denied.routeState, 'unauthorized')
-    assert.equal(denied.state, 'held')
-    assert.equal(denied.provider, 'commandcode')
-    assert.equal(denied.number, 3)
-    assert.equal(denied.http, 401)
-    assert.equal(denied.detail, 'http_401')
-    assert.equal(denied.recipient, unauthorized.peer.sessionId)
-    assert.equal(unauthorized.inbox()[0]!.state, 'held')
-    assert.deepEqual(unauthorized.outstandingReplies().map(reply => reply.toMessageId), [denied.id])
+    const advertisesRejected = await makePeer(3, 'route-gate-advertises-unauthorized')
+    assert.equal(advertisesRejected.peer.route?.number, 3, 'the advertisement follows the account the pool would select')
+    const pastTheDeadKey: any = await sender.send(advertisesRejected.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true)
+    assert.equal(pastTheDeadKey.ok, true)
+    assert.equal(pastTheDeadKey.alive, true)
+    assert.equal(pastTheDeadKey.delivered, true)
+    assert.equal(pastTheDeadKey.routeState, 'serving')
+    assert.equal(pastTheDeadKey.state, 'queued')
+    assert.equal(advertisesRejected.inbox()[0]!.state, 'queued')
+    assert.equal((await getJson(gateway.port, '/gateway/route-health?provider=commandcode')).fleet, 'serving')
 
-    // Nor is that hold released by a status change: only `serving` releases, and a
-    // rejected credential is not serving however many turns go by.
-    await unauthorized.update({ status: 'idle' })
-    await new Promise(resolve => setTimeout(resolve, 200))
-    assert.equal(unauthorized.inbox()[0]!.state, 'held')
-
-    // (f) liveness is a separate axis from route health. A registration whose
+    // Liveness is a separate axis from route health. A registration whose
     // session is gone refuses with a dead-peer verdict and no route verdict at
     // all - the credential of a session that is not there is not a fact.
     const dead = await makePeer(2, 'route-gate-dead')
@@ -325,22 +332,67 @@ test('a peer message is gated on the recipient route and held, not lost, when it
     assert.equal(good.state, 'queued')
     assert.equal(serving.inbox()[0]!.state, 'queued')
 
-    // (b) recovery: the credential serves again, and the held mail is released
-    // by the recipient itself - the sender is not asked to re-send.
-    keyOneServes = true
-    await selectGlobalAccount(gateway.port, 1)
-    const recovered = await postGateway(gateway.port, {
-      model: MODEL, stream: false, max_tokens: 8,
-      messages: [{ role: 'user', content: 'hello again' }],
-    })
+    // (f) every configured credential is exhausted: NOW the sender is refused,
+    // and the message is stored as owed rather than lost.
+    mode = 'all-exhausted'
+    const nothingLeft = await drive('everything is out')
+    assert.notEqual(nothingLeft.status, 200, 'the whole pool is refused, so the request cannot succeed')
+    const fleetDown = await getJson(gateway.port, '/gateway/route-health?provider=commandcode')
+    assert.deepEqual(Object.keys(fleetDown).sort(), ['fleet', 'numbers', 'provider', 'size'])
+    assert.equal(fleetDown.fleet, 'exhausted')
+    assert.equal(fleetDown.size, 3)
+    assert.deepEqual(fleetDown.numbers.map((entry: any) => entry.state), ['exhausted', 'exhausted', 'exhausted'])
+
+    const blocked = await makePeer(1, 'route-gate-pool-exhausted')
+    const refusal: any = await sender.send(
+      blocked.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true,
+    )
+    assert.equal(refusal.ok, false)
+    assert.equal(refusal.alive, true, 'the session is alive; its credentials are what cannot serve')
+    assert.equal(refusal.delivered, false)
+    assert.equal(refusal.reason, 'route_unavailable')
+    assert.equal(refusal.routeState, 'exhausted', 'the verdict is the pool, and the pool is what is down')
+    assert.equal(refusal.state, 'held')
+    assert.equal(refusal.provider, 'commandcode')
+    assert.equal(refusal.number, 1, 'the advertised credential is still named')
+    assert.equal(refusal.numberState, 'exhausted', 'and its own state travels beside the fleet verdict')
+    assert.equal(refusal.size, 3)
+    assert.equal(refusal.http, 400)
+    assert.equal(refusal.detail, 'http_400_insufficient_credits')
+    assert.equal(refusal.recipient, blocked.peer.sessionId)
+
+    const heldInbox = blocked.inbox()
+    assert.equal(heldInbox.length, 1)
+    assert.equal(heldInbox[0]!.state, 'held')
+    assert.deepEqual(
+      blocked.outstandingReplies().map(reply => reply.toMessageId),
+      [heldInbox[0]!.message.id],
+      'the refused message is still counted as owed',
+    )
+    // A held record is not injected, so no model that cannot answer is asked.
+    const deliveredToModel: string[] = []
+    const delivery = new GatewaySessionDelivery(blocked, id => deliveredToModel.push(id))
+    delivery.drain()
+    assert.deepEqual(deliveredToModel, [])
+    delivery.close()
+    // Nor is the hold released by a status change alone: the pool is still down,
+    // so the recipient re-probes, and a probe that still refuses must not release.
+    await blocked.update({ status: 'idle' })
+    await new Promise(resolve => setTimeout(resolve, 300))
+    assert.equal(blocked.inbox()[0]!.state, 'held')
+
+    // (g) recovery: the pool serves again, and the held mail is released by the
+    // recipient itself - the sender is not asked to re-send.
+    mode = 'mixed'
+    const recovered = await drive('back up')
     assert.equal(recovered.status, 200, recovered.body)
-    assert.equal((await getJson(gateway.port, '/gateway/route-health?provider=commandcode&number=1')).state, 'serving')
+    assert.equal((await getJson(gateway.port, '/gateway/route-health?provider=commandcode')).fleet, 'serving')
 
     await writeFile(preference, JSON.stringify({ number: 1 }))
     await blocked.update({ status: 'idle' })
     assert.ok(
       await waitFor(() => blocked.inbox()[0]?.state === 'queued'),
-      'the held message is released once the route serves',
+      'the held message is released once the pool serves',
     )
     const released = blocked.inbox()[0]!
     assert.equal(released.message.id, heldInbox[0]!.message.id, 'the same message, not a new copy')
@@ -353,6 +405,58 @@ test('a peer message is gated on the recipient route and held, not lost, when it
     resumed.drain()
     assert.deepEqual(releasedToModel, [released.message.id])
     resumed.close()
+
+    // (h) every configured credential is rejected: withheld on the same path as
+    // exhaustion, and reported as its own state - waiting changes nothing, so the
+    // move is the credential, not a retry.
+    mode = 'all-unauthorized'
+    const allRejected = await drive('nobody can serve')
+    assert.notEqual(allRejected.status, 200)
+    const fleetRejected = await getJson(gateway.port, '/gateway/route-health?provider=commandcode')
+    assert.equal(fleetRejected.fleet, 'unauthorized')
+    assert.equal(fleetRejected.size, 3)
+    assert.deepEqual(fleetRejected.numbers.map((entry: any) => entry.state), ['unauthorized', 'unauthorized', 'unauthorized'])
+
+    const rejectedPool = await makePeer(2, 'route-gate-pool-unauthorized')
+    const denied: any = await sender.send(rejectedPool.peer.sessionId, 'Please review the parser.', 'Review the parser', undefined, 'directive', true)
+    assert.equal(denied.ok, false)
+    assert.equal(denied.alive, true, 'the recipient answered; only its credentials are unusable')
+    assert.equal(denied.delivered, false)
+    assert.equal(denied.reason, 'route_unavailable')
+    assert.equal(denied.routeState, 'unauthorized')
+    assert.equal(denied.state, 'held')
+    assert.equal(denied.provider, 'commandcode')
+    assert.equal(denied.number, 2)
+    assert.equal(denied.numberState, 'unauthorized')
+    assert.equal(denied.http, 401)
+    assert.equal(denied.detail, 'http_401')
+    assert.equal(denied.recipient, rejectedPool.peer.sessionId)
+    assert.equal(rejectedPool.inbox()[0]!.state, 'held')
+    assert.deepEqual(rejectedPool.outstandingReplies().map(reply => reply.toMessageId), [denied.id])
+
+    // (i) the second probe is a real reload: a key injected into the RUNNING
+    // gateway is in the very next fleet answer, with no restart, and a credential
+    // nothing has exercised is `unknown` - a non-answer, not a failure - so the
+    // verdict falls from `unauthorized` to `unknown` and the send goes through.
+    const injected = await fetch(`http://127.0.0.1:${gateway.port}/gateway/keys`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'COMMANDCODE_API_KEY4', value: 'cc-fourth' }),
+    })
+    assert.equal(injected.status, 200, await injected.text())
+    const afterInject = await getJson(gateway.port, '/gateway/route-health?provider=commandcode')
+    assert.equal(afterInject.fleet, 'unknown')
+    assert.equal(afterInject.size, 4, 'the injected key is in the pool the request path uses')
+    assert.deepEqual(afterInject.numbers.map((entry: any) => [entry.number, entry.state]), [
+      [1, 'unauthorized'], [2, 'unauthorized'], [3, 'unauthorized'], [4, 'unknown'],
+    ])
+    const afterKey = await makePeer(2, 'route-gate-after-inject')
+    const throughUnknown: any = await sender.send(afterKey.peer.sessionId, 'Status?', 'Status', undefined, 'inquiry', true)
+    assert.equal(throughUnknown.ok, true)
+    assert.equal(throughUnknown.alive, true)
+    assert.equal(throughUnknown.delivered, true)
+    assert.equal(throughUnknown.routeState, 'unknown')
+    assert.equal(throughUnknown.state, 'queued')
   } finally {
     for (const transport of transports) await transport.close().catch(() => {})
     if (gateway) await stopChild(gateway.child)

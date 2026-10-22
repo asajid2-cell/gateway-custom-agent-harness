@@ -2825,10 +2825,6 @@ const ROUTE_HEALTH_PROVIDERS = new Map([
   ['codex', 'codex'],
 ])
 
-// Providers whose key is not a numbered pool. They have exactly one credential,
-// so number 1 is the whole truth about them, and a caller may omit the number.
-const SINGLE_KEY_ROUTE_PROVIDERS = new Set(['deepseek', 'amd-radeon', 'anthropic', 'codex'])
-
 /** The canonical provider id a health bit is keyed under, or null when unknown. */
 export function routeHealthProviderId(provider) {
   const key = String(provider ?? '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ')
@@ -2890,6 +2886,55 @@ async function sessionRouteNumber(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).number
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).number
   return 1
+}
+
+/**
+ * The numbered credentials a provider's request path would actually try.
+ *
+ * Pooled providers answer from the live pool. That getter re-reads the
+ * environment and the transient overlay on every access, so a key the keysafe
+ * child injected into a running gateway appears here with no restart - which is
+ * what makes asking twice a real reload of the credential set. A single-key
+ * provider (deepseek, amd-radeon, anthropic, codex) has exactly one credential
+ * slot by construction, so its fleet is that slot; an unconfigured slot reads
+ * `unknown`, never serving.
+ */
+async function providerRouteNumbers(providerId, sessionId) {
+  if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).numbers
+  if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).numbers
+  return [1]
+}
+
+/**
+ * What a provider's whole credential pool can do, as one verdict.
+ *
+ * The defect this closes: the gateway rotates on exactly the reply that marks a
+ * credential unusable (400 insufficient credits, 401, 402), so a pool with one
+ * dead key and one live key still answers. A caller that asked about the single
+ * key the session would select FIRST was told the route was dead while it was
+ * serving fine on the next key. The fleet verdict is the pool's ability, not
+ * the selected key's.
+ *
+ * Order is deliberate:
+ * - serving wins outright: one key that answered is proof the provider can serve.
+ * - unknown outranks exhausted: a credential nothing has exercised is NOT proof
+ *   of failure, and a caller must never withhold on a non-answer.
+ * - exhausted before unauthorized: a pool that is partly out of credit reads as
+ *   replenishable, which is the weaker and more actionable of the two claims.
+ * - all unauthorized is the only case where the credentials themselves are wrong.
+ */
+export function fleetRouteHealth(providerId, numbers) {
+  const list = [...new Set(numbers)].sort((a, b) => a - b).map(number => {
+    const health = routeHealthFor(providerId, number)
+    return { number, state: health.state, reason: health.reason, at: health.at }
+  })
+  const any = state => list.some(entry => entry.state === state)
+  const fleet = list.length === 0 ? 'unknown'
+    : any('serving') ? 'serving'
+    : any('unknown') ? 'unknown'
+    : any('exhausted') ? 'exhausted'
+    : 'unauthorized'
+  return { provider: providerId, fleet, size: list.length, numbers: list }
 }
 
 // Only the numbered pools consult the overlay, so only their variables can be
@@ -5174,6 +5219,11 @@ const server = http.createServer(async (req, res) => {
   // evidence cannot answer. A credential nothing has exercised yet reads
   // `unknown` - the pre-open caller has no recipient to ask, and a non-answer
   // must never be mistaken for a healthy route.
+  //
+  // Naming neither a number nor a session asks about the POOL (see
+  // `fleetRouteHealth`), which is the only question whose answer survives the
+  // gateway's own rotation: it fails over past a dead key, so the selected
+  // key's verdict does not decide whether the route can serve.
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/route-health') {
     const providerId = routeHealthProviderId(requestUrl.searchParams.get('provider'))
     if (!providerId) {
@@ -5182,6 +5232,18 @@ const server = http.createServer(async (req, res) => {
     }
     const sessionId = requestUrl.searchParams.get('sessionId')
     const rawNumber = requestUrl.searchParams.get('number')
+    // No credential named means the caller is asking about the pool as a
+    // whole. That is the question a sender can actually act on, because the
+    // gateway rotates past a dead key without the caller doing anything.
+    if (rawNumber === null && !sessionId) {
+      const numbers = await providerRouteNumbers(providerId, sessionId)
+      const fleet = fleetRouteHealth(providerId, numbers)
+      process.stderr.write(
+        `model-gateway route path=/gateway/route-health backend=route-health-fleet provider=${providerId} fleet=${fleet.fleet} size=${fleet.size}\n`,
+      )
+      json(res, 200, fleet)
+      return
+    }
     let number
     if (rawNumber !== null) {
       if (!/^[1-9][0-9]*$/.test(rawNumber)) {
@@ -5191,10 +5253,8 @@ const server = http.createServer(async (req, res) => {
       number = Number(rawNumber)
     } else if (sessionId) {
       number = await sessionRouteNumber(providerId, sessionId)
-    } else if (SINGLE_KEY_ROUTE_PROVIDERS.has(providerId)) {
-      number = 1
     } else {
-      json(res, 400, { error: 'Use number, or sessionId to resolve the account the session would select' })
+      json(res, 400, { error: 'Use number or sessionId to name a credential, or omit both for the provider fleet' })
       return
     }
     process.stderr.write(

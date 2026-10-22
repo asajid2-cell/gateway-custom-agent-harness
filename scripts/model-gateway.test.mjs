@@ -29,6 +29,9 @@ import {
   openCodeCredentialPool,
   readOpenCodeSubscriptionUsage,
   fetchWithRetry,
+  fleetRouteHealth,
+  recordRouteHealth,
+  resetRouteHealth,
 } from './model-gateway.mjs'
 import {
   anthropicToOpenCodeChat,
@@ -451,10 +454,15 @@ test('route health reports unknown, never serving, for a key that was never exer
         at: null,
       })
     }
-    // A provider with no pool has one credential, so number is inferable.
+    // A provider with no pool has one credential, so omitting the number asks a
+    // fleet of one - and that one slot is unknown until something exercises it.
     const single = JSON.parse((await getGatewayJson(gateway.port, '/gateway/route-health?provider=deepseek')).body)
-    assert.equal(single.number, 1)
-    assert.equal(single.state, 'unknown')
+    assert.deepEqual(single, {
+      provider: 'deepseek',
+      fleet: 'unknown',
+      size: 1,
+      numbers: [{ number: 1, state: 'unknown', reason: 'health_unavailable', at: null }],
+    })
   } finally {
     await stopChild(gateway.child)
     await rm(dir, { recursive: true, force: true })
@@ -506,6 +514,69 @@ test('route health separates an unauthorized key from an exhausted one', async (
     await new Promise(resolve => upstream.server.close(resolve))
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+test('the fleet verdict is the pool: serving wins, unknown outranks exhausted, all-unauthorized is last', () => {
+  const entriesFor = entries => {
+    resetRouteHealth()
+    for (const [number, state, reason] of entries) recordRouteHealth('commandcode', number, state, reason)
+    return fleetRouteHealth('commandcode', [1, 2, 3])
+  }
+
+  // Nothing exercised: unknown, never serving, and never a short pool.
+  const untouched = entriesFor([])
+  assert.deepEqual(Object.keys(untouched).sort(), ['fleet', 'numbers', 'provider', 'size'])
+  assert.equal(untouched.provider, 'commandcode')
+  assert.equal(untouched.fleet, 'unknown')
+  assert.equal(untouched.size, 3)
+  assert.deepEqual(untouched.numbers.map(entry => [entry.number, entry.state, entry.reason]), [
+    [1, 'unknown', 'health_unavailable'],
+    [2, 'unknown', 'health_unavailable'],
+    [3, 'unknown', 'health_unavailable'],
+  ])
+
+  // Today's field case: one dead credential does not close the route.
+  const mixed = entriesFor([[1, 'exhausted', 'http_400_insufficient_credits'], [2, 'serving', 'http_200']])
+  assert.equal(mixed.fleet, 'serving')
+  assert.deepEqual(mixed.numbers.map(entry => entry.state), ['exhausted', 'serving', 'unknown'])
+  assert.equal(mixed.numbers[0].reason, 'http_400_insufficient_credits', 'each credential keeps its own evidence')
+  assert.match(mixed.numbers[0].at, /^\d{4}-\d{2}-\d{2}T/)
+
+  // A credential nothing has exercised is a non-answer, so it outranks proven
+  // failure: a caller must deliver, never withhold on it.
+  assert.equal(entriesFor([[1, 'exhausted', 'http_400'], [3, 'unauthorized', 'http_401']]).fleet, 'unknown')
+
+  // Every credential proven unusable is the only refusal, and exhaustion is the
+  // more actionable of the two claims.
+  assert.equal(
+    entriesFor([[1, 'exhausted', 'http_400'], [2, 'exhausted', 'http_400'], [3, 'unauthorized', 'http_401']]).fleet,
+    'exhausted',
+  )
+  assert.equal(
+    entriesFor([[1, 'unauthorized', 'http_401'], [2, 'unauthorized', 'http_401'], [3, 'unauthorized', 'http_401']]).fleet,
+    'unauthorized',
+  )
+
+  // The numbers are the caller's real pool, so a stale bit for a credential the
+  // pool no longer carries cannot widen the answer, and duplicates are one key.
+  resetRouteHealth()
+  recordRouteHealth('commandcode', 3, 'serving', 'http_200')
+  assert.equal(fleetRouteHealth('commandcode', [1, 2]).fleet, 'unknown', 'a stale #3 is not in this pool')
+  assert.equal(fleetRouteHealth('commandcode', [3, 3, 3]).size, 1)
+  const noKeys = fleetRouteHealth('commandcode', [])
+  assert.equal(noKeys.fleet, 'unknown', 'no configured key is unknown, never healthy')
+  assert.equal(noKeys.size, 0)
+  assert.deepEqual(noKeys.numbers, [])
+
+  // A single-key provider has one slot by construction, so its fleet is that
+  // slot's state - the same rule, not a special case.
+  resetRouteHealth()
+  assert.equal(fleetRouteHealth('deepseek', [1]).fleet, 'unknown')
+  recordRouteHealth('deepseek', 1, 'exhausted', 'http_402')
+  const single = fleetRouteHealth('deepseek', [1])
+  assert.equal(single.fleet, 'exhausted')
+  assert.deepEqual(single.numbers.map(entry => [entry.number, entry.state]), [[1, 'exhausted']])
+  resetRouteHealth()
 })
 
 test('a genuinely invalid 400 leaves the credential unknown, not exhausted', async () => {

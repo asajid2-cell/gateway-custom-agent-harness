@@ -38,7 +38,13 @@ export type GatewayPeerSendResult = {
    * acknowledgement says nothing either way.
    */
   alive?: boolean
-  /** What the recipient's gateway last observed about the credential it would spend. */
+  /**
+   * What the recipient's gateway last observed about the POOL of credentials its
+   * next call would draw on - not about the one credential it advertises. The
+   * gateway rotates past a dead key on the very refusal that marks it dead, so a
+   * pool with one exhausted key and one serving key answers fine; judging the
+   * pool by the advertised key is what refused live sessions.
+   */
   routeState?: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
   /** The structured reason a send did not deliver, when there is one. */
   reason?: 'route_unavailable'
@@ -47,7 +53,12 @@ export type GatewayPeerSendResult = {
   /** `<model>/<effort>` the recipient would have spent, when it advertised one. */
   route?: string
   provider?: string
+  /** The credential the recipient advertises it would select first. */
   number?: number
+  /** That advertised credential's own verdict, alongside the pool's. */
+  numberState?: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
+  /** How many credentials the pool had when the route was asked. */
+  size?: number
   /** The upstream status behind the route verdict, when it carries one. */
   http?: number
   /** The gateway's own reason string, e.g. `http_400_insufficient_credits`. */
@@ -279,16 +290,36 @@ function routeUnavailableRefusal(
 ): GatewayPeerSendResult {
   const verdict = receipt.routeState === 'unauthorized' ? 'unauthorized' : 'exhausted'
   const provider = typeof receipt.provider === 'string' && receipt.provider ? receipt.provider : 'its provider'
-  const account = Number.isSafeInteger(receipt.number) ? ` #${receipt.number}` : ''
-  const reason = typeof receipt.detail === 'string' && receipt.detail ? receipt.detail : verdict
-  const observed = Number.isSafeInteger(receipt.http) ? ` (HTTP ${receipt.http}, ${reason})` : ''
+  const number = Number.isSafeInteger(receipt.number) ? receipt.number as number : undefined
+  const numberState: GatewayPeerSendResult['numberState'] = ['serving', 'exhausted', 'unauthorized', 'unknown'].includes(receipt.numberState)
+    ? receipt.numberState
+    : undefined
+  const size = Number.isSafeInteger(receipt.size) ? receipt.size as number : undefined
+  const reason = typeof receipt.detail === 'string' && receipt.detail ? receipt.detail : undefined
+  // `detail`/`http` are the advertised credential's own evidence, so they belong
+  // with the credential clause. `fleet_<state>` is the transport saying it had
+  // no per-credential evidence, and repeating it as an HTTP-less parenthetical
+  // would read as a second fact about the same key.
+  const evidence = Number.isSafeInteger(receipt.http)
+    ? ` (HTTP ${receipt.http}${reason ? `, ${reason}` : ''})`
+    : reason && !reason.startsWith('fleet_') ? ` (${reason})` : ''
   const route = typeof receipt.route === 'string' && receipt.route ? ` Route: ${receipt.route}.` : ''
   const held = receipt.state === 'held'
+  // The refusal names two different facts because they have different moves:
+  // the POOL decides whether the session can answer at all, and the advertised
+  // credential is what an operator looks at first. Today's field message named
+  // only the second - one dead key of two - and read as a whole-route outage.
+  const pool = size !== undefined
+    ? `the ${provider} pool in that session is ${verdict} (${size} credential${size === 1 ? '' : 's'} configured)`
+    : `the ${provider} pool in that session is ${verdict}`
+  const own = number !== undefined
+    ? ` It advertises #${number}, whose own state is ${numberState ?? 'unreported'}${evidence}.`
+    : evidence ? ` Its evidence:${evidence}.` : ''
   const remedy = verdict === 'unauthorized'
-    ? `replace or re-enter the credential for ${provider}${account} in that session`
-    : `replenish ${provider}${account}, or switch that session to a funded account`
+    ? `replace or re-enter the credentials for ${provider} in that session`
+    : `replenish the ${provider} pool that session draws on, or switch it to a funded account`
   const message = `Not delivered to ${label}: the session is alive, but its model route cannot serve. `
-    + `${provider} credential${account} is ${verdict === 'unauthorized' ? 'rejected as unauthorized' : 'exhausted'}${observed}.${route} `
+    + `${pool.charAt(0).toUpperCase() + pool.slice(1)}: no credential it could spend can serve, so nothing that session does next can answer.${own}${route} `
     + (held
       ? 'The message is held in that session\'s inbox and still counted as owed - it was not handed to its model, so nothing was lost. '
       : 'The recipient did not confirm it stored the message. ')
@@ -310,7 +341,9 @@ function routeUnavailableRefusal(
     routeState: verdict,
     recipient: sessionId,
     ...(typeof receipt.provider === 'string' ? { provider: receipt.provider } : {}),
-    ...(Number.isSafeInteger(receipt.number) ? { number: receipt.number } : {}),
+    ...(number !== undefined ? { number } : {}),
+    ...(numberState ? { numberState } : {}),
+    ...(size !== undefined ? { size } : {}),
     ...(typeof receipt.route === 'string' ? { route: receipt.route } : {}),
     ...(Number.isSafeInteger(receipt.http) ? { http: receipt.http } : {}),
     ...(typeof receipt.detail === 'string' ? { detail: receipt.detail } : {}),

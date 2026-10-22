@@ -279,15 +279,44 @@ export async function callGatewayPeer(endpoint: string, request: unknown, timeou
  */
 const ROUTE_PROBE_TIMEOUT_MS = 1500
 
+/**
+ * How long a refusal waits before asking a second time.
+ *
+ * Only a send that is about to be withheld pays this. The window is what makes
+ * the second probe a reload rather than a repeat: a keysafe child healing the
+ * gateway, or a session switching its selected account, lands in that time.
+ */
+const ROUTE_RECHECK_DELAY_MS = 150
+
 const ROUTE_HEALTH_STATES = new Set(['serving', 'exhausted', 'unauthorized', 'unknown'])
 
-/** What the recipient's gateway last observed about the credential it would use. */
+/**
+ * What the recipient's gateway last observed about the route its next call spends.
+ *
+ * `state` is the POOL's ability, not the selected credential's. That distinction
+ * is the whole defect this replaced: the gateway rotates on exactly the reply
+ * that marks one credential unusable, so a pool with a dead first key and a live
+ * second key serves fine while the first key reads `exhausted`.
+ *
+ * The selected credential's own verdict travels alongside instead of deciding,
+ * because it is still the most useful thing to tell a sender: `number` is what
+ * the recipient advertised it would select, `numberState` is what that one key
+ * last did, and `reason`/`http` carry its evidence (today's message named
+ * `http_400_insufficient_credits`, which is why it was actionable).
+ */
 export type PeerRouteHealth = {
+  /** The pool's ability: serving if any credential serves, else the worst proven state. */
   state: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
+  /** The evidence behind `numberState` when it has one; otherwise `fleet_<state>`. */
   reason: string
   provider?: string
+  /** The credential the recipient advertised it would select first. */
   number?: number
-  /** The upstream status behind the verdict, when the reason carries one. */
+  /** That one credential's own verdict, when the answer carried it. */
+  numberState?: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
+  /** How many credentials the pool had when it was asked. */
+  size?: number
+  /** The upstream status behind the credential verdict, when the reason names one. */
   http?: number
 }
 
@@ -337,23 +366,51 @@ function healthHttp(reason: unknown): number | undefined {
 export async function probePeerRoute(route: GatewayPeerRoute | undefined): Promise<PeerRouteHealth> {
   const origin = loopbackGatewayOrigin(route?.baseUrl)
   if (!route || !origin) return { ...UNKNOWN_ROUTE_HEALTH }
-  const query = new URLSearchParams({ provider: route.provider, number: String(route.number) })
+  // Ask about the POOL, naming no credential. The gateway fails over past a
+  // credential it has just marked unusable, so the selected credential's verdict
+  // is not the route's - asking by number is what reported a working session as
+  // dead.
+  const fleet = await readRouteHealth(origin, new URLSearchParams({ provider: route.provider }))
+  if (fleet && ROUTE_HEALTH_STATES.has(fleet.fleet)) {
+    const entries: any[] = Array.isArray(fleet.numbers) ? fleet.numbers : []
+    const own = entries.find(entry => entry?.number === route.number)
+    const numberState = own && ROUTE_HEALTH_STATES.has(own.state) ? own.state : undefined
+    const numberReason = typeof own?.reason === 'string' && own.reason ? own.reason : undefined
+    const http = healthHttp(numberReason)
+    return {
+      state: fleet.fleet,
+      reason: numberReason ?? `fleet_${fleet.fleet}`,
+      provider: typeof fleet.provider === 'string' ? fleet.provider : route.provider,
+      number: route.number,
+      ...(numberState ? { numberState } : {}),
+      ...(Number.isSafeInteger(fleet.size) ? { size: fleet.size } : {}),
+      ...(http !== undefined ? { http } : {}),
+    }
+  }
+  // A gateway that predates the fleet question answers the per-number form (and
+  // 400s on a missing number). Falling back keeps a mixed fleet on the old
+  // gate - which is narrower, but is the only verdict that build can give.
+  const single = await readRouteHealth(origin, new URLSearchParams({ provider: route.provider, number: String(route.number) }))
+  if (!single || !ROUTE_HEALTH_STATES.has(single.state)) return { ...UNKNOWN_ROUTE_HEALTH }
+  const reason = typeof single.reason === 'string' && single.reason ? single.reason : 'health_unavailable'
+  const http = healthHttp(reason)
+  return {
+    state: single.state,
+    reason,
+    provider: typeof single.provider === 'string' ? single.provider : route.provider,
+    number: Number.isSafeInteger(single.number) ? single.number : route.number,
+    numberState: single.state,
+    ...(http !== undefined ? { http } : {}),
+  }
+}
+
+/** One route-health read, or undefined for anything that is not a JSON answer. */
+async function readRouteHealth(origin: string, query: URLSearchParams): Promise<any | undefined> {
   const response = await fetch(new URL(`/gateway/route-health?${query.toString()}`, origin), {
     signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS),
   }).catch(() => undefined)
-  if (!response || !response.ok) return { ...UNKNOWN_ROUTE_HEALTH }
-  let body: any
-  try { body = await response.json() } catch { return { ...UNKNOWN_ROUTE_HEALTH } }
-  if (!ROUTE_HEALTH_STATES.has(body?.state)) return { ...UNKNOWN_ROUTE_HEALTH }
-  const reason = typeof body.reason === 'string' && body.reason ? body.reason : 'health_unavailable'
-  const http = healthHttp(reason)
-  return {
-    state: body.state,
-    reason,
-    provider: typeof body.provider === 'string' ? body.provider : route.provider,
-    number: Number.isSafeInteger(body.number) ? body.number : route.number,
-    ...(http !== undefined ? { http } : {}),
-  }
+  if (!response || !response.ok) return undefined
+  try { return await response.json() } catch { return undefined }
 }
 
 /** `<model>/<effort>` for a refusal, when the recipient advertised the model. */
@@ -1106,6 +1163,12 @@ export class GatewaySessionTransport {
     // lost. Under an `accept` policy a held record is therefore exactly the mail
     // this gate withheld, which is what `releaseRouteHeld` acts on; under a
     // `hold` policy it is the operator's, and is left alone.
+    //
+    // The state asked about is the POOL's, not the advertised number's: the
+    // gateway fails over past a dead credential on the very refusal that marks
+    // it dead, so a session whose #1 is exhausted and whose #2 serves is a
+    // session that answers. Gating on the advertised number held mail from
+    // sessions that were serving at the time - the field defect this fixed.
     const ownHealth = await probePeerRoute(this.peer.route)
     const heldForRoute = ownHealth.state === 'exhausted' || ownHealth.state === 'unauthorized'
     const state = heldForRoute || this.policy === 'hold' ? 'held' : 'queued'
@@ -1146,10 +1209,10 @@ export class GatewaySessionTransport {
    * here, on the boundaries that already exist: a status change and the arrival
    * of the next message.
    *
-   * Only `serving` releases. `unknown` must not: an unanswerable probe is not
-   * evidence that the key works, and handing the message to a model that still
-   * cannot answer is the defect this gate exists to prevent. A deliberate
-   * inbound policy of `hold` is untouched for the same reason.
+   * `serving` and `unknown` release. `unknown` is a non-answer, not a bad one:
+   * holding mail forever because a probe could not run would strand work that a
+   * later turn could have done, and the gate withholds only on a positive
+   * report. A deliberate inbound policy of `hold` is untouched.
    *
    * Under an `accept` policy a held record can only be one this gate withheld:
    * the policy path writes `queued`, and lifting a hold promotes every held
@@ -1161,7 +1224,7 @@ export class GatewaySessionTransport {
     if (this.policy !== 'accept') return
     if (!this.records.some(record => record.state === 'held')) return
     const health = await probePeerRoute(this.peer.route)
-    if (health.state !== 'serving') return
+    if (health.state !== 'serving' && health.state !== 'unknown') return
     await this.serial(async () => {
       const releasing = new Set(this.records.filter(record => record.state === 'held').map(record => record.message.id))
       if (releasing.size === 0) return
@@ -1221,7 +1284,24 @@ export class GatewaySessionTransport {
     // gate closes. Only a positive report of exhaustion or rejection withholds;
     // everything else - including an older peer with no advertised route - is
     // `unknown` and delivers.
-    const health = await probePeerRoute(target.peer.route)
+    let advertised = target.peer.route
+    let health = await probePeerRoute(advertised)
+    // A refusal is a claim about a POOL, and a pool changes without this process
+    // being told: a key can be injected into the gateway, and the recipient
+    // refreshes its advertisement at every turn boundary. So before withholding
+    // mail, re-read the registration and ask once more. Both halves are a real
+    // reload - the gateway re-derives its credential set from the environment and
+    // the key overlay on every request, and the registration on disk is the
+    // recipient's current answer - so this is a second question, not a repeat of
+    // the first. No restart is involved: `/gateway/reload-keys` exits the
+    // gateway for a supervisor to respawn, which is not something a send may do,
+    // and a probe never fabricates a credential.
+    if (health.state === 'exhausted' || health.state === 'unauthorized') {
+      await new Promise(resolve => setTimeout(resolve, ROUTE_RECHECK_DELAY_MS))
+      const refreshed = await readRegistration(this.options.directory, toSessionId).catch(() => undefined)
+      if (refreshed?.peer.route) advertised = refreshed.peer.route
+      health = await probePeerRoute(advertised)
+    }
     const routeUnavailable = health.state === 'exhausted' || health.state === 'unauthorized'
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
@@ -1268,8 +1348,9 @@ export class GatewaySessionTransport {
     // receipt is a success at the transport level - the message is durable and
     // owed. It is not a delivery, and reporting it as one is the defect this
     // gate closes: the sender would stop looking for an answer that cannot
-    // come. The route verdict is the sender's own probe, so the refusal names
-    // the credential the recipient would have spent.
+    // come. `routeState` is the POOL's verdict, because that is what decides
+    // whether the recipient can answer at all; the advertised number and its own
+    // verdict ride along because they are what the sender would have to change.
     if (routeUnavailable && receipt?.ok === true && receipt.state === 'held') {
       return {
         ok: false,
@@ -1283,11 +1364,13 @@ export class GatewaySessionTransport {
         id: message.id,
         historySaved,
         recipient: toSessionId,
-        ...(target.peer.route ? {
-          provider: target.peer.route.provider,
-          number: target.peer.route.number,
-          ...(describePeerRoute(target.peer.route) ? { route: describePeerRoute(target.peer.route) } : {}),
+        ...(advertised ? {
+          provider: advertised.provider,
+          number: advertised.number,
+          ...(describePeerRoute(advertised) ? { route: describePeerRoute(advertised) } : {}),
         } : {}),
+        ...(health.numberState ? { numberState: health.numberState } : {}),
+        ...(health.size !== undefined ? { size: health.size } : {}),
         ...(health.http !== undefined ? { http: health.http } : {}),
         detail: health.reason,
         meaning: 'Held in the recipient inbox and still owed; it was not handed to a model.',
