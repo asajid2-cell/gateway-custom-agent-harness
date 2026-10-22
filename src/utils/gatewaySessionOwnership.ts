@@ -1,9 +1,10 @@
-import { mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm, stat } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { join } from 'node:path'
 import { lock } from './lockfile.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { isProcessRunning } from './genericProcessUtils.js'
+import { TOMBSTONE_SUFFIX, TOMBSTONE_TTL_MS } from './gatewaySessionTransport.js'
 import { registerCleanup } from './cleanupRegistry.js'
 
 /**
@@ -74,6 +75,58 @@ async function endpointRefuses(endpoint: string): Promise<boolean> {
   })
 }
 
+type ClaimOwner = { pid?: unknown; endpoint?: unknown }
+
+/**
+ * The dead owner a reaped tombstone describes, when a tombstone may stand in for
+ * a missing live registration.
+ *
+ * Absence of `<id>.json` has two very different causes, and only one of them
+ * permits clearing a claim. Either the bus reaped a record it proved dead - then
+ * the tombstone is that record's death certificate and the claim it left is a
+ * corpse's. Or a session has taken its claim and has not published yet - a
+ * session that is starting, not one that is gone - and clearing that claim would
+ * let a second writer into the record the claim exists to protect.
+ *
+ * Time tells them apart, and it is the claim's creation time that does it: a
+ * claim made after the tombstone was written belongs to a later life, typically
+ * one starting this instant, and must be left alone; a claim that already existed
+ * when the tombstone was written is the claim of the session that was reaped.
+ *
+ * Creation time rather than modification time, for a reason worth recording:
+ * `proper-lockfile` refreshes a held lock's mtime on its update timer, so a
+ * corpse's claim can carry an mtime newer than the tombstone. The tombstone is
+ * the registration file moved aside, so its mtime is when the registration was
+ * last written - before the death - not when the reap happened. Comparing mtimes
+ * therefore rejects the ordinary reopen. Creation time is fixed at the moment the
+ * claim was taken and is never refreshed.
+ *
+ * A file system that reports no creation time falls back to the modification
+ * time, which can only postpone a reopen to the stale window - the safe failure.
+ *
+ * The tombstone must also still be within its TTL, and a claim directory that
+ * cannot be stat'd is not a claim at all, so there is nothing to clear and
+ * nothing to decide - both cases return "no evidence" rather than a guess.
+ */
+async function reapedOwnerEvidence(sessions: string, sessionId: string, claimPath: string): Promise<ClaimOwner | undefined> {
+  const tombstone = join(sessions, `${sessionId}${TOMBSTONE_SUFFIX}`)
+  let tombstoneTime: number
+  try {
+    const info = await stat(tombstone)
+    if (Date.now() - info.mtimeMs > TOMBSTONE_TTL_MS) return undefined
+    tombstoneTime = info.mtimeMs
+  } catch { return undefined }
+  let claimTime: number
+  try {
+    const claimInfo = await stat(`${claimPath}.lock`)
+    claimTime = claimInfo.birthtimeMs > 0 ? claimInfo.birthtimeMs : claimInfo.mtimeMs
+  } catch { return undefined }
+  if (!(tombstoneTime > claimTime)) return undefined
+  try {
+    return (JSON.parse(await readFile(tombstone, 'utf8')) as { peer?: ClaimOwner }).peer
+  } catch { return undefined }
+}
+
 /**
  * Clear a writer claim left behind by a session that provably no longer exists.
  *
@@ -84,21 +137,30 @@ async function endpointRefuses(endpoint: string): Promise<boolean> {
  * be instant instead waits out a corpse. The bus can prove the corpse is a corpse,
  * and this is the one case where removing someone else's claim is safe.
  *
- * Both signals are required, and both must be positive proofs: the registration
- * must name a pid that is gone AND an endpoint that refuses connections. A
- * missing or unreadable registration leaves the claim alone (the session may be
- * publishing right now), a live pid leaves it alone, and a busy endpoint leaves
- * it alone. Being wrong here would hand a live session's record to a second
- * writer, which is exactly what the claim exists to prevent; waiting 30s for an
- * empty lock is the safe failure.
+ * Both signals are required, and both must be positive proofs: the owner must
+ * name a pid that is gone AND an endpoint that refuses connections. A live pid
+ * leaves it alone and a busy endpoint leaves it alone. Being wrong here would
+ * hand a live session's record to a second writer, which is exactly what the
+ * claim exists to prevent; waiting 30s for an empty lock is the safe failure.
+ *
+ * The owner's evidence is normally the live registration. After a reap there is
+ * no live registration - and the reopen path almost always lists first, which is
+ * what reaps - so a tombstone is accepted in its place under the stricter time
+ * rule in `reapedOwnerEvidence`. An unreadable live registration still stops
+ * here: it might be a session publishing at this instant.
  */
 async function clearDeadWriterClaim(sessionId: string, claimPath: string): Promise<void> {
-  let registration: { peer?: { pid?: unknown; endpoint?: unknown } }
+  const sessions = join(getClaudeConfigHomeDir(), 'gateway-sessions')
+  let owner: ClaimOwner | undefined
   try {
-    registration = JSON.parse(await readFile(join(getClaudeConfigHomeDir(), 'gateway-sessions', `${sessionId}.json`), 'utf8')) as typeof registration
-  } catch { return }
-  const pid = registration?.peer?.pid
-  const endpoint = registration?.peer?.endpoint
+    owner = (JSON.parse(await readFile(join(sessions, `${sessionId}.json`), 'utf8')) as { peer?: ClaimOwner }).peer
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return
+    owner = await reapedOwnerEvidence(sessions, sessionId, claimPath)
+  }
+  if (!owner) return
+  const pid = owner.pid
+  const endpoint = owner.endpoint
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return
   if (typeof endpoint !== 'string' || endpoint.length === 0) return
   if (isProcessRunning(pid)) return

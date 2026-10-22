@@ -708,7 +708,7 @@ export async function broadcastIdentify(directory: string, asker?: { sessionId: 
  * dead registration is moved aside to a tombstone, where a restart can still find
  * it, and swept a day later, long after any crash-restart has had its chance.
  */
-const TOMBSTONE_TTL_MS = 86_400_000
+export const TOMBSTONE_TTL_MS = 86_400_000
 
 /**
  * The tombstone suffix deliberately makes the name fail the discovery filter,
@@ -717,7 +717,7 @@ const TOMBSTONE_TTL_MS = 86_400_000
  * are `listGatewayPeers`, which expires it, and `readPriorIntent`, which recovers
  * the intent of a session starting up again.
  */
-const TOMBSTONE_SUFFIX = '.dead.json'
+export const TOMBSTONE_SUFFIX = '.dead.json'
 
 function tombstonePath(directory: string, sessionId: string): string {
   return join(directory, `${sessionId}${TOMBSTONE_SUFFIX}`)

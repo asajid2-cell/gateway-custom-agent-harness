@@ -601,7 +601,7 @@ test('a peer from a newer build stays visible on the bus', async () => {
  * The child is spawned with the test runner's own executable because this file
  * is a `.ts` module importing the TypeScript source; bun runs it directly.
  */
-type ChildSession = { child: ChildProcess; pid: number }
+type ChildSession = { child: ChildProcess; pid: number; stdout: string }
 
 /**
  * Spawn a script until it prints READY, and hand back the live child.
@@ -618,11 +618,13 @@ async function spawnAndWait(script: string, args: string[], registry: string, wh
     windowsHide: true,
   })
   let stderr = ''
+  let stdout = ''
   child.stderr?.on('data', chunk => { stderr += String(chunk) })
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`the ${what} did not register: ${stderr}`)), 20_000)
     child.stdout?.on('data', chunk => {
-      if (!String(chunk).includes('READY')) return
+      stdout += String(chunk)
+      if (!stdout.includes('READY')) return
       clearTimeout(timer)
       resolve()
     })
@@ -632,7 +634,7 @@ async function spawnAndWait(script: string, args: string[], registry: string, wh
     })
   })
   assert.ok(child.pid, 'a spawned child has a pid')
-  return { child, pid: child.pid! }
+  return { child, pid: child.pid!, stdout }
 }
 
 /** A child running only the transport: enough to publish, hold, and be killed. */
@@ -1045,6 +1047,126 @@ test('a writer claim left by a dead session is cleared, and the claim is granted
   } finally {
     await releaseGatewaySessionWriter(sessionId).catch(() => {})
     if (holding) await holding().catch(() => {})
+    if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfig
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+/** A pid that certainly belonged to a process that has exited. */
+async function anExitedPid(): Promise<number> {
+  const gone = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore', windowsHide: true })
+  await new Promise<void>(resolve => gone.once('exit', () => resolve()))
+  assert.ok(gone.pid, 'a spawned child has a pid')
+  return gone.pid!
+}
+
+test('a session killed and reaped can be reopened at once', { timeout: 90_000 }, async () => {
+  // The user's actual path, in their order: Ctrl-C (or a kill) out of a session,
+  // then someone lists - /sessions, or a sender resolving an id - which is what
+  // reaps the registration into a tombstone, then the session is started again.
+  // By then the live file is gone, so the evidence the old writer claim is a
+  // corpse is the tombstone. Without it the reopen is refused by that corpse for
+  // the whole lock ladder, which is the ~42s wait the user was describing.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-reap-reopen-'))
+  const previousConfig = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = registry
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  const sessions = join(registry, 'gateway-sessions')
+  const sessionId = randomUUID()
+  const declaredPurpose = 'the work the killed session declared'
+  const declaredTopics = ['reap first', 'then reopen']
+  const tombstone = join(sessions, `${sessionId}.dead.json`)
+  const claim = join(registry, 'gateway-writers', `${sessionId}.lock`)
+  let first: ChildSession | undefined
+  let second: ChildSession | undefined
+  try {
+    first = await startChildRuntime(registry, sessionId, declaredPurpose, declaredTopics)
+    await killChild(first)
+    first = undefined
+
+    // The listing, repeated, is the bus doing its own reaping.
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
+      await listGatewayPeers(sessions)
+      if (await exists(tombstone)) break
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    assert.ok(await exists(tombstone), 'the listing must reap the killed session before the reopen')
+    assert.equal(await exists(join(sessions, `${sessionId}.json`)), false, 'and the live registration must be gone')
+    assert.ok(await exists(claim), 'the dead runtime left its writer claim behind')
+
+    const script = join(registry, 'reopen-child.ts')
+    const runtimeUrl = new URL('../src/utils/gatewaySessionRuntime.ts', import.meta.url).href
+    await writeFile(script, [
+      `import { GatewaySessionRuntime } from ${JSON.stringify(runtimeUrl)}`,
+      'const [sessionId, cwd] = process.argv.slice(2)',
+      "const runtime = new GatewaySessionRuntime(sessionId, cwd, 'Reopened child')",
+      'await runtime.start(new Set())',
+      'process.stdout.write(`READY ${JSON.stringify({ sessionId: runtime.transport.peer.sessionId, purpose: runtime.transport.peer.purpose, topics: runtime.transport.peer.topics })}\\n`)',
+      'setInterval(() => {}, 1000)',
+      '',
+    ].join('\n'))
+    const started = Date.now()
+    second = await spawnAndWait(script, [sessionId, registry], registry, 'reopened child')
+    const elapsed = Date.now() - started
+    assert.ok(elapsed < 5000, `a reopen after a reap must not wait out the lock ladder; it took ${elapsed}ms`)
+    const status = JSON.parse(second.stdout.slice(second.stdout.indexOf('READY') + 5).trim()) as { sessionId: string; purpose: string; topics: string[] }
+    assert.equal(status.sessionId, sessionId, 'the reopened child registers under the same id, not a new one')
+    assert.equal(status.purpose, declaredPurpose, 'the reopen recovers the purpose from the tombstone')
+    assert.deepEqual(status.topics, declaredTopics, 'the reopen recovers the topics from the tombstone')
+    assert.ok((await listGatewayPeers(sessions)).some(peer => peer.sessionId === sessionId), 'the reopened child is live')
+  } finally {
+    if (second) await killChild(second).catch(() => {})
+    if (first) await killChild(first).catch(() => {})
+    if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfig
+    if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
+    else process.env.CLAUDE_CODE_USE_GATEWAY = previousGateway
+    await rm(registry, { recursive: true, force: true })
+  }
+})
+
+test('a live starting claim is never cleared by an older tombstone', { timeout: 30_000 }, async () => {
+  // The tombstone rule needs its own guard. "No live registration" is also the
+  // state of a session that has taken its claim and has not published yet, and
+  // that session is alive. What separates it from a reaped corpse is time: a
+  // held claim is newer than the tombstone a previous life left, while a reaped
+  // owner's claim is older than the reap that produced its tombstone. Without
+  // that ordering, a starting session would be cleared by a stale death record
+  // and a second writer would be let into the record the claim protects.
+  const registry = await mkdtemp(join(tmpdir(), 'gateway-claim-starting-'))
+  const previousConfig = process.env.CLAUDE_CONFIG_DIR
+  const previousGateway = process.env.CLAUDE_CODE_USE_GATEWAY
+  process.env.CLAUDE_CONFIG_DIR = registry
+  process.env.CLAUDE_CODE_USE_GATEWAY = '1'
+  const sessionId = randomUUID()
+  const claimPath = join(registry, 'gateway-writers', sessionId)
+  let holding: (() => Promise<void>) | undefined
+  try {
+    await withRegistrySession(registry, async sessions => {
+      const tombstone = join(sessions, `${sessionId}.dead.json`)
+      await writeFile(tombstone, registrationJson({ sessionId, pid: await anExitedPid(), endpoint: deadEndpoint(), purpose: 'previous life' }))
+      const anHourAgo = new Date(Date.now() - 3_600_000)
+      await utimes(tombstone, anHourAgo, anHourAgo)
+      // A live owner that has claimed and not yet published: no `<id>.json`, and
+      // a claim newer than the tombstone.
+      await mkdir(join(registry, 'gateway-writers'), { recursive: true, mode: 0o700 })
+      holding = await lock(claimPath, { realpath: false, stale: 30000, retries: 0 })
+      await assert.rejects(
+        claimGatewaySessionWriter(sessionId),
+        /Another session is writing/,
+        'an older tombstone must not clear a live starting session\'s claim',
+      )
+      assert.ok(await exists(`${claimPath}.lock`), 'the starting session keeps the claim it just took')
+      assert.ok(await exists(tombstone), 'the tombstone is evidence about a previous life, not about this claim')
+    })
+  } finally {
+    if (holding) await holding().catch(() => {})
+    await releaseGatewaySessionWriter(sessionId).catch(() => {})
     if (previousConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = previousConfig
     if (previousGateway === undefined) delete process.env.CLAUDE_CODE_USE_GATEWAY
