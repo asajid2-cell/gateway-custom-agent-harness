@@ -34,7 +34,11 @@ async function withTransport<T>(run: (transport: GatewaySessionTransport, home: 
   }
 }
 
-async function waitFor(check: () => boolean, timeoutMs = 4000): Promise<void> {
+// Bounds are generous on purpose. These timers are real, and the whole file is
+// 4s of work on an idle box - but a busy one (several suites and a typecheck at
+// once) starved a 4s wait twice in practice, which turns a working timer into a
+// red line. Only the wall clock moves here: what is asserted is unchanged.
+async function waitFor(check: () => boolean, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (!check()) {
     if (Date.now() > deadline) throw new Error('timed out waiting for the timer to fire')
@@ -103,7 +107,7 @@ test('outstandingReplies counts only what is owed: no expectReply:false, no repl
   assert.deepEqual(transport.outstandingReplies().map((entry: any) => entry.toMessageId), ['owed-2'])
 })
 
-test('a one-shot wake fires once and deletes its state file', async () => {
+test('a one-shot wake fires once and deletes its state file', { timeout: 30_000 }, async () => {
   await withTransport(async (transport, home, directory) => {
     const fired: { token: string; at: string }[] = []
     ;(transport as any).options.onWake = (timer: { token: string; at: string }) => fired.push(timer)
@@ -125,7 +129,7 @@ test('a one-shot wake fires once and deletes its state file', async () => {
   })
 })
 
-test('a recurring wake rewrites its state, and stop ends it', async () => {
+test('a recurring wake rewrites its state, and stop ends it', { timeout: 30_000 }, async () => {
   await withTransport(async (transport, home, directory) => {
     const fired: string[] = []
     ;(transport as any).options.onWake = (timer: { token: string }) => fired.push(timer.token)
@@ -149,7 +153,7 @@ test('a recurring wake rewrites its state, and stop ends it', async () => {
   })
 })
 
-test('a re-set with the same token replaces rather than duplicates', async () => {
+test('a re-set with the same token replaces rather than duplicates', { timeout: 30_000 }, async () => {
   await withTransport(async (transport, home, directory) => {
     const fired: string[] = []
     ;(transport as any).options.onWake = (timer: { token: string }) => fired.push(timer.token)
@@ -163,7 +167,7 @@ test('a re-set with the same token replaces rather than duplicates', async () =>
   })
 })
 
-test('a wake with the wrong receiver token is refused and schedules nothing', async () => {
+test('a wake with the wrong receiver token is refused and schedules nothing', { timeout: 30_000 }, async () => {
   await withTransport(async (transport, home) => {
     const receipt = await callGatewayPeer(transport.peer.endpoint, { type: 'wake', token: 'bad-1', auth: 'not-the-token', reason: 'timer', at: new Date(Date.now() + 1000).toISOString() }) as any
     assert.equal(receipt.ok, false)
