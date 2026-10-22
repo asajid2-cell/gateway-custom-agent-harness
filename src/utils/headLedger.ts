@@ -515,8 +515,11 @@ export async function runHeadLedger(request: HeadLedgerRequest): Promise<string>
  * terminal. Reads never call this.
  */
 export async function requireHead(): Promise<string> {
-  const { getLeafPatriarchSessionId } = await import('./leafWorkspace.js')
-  const head = getLeafPatriarchSessionId()
+  // The answer decides an act, so it is read rather than remembered: a process
+  // that launched before a handoff holds the old head in memory, and answering
+  // from that let the member that had left the chair go on writing.
+  const { currentLeafPatriarchSessionId } = await import('./leafWorkspace.js')
+  const head = await currentLeafPatriarchSessionId()
   const self = getSessionId()
   if (self !== head) {
     throw new Error(`Only the family head writes the ledger; the head is ${head}, and any member may read.`)
@@ -535,8 +538,8 @@ export async function requireHead(): Promise<string> {
  * that can actually write, so a refused member knows who to ask.
  */
 export async function requireLedgerWriter(): Promise<string> {
-  const { getLeafPatriarchSessionId, liveLedgerWriters } = await import('./leafWorkspace.js')
-  const head = getLeafPatriarchSessionId()
+  const { currentLeafPatriarchSessionId, liveLedgerWriters } = await import('./leafWorkspace.js')
+  const head = await currentLeafPatriarchSessionId()
   const self = getSessionId()
   if (self === head) return head
   const writers = await liveLedgerWriters()

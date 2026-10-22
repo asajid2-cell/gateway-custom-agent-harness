@@ -23,7 +23,7 @@ import { withResolvers } from './withResolvers.js'
 import { isProcessRunning } from './genericProcessUtils.js'
 import { killTree, launchPartner, partnerStartupTimeoutMs, type PartnerHandle } from './partnerLeaf.js'
 import { launchSessionInTerminal } from './deepLink/terminalLauncher.js'
-import { getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafSelfClose, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
+import { adoptLeafDesignation, getLeafSnapshot, isInteractiveLeaf, leafSessionId, requestLeafSelfClose, requestLeafWorkspace, subscribeLeafSnapshot, type LeafTerminalMessage } from './leafTerminal.js'
 import { focusLeafTerminal, renderLeafTerminal } from './leafTerminalHost.js'
 import { LEAF_PEER_PROMPT_PREFIX } from './gatewaySessionProtocol.js'
 import { isLeafHeadReference, isLeafRootReference } from './leafAliases.js'
@@ -1245,10 +1245,53 @@ async function refreshDesignatedPatriarch(): Promise<LeafMember | undefined> {
   const member = await familyPatriarchMember(members, root)
   designatedPatriarch = member ? { sessionId: member.sessionId, name: member.name } : undefined
   designatedHeir = await familyHeirSessionId(root)
-  formerPatriarchIds = (await readLeafFamilyPointer(root))?.formerPatriarchIds ?? []
-  driverScope = (await readLeafFamilyPointer(root))?.driverScope ?? {}
-  ledgerWriterIds = (await readLeafFamilyPointer(root))?.ledgerWriterIds ?? []
+  // One read of the pointer: the three designations it carries were read apart
+  // before, so a write landing between them could be half-seen. Reading it once
+  // keeps what this refresh caches true of one state of the record.
+  const pointer = await readLeafFamilyPointer(root)
+  formerPatriarchIds = pointer?.formerPatriarchIds ?? []
+  driverScope = pointer?.driverScope ?? {}
+  ledgerWriterIds = pointer?.ledgerWriterIds ?? []
+  // The snapshot is the display cache a leaf draws from, and in a leaf the sync
+  // getters answer from it. This read is fresher than the publish that set it, so
+  // the cache is brought up to the answer just read rather than left naming a head
+  // that has since moved.
+  adoptLeafDesignation({
+    ...(member ? { patriarchSessionId: member.sessionId } : {}),
+    heirSessionId: designatedHeir,
+    formerPatriarchIds,
+    driverScope,
+    ledgerWriterIds,
+  })
   return member
+}
+
+/**
+ * The patriarch as the designation holds it now, read rather than remembered.
+ *
+ * `getLeafPatriarchSessionId` answers from memory because a render cannot await:
+ * the launch snapshot in a member, the last read in a host. Both are hints, and a
+ * designation that moves while a process is up is invisible to whichever one that
+ * process holds - which is exactly what a handoff did: the record on disk named
+ * the new head and every live process went on acting for the old one until it was
+ * restarted. A gate that decides whether an act is allowed cannot answer from a
+ * hint, so it pays for one read of the family's designation and resolves from
+ * that. Nothing is written: the answer is read, and the display cache is brought
+ * up to it.
+ *
+ * A record that cannot be read is not evidence the head moved, so the hint is
+ * what is left to answer with - the same answer this process would have given
+ * before asking.
+ */
+export async function currentLeafPatriarchSessionId(): Promise<string> {
+  try {
+    const root = await familyRootSessionId()
+    const member = await refreshDesignatedPatriarch()
+    publish()
+    return member?.sessionId ?? await familyPatriarchSessionId(root)
+  } catch {
+    return getLeafPatriarchSessionId()
+  }
 }
 
 /**

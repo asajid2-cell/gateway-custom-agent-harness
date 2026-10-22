@@ -281,6 +281,34 @@ export function adoptHeadlessLeafOwner(): void {
 }
 export function getLeafSnapshot(): LeafSnapshot | undefined { return snapshot }
 export function subscribeLeafSnapshot(listener: () => void): () => void { snapshotListeners.add(listener); return () => { snapshotListeners.delete(listener) } }
+
+/** Take the host's snapshot as this leaf's roster and display state. */
+export function adoptLeafSnapshot(next: LeafSnapshot): void {
+  snapshot = next
+  for (const listener of snapshotListeners) listener()
+}
+
+/**
+ * Re-seed the snapshot's designation fields from the designation just read.
+ *
+ * A leaf's snapshot is published by the session hosting the family, so it is
+ * only as fresh as the last publish - and a designation that moves while the
+ * leaf is up stays invisible until that host republishes. The designation
+ * itself is on disk, where any process can read it, so a process that reads it
+ * brings its display cache up to the same answer instead of going on naming a
+ * head that has left. Only designations are taken: membership and member state
+ * are the host's facts, and this process does not own the member processes.
+ *
+ * The rows and the names are untouched deliberately. A designation names a
+ * member; what that member is called is read with the roster, and rewriting it
+ * from a bare id here would rename a row on the strength of a narrowed read.
+ */
+export function adoptLeafDesignation(designation: Partial<Pick<LeafSnapshot,
+  'patriarchSessionId' | 'heirSessionId' | 'formerPatriarchIds' | 'driverScope' | 'ledgerWriterIds'>>): void {
+  if (!snapshot) return
+  snapshot = { ...snapshot, ...designation }
+  for (const listener of snapshotListeners) listener()
+}
 export function consumeLeafInitialDraft(): string { const value = initialDraft; initialDraft = ''; return value }
 export function sendLeafTerminal(message: LeafTerminalMessage): void {
   if (message.type === 'leaf-state') lastState = message.state
@@ -407,8 +435,7 @@ export async function installLeafTerminal(): Promise<void> {
       return
     }
     if (message.type === 'leaf-snapshot') {
-      snapshot = message.snapshot
-      for (const listener of snapshotListeners) listener()
+      adoptLeafSnapshot(message.snapshot)
       return
     }
     if (message.type === 'leaf-response') {
