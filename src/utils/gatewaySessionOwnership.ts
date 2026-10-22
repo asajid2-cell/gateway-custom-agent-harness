@@ -1,7 +1,9 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile, rm } from 'node:fs/promises'
+import { createConnection } from 'node:net'
 import { join } from 'node:path'
 import { lock } from './lockfile.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
+import { isProcessRunning } from './genericProcessUtils.js'
 import { registerCleanup } from './cleanupRegistry.js'
 
 /**
@@ -44,6 +46,67 @@ function writerClaimRefusal(sessionId: string, refused: unknown): Error {
 }
 
 /**
+ * Whether an endpoint positively refuses connections, which is proof that
+ * nothing is listening there any more.
+ *
+ * Only a refusal counts. A timeout is not a refusal - an endpoint that accepted
+ * the connection and then produced nothing is busy, and a busy owner is alive -
+ * so the caller must not read this as death just because the probe ran out of
+ * patience. Neither is an error of any other kind: a permission failure or a
+ * transient resource error says nothing about whether the owner exists.
+ */
+async function endpointRefuses(endpoint: string): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    let settled = false
+    const socket = createConnection(endpoint)
+    const finish = (refused: boolean): void => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(refused)
+    }
+    socket.setTimeout(1000, () => finish(false))
+    socket.once('connect', () => finish(false))
+    socket.once('error', error => {
+      const code = (error as NodeJS.ErrnoException).code
+      finish(code === 'ECONNREFUSED' || code === 'ENOENT')
+    })
+  })
+}
+
+/**
+ * Clear a writer claim left behind by a session that provably no longer exists.
+ *
+ * `proper-lockfile` locks are directories, and a directory outlives the process
+ * that created it. When a session is Ctrl-C'd or killed while it holds the claim,
+ * the claim survives, and the next launch is refused by its own corpse: the lock
+ * is only cleared once its 30s stale window has elapsed, so a reopen that should
+ * be instant instead waits out a corpse. The bus can prove the corpse is a corpse,
+ * and this is the one case where removing someone else's claim is safe.
+ *
+ * Both signals are required, and both must be positive proofs: the registration
+ * must name a pid that is gone AND an endpoint that refuses connections. A
+ * missing or unreadable registration leaves the claim alone (the session may be
+ * publishing right now), a live pid leaves it alone, and a busy endpoint leaves
+ * it alone. Being wrong here would hand a live session's record to a second
+ * writer, which is exactly what the claim exists to prevent; waiting 30s for an
+ * empty lock is the safe failure.
+ */
+async function clearDeadWriterClaim(sessionId: string, claimPath: string): Promise<void> {
+  let registration: { peer?: { pid?: unknown; endpoint?: unknown } }
+  try {
+    registration = JSON.parse(await readFile(join(getClaudeConfigHomeDir(), 'gateway-sessions', `${sessionId}.json`), 'utf8')) as typeof registration
+  } catch { return }
+  const pid = registration?.peer?.pid
+  const endpoint = registration?.peer?.endpoint
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return
+  if (typeof endpoint !== 'string' || endpoint.length === 0) return
+  if (isProcessRunning(pid)) return
+  if (!(await endpointRefuses(endpoint))) return
+  await rm(`${claimPath}.lock`, { recursive: true, force: true }).catch(() => {})
+}
+
+/**
  * Take the writer claim for a session, or hand back the one already held.
  */
 export async function claimGatewaySessionWriter(sessionId: string): Promise<void> {
@@ -58,7 +121,17 @@ export async function claimGatewaySessionWriter(sessionId: string): Promise<void
       try {
         return { release: await lock(path, { realpath: false, stale: 30000, retries: 0 }) }
       } catch (refused) {
-        return { refused }
+        // A refusal normally means a live process is writing this record and must
+        // be left alone. It also happens when the previous owner died holding the
+        // claim, where the 30s stale window makes a reopen wait on a process that
+        // no longer exists. Clearing a provably dead owner's claim is the only
+        // case worth retrying; everything else keeps the refusal verbatim.
+        await clearDeadWriterClaim(sessionId, path)
+        try {
+          return { release: await lock(path, { realpath: false, stale: 30000, retries: 0 }) }
+        } catch (again) {
+          return { refused: again }
+        }
       }
     })()
     claims.set(path, entry)

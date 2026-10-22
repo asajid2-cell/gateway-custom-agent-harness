@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { lstat, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Server } from 'node:net'
 import { join } from 'node:path'
 import { isProcessRunning } from './genericProcessUtils.js'
@@ -541,7 +541,14 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
   try { entries = await readdir(directory) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
   const candidates = entries.filter(entry => entry.endsWith('.json') && idPattern.test(entry.slice(0, -5)))
-  if (candidates.length === 0) return []
+  // Tombstones are swept, never listed. The suffix is deliberately not `.json`
+  // with a UUID stem, so a record of a death cannot be read as a claim of life:
+  // discovery filters on exactly that shape, and so does every other reader of
+  // this directory. The sweep is here because the listing is the only routine
+  // that reads the registry; it runs before the early return so a directory
+  // holding nothing but expired tombstones still empties.
+  const expiredTombstones = entries.filter(entry => entry.endsWith(TOMBSTONE_SUFFIX) && idPattern.test(entry.slice(0, -TOMBSTONE_SUFFIX.length)))
+  if (candidates.length === 0 && expiredTombstones.length === 0) return []
   // Validate the directory once for the whole listing. A stale registration is
   // the common case here, and the check is a PowerShell spawn on Windows: doing
   // it per file made discovery cost ~350ms per registration on disk.
@@ -552,6 +559,12 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
   // statement about a peer that is running, produced by a check that could not
   // be run. Only a missing directory means an empty registry.
   await validatePrivateDirectory(directory)
+  await Promise.all(expiredTombstones.map(async entry => {
+    const path = join(directory, entry)
+    try { if (Date.now() - (await stat(path)).mtimeMs > TOMBSTONE_TTL_MS) await unlink(path) }
+    catch { /* Gone already, or unreadable: the next listing tries again. */ }
+  }))
+  if (candidates.length === 0) return []
   // Probes run together, and the answer keeps the directory's order. One at a
   // time made the listing cost the sum of every probe, so a single hung, frozen
   // or foreign endpoint stalled the whole registry for its timeout - on the path
@@ -585,7 +598,7 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
     } catch (error) {
       connected = (error as { peerConnected?: boolean }).peerConnected === true
     }
-    if (peer && !answered && !connected) await unlinkIfDead(directory, sessionId, peer.pid)
+    if (peer && !answered && !connected) await reapIfDead(directory, sessionId, peer)
     return answered || connected ? peer : undefined
   })
   const peers: GatewayPeer[] = []
@@ -685,49 +698,104 @@ export async function broadcastIdentify(directory: string, asker?: { sessionId: 
 }
 
 /**
- * How long a dead registration is kept before a listing lets it go.
+ * How long a reaped registration is kept before a listing lets it go.
  *
- * Not zero, because a registration is not only a liveness advertisement: a
- * session that restarts reads it back to keep the intent it had already declared
- * and the topics it had already been working on, which is what stops a resumed
- * session reappearing as an unnamed stranger. A session that crashed and is about
- * to be resumed is dead for exactly that moment, so deleting on the first dead
- * listing would quietly throw that intent away. An hour is far longer than any
- * crash-restart and short enough that an abandoned fleet empties within the day.
+ * A registration is not only a liveness advertisement: a session that restarts
+ * reads it back to keep the intent it had already declared and the topics it had
+ * already been working on, which is what stops a resumed session reappearing as
+ * an unnamed stranger. Reaping therefore cannot simply delete the file - that
+ * would throw the intent away at the exact moment it becomes useful. Instead the
+ * dead registration is moved aside to a tombstone, where a restart can still find
+ * it, and swept a day later, long after any crash-restart has had its chance.
  */
-const DEAD_REGISTRATION_GRACE_MS = 3_600_000
+const TOMBSTONE_TTL_MS = 86_400_000
 
 /**
- * Delete a registration that is provably dead and no longer needed, rather than
- * only filtering it out of the answer.
+ * The tombstone suffix deliberately makes the name fail the discovery filter,
+ * which only accepts `<uuid>.json`. A tombstone must never be probed, listed, or
+ * mistaken for a live session; it is dead by construction. Its only two readers
+ * are `listGatewayPeers`, which expires it, and `readPriorIntent`, which recovers
+ * the intent of a session starting up again.
+ */
+const TOMBSTONE_SUFFIX = '.dead.json'
+
+function tombstonePath(directory: string, sessionId: string): string {
+  return join(directory, `${sessionId}${TOMBSTONE_SUFFIX}`)
+}
+
+/**
+ * The intent a restarted session left behind: its declared purpose and the
+ * topics it had been working on.
+ *
+ * The prior record can be in either of two places. A session that closed cleanly
+ * unlinks its registration and has no intent to recover; one that crashed or was
+ * killed had its record moved to a tombstone by the reaper, so looking only at
+ * the live path would restore intent in exactly the case that does not occur and
+ * lose it in exactly the case that does. The live path is still read first,
+ * because a session can restart before the bus has reaped it.
+ *
+ * A tombstone past its TTL is not read: by then it is the abandoned history of a
+ * session nobody resumed, and adopting it would give this launch a stale name and
+ * someone else's topics. Fields are validated here rather than trusted, because
+ * a tombstone can be any file left by any build.
+ */
+async function readPriorIntent(directory: string, sessionId: string): Promise<{ purpose?: string; topics?: string[] }> {
+  const sources = [join(directory, `${sessionId}.json`)]
+  try {
+    if (Date.now() - (await stat(tombstonePath(directory, sessionId))).mtimeMs <= TOMBSTONE_TTL_MS) sources.push(tombstonePath(directory, sessionId))
+  } catch { /* No tombstone: there is only the live path to try. */ }
+  for (const path of sources) {
+    try {
+      const raw = JSON.parse(await readFile(path, 'utf8')) as { peer?: { purpose?: unknown; topics?: unknown } }
+      const purpose = typeof raw?.peer?.purpose === 'string' ? raw.peer.purpose.slice(0, 1000) : undefined
+      const topics = Array.isArray(raw?.peer?.topics)
+        ? raw.peer.topics.filter((topic): topic is string => typeof topic === 'string' && topic.length >= 1 && topic.length <= 120).slice(0, 8)
+        : undefined
+      if (purpose !== undefined || (topics !== undefined && topics.length > 0)) return { purpose, topics }
+    } catch { /* Missing or unreadable: the next source may still hold the intent. */ }
+  }
+  return {}
+}
+
+/**
+ * Retire a registration the bus has proven dead, instead of only filtering it
+ * out of the answer.
  *
  * A filtered listing was correct and still left the problem behind: the file
  * stayed on disk advertising a name, a cwd and a pid for a session that had
  * exited, so anything reading the directory directly - a person, a process
- * scanner, a diagnosis of a pile-up - kept being told about sessions that no
- * longer existed. The listing is the only routine that reads every registration,
- * so it is also the only place that can let them go.
+ * scanner, a diagnosis of a pile-up, or the sender that refuses to talk to it -
+ * kept being told about sessions that no longer existed. The listing is the only
+ * routine that reads every registration, so it is also the only place that can
+ * let them go. Reaping is the bus's job, not the dead session's: a session that
+ * was Ctrl-C'd or killed cannot deregister itself, and should not have to.
  *
- * Two independent signals are required before deleting. The endpoint must have
- * failed to answer AND the recorded pid must be gone: a busy peer can miss a
- * ping, and a recycled pid reads as alive, while deleting a live session's
- * registration would make it unreachable until it happened to write one again.
- * Being wrong in the other direction only leaves a stale file, which is what
- * happens today anyway.
+ * Two independent signals are required before acting. The caller has already
+ * established that the endpoint did not answer; this function additionally
+ * requires that the recorded pid is gone. A busy peer can miss a ping, and a
+ * recycled pid reads as alive, while reaping a live session's registration would
+ * make it unreachable until it happened to write one again. Being wrong in the
+ * other direction only leaves a stale file, which is what happens today anyway -
+ * lingering is the safe failure.
+ *
+ * The registration is re-read immediately before the move and must still carry
+ * the same pid AND runtimeId that was listed. A session that rebound its own
+ * record between the probe and the rename (same pid, new runtime) is alive and
+ * must not have that record consumed; the reap is abandoned instead.
  */
-async function unlinkIfDead(directory: string, sessionId: string, pid: number): Promise<void> {
-  if (isProcessRunning(pid)) return
-  const path = join(directory, `${sessionId}.json`)
-  try {
-    if (Date.now() - (await stat(path)).mtimeMs < DEAD_REGISTRATION_GRACE_MS) return
-  } catch { return }
-  // A live process may have written a fresh registration since the read above;
-  // only remove the one that was actually proven dead.
+async function reapIfDead(directory: string, sessionId: string, peer: GatewayPeer): Promise<void> {
+  if (isProcessRunning(peer.pid)) return
+  const live = join(directory, `${sessionId}.json`)
   try {
     const current = await readRegistrationUnchecked(directory, sessionId)
-    if (current.peer.pid !== pid) return
+    if (current.peer.pid !== peer.pid || current.peer.runtimeId !== peer.runtimeId) return
   } catch { return }
-  await unlink(path).catch(() => {})
+  try {
+    await renameWithRetry(live, tombstonePath(directory, sessionId))
+  } catch { return }
+  // The dead session's own registration lock is worthless now; anything that
+  // acquires it would be locking a path that no longer holds a live record.
+  await rm(`${live}.lock`, { recursive: true, force: true }).catch(() => {})
 }
 
 export class GatewaySessionTransport {
@@ -971,10 +1039,9 @@ export class GatewaySessionTransport {
       // A session that restarts keeps the intent it already declared or derived.
       // Without this the registration is rewritten blank on every launch, so a
       // stated purpose silently disappeared the moment the session reconnected.
-      try {
-        const raw = JSON.parse(await readFile(this.registrationPath, 'utf8')) as { peer?: { purpose?: unknown } }
-        if (typeof raw?.peer?.purpose === 'string') this.peer.purpose = raw.peer.purpose.slice(0, 1000)
-      } catch { /* No prior registration, or it is unreadable: intent starts empty. */ }
+      const prior = await readPriorIntent(this.options.directory, this.peer.sessionId)
+      if (prior.purpose !== undefined) this.peer.purpose = prior.purpose
+      if (prior.topics !== undefined && prior.topics.length > 0) this.peer.topics = prior.topics
       this.server = createServer(socket => {
         let buffer = Buffer.alloc(0)
         let handled = false

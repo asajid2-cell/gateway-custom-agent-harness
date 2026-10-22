@@ -1,3 +1,4 @@
+import { access } from 'node:fs/promises'
 import { join } from 'path'
 import { getSessionId } from '../bootstrap/state.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
@@ -157,6 +158,25 @@ function ambiguousNameError(address: string, matches: Array<{ sessionId: string;
 }
 
 /**
+ * Whether a session's registration file is gone from the registry.
+ *
+ * The live set alone cannot answer this: a peer that is present on disk but
+ * failed to answer its ping is dropped from the listing without its registration
+ * being touched, so "not in the live set" and "no file on disk" are two different
+ * facts. Only ENOENT counts as gone. Any other failure returns false, which
+ * keeps the cautious "stale registration" sentence - the wrong direction here
+ * would tell a sender a file is gone while it is still there.
+ */
+async function registrationIsGone(directory: string, sessionId: string): Promise<boolean> {
+  try {
+    await access(join(directory, `${sessionId}.json`))
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+/**
  * Resolve an address to a live Gateway session.
  *
  * A session ID is exact; a name is matched against the advertised name, and an
@@ -169,8 +189,8 @@ export async function resolveGatewayPeer(
   address: string,
 ): Promise<{ sessionId: string; label: string } | { error: string }> {
   let peers
+  const directory = join(getClaudeConfigHomeDir(), 'gateway-sessions')
   try {
-    const directory = join(getClaudeConfigHomeDir(), 'gateway-sessions')
     peers = await listGatewayPeers(directory)
   } catch {
     return { error: 'Could not read the live session registry.' }
@@ -191,8 +211,17 @@ export async function resolveGatewayPeer(
   if (SESSION_ID_PATTERN.test(address)) {
     if (peers.length === 0 || peers.some(peer => peer.sessionId === address)) return { sessionId: address, label: address }
     const available = peers.map(peer => `"${peer.name}" (${peer.sessionId})`)
+    // The sentence that follows the refusal describes what is on disk, and the
+    // two cases are not the same advice. When the bus has already reaped the dead
+    // registration there is nothing stale left, so telling the sender there is
+    // sends it looking for a file that no longer exists. A registration that is
+    // still present - a peer that missed its ping while busy, or a build whose
+    // reaper has not run yet - keeps the older, more cautious clause.
+    const verdict = await registrationIsGone(directory, address)
+      ? `Session ${address} is not live; it has exited and its registration is gone.`
+      : `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk.`
     return {
-      error: `Session ${address} is not live; it has exited or crashed without deregistering, and its stale registration is still on disk. Live sessions: ${available.join(', ')}.${await liveFamilyMembers(address, peers)} Use /sessions list.`,
+      error: `${verdict} Live sessions: ${available.join(', ')}.${await liveFamilyMembers(address, peers)} Use /sessions list.`,
     }
   }
   // A truncated ID is an address the sender pasted short, not a name. Expanding

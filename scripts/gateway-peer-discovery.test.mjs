@@ -137,8 +137,20 @@ test('every session records an intent on registration', async () => {
   assert.doesNotMatch(hook, /transport\.update\(\{ name: peerName, status: status === 'busy'[^)]*purpose/)
 
   const transport = await readFile(new URL('../src/utils/gatewaySessionTransport.ts', import.meta.url), 'utf8')
-  // A restart keeps the intent it already advertised instead of blanking it.
-  assert.match(transport, /if \(typeof raw\?\.peer\?\.purpose === 'string'\) this\.peer\.purpose = raw\.peer\.purpose\.slice\(0, 1000\)/)
+  // A restart keeps the intent it already advertised instead of blanking it,
+  // topics included: a resumed session that came back with its opening purpose
+  // but none of the work it had been asked to do was still findable only by the
+  // last thing it was named.
+  assert.match(transport, /const prior = await readPriorIntent\(this\.options\.directory, this\.peer\.sessionId\)/)
+  assert.match(transport, /if \(prior\.purpose !== undefined\) this\.peer\.purpose = prior\.purpose/)
+  assert.match(transport, /if \(prior\.topics !== undefined && prior\.topics\.length > 0\) this\.peer\.topics = prior\.topics/)
+  // The prior record may be a tombstone rather than a live file: the bus reaps a
+  // dead registration by moving it aside, so a restart that read only the live
+  // path would lose intent precisely in the crash-restart case it exists for.
+  // An expired tombstone must not be adopted, or this launch would take on the
+  // abandoned history of a session nobody resumed.
+  assert.match(transport, /async function readPriorIntent\(/)
+  assert.match(transport, /await stat\(tombstonePath\(directory, sessionId\)\)\)\.mtimeMs <= TOMBSTONE_TTL_MS/)
 })
 
 test('a registration advertises the directory the conversation resumes from', async () => {
