@@ -18,6 +18,11 @@ import {
 } from '../src/utils/gatewaySessionTransport.ts'
 import { isProcessRunning } from '../src/utils/genericProcessUtils.ts'
 import { releaseGatewaySessionWriter } from '../src/utils/gatewaySessionOwnership.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 /**
  * Sessions that never reach the peer bus.

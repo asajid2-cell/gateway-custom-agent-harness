@@ -4,6 +4,11 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 /**
  * The ledger is what makes ownership a lookup instead of a guess.

@@ -13,6 +13,11 @@ import { registerGatewayPeersSkill } from '../src/skills/bundled/gatewayPeers.ts
 import { clearBundledSkills, getBundledSkills } from '../src/skills/bundledSkills.ts'
 import { getSessionId } from '../src/bootstrap/state.ts'
 import type { ToolUseContext } from '../src/Tool.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 /**
  * A leaf's family channel points inward: it addresses its own siblings and its

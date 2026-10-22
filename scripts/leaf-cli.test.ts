@@ -17,6 +17,12 @@ import { LeafProcess } from '../src/utils/leafProcess.ts'
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewaySessionTransport.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so the
+// in-process sender and policy fixtures here would advertise and probe the
+// ambient gateway. The spawned children get an explicit env and are unaffected.
+isolateAmbientGatewayRoute()
 
 for (const scenario of ['transport policy lifecycle', 'fork isolation']) test(`candidate CLI ${scenario} against a local provider fixture`, { timeout: 180000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'leaf-cli-'))

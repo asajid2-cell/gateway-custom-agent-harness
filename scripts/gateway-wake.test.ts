@@ -15,6 +15,11 @@ import {
   type GatewayInboxRecord,
 } from '../src/utils/gatewaySessionProtocol.ts'
 import { GatewaySessionTransport, callGatewayPeer } from '../src/utils/gatewaySessionTransport.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 /** A real transport in a scratch config home, so the timer runs in a real process. */
 async function withTransport<T>(run: (transport: GatewaySessionTransport, home: string, directory: string) => Promise<T>): Promise<T> {

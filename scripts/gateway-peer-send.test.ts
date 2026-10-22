@@ -6,6 +6,11 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { parseAddress } from '../src/utils/peerAddress.ts'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 /**
  * The defect: a send to another live session resolved to a teammate name,

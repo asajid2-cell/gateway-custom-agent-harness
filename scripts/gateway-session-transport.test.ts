@@ -9,6 +9,11 @@ import { dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { setCommandLifecycleListener, subscribeCommandLifecycle, notifyCommandLifecycle } from '../src/utils/commandLifecycle.ts'
 import { GatewaySessionTransport, callGatewayPeer, listGatewayPeers } from '../src/utils/gatewaySessionTransport.ts'
+import { isolateAmbientGatewayRoute } from './gateway-test-env.ts'
+
+// The launcher exports the box's real gateway route into every leaf, so a bare
+// transport here would advertise and probe the ambient gateway.
+isolateAmbientGatewayRoute()
 
 test('a ping is answered without waiting for the transport chain', { timeout: 30000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'gateway-peer-ping-'))
