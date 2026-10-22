@@ -149,6 +149,39 @@ export function serveLeafChannel(options: {
 }
 
 /**
+ * Ask a member whether it is there, without taking it over.
+ *
+ * The identity frame is written before anything else, so a live member answers
+ * and a member that is gone does not: on Windows a missing pipe fails with
+ * ENOENT, and elsewhere a stale socket file refuses the connection. The socket
+ * is closed at the identity frame, before `leaf-attach` is ever sent, so this
+ * never becomes an owner and cannot disturb a window that is already driving the
+ * member - which is what makes it usable as a liveness check rather than an
+ * attach.
+ *
+ * A timeout is `false`: the caller is asking whether a process answers, and one
+ * that does not answer within the window is, for that question, not answering.
+ */
+export function probeLeafChannel(sessionId: string, timeoutMs = 500): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false
+    const socket = createConnection(leafEndpoint(sessionId))
+    const finish = (answer: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(answer)
+    }
+    socket.on('error', () => finish(false))
+    socket.on('close', () => finish(false))
+    socket.setTimeout(timeoutMs, () => finish(false))
+    frames(socket, message => {
+      finish(message?.type === 'leaf-identity' && message.sessionId === sessionId)
+    }, () => finish(false))
+  })
+}
+
+/**
  * Reach a member and take it over, if one is listening.
  *
  * Resolves undefined when nothing answers, which is the ordinary "nobody has

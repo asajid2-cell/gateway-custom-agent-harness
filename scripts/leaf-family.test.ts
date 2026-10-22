@@ -1585,6 +1585,7 @@ test('a displaced matriarch refuses management but keeps the terminals it alread
   const directory = await mkdtemp(join(tmpdir(), 'leaf-host-handoff-'))
   const saved = process.env.CLAUDE_CONFIG_DIR
   process.env.CLAUDE_CONFIG_DIR = directory
+  let siblingChannel: { close: () => void } | undefined
   try {
     const { getSessionId } = await import('../src/bootstrap/state.ts')
     const workspace = await import('../src/utils/leafWorkspace.ts')
@@ -1592,6 +1593,11 @@ test('a displaced matriarch refuses management but keeps the terminals it alread
     const family = join(directory, 'leaf-families', `${root}.json`)
     const claimPath = join(directory, 'leaf-families', 'index', `${root}.host.json`)
     const sibling = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Sibling', transcriptPath: join(directory, 'sibling.jsonl'), forkMessageId: randomUUID() })
+    // The sibling is really there: it serves its own endpoint, which is what
+    // "another window is holding this member open" means to the claim reader.
+    // Without an answer the claim is a stale hint and is not believed.
+    const { serveLeafChannel } = await import('../src/utils/leafChannel.ts')
+    siblingChannel = serveLeafChannel({ sessionId: sibling.sessionId, identify: () => ({ sessionId: sibling.sessionId, pid: process.pid }) })
     // A window opened this family first and is holding one of its leaves. The
     // claim names this process as its pid, so the previous host reads as alive
     // and the member it was holding is inherited rather than started again.
@@ -1654,6 +1660,7 @@ test('a displaced matriarch refuses management but keeps the terminals it alread
       assert.equal(snapshots.at(-1)?.matriarchSessionId, second, 'the leaf is told which window manages its family now')
     } finally { unregister() }
   } finally {
+    siblingChannel?.close()
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved
     await rm(directory, { recursive: true, force: true })
@@ -1746,6 +1753,66 @@ test('reopening the family leaves the lease with the window that is holding it',
     assert.deepEqual([...workspace.externallyHeldLeafIds()], [], 'a displaced window holds nothing it was not given')
     assert.match(await workspace.listLeaves(), /Sibling/, 'and still renders the family it cannot manage')
   } finally {
+    workspace.clearMatriarchClaimForTesting()
+    if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = saved
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('a host claim is a hint: a member is open only while its own endpoint answers', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'leaf-host-stale-'))
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = directory
+  const { getSessionId } = await import('../src/bootstrap/state.ts')
+  const workspace = await import('../src/utils/leafWorkspace.ts')
+  const { serveLeafChannel } = await import('../src/utils/leafChannel.ts')
+  const root = getSessionId()
+  const family = join(directory, 'leaf-families', `${root}.json`)
+  const claimPath = join(directory, 'leaf-families', 'index', `${root}.host.json`)
+  const readClaim = async () => JSON.parse(await readFile(claimPath, 'utf8')) as { openMemberIds: string[] }
+  const live = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Live', transcriptPath: join(directory, 'live.jsonl'), forkMessageId: randomUUID() })
+  const active = await addLeafMember(family, root, { sessionId: randomUUID(), parentSessionId: root, name: 'Active', transcriptPath: join(directory, 'active.jsonl'), forkMessageId: randomUUID() })
+  // Two ids the file will claim and no process answers for: one member that was
+  // closed and one that died, which is exactly the pair the live family carries.
+  const gone = randomUUID()
+  const ghost = randomUUID()
+  const liveChannel = serveLeafChannel({ sessionId: live.sessionId, identify: () => ({ sessionId: live.sessionId, pid: process.pid }) })
+  let activeChannel: { close: () => void } | undefined
+  try {
+    await mkdir(join(directory, 'leaf-families', 'index'), { recursive: true })
+    // A window that exited left this claim behind: it names the member it really
+    // held, plus two that are gone.
+    await writeFile(claimPath, JSON.stringify({
+      familyId: root, matriarchSessionId: randomUUID(), pid: process.pid,
+      processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+      token: randomUUID(), generation: 3, openMemberIds: [live.sessionId, gone, ghost],
+    }))
+    workspace.clearMatriarchClaimForTesting()
+    await workspace.restoreLeafWorkspace()
+    assert.deepEqual([...workspace.externallyHeldLeafIds()], [live.sessionId], 'only the member whose endpoint answers is reported open')
+    assert.deepEqual((await readClaim()).openMemberIds, [live.sessionId], 'and the lease it takes is written with what answers, not with the stale ids it inherited')
+
+    // A process that dies without a close stops being reported: the endpoint is
+    // gone, so the next read of the lease drops the hint.
+    liveChannel.close()
+    await workspace.refreshLeafMatriarch()
+    assert.deepEqual([...workspace.externallyHeldLeafIds()], [], 'a member whose process is gone is not reported as open')
+
+    // A member this window holds and then closes: the claim it publishes is
+    // rewritten at the moment of the close, and the row is not called running.
+    activeChannel = serveLeafChannel({ sessionId: active.sessionId, identify: () => ({ sessionId: active.sessionId, pid: process.pid }) })
+    const { leaf } = parkedLeaf()
+    const unregister = workspace.registerLeafViewForTesting({ rootSessionId: root, member: active as never, process: leaf as never, draft: '' })
+    try {
+      await workspace.changeLeaf(active.sessionId, { status: 'closed' })
+    } finally { unregister() }
+    assert.deepEqual((await readClaim()).openMemberIds, [], 'a close rewrites the claim it holds')
+    assert.doesNotMatch(await workspace.listLeaves(), /Active \[(running|idle|starting)\]/)
+    assert.match(await workspace.listLeaves(), /Active \[closed\]/, 'the row is closed, which is what the family file says')
+  } finally {
+    liveChannel.close()
+    activeChannel?.close()
     workspace.clearMatriarchClaimForTesting()
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved

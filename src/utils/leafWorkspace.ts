@@ -15,7 +15,7 @@ import { flushSessionStorage, getCurrentSessionTitle, getProjectDir, getTranscri
 import { formatSessionResumeCommand } from './bottomBarUsage.js'
 import { addLeafMember, ensureCreatorMember, markLeafElder, readLeafFamily, resolveLeafMember, updateLeafMember, type LeafFamily, type LeafMember } from './leafFamily.js'
 import { LeafProcess, isLeafProcessAlive } from './leafProcess.js'
-import { LeafTakenError } from './leafChannel.js'
+import { LeafTakenError, probeLeafChannel } from './leafChannel.js'
 import { leafColorEnv } from './leafColor.js'
 import { registerCleanup } from './cleanupRegistry.js'
 import { lock } from './lockfile.js'
@@ -836,14 +836,23 @@ async function claimMatriarch(familyId: string): Promise<void> {
   }
   if (mine) {
     const generation = previous && previous.matriarchSessionId !== self ? previous.generation + 1 : previous?.generation ?? matriarchState!.generation
-    matriarchState = { ...matriarchState!, generation, displaced: false, matriarchSessionId: self }
+    // A renewal rewrites the claim from what is actually up, so the members
+    // another window still holds are kept only while they answer and this
+    // window's own are added to them.
+    const external = await openMembersThatAnswer(matriarchState!.external)
+    matriarchState = { ...matriarchState!, generation, displaced: false, matriarchSessionId: self, external }
     await writeLeafMatriarchClaim(familyId, {
       familyId, matriarchSessionId: self, pid: process.pid, processStartedAt: matriarchProcessStartedAt,
-      token: matriarchState.token, generation, openMemberIds: heldMemberIds(familyId),
+      token: matriarchState.token, generation,
+      openMemberIds: [...new Set([...heldMemberIds(familyId), ...external])],
     }).catch(() => {})
     return
   }
-  const inherited = rival ? previous!.openMemberIds : []
+  // An inherited member is inherited only if it answers. The previous host's
+  // claim is a list of what it believed was open, and one that has since been
+  // closed, archived or has died must not be carried forward as open - that
+  // carried-forward id is the stale row this guard exists to remove.
+  const inherited = rival ? await openMembersThatAnswer(previous!.openMemberIds) : []
   const token = randomUUID()
   const generation = (previous?.generation ?? 0) + 1
   matriarchState = { forSession: self, familyId, token, generation, matriarchSessionId: self, displaced: false, external: inherited }
@@ -860,6 +869,43 @@ async function writeLeafMatriarchClaim(familyId: string, claim: LeafMatriarchCla
 /** The members this session has a live process for. */
 function heldMemberIds(familyId: string): string[] {
   return [...views.values()].filter(view => view.rootSessionId === familyId && !['closed', 'failed'].includes(view.process.getState())).map(view => view.member.sessionId)
+}
+
+/**
+ * The ids from a claim that a live process actually answers for.
+ *
+ * `openMemberIds` in a host claim is a hint, not authority: it is written by
+ * whoever holds the lease and nothing rewrites it when a member is closed,
+ * archived, filed or simply dies, so a file can name members that are long
+ * gone. A row is live because a process answers - a member serves its own
+ * endpoint for as long as it runs - so every id is asked before it is believed,
+ * and an unanswered one is dropped. The cache keeps its value: it narrows the
+ * set to ask about instead of the whole family.
+ */
+async function openMembersThatAnswer(ids: readonly string[]): Promise<string[]> {
+  if (!ids.length) return []
+  const answers = await Promise.all(ids.map(id => probeLeafChannel(id).catch(() => false)))
+  return ids.filter((_, index) => answers[index])
+}
+
+/**
+ * Rewrite this window's lease so the members it calls open are the ones that
+ * answer now.
+ *
+ * A member changes status here - closed, archived, filed, promoted - and the
+ * claim is a file other windows read to learn what is up. Waiting for the next
+ * lease write would leave it naming a member that has just been put away, so
+ * the host that made the change records it at the moment it makes it. What is
+ * written is still only what answers: this window's own live views, plus the
+ * inherited ids a probe confirms.
+ */
+async function syncMatriarchOpenMembers(familyId: string): Promise<void> {
+  if (matriarchState?.forSession !== getSessionId() || matriarchState.familyId !== familyId || matriarchState.displaced) return
+  const claim = await readLeafMatriarchClaim(familyId)
+  if (!claim || claim.matriarchSessionId !== getSessionId()) return
+  const external = await openMembersThatAnswer(matriarchState.external)
+  matriarchState.external = external
+  await writeLeafMatriarchClaim(familyId, { ...claim, openMemberIds: [...new Set([...heldMemberIds(familyId), ...external])] }).catch(() => {})
 }
 
 /** Re-read the lease, so a host that was displaced learns it before its next action. */
@@ -884,9 +930,19 @@ async function refreshMatriarch(familyId: string): Promise<void> {
     if (wasDisplaced) publish()
     return
   }
+  // What the other window said it was holding is a hint, so it is re-checked
+  // whenever this one reads the lease: a member it has since closed, archived
+  // or lost must stop being reported as open, and the menu is about to draw
+  // exactly those rows.
+  const liveExternal = await openMembersThatAnswer(matriarchState.external)
+  const externalChanged = liveExternal.length !== matriarchState.external.length
+  if (externalChanged) matriarchState.external = liveExternal
   const displaced = claim !== undefined && claim.matriarchSessionId !== self
   const matriarchSessionId = displaced ? claim!.matriarchSessionId : self
-  if (matriarchState.displaced === displaced && matriarchState.matriarchSessionId === matriarchSessionId) return
+  if (matriarchState.displaced === displaced && matriarchState.matriarchSessionId === matriarchSessionId) {
+    if (externalChanged) publish()
+    return
+  }
   matriarchState.displaced = displaced
   matriarchState.matriarchSessionId = matriarchSessionId
   // The leaves already attached learn the family moved the moment this window
@@ -3202,6 +3258,10 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   // A reopen is asked for by reference, so a member another window already has
   // is a refusal this call owes the person who typed it: await the start.
   if (patch.status === 'open') await launch(member, root).started
+  // The member's status just changed, so the lease this window publishes is
+  // rewritten to match what it holds now - a close, archive or filing is
+  // exactly when an id stops being open.
+  if (patch.status) await syncMatriarchOpenMembers(root)
   // A member leaving is the only thing that moves the designation, and it moves
   // it before this call publishes - so the family is never briefly named after a
   // member that has just gone.
