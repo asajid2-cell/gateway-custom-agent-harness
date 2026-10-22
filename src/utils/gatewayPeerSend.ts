@@ -14,6 +14,46 @@ export type GatewayPeerSendResult = {
   /** Set when the peer accepted the message, so the caller can echo the ID. */
   messageId?: string
   state?: string
+  /**
+   * Whether the message reached the recipient's inbox.
+   *
+   * Kept apart from `ok` and from `routeState` because three different things
+   * can be true at once - the recipient can be alive, unfunded, and holding the
+   * message - and one boolean cannot say which. `delivered: false` with
+   * `state: 'held'` is the route gate's refusal: the message exists in the
+   * recipient's inbox and is still owed, but no model has been asked to answer
+   * it. A liveness failure instead has no `state` at all.
+   */
+  delivered?: boolean
+  /**
+   * Whether the recipient session itself answered.
+   *
+   * The liveness axis, kept apart from `routeState` because the two are
+   * independent: a session can be alive and unable to serve (ALIVE+EXHAUSTED),
+   * alive and serving (ALIVE+SERVING), or gone (DEAD). `false` means nothing
+   * answered at that address - re-addressing is the move, not a key change.
+   * `true` means the session itself produced the verdict, whatever it was, which
+   * is what makes a route refusal a statement about a live session. Left unset
+   * when liveness is genuinely unknown: a transport fault or a lost
+   * acknowledgement says nothing either way.
+   */
+  alive?: boolean
+  /** What the recipient's gateway last observed about the credential it would spend. */
+  routeState?: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
+  /** The structured reason a send did not deliver, when there is one. */
+  reason?: 'route_unavailable'
+  /** The live session the refusal is about. */
+  recipient?: string
+  /** `<model>/<effort>` the recipient would have spent, when it advertised one. */
+  route?: string
+  provider?: string
+  number?: number
+  /** The upstream status behind the route verdict, when it carries one. */
+  http?: number
+  /** The gateway's own reason string, e.g. `http_400_insufficient_credits`. */
+  detail?: string
+  /** What the sender can do next, in order. */
+  remedies?: string[]
 }
 
 /**
@@ -220,6 +260,67 @@ export async function readViaGatewayPeer(
   }
 }
 
+/**
+ * The sender-facing answer to a message the recipient could not answer.
+ *
+ * Three facts have to survive into one line, because a sender acts on all
+ * three: the session is ALIVE (so this is not a dead peer and re-addressing
+ * will not help), the credential it would spend is unusable (so nothing that
+ * session does next can answer), and the message is still owed (so the work is
+ * not lost and must not be duplicated). The move named is the only one that
+ * changes anything - the key - because a retry before that is refused the same
+ * way, and inventing a retry that cannot work is how a sender ends up looping.
+ */
+function routeUnavailableRefusal(
+  label: string,
+  sessionId: string,
+  receipt: any,
+  build: string,
+): GatewayPeerSendResult {
+  const verdict = receipt.routeState === 'unauthorized' ? 'unauthorized' : 'exhausted'
+  const provider = typeof receipt.provider === 'string' && receipt.provider ? receipt.provider : 'its provider'
+  const account = Number.isSafeInteger(receipt.number) ? ` #${receipt.number}` : ''
+  const reason = typeof receipt.detail === 'string' && receipt.detail ? receipt.detail : verdict
+  const observed = Number.isSafeInteger(receipt.http) ? ` (HTTP ${receipt.http}, ${reason})` : ''
+  const route = typeof receipt.route === 'string' && receipt.route ? ` Route: ${receipt.route}.` : ''
+  const held = receipt.state === 'held'
+  const remedy = verdict === 'unauthorized'
+    ? `replace or re-enter the credential for ${provider}${account} in that session`
+    : `replenish ${provider}${account}, or switch that session to a funded account`
+  const message = `Not delivered to ${label}: the session is alive, but its model route cannot serve. `
+    + `${provider} credential${account} is ${verdict === 'unauthorized' ? 'rejected as unauthorized' : 'exhausted'}${observed}.${route} `
+    + (held
+      ? 'The message is held in that session\'s inbox and still counted as owed - it was not handed to its model, so nothing was lost. '
+      : 'The recipient did not confirm it stored the message. ')
+    + `Move: ${remedy}. `
+    + (held
+      ? 'The held message is released when that route reports serving again; do not send another copy before the key changes.'
+      : 'Re-send only after the key changes; a copy now would be refused the same way.')
+    + build
+  return {
+    ok: false,
+    // The recipient answered this send - it is the session that stored the
+    // message as held - so the refusal is about a live session's credential.
+    alive: true,
+    delivered: false,
+    message,
+    messageId: typeof receipt.id === 'string' ? receipt.id : undefined,
+    state: receipt.state,
+    reason: 'route_unavailable',
+    routeState: verdict,
+    recipient: sessionId,
+    ...(typeof receipt.provider === 'string' ? { provider: receipt.provider } : {}),
+    ...(Number.isSafeInteger(receipt.number) ? { number: receipt.number } : {}),
+    ...(typeof receipt.route === 'string' ? { route: receipt.route } : {}),
+    ...(Number.isSafeInteger(receipt.http) ? { http: receipt.http } : {}),
+    ...(typeof receipt.detail === 'string' ? { detail: receipt.detail } : {}),
+    remedies: [
+      remedy.charAt(0).toUpperCase() + remedy.slice(1) + '.',
+      'The held message is released automatically when that route reports serving again; do not send another copy in the meantime.',
+    ],
+  }
+}
+
 /** Send through the Gateway peer transport, never through the teammate mailbox. */
 export async function sendViaGatewayPeer(
   address: string,
@@ -238,7 +339,10 @@ export async function sendViaGatewayPeer(
     }
   }
   const resolved = await resolveGatewayPeer(address)
-  if ('error' in resolved) return { ok: false, message: resolved.error }
+  // Nothing at that address resolved to a live session, so the refusal is a
+  // liveness verdict with no route verdict attached: the credential of a session
+  // that is not there is not a fact about anything.
+  if ('error' in resolved) return { ok: false, alive: false, message: resolved.error }
   let receipt: any
   try {
     receipt = await runtime.transport.send(resolved.sessionId, text, summary, replyTo, kind, expectReply)
@@ -246,9 +350,16 @@ export async function sendViaGatewayPeer(
     const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
     return { ok: false, message: `Delivery to ${resolved.label} failed: ${reason || 'transport error'}` }
   }
+  if (receipt?.ok === false && receipt.reason === 'route_unavailable') {
+    return routeUnavailableRefusal(resolved.label, resolved.sessionId, receipt, await peerBuildNote(resolved.sessionId))
+  }
   if (receipt?.ok === false) {
     return {
       ok: false,
+      // `failed` is the transport saying nothing answered at that endpoint; every
+      // other refusal was produced by the recipient itself, which proves it is
+      // alive even though it declined the message.
+      alive: receipt.state !== 'failed',
       message: `Delivery to ${resolved.label} was refused: ${String(receipt.reason ?? 'refused').slice(0, 300)}${await peerBuildNote(resolved.sessionId)}`,
       messageId: receipt.id,
       state: receipt.state,
@@ -274,10 +385,26 @@ export async function sendViaGatewayPeer(
   // delivered-not-done is what sent senders looking for a second way to hand
   // the work over.
   const delivered = kind === 'directive' ? 'Delivered a directive to' : 'Delivered an inquiry to'
+  // The route verdict travels with the receipt, and `unknown` is said out loud.
+  // Reporting only that the inbox accepted the message is what let a sender
+  // believe the work was under way when the recipient's key could not serve; a
+  // verdict the probe could not reach is not a healthy one, and saying nothing
+  // here would read as healthy.
+  const routeState = ['serving', 'exhausted', 'unauthorized', 'unknown'].includes(receipt.routeState)
+    ? receipt.routeState as NonNullable<GatewayPeerSendResult['routeState']>
+    : undefined
+  const routeNote = routeState === 'unknown'
+    ? ' Its route health is unverified (health_unavailable): this is not evidence that its key can serve.'
+    : routeState === 'serving'
+      ? ' Its route was serving when this was sent.'
+      : ''
   return {
     ok: true,
+    alive: true,
+    delivered: true,
     messageId: receipt.id,
     state,
-    message: `${delivered} ${resolved.label} (${state}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.${await peerBuildNote(resolved.sessionId)}`,
+    ...(routeState ? { routeState } : {}),
+    message: `${delivered} ${resolved.label} (${state}). queued/held means inbox acceptance; delivered means transcript-persisted, not executed or completed. It reaches them at their next step boundary, so do not re-send because their turn has not finished.${routeNote}${await peerBuildNote(resolved.sessionId)}`,
   }
 }

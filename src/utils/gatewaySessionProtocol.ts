@@ -33,6 +33,44 @@ export function peerMessageKind(message: Pick<GatewayPeerMessage, 'kind'>): Peer
   return message.kind ?? DEFAULT_PEER_MESSAGE_KIND
 }
 
+/**
+ * The model route a session said it would spend tokens on.
+ *
+ * A peer message used to be accepted by the transport and only fail at the
+ * recipient's next model call, so a sender was told "delivered" for a message
+ * that could never be answered. Health is a property of a CREDENTIAL, not of a
+ * model string - two sessions on the same model can differ because they are
+ * billed to different keys - so the thing a sender needs advertised is the
+ * provider and the credential number the recipient would select, not the model
+ * name it happens to share with a healthy neighbour.
+ *
+ * `baseUrl` is the recipient's own loopback model gateway: the health bit is
+ * observed by the process that served the traffic, so the sender has to ask the
+ * gateway that would serve the recipient's next call. It is loopback-only by
+ * construction, and a sender refuses to call anything else (see
+ * `probePeerRoute`).
+ *
+ * Optional as a whole, and every field except provider/number/baseUrl is
+ * optional within it: a session launched without a Gateway, or by a build that
+ * predates this field, advertises nothing - which reads as `unknown`, never as
+ * healthy.
+ */
+export const gatewayPeerRouteSchema = z.object({
+  provider: z.string().min(1).max(40),
+  number: z.number().int().positive(),
+  baseUrl: z.string().min(1).max(2048),
+  model: z.string().min(1).max(200).optional(),
+  effort: z.string().min(1).max(40).optional(),
+})
+// Deliberately NOT `.strict()`: the top-level tolerance in `parseGatewayPeer`
+// only drops unknown keys at the top, so a strict inner schema would turn a
+// field a newer build adds here into an unreadable registration - the peer
+// disappears from discovery rather than losing the field. Unknown route fields
+// are stripped by `z.object`, which is the failure direction every optional
+// field on this wire takes.
+
+export type GatewayPeerRoute = z.infer<typeof gatewayPeerRouteSchema>
+
 export const gatewayPeerSchema = z.object({
   protocol: z.literal(GATEWAY_SESSION_PROTOCOL),
   sessionId: z.string().uuid(),
@@ -66,6 +104,9 @@ export const gatewayPeerSchema = z.object({
   // live fleet on an older build writes registrations without it and must stay
   // readable. A missing buildId means "unknown", never "old".
   buildId: z.string().min(1).max(100).optional(),
+  // What this session's next model call would spend: the provider and the
+  // credential number its pool would select. See `gatewayPeerRouteSchema`.
+  route: gatewayPeerRouteSchema.optional(),
 }).strict()
 
 /**

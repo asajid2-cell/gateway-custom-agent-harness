@@ -15,6 +15,8 @@ import {
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
 import { readTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
+import { getClaudeConfigHomeDir } from './envUtils.js'
+import type { GatewayPeerRoute } from './gatewaySessionProtocol.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -260,6 +262,179 @@ export async function callGatewayPeer(endpoint: string, request: unknown, timeou
     })
     socket.on('end', () => { if (response.indexOf(10) < 0) fail() })
   })
+}
+
+// ---------------------------------------------------------------------------
+// Route health: whether the recipient's next model call can actually be served
+// ---------------------------------------------------------------------------
+
+/**
+ * How long a pre-delivery health probe may take before it stops being an answer.
+ *
+ * The probe is a loopback GET against the recipient's own gateway, which
+ * normally answers in single-digit milliseconds. The ceiling is for the case
+ * where it does not answer at all: a wedged gateway must not hold a send open,
+ * and a probe that ran out of time is `unknown` - never healthy, and never a
+ * refusal. Only a withheld delivery depends on an answer; a delivery does not.
+ */
+const ROUTE_PROBE_TIMEOUT_MS = 1500
+
+const ROUTE_HEALTH_STATES = new Set(['serving', 'exhausted', 'unauthorized', 'unknown'])
+
+/** What the recipient's gateway last observed about the credential it would use. */
+export type PeerRouteHealth = {
+  state: 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
+  reason: string
+  provider?: string
+  number?: number
+  /** The upstream status behind the verdict, when the reason carries one. */
+  http?: number
+}
+
+const UNKNOWN_ROUTE_HEALTH: PeerRouteHealth = { state: 'unknown', reason: 'health_unavailable' }
+
+/**
+ * The origin of a loopback gateway URL, or undefined for anything else.
+ *
+ * A registration is a file, and a file can say any URL at all. The sender is
+ * the process that fetches it, so validating here is what keeps an advertised
+ * route from turning a peer message into a request to an arbitrary host. Only
+ * plain http on the loopback interface is a Gateway: a gateway is never remote,
+ * and a peer that claims otherwise gets `unknown`, which delivers.
+ */
+export function loopbackGatewayOrigin(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined
+  let url: URL
+  try { url = new URL(value) } catch { return undefined }
+  if (url.protocol !== 'http:') return undefined
+  if (!['127.0.0.1', 'localhost', '::1', '[::1]'].includes(url.hostname)) return undefined
+  return url.origin
+}
+
+/** The upstream status a health reason names, when it names one. */
+function healthHttp(reason: unknown): number | undefined {
+  // `http_400_insufficient_credits` is one token, so a word boundary after the
+  // digits would never match: `_` is a word character. Only a following digit
+  // disqualifies the status.
+  const match = typeof reason === 'string' ? /^http_(\d{3})(?![0-9])/.exec(reason) : null
+  return match ? Number(match[1]) : undefined
+}
+
+/**
+ * Ask the gateway that would serve a recipient's next call what it last saw.
+ *
+ * The health bit is kept by the process that served the traffic, so the only
+ * process that can answer for a recipient is the recipient's own gateway. A
+ * peer that advertised no route (an older build, or a session launched outside
+ * the Gateway launcher) is `unknown` without a request being made.
+ *
+ * Every failure mode - no route, a non-loopback URL, a non-200, a body this
+ * build does not recognise, a timeout, a dead gateway - is `unknown`. That is a
+ * deliberate asymmetry: the gate withholds only on a positive report of
+ * exhaustion or rejection, so an unanswerable probe must degrade to delivery
+ * rather than to a refusal a sender cannot act on.
+ */
+export async function probePeerRoute(route: GatewayPeerRoute | undefined): Promise<PeerRouteHealth> {
+  const origin = loopbackGatewayOrigin(route?.baseUrl)
+  if (!route || !origin) return { ...UNKNOWN_ROUTE_HEALTH }
+  const query = new URLSearchParams({ provider: route.provider, number: String(route.number) })
+  const response = await fetch(new URL(`/gateway/route-health?${query.toString()}`, origin), {
+    signal: AbortSignal.timeout(ROUTE_PROBE_TIMEOUT_MS),
+  }).catch(() => undefined)
+  if (!response || !response.ok) return { ...UNKNOWN_ROUTE_HEALTH }
+  let body: any
+  try { body = await response.json() } catch { return { ...UNKNOWN_ROUTE_HEALTH } }
+  if (!ROUTE_HEALTH_STATES.has(body?.state)) return { ...UNKNOWN_ROUTE_HEALTH }
+  const reason = typeof body.reason === 'string' && body.reason ? body.reason : 'health_unavailable'
+  const http = healthHttp(reason)
+  return {
+    state: body.state,
+    reason,
+    provider: typeof body.provider === 'string' ? body.provider : route.provider,
+    number: Number.isSafeInteger(body.number) ? body.number : route.number,
+    ...(http !== undefined ? { http } : {}),
+  }
+}
+
+/** `<model>/<effort>` for a refusal, when the recipient advertised the model. */
+export function describePeerRoute(route: GatewayPeerRoute | undefined): string | undefined {
+  if (!route?.model) return undefined
+  return route.effort ? `${route.model}/${route.effort}` : route.model
+}
+
+/** The preference file a provider's account selection is read from, when it has one. */
+const ROUTE_PREFERENCE_FILES: Record<string, string> = {
+  commandcode: 'commandcode-account.json',
+  'opencode-go': 'opencode-account.json',
+  'opencode-zen': 'opencode-account.json',
+}
+
+/**
+ * The credential number this session's pool would select for a provider.
+ *
+ * Single-key providers always select 1. Pooled providers persist their global
+ * default in a preference file the gateway itself reads, and that file is what a
+ * fresh launch would follow - so reading it here advertises the same account the
+ * next call would spend. A session pinned to a different account in memory is
+ * the one case this cannot see; the probe then answers about the advertised
+ * number, and the report names that limitation rather than guessing.
+ */
+async function routeCredentialNumber(provider: string): Promise<number> {
+  const preference = ROUTE_PREFERENCE_FILES[provider]
+  if (!preference) return 1
+  try {
+    const saved = JSON.parse(await readFile(join(getClaudeConfigHomeDir(), preference), 'utf8'))
+    return Number.isSafeInteger(saved?.number) && saved.number > 0 ? saved.number : 1
+  } catch {
+    return 1
+  }
+}
+
+/**
+ * The route this session would spend on, as its registration advertises it.
+ *
+ * Undefined whenever the answer would be a guess: no Gateway base URL (this
+ * session was launched outside the launcher), a model whose backend this build
+ * cannot name, or an unreadable preference. A session that advertises nothing
+ * reads as `unknown` on the sending side, which delivers - the same failure
+ * direction as a probe that could not answer.
+ */
+async function describeOwnRoute(): Promise<GatewayPeerRoute | undefined> {
+  const baseUrl = loopbackGatewayOrigin(process.env.CLAUDE_CODE_GATEWAY_BASE_URL?.trim())
+  if (!baseUrl) return undefined
+  try {
+    // The model is read the same way `getMainLoopModel` reads it in Gateway
+    // mode - the in-session `/model` override, else MODEL_GATEWAY_MODEL, which
+    // every launcher sets - but without importing `model.ts`. That module costs
+    // about five seconds to load cold, and `start()` would pay it before
+    // publishing a registration. A session with neither source advertises no
+    // route, which is the same `unknown` a probe that could not answer gets.
+    const [{ getMainLoopModelOverride }, { resolveModelBackend }] = await Promise.all([
+      import('../bootstrap/state.js'),
+      import('../utils/model/gatewayBackend.js'),
+    ])
+    const override = getMainLoopModelOverride()
+    const model = typeof override === 'string' && override.trim()
+      ? override.trim()
+      : process.env.MODEL_GATEWAY_MODEL?.trim()
+    if (!model) return undefined
+    const provider = resolveModelBackend(model)
+    if (provider === 'unknown') return undefined
+    const number = await routeCredentialNumber(provider)
+    let effort: string | undefined
+    try {
+      const { resolveAppliedEffort } = await import('../utils/effort.js')
+      const applied = resolveAppliedEffort(model, undefined)
+      // A numeric effort is still a route label; the advertisement carries it
+      // as text because that is all a refusal needs to name.
+      effort = applied === undefined ? undefined : String(applied)
+    } catch {
+      // Effort only decorates the refusal; a route without it is still exact.
+    }
+    return { provider, number, baseUrl, model, ...(effort ? { effort } : {}) }
+  } catch {
+    return undefined
+  }
 }
 
 async function readRegistration(directory: string, sessionId: string): Promise<{ peer: GatewayPeer; token: string }> {
@@ -811,6 +986,11 @@ export class GatewaySessionTransport {
         this.server!.once('error', reject)
         this.server!.listen(this.peer.endpoint, resolve)
       })
+      // Advertise the route before publishing. A registration is what a sender
+      // reads to decide whether a message can be answered, and a peer that
+      // appears without a route is one every sender has to treat as unknown.
+      const route = await describeOwnRoute()
+      if (route) this.peer.route = route
       await atomicJson(this.registrationPath, { peer: this.peer, token: this.token })
     } catch (error) {
       this.server?.close()
@@ -916,7 +1096,19 @@ export class GatewaySessionTransport {
     if (recent.length >= 10) return { ok: false, reason: 'Rate limit reached; do not resend immediately' }
     if (this.records.filter(record => record.state === 'queued' || record.state === 'held').length >= MAX_PEER_QUEUE) return { ok: false, reason: 'Recipient inbox is full' }
     if (Buffer.byteLength(message.text, 'utf8') > MAX_PEER_MESSAGE_BYTES) throw new Error('Message too large')
-    const state = this.policy === 'hold' ? 'held' : 'queued'
+    // The receiver checks its own route before accepting mail as deliverable.
+    // It is the only party that can: the health bit lives in the gateway that
+    // would serve its next call, and a sender's probe is second-hand evidence.
+    // A message that cannot be answered is stored, not delivered - `held` is
+    // exactly that state here, because the Stop hook claims only `queued`, so
+    // it is never handed to a model that cannot answer, while
+    // `outstandingReplies` still counts it, so the sender's request is not
+    // lost. Under an `accept` policy a held record is therefore exactly the mail
+    // this gate withheld, which is what `releaseRouteHeld` acts on; under a
+    // `hold` policy it is the operator's, and is left alone.
+    const ownHealth = await probePeerRoute(this.peer.route)
+    const heldForRoute = ownHealth.state === 'exhausted' || ownHealth.state === 'unauthorized'
+    const state = heldForRoute || this.policy === 'hold' ? 'held' : 'queued'
     const record: GatewayInboxRecord = { message, senderName: sender.peer.name, state, receivedAt: new Date().toISOString() }
     const completed = this.records.filter(item => item.state === 'delivered' || item.state === 'refused').slice(-MAX_PEER_QUEUE)
     const next = [...completed, ...this.records.filter(item => item.state === 'queued' || item.state === 'held'), record]
@@ -935,7 +1127,53 @@ export class GatewaySessionTransport {
     recent.push(now)
     this.bursts.set(message.fromRuntimeId, recent)
     this.options.onInboxChanged?.()
+    // A message only reaches this branch when the sender's probe did not report
+    // the route as exhausted or rejected, so this is the moment route-held mail
+    // can be released if the gateway has since seen the credential serve.
+    if (!heldForRoute) void this.releaseRouteHeld().catch(() => {})
     return { ok: true, state: record.state, id: message.id }
+  }
+
+  /**
+   * Release mail that was withheld because this session's route could not serve.
+   *
+   * A route-held record is not the operator's hold: it exists because a sender
+   * found this session's credential exhausted or rejected, and it must come
+   * back on its own once the credential serves again - otherwise the sender is
+   * told the message is owed and nothing ever delivers it. The sender cannot
+   * watch the recovery (it would need to poll this session forever), and this
+   * session is the only one whose gateway holds the bit, so the check is made
+   * here, on the boundaries that already exist: a status change and the arrival
+   * of the next message.
+   *
+   * Only `serving` releases. `unknown` must not: an unanswerable probe is not
+   * evidence that the key works, and handing the message to a model that still
+   * cannot answer is the defect this gate exists to prevent. A deliberate
+   * inbound policy of `hold` is untouched for the same reason.
+   *
+   * Under an `accept` policy a held record can only be one this gate withheld:
+   * the policy path writes `queued`, and lifting a hold promotes every held
+   * record, so nothing else is left in that state. That is why the record needs
+   * no reason field - and why a persisted reason would have been a schema
+   * change with a downgrade hazard for no gain.
+   */
+  private async releaseRouteHeld(): Promise<void> {
+    if (this.policy !== 'accept') return
+    if (!this.records.some(record => record.state === 'held')) return
+    const health = await probePeerRoute(this.peer.route)
+    if (health.state !== 'serving') return
+    await this.serial(async () => {
+      const releasing = new Set(this.records.filter(record => record.state === 'held').map(record => record.message.id))
+      if (releasing.size === 0) return
+      const next: GatewayInboxRecord[] = this.records.map(record => releasing.has(record.message.id)
+        ? { ...record, state: 'queued' as const }
+        : record)
+      const history = this.history.map(entry => entry.direction === 'received' && releasing.has(entry.message.id) ? { ...entry, status: 'queued' as const } : entry)
+      await this.persist(next, this.policy, history)
+      this.records = next
+      this.history = history
+      this.options.onInboxChanged?.()
+    })
   }
 
   hookEnvironment(): NodeJS.ProcessEnv {
@@ -977,6 +1215,14 @@ export class GatewaySessionTransport {
     // its own address as a transport fault and retrying it unchanged.
     if (toSessionId === this.peer.sessionId) throw new Error('That is this session; a session cannot send a message to itself')
     const target = await readRegistration(this.options.directory, toSessionId)
+    // Ask what the recipient's next model call would spend before handing it
+    // anything. Acceptance at the transport is not answerability, and a receipt
+    // that says "queued" for a message nobody can answer is the defect this
+    // gate closes. Only a positive report of exhaustion or rejection withholds;
+    // everything else - including an older peer with no advertised route - is
+    // `unknown` and delivers.
+    const health = await probePeerRoute(target.peer.route)
+    const routeUnavailable = health.state === 'exhausted' || health.state === 'unauthorized'
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
       toSessionId, text, summary, replyTo, ...(kind ? { kind } : {}), ...(expectReply === undefined ? {} : { expectReply }), createdAt: new Date().toISOString(),
@@ -1004,7 +1250,7 @@ export class GatewaySessionTransport {
           this.history = history
         }).catch(() => {})
         return {
-          ok: false, state: 'failed', id: message.id,
+          ok: false, alive: false, state: 'failed', id: message.id,
           reason: `Session ${toSessionId} is not reachable: its registration is on disk but nothing is listening. That session has exited or crashed without deregistering. Do not retry it; use /sessions list for peers that are live.`,
         }
       }
@@ -1018,7 +1264,46 @@ export class GatewaySessionTransport {
         this.history = history
       })
     } catch { historySaved = false }
-    return { ...receipt, id: message.id, historySaved, meaning: 'queued/held means inbox acceptance; delivered means transcript-persisted, not task completion' }
+    // The recipient stores a message it cannot answer as `held`, and that
+    // receipt is a success at the transport level - the message is durable and
+    // owed. It is not a delivery, and reporting it as one is the defect this
+    // gate closes: the sender would stop looking for an answer that cannot
+    // come. The route verdict is the sender's own probe, so the refusal names
+    // the credential the recipient would have spent.
+    if (routeUnavailable && receipt?.ok === true && receipt.state === 'held') {
+      return {
+        ok: false,
+        // The receipt is the recipient's own: it is alive, it stored the mail,
+        // and it is only its credential that cannot serve.
+        alive: true,
+        delivered: false,
+        state: 'held',
+        reason: 'route_unavailable',
+        routeState: health.state,
+        id: message.id,
+        historySaved,
+        recipient: toSessionId,
+        ...(target.peer.route ? {
+          provider: target.peer.route.provider,
+          number: target.peer.route.number,
+          ...(describePeerRoute(target.peer.route) ? { route: describePeerRoute(target.peer.route) } : {}),
+        } : {}),
+        ...(health.http !== undefined ? { http: health.http } : {}),
+        detail: health.reason,
+        meaning: 'Held in the recipient inbox and still owed; it was not handed to a model.',
+      }
+    }
+    return {
+      ...receipt,
+      id: message.id,
+      alive: true,
+      historySaved,
+      routeState: health.state,
+      // A recipient can still refuse for its own reasons; the gate is only a
+      // statement about the route, never a substitute for the receipt.
+      delivered: receipt?.ok !== false,
+      meaning: 'queued/held means inbox acceptance; delivered means transcript-persisted, not task completion',
+    }
   }
 
   async receipt(toSessionId: string, id: string): Promise<unknown> {
@@ -1103,8 +1388,15 @@ export class GatewaySessionTransport {
   }
 
   async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics' | 'compactBoundaryCount' | 'microcompactBoundaryCount'>>): Promise<void> {
+    // A session that switches model or account mid-life spends on the new route,
+    // and a registration that keeps advertising the launch-time credential
+    // would let a sender withhold mail for a key that is no longer in use. A
+    // status change is the ordinary boundary at which that can be true - it
+    // happens at every turn start and end - so it is where the advertisement is
+    // refreshed.
+    const route = await describeOwnRoute()
     const subscribers = await this.serial(async () => {
-      const next = gatewayPeerSchema.parse({ ...this.peer, ...values })
+      const next = gatewayPeerSchema.parse({ ...this.peer, ...(route ? { route } : {}), ...values })
       await atomicJson(this.registrationPath, { peer: next, token: this.token })
       const becameIdle = this.peer.status !== 'idle' && next.status === 'idle'
       Object.assign(this.peer, next)
@@ -1119,6 +1411,10 @@ export class GatewaySessionTransport {
         if (target.peer.runtimeId === runtimeId) await this.send(sessionId, `Session ${this.peer.sessionId} is now idle. This one-shot subscription has ended.`, 'Session became idle')
       } catch { /* Offline subscribers are not resumed or retried automatically. */ }
     }
+    // A turn boundary is also when a credential that was exhausted may have been
+    // rotated or replenished, so any mail held for the old verdict is offered
+    // back to the model.
+    void this.releaseRouteHeld().catch(() => {})
   }
 
   close(): Promise<void> {
