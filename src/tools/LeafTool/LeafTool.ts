@@ -5,53 +5,123 @@ import { lazySchema } from '../../utils/lazySchema.js'
 import { LEAF_TOOL_NAME } from './constants.js'
 import { DESCRIPTION, getPrompt } from './prompt.js'
 
+const LEAF_ACTIONS = [
+  'list',
+  'status',
+  'fork',
+  'new',
+  'send',
+  'interrupt',
+  'checkpoint',
+  'close',
+  'reopen',
+  'archive',
+  'model',
+  'effort',
+  'return',
+  'notify',
+  'roster',
+  'head',
+  'heir',
+  'driver',
+  'ledger',
+  'read',
+  'checkpoints',
+  'checkpoint-drop',
+  'checkpoint-purge',
+  'seed',
+  'seedling',
+  'merge',
+  'compact',
+  'partner',
+  'partners',
+  'partner-watch',
+  'partner-close',
+] as const
+
+const LEAF_FIELDS = ['action', 'leaf', 'name', 'message', 'value', 'tail', 'since', 'leaves'] as const
+
+/**
+ * Turn a schema refusal into a sentence that names the call that would work.
+ *
+ * The shape is strict and the action is a closed set, and both are right - but
+ * the refusal they produced did not say so. An unknown key arrived as
+ * "An unexpected parameter `model` was provided", which invites the caller to
+ * drop the model rather than move it into the field that carries it; an action
+ * outside the enum arrived as raw zod issue JSON. A caller that has to guess a
+ * second time has paid the round trip this message exists to prevent, so every
+ * recognised mistake is answered with the field or the verb it should have been.
+ */
+function describeLeafInputFailure(error: z.ZodError, input: unknown): string | undefined {
+  const lines: string[] = []
+  for (const issue of error.issues) {
+    if (issue.code === 'unrecognized_keys') {
+      for (const key of issue.keys) {
+        lines.push(
+          key === 'model' || key === 'effort'
+            ? `\`${key}\` is not a top-level field: pass the ${key} in \`value\` with \`action:"${key}"\`, e.g. {"action":"${key}","leaf":"2","value":"<${key}>"}.`
+            : `\`${key}\` is not a field of this tool. Accepted fields: ${LEAF_FIELDS.join(', ')}.`,
+        )
+      }
+    } else if (issue.code === 'invalid_value' && issue.path[0] === 'action') {
+      // The issue carries the accepted values but not what was passed, so the
+      // "received" is read from the call itself.
+      const received = input && typeof input === 'object' && 'action' in input
+        ? JSON.stringify((input as { action: unknown }).action)
+        : 'nothing'
+      lines.push(`\`action\` must be one of: ${LEAF_ACTIONS.join(', ')}; received ${received}.`)
+    } else {
+      lines.push(issue.message)
+    }
+  }
+  return lines.length ? `Leaf rejected this call:\n${lines.map(line => `- ${line}`).join('\n')}` : undefined
+}
+
+/**
+ * Keep the schema a real `z.ZodObject` - the same object the model-facing JSON
+ * schema is generated from - but answer its failures with prose. Only the error
+ * is replaced; `success` and the fact of the refusal are untouched.
+ */
+function withReadableSchemaErrors<T extends z.ZodType>(schema: T): T {
+  const parse = schema.safeParse.bind(schema)
+  Object.defineProperty(schema, 'safeParse', {
+    configurable: true,
+    writable: true,
+    value: (input: unknown, params?: unknown) => {
+      const result = parse(input, params as never)
+      if (result.success) return result
+      const message = describeLeafInputFailure(result.error, input)
+      if (!message) return result
+      // A plain `Error` carrying `issues`, because zod's own `message` is a
+      // fixed JSON rendering of the issues; the validation formatter reads
+      // exactly `message` and `issues`, and renders `message` when no issue
+      // matches one of its categories.
+      const error = Object.assign(new Error(message), {
+        name: 'ZodError',
+        issues: [{ code: 'custom', path: [] as PropertyKey[], message }],
+      })
+      return { success: false as const, error }
+    },
+  })
+  return schema
+}
+
 const inputSchema = lazySchema(() =>
-  z.strictObject({
-    action: z
-      .enum([
-        'list',
-        'status',
-        'fork',
-        'new',
-        'send',
-        'interrupt',
-        'checkpoint',
-        'close',
-        'reopen',
-        'model',
-        'effort',
-        'return',
-        'notify',
-        'roster',
-        'head',
-        'heir',
-        'driver',
-        'ledger',
-        'read',
-        'checkpoints',
-        'checkpoint-drop',
-        'checkpoint-purge',
-        'seed',
-        'seedling',
-        'merge',
-        'compact',
-        'partner',
-        'partners',
-        'partner-watch',
-        'partner-close',
-      ])
-      .describe('Operation to perform on the leaf family'),
-    leaf: z
-      .string()
-      .optional()
-      .describe('Leaf reference: session ID, number, N:name, or name. A checkpoint reference is #number, or a label'),
-    name: z.string().optional().describe('Name for a new leaf, a label for a checkpoint, or a watch mode (idle or new)'),
-    message: z.string().optional().describe('Text for send, a context return, or a ledger entry'),
-    value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
-    tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
-    since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
-    leaves: z.array(z.string()).optional().describe('Leaf references. For driver: the leaves the named driver is put in charge of; empty or omitted clears the scope, and the single word `clear` drops the role itself. For ledger writers: the members the head delegates the ledger pen to; empty or omitted clears it back to the head alone'),
-  }),
+  withReadableSchemaErrors(
+    z.strictObject({
+      action: z.enum(LEAF_ACTIONS).describe('Operation to perform on the leaf family'),
+      leaf: z
+        .string()
+        .optional()
+        .describe('Leaf reference: session ID, number, N:name, or name. A checkpoint reference is #number, or a label'),
+      name: z.string().optional().describe('Name for a new leaf, a label for a checkpoint, or a watch mode (idle or new)'),
+      message: z.string().optional().describe('Text for send, a context return, or a ledger entry'),
+      value: z.string().optional().describe('Model name, effort level, merge fidelity (full or ledger), or a ledger subverb'),
+      tail: z.number().int().positive().optional().describe('For read: how many of the newest turns to return (default 12, max 200)'),
+      since: z.string().optional().describe('For read: return only the turns after this cursor, taken from a previous read'),
+      leaves: z.array(z.string()).optional().describe('Leaf references. For driver: the leaves the named driver is put in charge of; empty or omitted clears the scope, and the single word `clear` drops the role itself. For ledger writers: the members the head delegates the ledger pen to; empty or omitted clears it back to the head alone'),
+    }),
+  ),
 )
 type InputSchema = ReturnType<typeof inputSchema>
 
@@ -122,16 +192,23 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
     case 'checkpoint':
       return workspace.checkpointLeaf(requireLeaf(), input.name?.trim() || undefined)
     case 'close':
-    case 'reopen': {
+    case 'reopen':
+    case 'archive': {
       // Closing may name the session you are in; reopening may not, because the
       // session on screen is already running - and that is refused with its own
       // message rather than being reported as a leaf that does not exist.
-      const member = input.action === 'close'
-        ? await workspace.resolveCloseTarget(requireLeaf())
-        : await workspace.resolveOpenTarget(requireLeaf())
-      if (!member) throw new Error('Unknown or ambiguous leaf reference')
-      const promoted = await workspace.changeLeaf(member.sessionId, { status: input.action === 'close' ? 'closed' : 'open' })
-      return `Leaf #${member.number} ${member.name} ${input.action === 'close' ? 'closed' : 'reopened'}; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`
+      // Archiving files a member away, which is the one act that actually
+      // shortens `list`; it is not a way out of the conversation you are in, so
+      // it resolves like a close and is refused for the session on screen there.
+      const reference = requireLeaf()
+      const member = input.action === 'reopen'
+        ? await workspace.resolveOpenTarget(reference)
+        : await workspace.resolveCloseTarget(reference)
+      if (!member) throw new Error(await workspace.leafReferenceFailure(reference))
+      const status: 'closed' | 'archived' | 'open' = input.action === 'close' ? 'closed' : input.action === 'archive' ? 'archived' : 'open'
+      const verb = input.action === 'close' ? 'closed' : input.action === 'archive' ? 'archived' : 'reopened'
+      const promoted = await workspace.changeLeaf(member.sessionId, { status })
+      return `Leaf #${member.number} ${member.name} ${verb}; transcript and ancestry retained.${promoted ? ` ${promoted}` : ''}`
     }
     case 'model':
     case 'effort': {
@@ -166,20 +243,23 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
         ...(input.since?.trim() ? { since: input.since.trim() } : {}),
       })
     case 'head': {
-      const member = await workspace.resolveLeafRef(requireLeaf())
-      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const reference = requireLeaf()
+      const member = await workspace.resolveLeafRef(reference)
+      if (!member) throw new Error(await workspace.leafReferenceFailure(reference))
       return workspace.conferPatriarch(member.sessionId)
     }
     case 'heir': {
-      const member = await workspace.resolveLeafRef(requireLeaf())
-      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const reference = requireLeaf()
+      const member = await workspace.resolveLeafRef(reference)
+      if (!member) throw new Error(await workspace.leafReferenceFailure(reference))
       return workspace.conferHeir(member.sessionId)
     }
     // The driver is `leaf`; the leaves it is put in charge of are `leaves`. Both
     // are resolved here so the designation is written once, against member ids.
     case 'driver': {
-      const member = await workspace.resolveLeafRef(requireLeaf())
-      if (!member) throw new Error('Unknown or ambiguous leaf reference')
+      const driverReference = requireLeaf()
+      const member = await workspace.resolveLeafRef(driverReference)
+      if (!member) throw new Error(await workspace.leafReferenceFailure(driverReference))
       const words = (input.leaves ?? []).map(reference => reference.trim()).filter(Boolean)
       // `clear` in the scope position drops the role, so it is passed through as
       // the reserved word rather than resolved as a leaf to drive.
@@ -187,7 +267,7 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
       const leafIds: string[] = []
       for (const reference of words) {
         const driven = await workspace.resolveLeafRef(reference)
-        if (!driven) throw new Error(`Unknown or ambiguous leaf reference: ${reference}`)
+        if (!driven) throw new Error(await workspace.leafReferenceFailure(reference))
         leafIds.push(driven.sessionId)
       }
       return workspace.conferDriver(member.sessionId, leafIds)

@@ -1461,10 +1461,11 @@ test('the session on screen sets its own model and effort by any of its names, a
     await assert.rejects(workspace.sendLeafMessage(String(self.number), 'hello'), /is the session asking: a message to the conversation you are in is the turn you are already typing/)
     await assert.rejects(workspace.interruptLeaf(String(self.number)), /is the session asking: the turn you would stop is the turn you are typing/)
 
-    // A reference that names no member at all keeps the ordinary message, for
-    // both a control verb and a launch verb.
-    await assert.rejects(workspace.resolveOpenTarget('Nonexistent'), /Unknown or ambiguous leaf reference/)
-    await assert.rejects(workspace.configureLeaf('Nonexistent', { model: 'x' }), /Unknown or ambiguous leaf reference/)
+    // A reference that names no member at all is refused as unknown - and the
+    // refusal now says how to discover the members, for both a control verb and
+    // a launch verb.
+    await assert.rejects(workspace.resolveOpenTarget('Nonexistent'), /No member of this family matches "Nonexistent"/)
+    await assert.rejects(workspace.configureLeaf('Nonexistent', { model: 'x' }), /No member of this family matches "Nonexistent"/)
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved

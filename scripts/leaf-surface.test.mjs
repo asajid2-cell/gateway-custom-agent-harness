@@ -1023,7 +1023,9 @@ test('the session on screen is addressable by its own names, and the prompt says
   const open = workspace.slice(workspace.indexOf('export async function openLeaf'), workspace.indexOf('export async function openLeafOnce'))
   assert.match(open, /await resolveOpenTarget\(reference\)/)
   const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
-  assert.match(tool, /await workspace\.resolveOpenTarget\(requireLeaf\(\)\)/)
+  // The reference is named once and handed to the resolver, so the refusal that
+  // follows can describe it.
+  assert.match(tool, /const reference = requireLeaf\(\)[\s\S]*await workspace\.resolveOpenTarget\(reference\)/)
 
   // A send or an interrupt reaches into another conversation, so the session on
   // screen is not a target either - and each says so, rather than reporting

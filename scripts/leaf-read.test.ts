@@ -203,7 +203,7 @@ test('an unknown reference is a refusal, not an empty read', async () => {
   try {
     const { forgetLeafFamilyRoot, readLeafTranscript } = await import('../src/utils/leafWorkspace.ts')
     forgetLeafFamilyRoot()
-    await assert.rejects(readLeafTranscript('no-such-leaf'), /Unknown or ambiguous leaf reference/)
+    await assert.rejects(readLeafTranscript('no-such-leaf'), /No member of this family matches "no-such-leaf"/)
   } finally {
     if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = saved

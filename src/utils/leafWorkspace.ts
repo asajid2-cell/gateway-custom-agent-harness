@@ -1561,6 +1561,47 @@ export async function resolveLeafRef(reference: string): Promise<LeafMember | un
 }
 
 /**
+ * The members a reference could mean when it is ambiguous.
+ *
+ * The same rule `resolveLeafMember` uses to refuse: an exact name more than one
+ * member holds, or a substring more than one member contains. A numbered
+ * reference is never ambiguous - a number names at most one row - so it answers
+ * with nothing here and is reported as unknown instead.
+ */
+function ambiguousLeafMatches(members: readonly LeafMember[], reference: string): LeafMember[] {
+  const lower = reference.trim().toLowerCase()
+  if (!lower) return []
+  if (/^\d+(?::[\s\S]*)?$/.test(lower)) return []
+  const exact = members.filter(member => member.name.toLowerCase() === lower)
+  if (exact.length > 1) return exact
+  const partial = members.filter(member => member.name.toLowerCase().includes(lower))
+  return partial.length > 1 ? partial : []
+}
+
+/**
+ * The refusal a reference earns when it names no single member.
+ *
+ * "Unknown or ambiguous" used to be one sentence, so a caller could not tell a
+ * typo from a name that answers to two rows - and the only next move it could
+ * guess was to try the same reference again. The two cases are different
+ * questions with different answers: a sparse family wants the list, and a
+ * crowded name wants the candidates and the spelling that picks one. A number
+ * is never ambiguous, so it is offered as the disambiguation that always works.
+ */
+export async function leafReferenceFailure(reference: string, members?: readonly LeafMember[]): Promise<string> {
+  const ref = reference.trim()
+  const family = members ?? await listLeafMembers()
+  const candidates = ambiguousLeafMatches(family, ref)
+  if (candidates.length) {
+    const listed = candidates.map(member => `${memberLabel(member)} (${member.sessionId})`).join(', ')
+    // A leaf reference is the bare number - `#2` is a checkpoint reference, so
+    // offering it here would send the caller into a second wrong guess.
+    return `Leaf reference "${ref}" is ambiguous: it matches ${listed}. Use "${candidates[0]!.number}" (the member's number) or the full session ID.`
+  }
+  return `No member of this family matches "${ref}". action:"list" shows every member with its number and session ID; address one as the bare number ("2"), "N:name", or the session ID.`
+}
+
+/**
  * Resolve the target of a `close`, which is the one verb that may name the
  * session you are in.
  *
@@ -1637,7 +1678,7 @@ export async function resolveOpenTarget(reference: string): Promise<LeafMember> 
   if (member) return member
   const self = await selfMemberNamed(reference)
   if (self) throw new Error(`${memberLabel(self)} is the session asking: it is already running, so opening it here would start a second copy of the conversation you are in.`)
-  throw new Error('Unknown or ambiguous leaf reference')
+  throw new Error(await leafReferenceFailure(reference))
 }
 
 /** Names every member can use for the conversation the family came from. */
@@ -1712,7 +1753,12 @@ export async function familyRoster(): Promise<string> {
 
 /** Human/model readable family listing with live process state where known. */
 export async function listLeaves(): Promise<string> {
-  const members = await listLeafMembers()
+  // Archiving is filing away, and filing away is what actually shortens this
+  // list: a closed member keeps its row (it is one reopen away), while an
+  // archived one is out of the way until it is asked for by number or id. That
+  // is the whole point of the archive verb, so it is applied here rather than
+  // left for every reader to remember.
+  const members = (await listLeafMembers()).filter(member => member.status !== 'archived')
   if (!members.length) return 'No leafs in this family.'
   const states = new Map(getLeafViews().map(view => [view.member.sessionId, view.process.getState()]))
   return members.map(member => {
@@ -1791,7 +1837,7 @@ async function readFamilyTranscript(reference: string | undefined, options: Leaf
   const members = (await currentFamily()).members
   if (!reference) return familyDigest(members)
   const member = resolveReadTarget(members, reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference, members))
   const slice = await readTranscriptSlice(member.transcriptPath, member.sessionId, options)
   return renderTranscriptSlice(slice, `${memberLabel(member)} (${member.sessionId})`)
 }
@@ -1825,6 +1871,11 @@ async function viewForMember(member: LeafMember): Promise<OwnedLeafView> {
   let view = views.get(member.sessionId)
   if (view && view.rootSessionId !== root) view = undefined
   if (!view || !isLeafProcessAlive(view.process.getState())) {
+    // A closed member is not a leaf that does not exist: its row is right there
+    // and the fix is one verb away. Saying only "is closed" left the caller to
+    // guess whether to reopen, revive or give up, which is the round trip this
+    // refusal exists to save.
+    if (member.status === 'closed') throw new Error(`${memberLabel(member)} is closed, so it has no running conversation to act on. Reopen it with action:"reopen" ({"action":"reopen","leaf":"${member.number}"}) and retry.`)
     if (member.status !== 'open') throw new Error(`${memberLabel(member)} is ${member.status}`)
     const launched = launch(member, root)
     // This view is about to be sent input, so it has to be listening first.
@@ -1836,7 +1887,7 @@ async function viewForMember(member: LeafMember): Promise<OwnedLeafView> {
 
 async function requireLeafView(reference: string): Promise<{ member: LeafMember; view: OwnedLeafView }> {
   const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference))
   return { member, view: await viewForMember(member) }
 }
 
@@ -1928,7 +1979,7 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
   if (isInteractiveLeaf() && rootReference(reference)) return notifyLeafMatriarch(message)
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
-    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    if (!member) throw new Error(await leafReferenceFailure(reference))
     return requestLeafWorkspace<string>('send', [member.sessionId, message])
   }
   // A send hands a turn to a leaf's own process and reads the reply. The session
@@ -1963,7 +2014,7 @@ export async function sendLeafMessage(reference: string, text: string, origin?: 
 export async function interruptLeaf(reference: string): Promise<string> {
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
-    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    if (!member) throw new Error(await leafReferenceFailure(reference))
     return requestLeafWorkspace<string>('interrupt', [member.sessionId])
   }
   // Like a send, an interrupt acts on another conversation: there is no separate
@@ -1989,7 +2040,7 @@ async function recordLeafCheckpoint(reference: string, label: string | undefined
   const root = await familyRootSessionId()
   await requireMatriarch(root)
   const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference))
   const view = views.get(member.sessionId)
   if (view && isLeafProcessAlive(view.process.getState())) {
     try { await view.process.checkpoint() }
@@ -2015,7 +2066,7 @@ function describeCheckpoint(result: { checkpoint: LeafCheckpoint; existed: boole
 export async function checkpointLeaf(reference: string, label?: string): Promise<string> {
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
-    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    if (!member) throw new Error(await leafReferenceFailure(reference))
     // The host holds the member list and the transcript paths, and it is the
     // party that can flush the member being snapshotted.
     return requestLeafWorkspace<string>('checkpoint', [member.sessionId, label])
@@ -2029,7 +2080,7 @@ export async function listLeafCheckpoints(reference?: string): Promise<string> {
   const ref = reference?.trim()
   if (!ref) return renderCheckpoints(await listCheckpoints(root), root)
   const member = await resolveLeafRef(ref)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(ref))
   return renderCheckpoints(await listCheckpoints(root, member.sessionId), root)
 }
 
@@ -2077,14 +2128,14 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
   if (patch.model === undefined && patch.effort === undefined) throw new Error('Model or effort required')
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
-    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    if (!member) throw new Error(await leafReferenceFailure(reference))
     return requestLeafWorkspace<string>('configure', [member.sessionId, patch])
   }
   await requireMatriarch(await familyRootSessionId())
   const applied = patch.model !== undefined ? `model ${patch.model}` : `effort ${patch.effort}`
   const setting = patch.model !== undefined ? { model: patch.model } : { effort: patch.effort as LeafMember['effort'] }
   const member = await resolveControlMember(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference))
   // The session on screen is a member of its own family, but it has no view: a
   // view is a second process, and this is the conversation itself. A setting is
   // a row write that the next launch reads, so naming this session changes its
@@ -2096,7 +2147,12 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
     return `${memberLabel(member)} ${applied} saved for restart; this session keeps its current route until it is relaunched.`
   }
   const view = await viewForMember(member)
-  if (view.process.getState() !== 'idle') throw new Error('Leaf must be idle before its settings change')
+  const state = view.process.getState()
+  // A setting is a row the next launch reads, and it is written further down -
+  // so a member that is mid-turn is a wait, not a dead end. The old refusal said
+  // only "must be idle", leaving the caller to guess both what it was doing and
+  // what would change that.
+  if (state !== 'idle') throw new Error(`${memberLabel(member)} is ${state}, not idle, so its ${applied} cannot be applied to the running conversation. Wait for its turn to end and retry, or stop that turn first with action:"interrupt" ({"action":"interrupt","leaf":"${member.number}"}); a setting is a row the next launch reads, so it can also be set later.`)
   if (patch.model !== undefined) await view.process.setModel(patch.model)
   if (patch.effort !== undefined) await view.process.setEffort(patch.effort)
   await saveLeafSettings(member.sessionId, setting)
@@ -2118,7 +2174,7 @@ export async function configureLeaf(reference: string, patch: { model?: string; 
 export async function compactLeaf(reference: string, requester?: string): Promise<string> {
   if (isInteractiveLeaf()) {
     const member = await resolveLeafRef(reference)
-    if (!member) throw new Error('Unknown or ambiguous leaf reference')
+    if (!member) throw new Error(await leafReferenceFailure(reference))
     return requestLeafWorkspace<string>('compact', [member.sessionId])
   }
   await requireMatriarch(await familyRootSessionId())
@@ -2150,7 +2206,7 @@ export async function notifyLeafMatriarch(text: string): Promise<string> {
 /** Pull selected context from a leaf into the matriarch's transcript. */
 export async function returnLeafContext(reference: string, text: string): Promise<string> {
   const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference))
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('return', [member.sessionId, text])
   await requireMatriarch(await familyRootSessionId())
   if (!contextReturn) throw new Error('The matriarch is unavailable')
@@ -3040,7 +3096,7 @@ export async function openLeafOnce(reference: string): Promise<string> {
  */
 export async function reviveLeaf(reference: string): Promise<string> {
   const member = await resolveLeafRef(reference)
-  if (!member) throw new Error('Unknown or ambiguous leaf reference')
+  if (!member) throw new Error(await leafReferenceFailure(reference))
   await changeLeaf(member.sessionId, { status: 'closed' })
   return `${memberLabel(member)} is back in the leaf list. It stays closed until you open it.`
 }
@@ -3069,6 +3125,10 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
   // runs on. It is the same door for a leaf asking for that terminal and for
   // this session asking to close itself, and the asker's id is the difference -
   // `closeMatriarch` reads it to tell a refusal from a departure.
+  // Filing the session on screen away would hide the row while the conversation
+  // goes on running under it, which is a different thing from leaving - so the
+  // one door out for this session stays close.
+  if (sessionId === self && patch.status === 'archived') throw new Error('That is the session you are in; archiving it would hide the conversation you are typing in while it keeps running. Archive a different member.')
   if (sessionId === self && patch.status === 'closed') {
     const result = await closeMatriarch(requestedBy)
     // The reply is owed before the terminal changes hands. A leaf's request is
@@ -3101,6 +3161,13 @@ export async function changeLeaf(sessionId: string, patch: Pick<Partial<LeafMemb
     await refreshDesignatedPatriarch()
     publish()
     return
+  }
+  // Archiving a member closes its conversation, so a turn in flight would be
+  // stopped without being asked. Refuse with the state and the two ways to get
+  // to an archive: let the turn end, or interrupt it first.
+  if (patch.status === 'archived' && view) {
+    const state = view.process.getState()
+    if (state === 'running' || state === 'awaiting-approval') throw new Error(`${memberLabel(view.member)} is ${state}, not idle, so it cannot be archived: archiving closes its conversation. Wait for its turn to end and retry, or stop that turn first with action:"interrupt" ({"action":"interrupt","leaf":"${view.member.number}"}).`)
   }
   if (patch.status && patch.status !== 'open' && view) {
     // A member's row exists before the member is listening, so the close a
