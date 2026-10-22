@@ -2297,6 +2297,7 @@ function retryAfterMs(response) {
 
 function retryableStatus(status) {
   return (RETRY_400 && status === 400) ||
+    status === 402 ||
     status === 408 ||
     status === 409 ||
     status === 425 ||
@@ -2304,9 +2305,42 @@ function retryableStatus(status) {
     status >= 500
 }
 
+// A 400 body carries the provider's own words for a transient or quota
+// condition. Only providers whose gateway-side pool can rotate keys are
+// inspected this way; a genuinely invalid request (unknown model, bad body) is
+// still surfaced rather than retried.
+function providerHasRotatingBodyMarkers(provider) {
+  const name = String(provider).toLowerCase()
+  return name.includes('opencode') || name.includes('commandcode') || name.includes('command code')
+}
+
+// Wording that means the key cannot serve, not that the request is wrong. Kept
+// specific on purpose: a broad token like "out of" false-positives on ordinary
+// validation errors. "credit" covers "credits"/"insufficient credits".
+const QUOTA_BODY_MARKERS = [
+  'usage limit',
+  'quota',
+  'insufficient',
+  'credit',
+  'exceed',
+  'balance',
+  'billing',
+  'payment required',
+  'rate limit',
+  'capacity',
+  'exhausted',
+  'temporarily unavailable',
+  'try again',
+  'overloaded',
+]
+
+// A timeout is transient but not a quota problem, so it retries but does not
+// count as a credential failure.
+const TRANSIENT_BODY_MARKERS = [...QUOTA_BODY_MARKERS, 'timeout']
+
 async function retryableResponse(provider, response, control = null) {
   if (retryableStatus(response.status)) return true
-  if (response.status !== 400 || !String(provider).toLowerCase().includes('opencode')) {
+  if (response.status !== 400 || !providerHasRotatingBodyMarkers(provider)) {
     return false
   }
 
@@ -2316,16 +2350,30 @@ async function retryableResponse(provider, response, control = null) {
       timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
       onTimeout: error => control?.abortUpstream?.(error),
     })).toLowerCase()
-    return [
-      'temporarily unavailable',
-      'try again',
-      'overloaded',
-      'upstream timeout',
-      'gateway timeout',
-      'provider timeout',
-      'capacity',
-      'rate limit',
-    ].some(marker => body.includes(marker))
+    return TRANSIENT_BODY_MARKERS.some(marker => body.includes(marker))
+  } catch {
+    if (control?.signal?.aborted) throw control.signal.reason
+    return false
+  }
+}
+
+// A credential failure is a reply that means "this key cannot serve" rather than
+// "this request is wrong". 401/403 say so directly; 402 is payment/quota
+// exhaustion; and a 400 carrying quota wording does too. Any of them must move
+// the pool to the next key when more than one is loaded.
+async function credentialFailure(provider, response, credentials, control) {
+  if (!(credentials?.size > 1)) return false
+  if (response.status === 401 || response.status === 402 || response.status === 403) return true
+  if (response.status !== 400) return false
+  const markers = providerHasRotatingBodyMarkers(provider)
+    ? ['privacy settings', ...QUOTA_BODY_MARKERS]
+    : ['privacy settings']
+  try {
+    const body = (await readResponseCloneText(response, {
+      signal: control?.signal,
+      timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+    })).toLowerCase()
+    return markers.some(marker => body.includes(marker))
   } catch {
     if (control?.signal?.aborted) throw control.signal.reason
     return false
@@ -2590,8 +2638,27 @@ async function persistCommandCodePromotion(record) {
   }
 }
 
+let commandCodeGlobalNumber = 1
+const commandCodeSessionCredentials = new Map()
+
+function commandCodePoolList() {
+  return [commandCodeCredentials, ...[...commandCodeSessionCredentials.values()].map(entry => entry.pool)]
+}
+
+// A CommandCode pool that promotes a new key tells every other CommandCode pool,
+// so a session pool created before the key existed promotes it too, and the
+// promotion is written down so a respawn re-applies it.
 function commandCodePromotion(record) {
+  if (record) {
+    for (const pool of commandCodePoolList()) {
+      if (pool.pending?.number !== record.number) pool.adoptPending(record)
+    }
+  }
   void persistCommandCodePromotion(record)
+}
+
+export function commandCodeCredentialPool(env = process.env, overlay = null, onPromote = null) {
+  return credentialPool({ env, prefix: 'COMMANDCODE_API_KEY', overlay, onPromote })
 }
 
 // The CommandCode pool: COMMANDCODE_API_KEY, __KEY2, __KEY3 ... It shares the
@@ -2603,21 +2670,48 @@ const commandCodeCredentials = credentialPool({
   onPromote: commandCodePromotion,
 })
 
-// Re-apply a promotion recorded before a respawn. Read once, on the first
-// CommandCode request, so the file is not consulted on every turn.
-let commandCodePreferenceLoaded = false
-async function ensureCommandCodePreference() {
-  if (commandCodePreferenceLoaded) return commandCodeCredentials
-  commandCodePreferenceLoaded = true
+// Per-session CommandCode pools, mirroring the OpenCode-Go selection contract: a
+// session may pin its own account, while every unpinned session follows the
+// global default persisted in commandcode-account.json. With no session id the
+// process-wide pool is returned, which is what background/no-session callers use.
+async function sessionCommandCodeCredentials(sessionId) {
+  let number = 1
   let saved = null
-  try { saved = JSON.parse(await fs.readFile(commandCodePreferencePath, 'utf8')) } catch {}
-  const carried = saved?.pendingNew
-  if (carried && Number.isSafeInteger(carried.number) &&
-      commandCodeCredentials.pending?.number !== carried.number &&
-      commandCodeCredentials.numbers.includes(carried.number)) {
-    commandCodeCredentials.adoptPending({ number: carried.number })
+  try {
+    saved = JSON.parse(await fs.readFile(commandCodePreferencePath, 'utf8'))
+    if (Number.isSafeInteger(saved.number) && saved.number > 0) number = saved.number
+  } catch {}
+  if (number !== commandCodeGlobalNumber) {
+    commandCodeGlobalNumber = number
+    commandCodeCredentials.select(number)
+    for (const entry of commandCodeSessionCredentials.values()) {
+      if (!entry.explicit) entry.pool.select(number)
+    }
   }
-  return commandCodeCredentials
+  // A promotion recorded before a respawn is re-applied to any pool that has
+  // not already adopted it.
+  const carried = saved?.pendingNew
+  if (carried && Number.isSafeInteger(carried.number) && number !== carried.number) {
+    for (const pool of commandCodePoolList()) {
+      if (pool.pending?.number !== carried.number && pool.numbers.includes(carried.number)) {
+        pool.adoptPending(carried)
+      }
+    }
+  }
+  if (!sessionId) return commandCodeCredentials
+  let entry = commandCodeSessionCredentials.get(sessionId)
+  if (!entry) {
+    entry = { pool: commandCodeCredentialPool(process.env, gatewayKeyOverlay, commandCodePromotion), explicit: false }
+    entry.pool.select(commandCodeGlobalNumber)
+    commandCodeSessionCredentials.set(sessionId, entry)
+  }
+  return entry.pool
+}
+
+// Session-aware: the caller passes the per-request session id so a pinned
+// account choice is honoured, and no id falls back to the process-wide pool.
+async function ensureCommandCodePreference(sessionId) {
+  return sessionCommandCodeCredentials(sessionId)
 }
 
 async function sessionOpenCodeCredentials(sessionId) {
@@ -2660,7 +2754,7 @@ function noteGatewayKeyInjected(name) {
   if (name.startsWith('OPENCODE_API_KEY')) {
     for (const pool of openCodePoolList()) void pool.numbers
   } else if (name.startsWith('COMMANDCODE_API_KEY')) {
-    void commandCodeCredentials.numbers
+    for (const pool of commandCodePoolList()) void pool.numbers
   }
 }
 
@@ -2688,14 +2782,8 @@ export async function fetchWithRetry({
       const response = await fetch(url, typeof options === 'function' ? options() : options)
       trace.markUpstreamConnect()
       control.upstreamConnected()
-      const credentialFailure = credentials?.size > 1 && (
-        response.status === 401 || response.status === 403 ||
-        (response.status === 400 && (await readResponseCloneText(response, {
-          signal: control.signal,
-          timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
-        })).toLowerCase().includes('privacy settings'))
-      )
-      if (response.ok || !(credentialFailure || await retryableResponse(provider, response, control)) || attempt > retries) {
+      const failedCredential = await credentialFailure(provider, response, credentials, control)
+      if (response.ok || !(failedCredential || await retryableResponse(provider, response, control)) || attempt > retries) {
         // A 2xx is the key that answered, recorded for the usage read; pools
         // that do not rotate (or do not track this) simply ignore the call.
         if (response.ok) credentials?.markServed?.()
@@ -3704,10 +3792,11 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
 
 async function handleCommandCode(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
+  const sessionId = upstreamSessionId(req, body)
   const trace = createGatewayTrace({ model: modelName, backend: 'commandcode', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const credentials = await ensureCommandCodePreference()
+  const credentials = await ensureCommandCodePreference(sessionId)
   let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'Command Code API key is not configured')
@@ -4841,16 +4930,72 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/commandcode-account') {
+    let selection
+    try { selection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid account selection' })
+      return
+    }
+    const { number, sessionId, scope } = selection ?? {}
+    if (!Number.isSafeInteger(number) || number < 1 || !['session', 'global'].includes(scope) || typeof sessionId !== 'string' || !sessionId.trim()) {
+      json(res, 400, { error: 'Use a positive account number and session or global scope' })
+      return
+    }
+    const pool = await sessionCommandCodeCredentials(sessionId)
+    if (!pool.numbers.includes(number)) {
+      json(res, 400, { error: `Account ${number} is not loaded. Available: ${pool.numbers.join(', ')}. Run /refreshlogin after adding a key.` })
+      return
+    }
+    if (scope === 'global') {
+      const temp = `${commandCodePreferencePath}.${randomUUID()}.tmp`
+      try {
+        await fs.mkdir(path.dirname(commandCodePreferencePath), { recursive: true })
+        await fs.writeFile(temp, JSON.stringify({ number }))
+        await fs.rename(temp, commandCodePreferencePath)
+      } catch {
+        await fs.unlink(temp).catch(() => {})
+        json(res, 500, { error: 'Could not save the global Command Code account' })
+        return
+      }
+      await sessionCommandCodeCredentials(sessionId)
+      commandCodeCredentials.select(number)
+      for (const entry of commandCodeSessionCredentials.values()) {
+        if (!entry.explicit) entry.pool.select(number)
+      }
+      commandCodeSessionCredentials.get(sessionId).explicit = false
+    } else {
+      commandCodeSessionCredentials.get(sessionId).explicit = true
+    }
+    pool.select(number)
+    json(res, 200, { number, scope })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/commandcode-account') {
+    const pool = await sessionCommandCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, { number: pool.number, global: commandCodeGlobalNumber, available: pool.numbers })
+    return
+  }
+
   // Reload the credential set from Keysafe. The gateway cannot re-read the vault
   // itself (it only ever reads env), so it answers the caller, flushes, and exits
   // with a code the supervisor recognizes as a deliberate restart; the supervisor
   // respawns it under a freshly built keysafe chain. Answered before the exit so
   // /refreshlogin gets the account list it is about to load.
   if (req.method === 'POST' && requestUrl.pathname === '/gateway/reload-keys') {
-    const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    const sessionId = requestUrl.searchParams.get('sessionId')
+    const pool = await sessionOpenCodeCredentials(sessionId)
+    const commandCodePool = await sessionCommandCodeCredentials(sessionId)
+    // `available` stays the OpenCode list: the opencode CLI reads it as its own
+    // accounts. CommandCode numbers travel separately and its CLI re-reads GET
+    // /gateway/commandcode-account, which already returns its own `available`.
     process.stderr.write('model-gateway route path=/gateway/reload-keys backend=reload-keys\n')
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ reloading: true, available: pool.numbers }), () => {
+    res.end(JSON.stringify({
+      reloading: true,
+      available: pool.numbers,
+      commandcodeAvailable: commandCodePool.numbers,
+    }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })
     return

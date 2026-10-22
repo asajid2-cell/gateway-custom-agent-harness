@@ -255,6 +255,105 @@ test('a CommandCode key added mid-session is persisted and re-promoted after a r
   }
 })
 
+test('CommandCode rotates to the next key on a 400 insufficient-credits body', async () => {
+  // The exact live shape observed from the provider: a 400 whose body reports
+  // exhausted credits must advance the pool, not fail the request on key 1.
+  const env = { COMMANDCODE_API_KEY: 'cc-first', COMMANDCODE_API_KEY2: 'cc-second' }
+  const credentials = credentialPool({ env, prefix: 'COMMANDCODE_API_KEY' })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    if (seen.length === 1) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        error: { type: 'api_error', message: 'You have insufficient credits to make this request' },
+      }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{}')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'Command Code',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: `Bearer ${credentials.key}` } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 200, 'the request is served by a later key, not failed')
+    await response.text()
+    assert.deepEqual(seen, ['Bearer cc-first', 'Bearer cc-second'], 'the pool advanced to key 2')
+    assert.equal(credentials.number, 2)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('CommandCode rotates on 402 payment required', async () => {
+  const env = { COMMANDCODE_API_KEY: 'cc-first', COMMANDCODE_API_KEY2: 'cc-second' }
+  const credentials = credentialPool({ env, prefix: 'COMMANDCODE_API_KEY' })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(seen.length === 1 ? 402 : 200, { 'content-type': 'application/json' })
+    res.end('{}')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'Command Code',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: `Bearer ${credentials.key}` } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 200)
+    await response.text()
+    assert.deepEqual(seen, ['Bearer cc-first', 'Bearer cc-second'])
+    assert.equal(credentials.number, 2)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
+test('CommandCode does not retry a genuinely invalid 400', async () => {
+  const env = { COMMANDCODE_API_KEY: 'cc-first', COMMANDCODE_API_KEY2: 'cc-second' }
+  const credentials = credentialPool({ env, prefix: 'COMMANDCODE_API_KEY' })
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'unknown model: nope' } }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  try {
+    const response = await fetchWithRetry({
+      provider: 'Command Code',
+      url: `http://127.0.0.1:${server.address().port}`,
+      options: () => ({ headers: { authorization: `Bearer ${credentials.key}` } }),
+      credentials,
+      control: { signal: new AbortController().signal, upstreamConnected() {} },
+      trace: { markUpstreamConnect() {} },
+    })
+    assert.equal(response.status, 400)
+    await response.text()
+    assert.deepEqual(seen, ['Bearer cc-first'], 'a bad request is surfaced, not rotated')
+    assert.equal(credentials.number, 1)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+  }
+})
+
 test('a key posted to a running gateway is used at once, with no restart and no plaintext in the log', async () => {
   const firstKey = randomUUID()
   const secondKey = randomUUID()
@@ -761,6 +860,43 @@ test('OpenCode account selection isolates sessions and persists the global defau
     await stopChild(gateway.child)
     gateway = await startGatewayForTest(env)
     assert.equal((await status('new')).number, 2)
+  } finally {
+    await stopChild(gateway.child)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('CommandCode account selection isolates sessions and persists the global default', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'commandcode-selection-'))
+  const env = { CLAUDE_CONFIG_DIR: dir, COMMANDCODE_API_KEY: 'cc-one', COMMANDCODE_API_KEY2: 'cc-two' }
+  let gateway = await startGatewayForTest(env)
+  const status = async session => {
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/gateway/commandcode-account?sessionId=${session}`)
+    assert.equal(response.status, 200, 'account status route must exist')
+    const body = await response.json()
+    assert.deepEqual(Object.keys(body).sort(), ['available', 'global', 'number'])
+    return body
+  }
+  const select = async (sessionId, number, scope) => fetch(`http://127.0.0.1:${gateway.port}/gateway/commandcode-account`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, number, scope }),
+  })
+  try {
+    assert.deepEqual((await status('a')).available, [1, 2])
+    assert.deepEqual((await status('a')).global, 1)
+    assert.equal((await select('a', 2, 'session')).status, 200)
+    assert.equal((await status('a')).number, 2)
+    assert.equal((await status('b')).number, 1)
+    assert.equal((await select('b', 2, 'global')).status, 200)
+    assert.equal((await status('c')).number, 2)
+    assert.equal((await status('c')).global, 2)
+    assert.equal((await select('a', 1, 'session')).status, 200)
+    assert.equal((await status('a')).number, 1)
+    const rejected = await select('b', 99, 'global')
+    assert.equal(rejected.status, 400)
+    assert.match((await rejected.json()).error, /Account 99 is not loaded\. Available: 1, 2\./)
+    await stopChild(gateway.child)
+    gateway = await startGatewayForTest(env)
+    assert.equal((await status('new')).number, 2, 'the global selection survives a restart')
   } finally {
     await stopChild(gateway.child)
     await rm(dir, { recursive: true, force: true })

@@ -22,25 +22,29 @@ function keyPath(keyName: string): string {
 function keyLabel(keyName: string): string {
   if (keyName === 'ds') return 'DeepSeek'
   if (keyName === 'openrouter') return 'OpenRouter'
-  if (keyName === 'commandcode') return 'Command Code'
+  if (keyName.startsWith('commandcode')) {
+    const suffix = keyName.slice('commandcode'.length)
+    return suffix ? `Command Code ${suffix}` : 'Command Code'
+  }
   const suffix = keyName.slice('opencode-go'.length)
   return suffix ? `OpenCode Go ${suffix}` : 'OpenCode Go'
 }
 
-// The next free OpenCode vault slot: `opencode-go` is slot 1, then
-// `opencode-go2`, `opencode-go3`, ... in the first gap. This is the number the
-// gateway will report for the key, so it is chosen before the key is stored.
-async function nextOpenCodeSlot(): Promise<string> {
+// The next free vault slot for a key prefix: `<prefix>` is slot 1, then
+// `<prefix>2`, `<prefix>3`, ... in the first gap. This is the number the gateway
+// will report for the key, so it is chosen before the key is stored.
+async function nextKeySlot(prefix: string): Promise<string> {
   const used = new Set<number>()
+  const pattern = new RegExp(`^${prefix}([2-9]|[1-9][0-9]+)?\\.cred$`)
   try {
     for (const entry of await readdir(join(homedir(), '.keysafe'))) {
-      const match = /^opencode-go([2-9]|[1-9][0-9]+)?\.cred$/.exec(entry)
+      const match = pattern.exec(entry)
       if (match) used.add(Number(match[1] || 1))
     }
   } catch {}
   let number = 1
   while (used.has(number)) number += 1
-  return number === 1 ? 'opencode-go' : `opencode-go${number}`
+  return number === 1 ? prefix : `${prefix}${number}`
 }
 
 async function reloadGatewayKeys(): Promise<{ ok: boolean; available?: number[]; error?: string }> {
@@ -62,13 +66,16 @@ async function reloadGatewayKeys(): Promise<{ ok: boolean; available?: number[];
 
 // The reloaded gateway exits to pick up the new chain, so the account list is
 // read back after it has come up again rather than from the reload response.
-async function waitForOpenCodeAccounts(timeoutMs = 8_000): Promise<number[] | null> {
+async function waitForAccounts(
+  accountPath = '/gateway/opencode-account',
+  timeoutMs = 8_000,
+): Promise<number[] | null> {
   const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
   if (!base) return null
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     try {
-      const url = new URL('/gateway/opencode-account', base)
+      const url = new URL(accountPath, base)
       url.searchParams.set('sessionId', getSessionId())
       const response = await fetch(url, { signal: AbortSignal.timeout(2_000) })
       if (response.ok) {
@@ -84,7 +91,7 @@ async function waitForOpenCodeAccounts(timeoutMs = 8_000): Promise<number[] | nu
 function keyCommand(keyName: string): string {
   if (keyName === 'ds') return 'deepseeklogin'
   if (keyName === 'openrouter') return 'openrouterlogin'
-  if (keyName === 'commandcode') return 'commandcodelogin'
+  if (keyName.startsWith('commandcode')) return 'commandcodelogin'
   return 'opencodelogin'
 }
 
@@ -124,13 +131,20 @@ export const call: LocalJSXCommandCall = async (
   const keyName = boundKeyName ?? (args.trim().startsWith('deepseek') ? 'ds' : 'opencode-go')
   const action = args.trim().toLowerCase()
 
-  if (keyName === 'opencode-go' && action) {
-    const match = /^(?:switch\s+)?(?:opencode-go)?([1-9][0-9]*)(?:\s+(session|global))?$/.exec(action)
+  const accountKeyPrefix = keyName.startsWith('commandcode')
+    ? 'commandcode'
+    : keyName === 'opencode-go'
+      ? 'opencode-go'
+      : null
+  if (accountKeyPrefix && action) {
+    const label = accountKeyPrefix === 'commandcode' ? 'Command Code' : 'OpenCode'
+    const accountPath = accountKeyPrefix === 'commandcode' ? '/gateway/commandcode-account' : '/gateway/opencode-account'
+    const match = new RegExp(`^(?:switch\\s+)?(?:${accountKeyPrefix})?([1-9][0-9]*)(?:\\s+(session|global))?$`).exec(action)
     if (match || action === 'status') {
       const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
-      if (!base) { onDone('OpenCode account selection requires gateway mode.'); return null }
+      if (!base) { onDone(`${label} account selection requires gateway mode.`); return null }
       try {
-        const url = new URL('/gateway/opencode-account', base)
+        const url = new URL(accountPath, base)
         url.searchParams.set('sessionId', getSessionId())
         const response = await fetch(url, {
           ...(match ? {
@@ -143,18 +157,26 @@ export const call: LocalJSXCommandCall = async (
         const result = await response.json()
         onDone(response.ok
           ? match
-            ? `OpenCode account ${result.number} selected ${result.scope === 'global' ? 'globally' : 'for this session'}. Automatic fallback remains enabled.`
-            : `OpenCode active account: ${result.number}; global default: ${result.global}; loaded accounts: ${result.available.join(', ')}.`
-          : result.error ?? 'Could not select the OpenCode account.')
+            ? `${label} account ${result.number} selected ${result.scope === 'global' ? 'globally' : 'for this session'}. Automatic fallback remains enabled.`
+            : `${label} active account: ${result.number}; global default: ${result.global}; loaded accounts: ${result.available.join(', ')}.`
+          : result.error ?? `Could not select the ${label} account.`)
       } catch { onDone('Could not reach the gateway account selector. Restart cc with the updated gateway.') }
       return null
     }
     if (action === 'new') {
-      const slot = await nextOpenCodeSlot()
-      return <GatewayLoginDialog keyName={slot} reload onDone={onDone} />
+      const slot = await nextKeySlot(accountKeyPrefix)
+      return (
+        <GatewayLoginDialog
+          keyName={slot}
+          accountKind={accountKeyPrefix === 'commandcode' ? 'commandcode' : 'opencode'}
+          reload
+          onDone={onDone}
+        />
+      )
     }
     if (action !== 'remove') {
-      onDone('Use /opencodelogin new, /opencodelogin switch 2 [session|global], /opencodelogin status, or /opencodelogin remove.')
+      const commandName = keyCommand(keyName)
+      onDone(`Use /${commandName} new, /${commandName} switch 2 [session|global], /${commandName} status, or /${commandName} remove.`)
       return null
     }
   }
@@ -186,6 +208,7 @@ function GatewayLoginDialog(props: {
   keyName: string
   onDone: (result?: string) => void
   reload?: boolean
+  accountKind?: 'opencode' | 'commandcode'
 }): React.ReactNode {
   const [value, setValue] = useState('')
   const [cursorOffset, setCursorOffset] = useState(0)
@@ -193,6 +216,8 @@ function GatewayLoginDialog(props: {
   const [error, setError] = useState<string | null>(null)
   const terminalSize = useTerminalSize()
   const label = keyLabel(props.keyName)
+  const accountsName = props.accountKind === 'commandcode' ? 'Command Code' : 'OpenCode'
+  const accountsPath = props.accountKind === 'commandcode' ? '/gateway/commandcode-account' : '/gateway/opencode-account'
 
   const submit = async () => {
     if (busy) return
@@ -211,11 +236,11 @@ function GatewayLoginDialog(props: {
     setValue('')
     if (props.reload) {
       const reload = await reloadGatewayKeys()
-      const accounts = reload.ok ? await waitForOpenCodeAccounts() : null
+      const accounts = reload.ok ? await waitForAccounts(accountsPath) : null
       setBusy(false)
       props.onDone(
         reload.ok
-          ? `${label} key saved in Keysafe. Gateway reloaded; OpenCode accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
+          ? `${label} key saved in Keysafe. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
           : `${label} key saved in Keysafe, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.`,
       )
       return
@@ -266,7 +291,7 @@ export const refreshLogin: LocalJSXCommandCall = async (
     onDone(reload.error ?? 'Could not reload the gateway keys.')
     return null
   }
-  const accounts = await waitForOpenCodeAccounts()
+  const accounts = await waitForAccounts()
   onDone(
     accounts
       ? `Gateway reloaded from Keysafe. OpenCode accounts: ${accounts.join(', ') || 'none'}.`
