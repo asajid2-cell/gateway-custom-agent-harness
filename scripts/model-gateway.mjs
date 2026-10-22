@@ -2357,27 +2357,63 @@ async function retryableResponse(provider, response, control = null) {
   }
 }
 
+/**
+ * Classify a reply as "this credential cannot serve" and say why.
+ *
+ * Kept separate from the rotation decision because the two are not the same
+ * fact. Rotation needs more than one key; the health bit does not, and a
+ * single-key provider whose only key just reported exhausted credits is exactly
+ * the case a pre-open gate has to be able to see.
+ */
+function credentialFailureState(marker, label = marker) {
+  // `marker` decides the state; `label` names the wording in the reason. They
+  // differ only for the most useful case: the provider's literal phrase is
+  // "insufficient credits", and recording just "insufficient" drops the noun a
+  // reader needs.
+  const normalized = String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+  return marker === 'privacy settings'
+    ? { state: 'unauthorized', reason: 'http_400_privacy_settings' }
+    : { state: 'exhausted', reason: `http_400_${normalized}` }
+}
+
 // A credential failure is a reply that means "this key cannot serve" rather than
 // "this request is wrong". 401/403 say so directly; 402 is payment/quota
 // exhaustion; and a 400 carrying quota wording does too. Any of them must move
 // the pool to the next key when more than one is loaded.
 async function credentialFailure(provider, response, credentials, control) {
-  if (!(credentials?.size > 1)) return false
-  if (response.status === 401 || response.status === 402 || response.status === 403) return true
-  if (response.status !== 400) return false
-  const markers = providerHasRotatingBodyMarkers(provider)
-    ? ['privacy settings', ...QUOTA_BODY_MARKERS]
-    : ['privacy settings']
-  try {
-    const body = (await readResponseCloneText(response, {
-      signal: control?.signal,
-      timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
-    })).toLowerCase()
-    return markers.some(marker => body.includes(marker))
-  } catch {
-    if (control?.signal?.aborted) throw control.signal.reason
-    return false
+  let verdict = null
+  if (response.status === 401 || response.status === 403) {
+    verdict = { state: 'unauthorized', reason: `http_${response.status}` }
+  } else if (response.status === 402) {
+    verdict = { state: 'exhausted', reason: 'http_402' }
+  } else if (response.status === 400) {
+    const markers = providerHasRotatingBodyMarkers(provider)
+      ? ['privacy settings', ...QUOTA_BODY_MARKERS]
+      : ['privacy settings']
+    let body
+    try {
+      body = (await readResponseCloneText(response, {
+        signal: control?.signal,
+        timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+      })).toLowerCase()
+    } catch {
+      if (control?.signal?.aborted) throw control.signal.reason
+      body = null
+    }
+    const marker = body === null ? undefined : markers.find(marker => body.includes(marker))
+    if (marker !== undefined) {
+      const label = marker === 'insufficient' && body.includes('insufficient credit')
+        ? 'insufficient_credits'
+        : marker
+      verdict = credentialFailureState(marker, label)
+    }
   }
+  if (verdict === null) return false
+  // Recorded for every provider, including one whose key cannot rotate: the
+  // request outcome is the health fact, and the pool's size only decides
+  // whether this gateway can do anything about it.
+  recordRouteHealth(provider, routeHealthNumberOf(credentials), verdict.state, verdict.reason)
+  return credentials?.size > 1
 }
 
 function retryableConnectionError(error, signal) {
@@ -2758,6 +2794,104 @@ function noteGatewayKeyInjected(name) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Route health: can this CREDENTIAL serve at all?
+//
+// Liveness and route health are different axes. A peer answering a ping proves
+// its process is up; it says nothing about whether the key its next call will
+// use still has credits. This store is the second axis, and it is keyed by
+// provider + credential NUMBER, never by model string: several model ids alias
+// onto one key, so a model-keyed bit would be true for a sibling that happens to
+// be served by a different account.
+//
+// In-memory on purpose. A respawned gateway knows nothing, and the safety rule
+// is that nothing known is reported as unknown - never as serving. Persisting
+// this would let a bit outlive the account state that produced it, which is the
+// failure mode the bit exists to prevent.
+// ---------------------------------------------------------------------------
+const ROUTE_HEALTH = new Map()
+
+const ROUTE_HEALTH_PROVIDERS = new Map([
+  ['command code', 'commandcode'],
+  ['commandcode', 'commandcode'],
+  ['opencode go', 'opencode-go'],
+  ['opencode-go', 'opencode-go'],
+  ['opencode zen', 'opencode-zen'],
+  ['opencode-zen', 'opencode-zen'],
+  ['deepseek', 'deepseek'],
+  ['amd radeon', 'amd-radeon'],
+  ['amd-radeon', 'amd-radeon'],
+  ['anthropic', 'anthropic'],
+  ['codex', 'codex'],
+])
+
+// Providers whose key is not a numbered pool. They have exactly one credential,
+// so number 1 is the whole truth about them, and a caller may omit the number.
+const SINGLE_KEY_ROUTE_PROVIDERS = new Set(['deepseek', 'amd-radeon', 'anthropic', 'codex'])
+
+/** The canonical provider id a health bit is keyed under, or null when unknown. */
+export function routeHealthProviderId(provider) {
+  const key = String(provider ?? '').trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ')
+  return ROUTE_HEALTH_PROVIDERS.get(key) ?? null
+}
+
+/** The credential number a provider's call is using, 1 when it has no pool. */
+function routeHealthNumberOf(credentials) {
+  return Number.isSafeInteger(credentials?.number) && credentials.number > 0 ? credentials.number : 1
+}
+
+/**
+ * Record one outcome for one credential.
+ *
+ * Only the three states that are evidence are accepted. There is no way to
+ * record 'unknown': a credential is unknown exactly while it has no entry, so
+ * clearing the map is the only way back to it.
+ */
+export function recordRouteHealth(provider, number, state, reason) {
+  if (!['serving', 'exhausted', 'unauthorized'].includes(state)) return false
+  if (!Number.isSafeInteger(number) || number < 1) return false
+  const id = routeHealthProviderId(provider)
+  if (!id) return false
+  ROUTE_HEALTH.set(`${id}:${number}`, {
+    provider: id,
+    number,
+    state,
+    reason: String(reason ?? '').slice(0, 120),
+    at: new Date().toISOString(),
+  })
+  return true
+}
+
+/**
+ * What is known about one credential.
+ *
+ * A credential with no recorded outcome is `unknown` with `health_unavailable`,
+ * and `at` is null rather than a fabricated timestamp: the caller must be able
+ * to tell "never observed" from "observed a while ago".
+ */
+export function routeHealthFor(provider, number) {
+  const id = routeHealthProviderId(provider)
+  if (!id) return { provider: provider ?? null, number: number ?? null, state: 'unknown', reason: 'unknown_provider', at: null }
+  if (!Number.isSafeInteger(number) || number < 1) {
+    return { provider: id, number: number ?? null, state: 'unknown', reason: 'unknown_credential', at: null }
+  }
+  const record = ROUTE_HEALTH.get(`${id}:${number}`)
+  if (!record) return { provider: id, number, state: 'unknown', reason: 'health_unavailable', at: null }
+  return { ...record }
+}
+
+/** Forget every recorded outcome. Used by tests; a respawn does this implicitly. */
+export function resetRouteHealth() {
+  ROUTE_HEALTH.clear()
+}
+
+/** The credential number a session's pool would select for a provider. */
+async function sessionRouteNumber(providerId, sessionId) {
+  if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).number
+  if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).number
+  return 1
+}
+
 // Only the numbered pools consult the overlay, so only their variables can be
 // live-injected. A single-key provider (DeepSeek, AMD) would be a silent no-op.
 const POOLED_KEY_PATTERN = /^(?:OPENCODE|COMMANDCODE)_API_KEY(?:[2-9]|[1-9][0-9]+)?$/
@@ -2786,7 +2920,16 @@ export async function fetchWithRetry({
       if (response.ok || !(failedCredential || await retryableResponse(provider, response, control)) || attempt > retries) {
         // A 2xx is the key that answered, recorded for the usage read; pools
         // that do not rotate (or do not track this) simply ignore the call.
-        if (response.ok) credentials?.markServed?.()
+        // It is also the only evidence that a credential is currently serving,
+        // and it names the NUMBER that answered rather than the selected one:
+        // a failover advances the pool, so the two differ exactly after a retry.
+        if (response.ok) {
+          credentials?.markServed?.()
+          const served = Number.isSafeInteger(credentials?.lastServed) && credentials.lastServed > 0
+            ? credentials.lastServed
+            : routeHealthNumberOf(credentials)
+          recordRouteHealth(provider, served, 'serving', 'http_200')
+        }
         return response
       }
 
@@ -5021,6 +5164,43 @@ const server = http.createServer(async (req, res) => {
     process.stderr.write(`model-gateway route path=/gateway/keys backend=keys name=${safeLogValue(name)}\n`)
     noteGatewayKeyInjected(name)
     json(res, 200, { name, injected: true })
+    return
+  }
+
+  // What this gateway knows about a credential's ability to serve.
+  //
+  // The answer is about a NUMBER, not a model: one key serves several model
+  // ids, so asking "is this model healthy" would be asking a question the
+  // evidence cannot answer. A credential nothing has exercised yet reads
+  // `unknown` - the pre-open caller has no recipient to ask, and a non-answer
+  // must never be mistaken for a healthy route.
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/route-health') {
+    const providerId = routeHealthProviderId(requestUrl.searchParams.get('provider'))
+    if (!providerId) {
+      json(res, 400, { error: 'Use provider=commandcode|opencode-go|opencode-zen|deepseek|amd-radeon|anthropic|codex' })
+      return
+    }
+    const sessionId = requestUrl.searchParams.get('sessionId')
+    const rawNumber = requestUrl.searchParams.get('number')
+    let number
+    if (rawNumber !== null) {
+      if (!/^[1-9][0-9]*$/.test(rawNumber)) {
+        json(res, 400, { error: 'number must be a positive integer' })
+        return
+      }
+      number = Number(rawNumber)
+    } else if (sessionId) {
+      number = await sessionRouteNumber(providerId, sessionId)
+    } else if (SINGLE_KEY_ROUTE_PROVIDERS.has(providerId)) {
+      number = 1
+    } else {
+      json(res, 400, { error: 'Use number, or sessionId to resolve the account the session would select' })
+      return
+    }
+    process.stderr.write(
+      `model-gateway route path=/gateway/route-health backend=route-health provider=${providerId} number=${number}\n`,
+    )
+    json(res, 200, routeHealthFor(providerId, number))
     return
   }
 

@@ -354,6 +354,192 @@ test('CommandCode does not retry a genuinely invalid 400', async () => {
   }
 })
 
+test('route health names the exhausted key and the key that served, by credential number', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'route-health-rotation-'))
+  const seen = []
+  // A real synthetic upstream: key 1 reports the exact live quota refusal, key 2
+  // answers. The gateway under test is a real child process, so the health bit
+  // is produced by the same code that serves a live session.
+  const upstream = await fakeCodexServer((req, res) => {
+    seen.push(req.headers.authorization)
+    if (seen.length === 1) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        error: { type: 'api_error', message: 'You have insufficient credits to make this request' },
+      }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    }))
+  })
+  const gateway = await startGatewayForTest({
+    CLAUDE_CONFIG_DIR: dir,
+    COMMANDCODE_API_KEY: 'cc-first',
+    COMMANDCODE_API_KEY2: 'cc-second',
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/provider/v1`,
+  })
+  try {
+    const result = await postGateway(gateway.port, {
+      model: 'gateway-commandcode-longcat-2.0-free',
+      stream: false,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.equal(result.status, 200, 'the request is served by key 2, not failed on key 1')
+    assert.deepEqual(seen, ['Bearer cc-first', 'Bearer cc-second'])
+
+    const exhaustedResponse = await getGatewayJson(gateway.port, '/gateway/route-health?provider=commandcode&number=1')
+    assert.equal(exhaustedResponse.status, 200)
+    const exhausted = JSON.parse(exhaustedResponse.body)
+    // Assert the actual body, field by field, not a helper's return value.
+    assert.deepEqual(Object.keys(exhausted).sort(), ['at', 'number', 'provider', 'reason', 'state'])
+    assert.equal(exhausted.provider, 'commandcode')
+    assert.equal(exhausted.number, 1)
+    assert.equal(exhausted.state, 'exhausted')
+    assert.equal(exhausted.reason, 'http_400_insufficient_credits')
+    assert.match(exhausted.at, /^\d{4}-\d{2}-\d{2}T/, 'the outcome carries when it was observed')
+
+    const servingResponse = await getGatewayJson(gateway.port, '/gateway/route-health?provider=commandcode&number=2')
+    assert.equal(servingResponse.status, 200)
+    const serving = JSON.parse(servingResponse.body)
+    assert.equal(serving.provider, 'commandcode')
+    assert.equal(serving.number, 2)
+    assert.equal(serving.state, 'serving')
+    assert.equal(serving.reason, 'http_200')
+    assert.match(serving.at, /^\d{4}-\d{2}-\d{2}T/)
+
+    // A session asks about the account its own pool would select. The global
+    // default is what a fresh launch reads, so this is the answer the pre-open
+    // gate needs without a recipient to ask.
+    const selected = await fetch(`http://127.0.0.1:${gateway.port}/gateway/commandcode-account`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'route-health-session', number: 2, scope: 'global' }),
+    })
+    assert.equal(selected.status, 200)
+    const viaSession = JSON.parse((await getGatewayJson(
+      gateway.port,
+      '/gateway/route-health?provider=commandcode&sessionId=route-health-session',
+    )).body)
+    assert.equal(viaSession.number, 2)
+    assert.equal(viaSession.state, 'serving')
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => upstream.server.close(resolve))
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('route health reports unknown, never serving, for a key that was never exercised', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'route-health-unknown-'))
+  const gateway = await startGatewayForTest({
+    CLAUDE_CONFIG_DIR: dir,
+    COMMANDCODE_API_KEY: 'cc-first',
+    COMMANDCODE_API_KEY2: 'cc-second',
+  })
+  try {
+    for (const number of [1, 2]) {
+      const response = await getGatewayJson(gateway.port, `/gateway/route-health?provider=commandcode&number=${number}`)
+      assert.equal(response.status, 200)
+      assert.deepEqual(JSON.parse(response.body), {
+        provider: 'commandcode',
+        number,
+        state: 'unknown',
+        reason: 'health_unavailable',
+        at: null,
+      })
+    }
+    // A provider with no pool has one credential, so number is inferable.
+    const single = JSON.parse((await getGatewayJson(gateway.port, '/gateway/route-health?provider=deepseek')).body)
+    assert.equal(single.number, 1)
+    assert.equal(single.state, 'unknown')
+  } finally {
+    await stopChild(gateway.child)
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('route health separates an unauthorized key from an exhausted one', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'route-health-401-'))
+  const seen = []
+  const upstream = await fakeCodexServer((req, res) => {
+    seen.push(req.headers.authorization)
+    if (seen.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'invalid api key' } }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    }))
+  })
+  const gateway = await startGatewayForTest({
+    CLAUDE_CONFIG_DIR: dir,
+    COMMANDCODE_API_KEY: 'cc-first',
+    COMMANDCODE_API_KEY2: 'cc-second',
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/provider/v1`,
+  })
+  try {
+    const result = await postGateway(gateway.port, {
+      model: 'gateway-commandcode-longcat-2.0-free',
+      stream: false,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.equal(result.status, 200)
+    const unauthorized = JSON.parse((await getGatewayJson(
+      gateway.port,
+      '/gateway/route-health?provider=commandcode&number=1',
+    )).body)
+    assert.equal(unauthorized.state, 'unauthorized')
+    assert.equal(unauthorized.reason, 'http_401')
+    const serving = JSON.parse((await getGatewayJson(
+      gateway.port,
+      '/gateway/route-health?provider=commandcode&number=2',
+    )).body)
+    assert.equal(serving.state, 'serving')
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => upstream.server.close(resolve))
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a genuinely invalid 400 leaves the credential unknown, not exhausted', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'route-health-invalid-'))
+  const upstream = await fakeCodexServer((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'unknown model: nope' } }))
+  })
+  const gateway = await startGatewayForTest({
+    CLAUDE_CONFIG_DIR: dir,
+    COMMANDCODE_API_KEY: 'cc-first',
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/provider/v1`,
+  })
+  try {
+    const result = await postGateway(gateway.port, {
+      model: 'gateway-commandcode-longcat-2.0-free',
+      stream: false,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.equal(result.status, 400, 'the bad request is surfaced to the caller')
+    const health = JSON.parse((await getGatewayJson(
+      gateway.port,
+      '/gateway/route-health?provider=commandcode&number=1',
+    )).body)
+    assert.equal(health.state, 'unknown')
+    assert.equal(health.reason, 'health_unavailable')
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => upstream.server.close(resolve))
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('a key posted to a running gateway is used at once, with no restart and no plaintext in the log', async () => {
   const firstKey = randomUUID()
   const secondKey = randomUUID()
