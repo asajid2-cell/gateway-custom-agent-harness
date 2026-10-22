@@ -158,6 +158,35 @@ test('a recurring wake rewrites its state, and stop ends it', { timeout: 30_000 
   })
 })
 
+test('a stop issued from inside the wake callback leaves nothing armed and no state file', { timeout: 30_000 }, async () => {
+  await withTransport(async (transport, home, directory) => {
+    const fired: string[] = []
+    ;(transport as any).options.onWake = (timer: { token: string }) => {
+      fired.push(timer.token)
+      // The hazard in the shape the runtime has it: the turn that handles a wake
+      // decides the timer is wrong and stops it. `onWake` is synchronous, so the
+      // stop is a promise nobody here can await - and the fire path used to
+      // carry on afterwards, re-arm the schedule and rewrite the state file it
+      // had just been told to forget.
+      void transport.stopWakeTimer(timer.token)
+    }
+    const registration = JSON.parse(await readFile(join(directory, `${transport.peer.sessionId}.json`), 'utf8'))
+    const receipt = await callGatewayPeer(transport.peer.endpoint, {
+      type: 'wake', token: 'stop-inside', auth: registration.token, reason: 'timer',
+      intervalMs: 60, at: new Date(Date.now() + 40).toISOString(),
+    }) as any
+    assert.equal(receipt.ok, true)
+    // `>= 1`, not `=== 1`: when the fire path resurrects the schedule this is
+    // already several fires by the time the wait is evaluated, and the red line
+    // should be the assertion below rather than a timeout here.
+    await waitFor(() => fired.length >= 1)
+    // Long enough for a resurrected 60ms schedule to fire repeatedly.
+    await new Promise(resolve => setTimeout(resolve, 400))
+    assert.deepEqual(fired, ['stop-inside'], 'RED LINE: a stopped timer fired again')
+    await assert.rejects(readFile(timerFile(home, 'stop-inside'), 'utf8'), /ENOENT/, 'the state file was written back after the stop')
+  })
+})
+
 test('a re-set with the same token replaces rather than duplicates', { timeout: 30_000 }, async () => {
   await withTransport(async (transport, home, directory) => {
     const fired: string[] = []

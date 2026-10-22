@@ -818,7 +818,30 @@ export class GatewaySessionTransport {
    * clock. The state files beside the inbox are what `gateway-wake --status`
    * reads, and `close()` clears both.
    */
-  private readonly wakeTimers = new Map<string, { handle: NodeJS.Timeout; token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }>()
+  private readonly wakeTimers = new Map<string, { handle: NodeJS.Timeout; token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number; generation: number }>()
+
+  /**
+   * Bumped every time a schedule is armed.
+   *
+   * A `setTimeout` callback that is already queued cannot be cancelled, and a
+   * state write that already started cannot be recalled; both carry the
+   * generation they were armed with and compare it against this map before they
+   * act. That is the whole point: a stop or a replacement is a fact in the map,
+   * and anything armed earlier is no longer the truth.
+   */
+  private wakeGeneration = 0
+
+  /**
+   * The last state write queued per token.
+   *
+   * A caller that unlinks a timer's state file has to wait for an in-flight
+   * write first: the write's rename would otherwise land after the unlink and
+   * put the file - and the stopped timer - back on disk. Serialising writes per
+   * token is also what stops an older generation's write from overwriting a
+   * newer one: each write re-checks its generation at the head of this queue,
+   * once the write before it has settled.
+   */
+  private readonly wakeWrites = new Map<string, Promise<void>>()
 
   constructor(private readonly options: {
     directory: string
@@ -895,6 +918,41 @@ export class GatewaySessionTransport {
       fires: timer.fires,
     })
   }
+
+  /**
+   * Write a timer's state, serialised per token and skipped if it went stale.
+   *
+   * `isObsolete` runs at the head of this token's write queue - after the write
+   * before it has settled, and one step before the file is replaced - so a stop
+   * or a re-set that landed while an earlier write was in flight can neither be
+   * overwritten by it nor leave the file describing a schedule nobody holds.
+   * The write is awaitable, which is how a caller that unlinks the file can wait
+   * for it instead of racing its rename.
+   */
+  private queueWakeStateWrite(
+    timer: { token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number },
+    isObsolete: () => boolean = () => false,
+  ): Promise<void> {
+    const previous = this.wakeWrites.get(timer.token) ?? Promise.resolve()
+    const write = previous.catch(() => {}).then(async () => {
+      if (isObsolete()) return
+      await this.persistWakeState(timer)
+    })
+    this.wakeWrites.set(timer.token, write)
+    void write.catch(() => {}).finally(() => {
+      if (this.wakeWrites.get(timer.token) === write) this.wakeWrites.delete(timer.token)
+    })
+    return write
+  }
+
+  /** Settle any state write already queued for a token, so an unlink cannot be undone. */
+  private async settleWakeWrites(token: string): Promise<void> {
+    // Captured synchronously: nothing can register a newer write between this
+    // read and the await, because the write queue is only entered from code that
+    // runs synchronously before this call or after it returns.
+    await this.wakeWrites.get(token)?.catch(() => {})
+  }
+
   private async clearWakeState(token: string): Promise<void> {
     await unlink(this.wakeStatePath(token)).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
   }
@@ -905,13 +963,25 @@ export class GatewaySessionTransport {
     // next tick, so cap it and let the fire path reschedule if the deadline is
     // still in the future.
     const delay = Math.max(0, Math.min(timer.at - Date.now(), 2_147_483_647))
-    const handle = setTimeout(() => this.fireWake(timer), delay)
+    const generation = ++this.wakeGeneration
+    const handle = setTimeout(() => {
+      // A queued callback is not proof the schedule is still wanted: a stop or a
+      // replacement that landed while it waited has written a newer truth, and
+      // `clearTimeout` cannot reach a callback that is already due.
+      if (this.wakeTimers.get(timer.token)?.generation !== generation) return
+      this.fireWake(timer)
+    }, delay)
     handle.unref?.()
-    this.wakeTimers.set(timer.token, { ...timer, handle })
+    this.wakeTimers.set(timer.token, { ...timer, handle, generation })
   }
 
   private fireWake(timer: { token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }): void {
-    this.wakeTimers.delete(timer.token)
+    // The entry stays in the map while the callback runs. Deleting it here would
+    // make "I stopped this from inside the callback" look exactly like "I am the
+    // schedule", and the checks below would have nothing to compare against.
+    const armed = this.wakeTimers.get(timer.token)
+    if (!armed) return
+    const generation = armed.generation
     if (this.isClosing) return
     // A capped delay can land before a distant deadline; wait again rather
     // than injecting a turn early.
@@ -926,15 +996,25 @@ export class GatewaySessionTransport {
       ...(timer.intervalMs === undefined ? {} : { intervalMs: timer.intervalMs }),
       at: firedAt,
     })
+    // The callback may have stopped or replaced this timer from inside itself:
+    // that is what a session does when a wake shows it the schedule is wrong.
+    // Carrying on would re-arm - and rewrite - the schedule it just stopped.
+    const still = this.wakeTimers.get(timer.token)
+    if (!still || still.generation !== generation) return
     const next = { ...timer, fires: timer.fires + 1 }
     if (timer.intervalMs === undefined) {
       // One-shot timers have no state left to describe after they fire.
+      this.wakeTimers.delete(timer.token)
       void this.clearWakeState(timer.token).catch(() => {})
       return
     }
     next.at = Date.now() + timer.intervalMs
     this.scheduleWake(next)
-    void this.persistWakeState(next).catch(() => {})
+    // The write describes the generation just armed, and says so at the head of
+    // the write queue: if a stop or a re-set gets in first, this write is stale,
+    // and letting it land would resurrect the schedule it describes.
+    const armedGeneration = this.wakeTimers.get(next.token)?.generation
+    void this.queueWakeStateWrite(next, () => this.wakeTimers.get(next.token)?.generation !== armedGeneration).catch(() => {})
   }
 
   private clearWakeTimer(token: string): boolean {
@@ -953,13 +1033,17 @@ export class GatewaySessionTransport {
     const next = { ...timer, createdAt: new Date().toISOString(), fires: 0 }
     // Persist before arming: a schedule that cannot be described to `--status`
     // is a schedule the caller was told about but cannot see, and a rejected
-    // write must not leave a live timer behind.
-    await this.persistWakeState(next)
+    // write must not leave a live timer behind. Through the queue, so a fire's
+    // in-flight write cannot land after this one and restore the old schedule.
+    await this.queueWakeStateWrite(next)
     this.scheduleWake(next)
   }
 
   async stopWakeTimer(token: string): Promise<boolean> {
     const stopped = this.clearWakeTimer(token)
+    // Wait for a fire's write before unlinking: its rename would otherwise land
+    // after the unlink and put the stopped timer's state back on disk.
+    await this.settleWakeWrites(token)
     await this.clearWakeState(token)
     return stopped
   }
@@ -1571,12 +1655,16 @@ export class GatewaySessionTransport {
     if (this.closing) return this.closing
     this.isClosing = true
     // A closed session can no longer start a turn, so its timers are dead
-    // schedules and its state files would lie to `--status`. Stop both.
-    for (const token of [...this.wakeTimers.keys()]) {
-      this.clearWakeTimer(token)
-      void this.clearWakeState(token).catch(() => {})
-    }
+    // schedules and its state files would lie to `--status`. Stop both - the
+    // unlink in the shutdown chain, because deleting a file before a fire's
+    // write settles is the same race a stop has: the rename lands last.
+    const wakeTokens = [...this.wakeTimers.keys()]
+    for (const token of wakeTokens) this.clearWakeTimer(token)
     this.closing = (async () => {
+      for (const token of wakeTokens) {
+        await this.settleWakeWrites(token)
+        await this.clearWakeState(token).catch(() => {})
+      }
       await this.starting?.catch(() => {})
       await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
       await this.chain
