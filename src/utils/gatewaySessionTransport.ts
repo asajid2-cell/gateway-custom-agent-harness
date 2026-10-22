@@ -10,6 +10,7 @@ import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
   gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage, parseGatewayPeer,
+  peerMessageExpectsReply,
   type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
@@ -510,6 +511,14 @@ export class GatewaySessionTransport {
   private policy: GatewayInboundPolicy
   private readonly bursts = new Map<string, number[]>()
   private readonly idleSubscribers = new Map<string, string>()
+  /**
+   * Timers this session has been asked to fire, keyed by the timer token that
+   * identifies them. In memory because a timer wakes a live process that is
+   * merely idle: the process that owns the turn is the one that must own the
+   * clock. The state files beside the inbox are what `gateway-wake --status`
+   * reads, and `close()` clears both.
+   */
+  private readonly wakeTimers = new Map<string, { handle: NodeJS.Timeout; token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }>()
 
   constructor(private readonly options: {
     directory: string
@@ -519,6 +528,11 @@ export class GatewaySessionTransport {
     purpose?: string
     policy?: GatewayInboundPolicy
     onInboxChanged?: () => void
+    /**
+     * Called when a wake timer fires, in this process. The runtime turns it
+     * into a synthetic user turn; the transport never touches the queue.
+     */
+    onWake?: (timer: { token: string; label?: string; intervalMs?: number; at: string }) => void
   }) {
     const runtimeId = randomUUID()
     // The build this process is running, as the build's own timestamp. The dist
@@ -553,6 +567,123 @@ export class GatewaySessionTransport {
 
   private addHistory(entry: GatewayPeerHistoryEntry): void {
     this.history = [...this.history, entry].slice(-MAX_PEER_HISTORY)
+  }
+
+  /**
+   * Where one timer's state lives.
+   *
+   * A sibling of the session directory, keyed by a filename-safe encoding of
+   * the timer token: tokens are caller-chosen and may contain separators, so
+   * the encoded form is what keeps two timers from overwriting one file. The
+   * session id is inside the record, so `--status` can filter without parsing
+   * names.
+   */
+  private get wakeDirectory(): string { return join(this.options.directory, '..', 'gateway-timers') }
+  private wakeStatePath(token: string): string {
+    const safe = Buffer.from(token, 'utf8').toString('hex').slice(0, 160)
+    return join(this.wakeDirectory, `${safe}.json`)
+  }
+  private async persistWakeState(timer: { token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }): Promise<void> {
+    await mkdir(this.wakeDirectory, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error })
+    await atomicJson(this.wakeStatePath(timer.token), {
+      token: timer.token,
+      sessionId: this.peer.sessionId,
+      ...(timer.label ? { label: timer.label } : {}),
+      ...(timer.intervalMs === undefined ? {} : { intervalMs: timer.intervalMs }),
+      at: new Date(timer.at).toISOString(),
+      createdAt: timer.createdAt,
+      fires: timer.fires,
+    })
+  }
+  private async clearWakeState(token: string): Promise<void> {
+    await unlink(this.wakeStatePath(token)).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error })
+  }
+
+  private scheduleWake(timer: { token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }): void {
+    this.clearWakeTimer(timer.token)
+    // setTimeout's delay is a 32-bit signed int; anything longer fires on the
+    // next tick, so cap it and let the fire path reschedule if the deadline is
+    // still in the future.
+    const delay = Math.max(0, Math.min(timer.at - Date.now(), 2_147_483_647))
+    const handle = setTimeout(() => this.fireWake(timer), delay)
+    handle.unref?.()
+    this.wakeTimers.set(timer.token, { ...timer, handle })
+  }
+
+  private fireWake(timer: { token: string; label?: string; intervalMs?: number; at: number; createdAt: string; fires: number }): void {
+    this.wakeTimers.delete(timer.token)
+    if (this.isClosing) return
+    // A capped delay can land before a distant deadline; wait again rather
+    // than injecting a turn early.
+    if (timer.at > Date.now() + 1_000) {
+      this.scheduleWake(timer)
+      return
+    }
+    const firedAt = new Date().toISOString()
+    this.options.onWake?.({
+      token: timer.token,
+      ...(timer.label ? { label: timer.label } : {}),
+      ...(timer.intervalMs === undefined ? {} : { intervalMs: timer.intervalMs }),
+      at: firedAt,
+    })
+    const next = { ...timer, fires: timer.fires + 1 }
+    if (timer.intervalMs === undefined) {
+      // One-shot timers have no state left to describe after they fire.
+      void this.clearWakeState(timer.token).catch(() => {})
+      return
+    }
+    next.at = Date.now() + timer.intervalMs
+    this.scheduleWake(next)
+    void this.persistWakeState(next).catch(() => {})
+  }
+
+  private clearWakeTimer(token: string): boolean {
+    const existing = this.wakeTimers.get(token)
+    if (!existing) return false
+    clearTimeout(existing.handle)
+    this.wakeTimers.delete(token)
+    return true
+  }
+
+  /**
+   * Set, replace, or cancel a timer. The token is the identity: a re-set with
+   * the same token replaces the schedule rather than adding a second one.
+   */
+  async setWakeTimer(timer: { token: string; label?: string; intervalMs?: number; at: number }): Promise<void> {
+    const next = { ...timer, createdAt: new Date().toISOString(), fires: 0 }
+    // Persist before arming: a schedule that cannot be described to `--status`
+    // is a schedule the caller was told about but cannot see, and a rejected
+    // write must not leave a live timer behind.
+    await this.persistWakeState(next)
+    this.scheduleWake(next)
+  }
+
+  async stopWakeTimer(token: string): Promise<boolean> {
+    const stopped = this.clearWakeTimer(token)
+    await this.clearWakeState(token)
+    return stopped
+  }
+
+  private async handleWake(request: any): Promise<unknown> {
+    // The wake request carries the timer token in `token`, which is why it is
+    // authenticated by `auth` instead of the usual field. A caller that reads
+    // this session's registration can already speak to it; a caller that
+    // cannot read it has no business scheduling turns in it.
+    const supplied = Buffer.from(typeof request.auth === 'string' ? request.auth : '')
+    const expected = Buffer.from(this.token)
+    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) throw new Error('Unauthorized')
+    if (request.reason !== 'timer') throw new Error('Unsupported wake reason')
+    const token = typeof request.token === 'string' ? request.token.trim() : ''
+    if (!token || token.length > 200) throw new Error('Wake requires a timer token of 1-200 characters')
+    if (request.stop === true) return { ok: true, token, stopped: await this.stopWakeTimer(token), sessionId: this.peer.sessionId }
+    const at = typeof request.at === 'string' ? Date.parse(request.at) : NaN
+    if (!Number.isFinite(at)) throw new Error('Wake requires a valid `at` timestamp')
+    if (at < Date.now() - 60_000) throw new Error('Wake `at` is in the past')
+    const intervalMs = request.intervalMs
+    if (intervalMs !== undefined && (!Number.isInteger(intervalMs) || intervalMs <= 0)) throw new Error('Wake interval must be a positive integer of milliseconds')
+    const label = typeof request.label === 'string' ? request.label.slice(0, 200) : undefined
+    await this.setWakeTimer({ token, ...(label ? { label } : {}), ...(intervalMs === undefined ? {} : { intervalMs }), at })
+    return { ok: true, token, ...(label ? { label } : {}), ...(intervalMs === undefined ? {} : { intervalMs }), at: new Date(at).toISOString(), sessionId: this.peer.sessionId }
   }
 
   start(): Promise<void> {
@@ -637,7 +768,11 @@ export class GatewaySessionTransport {
           // session is mid-request, and a listing that gets no answer drops the
           // peer. It reads nothing mutable (the runtime id is fixed for the life
           // of the transport), so it does not need the ordering the chain gives.
-          if (request.type === 'ping') {
+          // A wake carries no sender registration: the detached CLI is not a
+          // peer session. It authenticates with the receiver's own token, read
+          // from the registration, so it is answered on this out-of-band path
+          // exactly like a probe rather than through `authenticateSender`.
+          if (request.type === 'ping' || request.type === 'wake') {
             void this.handle(request).then(
               response => socket.end(`${JSON.stringify(response)}\n`),
               () => socket.end(`${JSON.stringify({ ok: false, reason: 'Invalid or unauthorized peer request' })}\n`),
@@ -700,6 +835,9 @@ export class GatewaySessionTransport {
   }
 
   private async handle(request: any, authenticatedSender?: { peer: GatewayPeer; token: string }): Promise<unknown> {
+    // `token` is the timer's identity on a wake, not this session's secret, so
+    // it is read on its own path. `handleWake` validates `auth` itself.
+    if (request?.type === 'wake') return this.handleWake(request)
     if (typeof request?.token !== 'string') throw new Error('Unauthorized')
     const supplied = Buffer.from(request.token)
     const expected = Buffer.from(this.token)
@@ -812,13 +950,18 @@ export class GatewaySessionTransport {
    * The defect this closes: a message could be read and understood, and then
    * simply never answered, with nothing anywhere recording that a reply was
    * owed. A request that arrived with `replyTo` set is itself a reply and owes
-   * nothing, so it is excluded - this exists to surface the first turn of a
-   * conversation, not to make two agents acknowledge each other forever.
+   * nothing, and a request that arrived with `expectReply: false` is the sender
+   * saying no answer is wanted - both are excluded. This exists to surface the
+   * first turn of a conversation, not to make two agents acknowledge each other
+   * forever, nor to make an informational note look unanswered.
    */
   outstandingReplies(): readonly { toMessageId: string; toSessionId: string; summary: string; receivedAt: string }[] {
     const answered = new Set(this.history.filter(entry => entry.direction === 'sent').map(entry => entry.message.replyTo).filter(Boolean) as string[])
     return this.records
-      .filter(record => record.message.replyTo === undefined && !answered.has(record.message.id))
+      // `expectReply: false` is the sender saying no answer is owed, so it is
+      // settled on arrival and never re-surfaced. Absent still means owed:
+      // silence about intent is not a statement that no reply is wanted.
+      .filter(record => record.message.replyTo === undefined && peerMessageExpectsReply(record.message) && !answered.has(record.message.id))
       .map(record => ({
         toMessageId: record.message.id,
         toSessionId: record.message.fromSessionId,
@@ -827,7 +970,7 @@ export class GatewaySessionTransport {
       }))
   }
 
-  async send(toSessionId: string, text: string, summary: string, replyTo?: string, kind?: PeerMessageKind): Promise<unknown> {
+  async send(toSessionId: string, text: string, summary: string, replyTo?: string, kind?: PeerMessageKind, expectReply?: boolean): Promise<unknown> {
     // A session addressing itself is a real mistake - an ID read off a listing
     // and mistaken for the peer's - and the receiver rejects it anyway, as a
     // request it cannot attribute. Saying so here keeps the sender from reading
@@ -836,7 +979,7 @@ export class GatewaySessionTransport {
     const target = await readRegistration(this.options.directory, toSessionId)
     const message: GatewayPeerMessage = gatewayPeerMessageSchema.parse({
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
-      toSessionId, text, summary, replyTo, ...(kind ? { kind } : {}), createdAt: new Date().toISOString(),
+      toSessionId, text, summary, replyTo, ...(kind ? { kind } : {}), ...(expectReply === undefined ? {} : { expectReply }), createdAt: new Date().toISOString(),
     })
     // Persist the identity before sending: a lost acknowledgement must not
     // turn a retry into a new task with a different message ID.
@@ -981,6 +1124,12 @@ export class GatewaySessionTransport {
   close(): Promise<void> {
     if (this.closing) return this.closing
     this.isClosing = true
+    // A closed session can no longer start a turn, so its timers are dead
+    // schedules and its state files would lie to `--status`. Stop both.
+    for (const token of [...this.wakeTimers.keys()]) {
+      this.clearWakeTimer(token)
+      void this.clearWakeState(token).catch(() => {})
+    }
     this.closing = (async () => {
       await this.starting?.catch(() => {})
       await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())

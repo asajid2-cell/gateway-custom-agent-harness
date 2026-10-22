@@ -32,7 +32,9 @@ test('a peer body splits into who sent it, what it says, and how to reply', () =
   assert.equal(parts.body, 'Please review the parser.\n\nEspecially the jump table.')
   // The policy paragraph is framing for the model, not the sender's content.
   assert.ok(!parts.body.includes('originate from a peer'))
-  assert.match(parts.replyHint ?? '', /^To reply: /)
+  // The hint now leads with whether an answer is owed; the instruction itself
+  // is unchanged, so the affordance the reader needs is still there.
+  assert.match(parts.replyHint ?? '', /^Reply expected\. To reply: /)
   // The hint has to name the tool route as well as the skill: SendMessage is the
   // tool a session already has, and a reply through it with no replyTo leaves
   // the sender counting the request as owed.

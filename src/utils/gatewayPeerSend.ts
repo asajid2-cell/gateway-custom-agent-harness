@@ -227,6 +227,7 @@ export async function sendViaGatewayPeer(
   summary: string,
   replyTo?: string,
   kind?: PeerMessageKind,
+  expectReply?: boolean,
 ): Promise<GatewayPeerSendResult> {
   const runtime = getGatewaySessionRuntime(getSessionId())
   if (!runtime) {
@@ -240,7 +241,7 @@ export async function sendViaGatewayPeer(
   if ('error' in resolved) return { ok: false, message: resolved.error }
   let receipt: any
   try {
-    receipt = await runtime.transport.send(resolved.sessionId, text, summary, replyTo, kind)
+    receipt = await runtime.transport.send(resolved.sessionId, text, summary, replyTo, kind, expectReply)
   } catch (error) {
     const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
     return { ok: false, message: `Delivery to ${resolved.label} failed: ${reason || 'transport error'}` }

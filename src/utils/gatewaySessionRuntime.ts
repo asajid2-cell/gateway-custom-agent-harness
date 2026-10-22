@@ -1,10 +1,11 @@
-import type { UUID } from 'crypto'
+import { randomUUID, type UUID } from 'crypto'
 import { onSessionWillSwitch } from '../bootstrap/state.js'
 import { join } from 'path'
 import { GatewaySessionTransport, listGatewayPeers } from './gatewaySessionTransport.js'
 import { GatewaySessionDelivery } from './gatewaySessionDelivery.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { logForDebugging } from './debug.js'
+import { formatWakeInjection } from './gatewaySessionProtocol.js'
 import { enqueue, removeByFilter } from './messageQueueManager.js'
 import { isInteractiveLeaf } from './leafTerminal.js'
 import { startSessionReaper } from './sessionReaper.js'
@@ -73,6 +74,27 @@ export class GatewaySessionRuntime {
     this.transport = new GatewaySessionTransport({
       directory: join(getClaudeConfigHomeDir(), 'gateway-sessions'), sessionId, cwd, name,
       onInboxChanged: () => { if (this.ready) this.delivery.drain() },
+      // A timer wake is the session resuming itself, so it enters through the
+      // same prompt queue an operator's typing does - not through the peer
+      // inbox, and not as a self-addressed peer message (which the transport
+      // refuses). That is what lets it start a turn on an otherwise idle
+      // session: the queue is what the REPL drains and what the headless loop
+      // watches for a reason to run again.
+      onWake: timer => {
+        enqueue({
+          value: formatWakeInjection(timer),
+          mode: 'prompt',
+          priority: 'next',
+          uuid: randomUUID() as UUID,
+          skipSlashCommands: true,
+          isMeta: true,
+        })
+        // Same pause as peer delivery: a leaf nobody is watching drains only
+        // when its input is woken, and a timer is no more the person typing.
+        if (isInteractiveLeaf()) {
+          void import('./leafTerminal.js').then(leaf => leaf.wakeLeafInput()).catch(() => {})
+        }
+      },
     })
     this.delivery = new GatewaySessionDelivery(this.transport, (id, text) => {
       this.pendingIds.add(id)

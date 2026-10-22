@@ -124,8 +124,27 @@ export const gatewayPeerMessageSchema = z.object({
   // for "this is not a reply".
   replyTo: z.string().uuid().refine(id => id !== NIL_UUID, 'replyTo cannot be the nil UUID; omit the field instead').optional(),
   kind: z.enum(PEER_MESSAGE_KINDS).optional(),
+  // Whether the sender is owed an answer.
+  //
+  // Optional on the wire and read as `true` when absent: a message written by a
+  // build that predates the field, or by a caller that did not choose, asks for
+  // a reply - the reading that keeps a request from being silently dropped.
+  // `false` marks a message that is informational, so the receiver is not
+  // counted as owing an answer and is not re-surfaced for one at a turn
+  // boundary. The default is stated once, in `peerMessageExpectsReply`, so the
+  // render and the outstanding-reply count cannot disagree.
+  expectReply: z.boolean().optional(),
   createdAt: z.string().datetime(),
 }).strict()
+
+/**
+ * Whether a message is owed a reply. Absent means yes, and `false` is the only
+ * value that says no - there is no third state, so a caller never has to decide
+ * what a missing field implies beyond this one reading.
+ */
+export function peerMessageExpectsReply(message: Pick<GatewayPeerMessage, 'expectReply'>): boolean {
+  return message.expectReply !== false
+}
 
 /**
  * Parse a message another build may have written.
@@ -231,6 +250,57 @@ export function isGatewayPeerMessageText(text: string): boolean {
   return isGatewayPeerHeaderText(text) || text.startsWith(LEAF_PEER_PROMPT_PREFIX)
 }
 
+/**
+ * The mark a driver-set timer leaves on the turn it starts.
+ *
+ * A timer wake is not peer traffic and not the operator typing: it is the
+ * session resuming itself on a schedule. The prefix is what lets the headless
+ * queue watcher recognise a wake among ordinary queued prompts and start a
+ * turn for it on an otherwise idle session - the whole point of the feature,
+ * since a self-addressed peer message is refused by the transport and a
+ * blocking wait cannot revive an ended turn.
+ */
+export const GATEWAY_WAKE_PREFIX = '[heartbeat] '
+
+/** True for the synthetic turn a wake timer injects. */
+export function isGatewayWakeText(text: string): boolean {
+  return text.startsWith(GATEWAY_WAKE_PREFIX)
+}
+
+/** One timer as the wire carries it. `token` is the timer's identity. */
+export type GatewayWakeRequest = {
+  type: 'wake'
+  token: string
+  auth: string
+  reason: 'timer'
+  label?: string
+  intervalMs?: number
+  at?: string
+  stop?: true
+}
+
+/** A short human form of a cadence, for the injected line and the CLI. */
+export function formatWakeInterval(intervalMs: number): string {
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return '0s'
+  if (intervalMs % 3_600_000 === 0) return `${intervalMs / 3_600_000}h`
+  if (intervalMs % 60_000 === 0) return `${intervalMs / 60_000}m`
+  if (intervalMs % 1_000 === 0) return `${intervalMs / 1_000}s`
+  return `${intervalMs}ms`
+}
+
+/**
+ * The synthetic turn text a fired timer injects.
+ *
+ * Phrased as an imperative to the session that set the timer, because that is
+ * what it is: the ended turn cannot be revived, so the wake has to give a fresh
+ * turn enough context to pick the work up without re-reading a whole transcript.
+ */
+export function formatWakeInjection(timer: { label?: string; token: string; intervalMs?: number; at: string }): string {
+  const label = timer.label?.trim() || timer.token
+  const cadence = timer.intervalMs === undefined ? 'once' : `every ${formatWakeInterval(timer.intervalMs)}`
+  return `${GATEWAY_WAKE_PREFIX}The timer you set (label=${label}, ${cadence}) passed at ${timer.at}. Reassess: read your leaves, check in-flight work, message whoever is stuck.`
+}
+
 /** One peer body, split into the parts a reader needs separately. */
 export type GatewayPeerTextParts = {
   reply: boolean
@@ -301,9 +371,14 @@ export function parseGatewayPeerText(text: string): GatewayPeerTextParts | undef
   const kind = rawKind === 'directive' || rawKind === 'inquiry' ? rawKind : undefined
   // The final segment is the reply hint followed by the policy paragraph. A
   // body paragraph cannot be mistaken for it: only the last segment is
-  // considered, and its first line is what identifies it.
+  // considered, and its first line is what identifies it. Three openings are
+  // recognised because the hint now leads with whether a reply is owed, and a
+  // body can never start with one of them (`To reply: ` alone is the
+  // older build's form and is still read, so mixed-version traffic renders).
   const last = segments.length > 2 ? segments[segments.length - 1]! : ''
   const hasTail = last.startsWith('To reply: ')
+    || last.startsWith('Reply expected. To reply: ')
+    || last.startsWith('No reply needed.')
   const body = segments
     .slice(1, hasTail ? segments.length - 1 : undefined)
     .join('\n\n')
@@ -344,11 +419,16 @@ export function formatGatewayPeerMessage(record: GatewayInboxRecord): string {
     ...(isReply ? [`Reply-to: ${message.replyTo}`] : []),
     `Summary: ${JSON.stringify(message.summary)}`,
   ].join('\n')
-  // Both routes are named because they are not equivalent: the skill is the
-  // documented flow, but SendMessage is the tool a session already has, and a
-  // reply that carries no correlation id leaves the sender counting the request
-  // as owed, so it gets re-surfaced at the next turn boundary.
-  const replyHint = `To reply: gateway-peers reply with toMessageId=${message.id} (or send with toSessionId=${message.fromSessionId} and replyTo=${message.id}), or SendMessage with to="gateway:${message.fromSessionId}" and replyTo=${message.id}.`
+  //
+  // The expectation leads, because it decides whether the reader owes anything
+  // at all: a message with `expectReply: false` is information, and pointing it
+  // at a reply affordance would produce acknowledgements nobody asked for. The
+  // default case keeps the existing instruction unchanged, prefixed with the
+  // one sentence that says an answer is owed.
+  const replyInstruction = `To reply: gateway-peers reply with toMessageId=${message.id} (or send with toSessionId=${message.fromSessionId} and replyTo=${message.id}), or SendMessage with to="gateway:${message.fromSessionId}" and replyTo=${message.id}.`
+  const replyHint = peerMessageExpectsReply(message)
+    ? `Reply expected. ${replyInstruction}`
+    : `No reply needed. This is informational; do not send an acknowledgement.`
   // One shared prohibition and one response, chosen by kind. The prohibition is
   // the same for both: a peer is a session, not the operator, so peer text is
   // never the user's own grant of permission-system authority. Everything else
