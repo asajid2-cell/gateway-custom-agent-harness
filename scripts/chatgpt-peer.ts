@@ -159,6 +159,13 @@ function slug(value: string | null | undefined, cap = 40): string {
   return text.slice(0, cap).replace(/-+$/g, '')
 }
 
+/** The two deliberate ways to leave a thread. Named once so every refusal agrees. */
+const THREAD_RECOVERY = 'adopt another thread with the thread use action, or start a fresh one deliberately with the thread new action'
+
+/** A bridge whose thread is gone: fail the turn, never follow the page elsewhere. */
+const threadGone = (asked: string, landed: string): string =>
+  `the ChatGPT thread ${asked} is no longer reachable: the page landed on ${landed}; ${THREAD_RECOVERY}`
+
 export class ChatGptHost {
   private readonly config: Config
   private readonly files: { stat: typeof stat; readFile: typeof readFile }
@@ -995,25 +1002,29 @@ export class ChatGptHost {
   /**
    * Post the primer into a fresh thread, or re-post it when it changed.
    *
-   * The primer is versioned by its sha256. A thread THIS HOST primed with an
-   * older command table is abandoned for a new thread rather than layering the
-   * new table over answers given under the old one. A thread this host did not
-   * prime (adopted, or selected with `use`) is kept and primed in place: it has
-   * no primer of ours to be stale.
+   * The primer is versioned by its sha256, but the version is not a reason to
+   * leave the thread: a stale primer is fixed by posting the new one into the
+   * SAME conversation - which is what adopting a thread and `use` already rely
+   * on. The host never walks a bridge to another conversation on its own. If the
+   * thread is gone, the turn fails and says how to choose another.
    */
   private async ensurePrimerAndThread(bridge: Bridge): Promise<void> {
     const state = bridge.state
     // The sha is only evidence for the thread it was recorded against.
     if (state.threadId && state.primedThreadId === state.threadId && state.primerSha256 === this.primer.sha) return
-    const primedByUs = state.primedThreadId !== null && state.primedThreadId === state.threadId
-    if (primedByUs && state.primerSha256 !== this.primer.sha) state.threadId = null
     if (!this.primer.text.trim()) throw new Error('primer.md is empty or missing')
     const prompt = `${this.primer.text}\n\n---\n\nReply in one short sentence confirming you understand, and do not emit any command block.`
     const selected = state.threadId
     const reply = await this.driver.call({ op: 'send', text: prompt, ...(selected ? { threadId: selected } : { newChat: true }) }, TURN_TIMEOUT_MS)
-    if (reply.ok !== true) throw new Error(`could not post the primer: ${one(reply.error, 200)}`)
+    if (reply.ok !== true) {
+      const reason = one(reply.error, 200) || 'the page refused'
+      throw new Error(selected
+        ? `could not post the primer into thread ${selected}: ${reason}; if that thread is gone, ${THREAD_RECOVERY}`
+        : `could not post the primer: ${reason}`)
+    }
     const threadId = String(reply.threadId ?? '')
     if (!UUID.test(threadId)) throw new Error('the page did not return a thread id for the primer')
+    if (selected && threadId.toLowerCase() !== selected.toLowerCase()) throw new Error(threadGone(selected, threadId))
     state.threadId = threadId
     state.primedThreadId = threadId
     state.primerSha256 = this.primer.sha
@@ -1033,19 +1044,25 @@ export class ChatGptHost {
 
   /** One page turn for one bridge: post the prompt and return the answer text. */
   private async pageTurn(bridge: Bridge, text: string): Promise<string> {
+    const requested = bridge.state.threadId
     const reply = await this.driver.call({
       op: 'send',
       text,
-      ...(bridge.state.threadId ? { threadId: bridge.state.threadId } : { newChat: true }),
+      ...(requested ? { threadId: requested } : { newChat: true }),
     }, TURN_TIMEOUT_MS)
     if (reply.ok !== true) {
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== bridge.state.threadId) {
-      // The page landed in a different thread from the primed one, so that
-      // thread has never seen the primer.
+    if (requested && threadId && threadId.toLowerCase() !== requested.toLowerCase()) {
+      // The page is in another conversation. Following it would move the
+      // bridge off the thread it is bound to, and that is the operator's
+      // decision - made with `use` or `new`, never as a side effect of a turn.
+      throw new Error(threadGone(requested, threadId))
+    }
+    if (threadId && threadId !== requested) {
+      // Only reachable when there was no thread to begin with: a new chat.
       bridge.state.threadId = threadId
       bridge.state.primedThreadId = null
       await this.persistBridgeState(bridge)

@@ -33,6 +33,10 @@ class FakeDriver {
   evidence = 'state-complete'
   readError: string | null = null
   readCalls = 0
+  /** When set, a `send` lands on this thread instead of the one asked for. */
+  landOn: string | null = null
+  /** When set, `send` fails with this error. */
+  sendError: string | null = null
   /** Derive the settled answer from the prompt that was just sent. */
   answerFor: ((request: Call) => string | undefined) | undefined
   private accepted: ((id: string) => void) | undefined
@@ -54,8 +58,9 @@ class FakeDriver {
       return { ok: true, op, threadId, url: `https://chatgpt.com/c/${threadId}`, adopted: true }
     }
     if (op === 'send') {
+      if (this.sendError) return { ok: false, op, error: this.sendError }
       const requested = typeof request.threadId === 'string' ? request.threadId : null
-      const threadId = requested ?? (request.newChat ? randomUUID() : this.current)
+      const threadId = this.landOn ?? requested ?? (request.newChat ? randomUUID() : this.current)
       if (!threadId) return { ok: false, op, error: 'no thread is open' }
       this.current = threadId
       this.answer = this.answerFor?.(request) ?? this.answer
@@ -156,6 +161,12 @@ const sha256 = (value: string): string => createHash('sha256').update(value, 'ut
  * markdown - is the text `read` hands back.
  */
 const rendered = (fields: Record<string, unknown>): string => 'gateway\n' + JSON.stringify(fields)
+
+/** The primer the host on disk would load - what `primerSha256` must become. */
+const primerSha = async (): Promise<string> =>
+  sha256(await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8'))
+
+const THREAD_RECOVERY = 'adopt another thread with the thread use action, or start a fresh one deliberately with the thread new action'
 
 async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
   return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
@@ -651,6 +662,108 @@ describe('multi-bridge host', () => {
       expect(driver.readCalls).toBeGreaterThanOrEqual(1)
     } finally {
       await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a primer sha change re-posts into the SAME thread instead of abandoning it', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = 'a'.repeat(64) // an older primer than the one on disk
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const answered = await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'hello' })
+      expect(answered.status).toBe(200)
+
+      const sends = driver.calls.filter(call => call.op === 'send')
+      const primer = sends.find(call => String(call.text ?? '').includes('a peer on a local session bus'))
+      expect(primer).toBeDefined()
+      expect(primer?.threadId).toBe(THREAD_A)
+      expect(primer?.newChat).toBeUndefined()
+      // The turn itself went to the same thread, and no send ever asked for a
+      // new chat.
+      expect(sends.at(-1)?.threadId).toBe(THREAD_A)
+      expect(sends.some(call => call.newChat === true)).toBe(false)
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(stored.primedThreadId).toBe(THREAD_A)
+      expect(stored.primerSha256).toBe(await primerSha())
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a thread that no longer exists fails the turn and never starts a new chat', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = 'a'.repeat(64)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      driver.landOn = THREAD_B
+      const answered = await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'hello' })
+      expect(answered.status).toBe(500)
+      expect(String(answered.body.error)).toBe(
+        `the ChatGPT thread ${THREAD_A} is no longer reachable: the page landed on ${THREAD_B}; ${THREAD_RECOVERY}`)
+      expect(driver.calls.some(call => call.newChat === true)).toBe(false)
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(stored.primedThreadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a page turn that lands on another thread fails instead of moving the bridge', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha() // the primer is current: no primer post
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      driver.landOn = THREAD_B
+      const answered = await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'hello' })
+      expect(answered.status).toBe(500)
+      expect(String(answered.body.error)).toBe(
+        `the ChatGPT thread ${THREAD_A} is no longer reachable: the page landed on ${THREAD_B}; ${THREAD_RECOVERY}`)
+      expect((await readBridge(dir, alpha.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a primer post that fails on a bound thread names the deliberate ways out', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = 'a'.repeat(64)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      driver.sendError = 'no thread is open'
+      const answered = await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'hello' })
+      expect(answered.status).toBe(500)
+      expect(String(answered.body.error)).toBe(
+        `could not post the primer into thread ${THREAD_A}: no thread is open; if that thread is gone, ${THREAD_RECOVERY}`)
+      expect((await readBridge(dir, alpha.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
       await host.stop()
       await cleanup()
     }
