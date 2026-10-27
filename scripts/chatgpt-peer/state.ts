@@ -1,13 +1,23 @@
 /**
- * Everything the host must remember between launches, in one file.
+ * Everything the host must remember between launches.
  *
- * The bus registration lives in the harness directory and is rewritten on every
- * start; this file is the host's own memory - which thread is current, what the
- * page was set to, which timers are pending, what it owed and what it did.
+ * There are two kinds of memory and they are deliberately separate files:
+ *
+ * - `peer.json` is the HOST: the instance slug, the loopback port, the Chrome
+ *   profile, the page's idle policy, the rolling audit, and the host's own
+ *   identity (`hostId`). None of it belongs to a thread, so none of it moves
+ *   when a bridge is adopted or removed.
+ * - `bridges/<sessionId>.json` is one BUS PEER: the address that peer answers
+ *   on, the thread it is bound to, the primer it was primed with, what it owes,
+ *   its timers, and the model/effort the page last reported. One bridged thread
+ *   is one peer, so these files come and go independently.
+ *
+ * The bus registration itself still lives in the harness directory and is
+ * rewritten on every start; these files are the host's own memory.
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { z } from 'zod/v4'
 
 export const auditEntrySchema = z.object({
@@ -30,7 +40,16 @@ export const scheduleSchema = z.object({ label: z.string().max(80), at: z.string
 
 /** A slug, not a sentence: it names one browser instance on disk. */
 export const INSTANCE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
+/** A single token: the address another peer types. Never a display label. */
+export const BRIDGE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
+/**
+ * The pre-split file: one host, one thread, one peer.
+ *
+ * It is kept read-only for migration. Nothing writes this shape any more; a
+ * file in it is turned into one bridge with the SAME session id, so the address
+ * every other peer already knows never changes.
+ */
 export const peerStateSchema = z.object({
   sessionId: z.string().uuid(),
   /** Which signed-in browser instance this host owns. Defaults to `default`. */
@@ -55,6 +74,36 @@ export const peerStateSchema = z.object({
 
 export type PeerState = z.infer<typeof peerStateSchema>
 
+/** Host-level memory. Ownership here is the process and the Chrome profile. */
+export const hostStateSchema = z.object({
+  /** Stable for the life of this state file; never a bus address. */
+  hostId: z.string().uuid(),
+  instanceId: z.string().regex(INSTANCE_ID_PATTERN),
+  healthPort: z.number().int(),
+  idleUnloadMinutes: z.number(),
+  profile: z.string().max(4096),
+  audit: z.array(auditEntrySchema).max(200),
+}).strict()
+
+export type HostState = z.infer<typeof hostStateSchema>
+
+/** Per-bridge memory: one bridged thread, one bus peer. */
+export const bridgeStateSchema = z.object({
+  sessionId: z.string().uuid(),
+  name: z.string().regex(BRIDGE_NAME_PATTERN),
+  threadId: z.string().uuid().nullable(),
+  primedThreadId: z.string().uuid().nullable(),
+  primerSha256: z.string().max(64).nullable(),
+  owed: z.array(owedEntrySchema).max(50),
+  schedules: z.array(scheduleSchema).max(8),
+  model: z.string().max(100).nullable(),
+  effort: z.string().max(40).nullable(),
+  createdAt: z.string(),
+  title: z.string().max(200).optional(),
+}).strict()
+
+export type BridgeState = z.infer<typeof bridgeStateSchema>
+
 export function newState(options: { profile: string; healthPort: number; idleUnloadMinutes: number; instanceId?: string }): PeerState {
   return {
     sessionId: randomUUID(),
@@ -73,13 +122,162 @@ export function newState(options: { profile: string; healthPort: number; idleUnl
   }
 }
 
+export function newHostState(options: { profile: string; healthPort: number; idleUnloadMinutes: number; instanceId?: string }): HostState {
+  return {
+    hostId: randomUUID(),
+    instanceId: options.instanceId ?? 'default',
+    healthPort: options.healthPort,
+    idleUnloadMinutes: options.idleUnloadMinutes,
+    profile: options.profile,
+    audit: [],
+  }
+}
+
+export function newBridgeState(options: {
+  sessionId: string
+  name: string
+  threadId?: string | null
+  title?: string
+  model?: string | null
+  effort?: string | null
+  createdAt?: string
+}): BridgeState {
+  return {
+    sessionId: options.sessionId,
+    name: options.name,
+    threadId: options.threadId ?? null,
+    primedThreadId: null,
+    primerSha256: null,
+    owed: [],
+    schedules: [],
+    model: options.model ?? null,
+    effort: options.effort ?? null,
+    createdAt: options.createdAt ?? new Date().toISOString(),
+    ...(options.title ? { title: options.title } : {}),
+  }
+}
+
+/** The legacy single-bridge file as exactly one bridge, keeping its address. */
+export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = new Date().toISOString()): BridgeState {
+  return {
+    sessionId: legacy.sessionId,
+    name,
+    threadId: legacy.threadId,
+    primedThreadId: legacy.primedThreadId,
+    primerSha256: legacy.primerSha256,
+    owed: legacy.owed,
+    schedules: legacy.schedules,
+    model: legacy.model,
+    effort: legacy.effort,
+    createdAt,
+  }
+}
+
 /**
- * Read the file, or start from defaults when it is absent.
+ * Read the host file, or start from defaults when it is absent.
  *
- * A file this build cannot read is reported rather than silently replaced: it
- * holds the session id, and minting a new one would silently change the address
- * every peer already has.
+ * A file in the pre-split shape is recognised and returned alongside the host
+ * state (`legacy`), so the caller can turn it into one bridge before the host
+ * file is rewritten. A file this build cannot read is reported rather than
+ * silently replaced: it holds the host id and the profile binding.
  */
+export async function loadHostState(
+  path: string,
+  defaults: () => HostState,
+): Promise<{ state: HostState; legacy?: PeerState; fresh: boolean }> {
+  let raw: string
+  try { raw = await readFile(path, 'utf8') }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { state: defaults(), fresh: true }
+    throw error
+  }
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) }
+  catch (error) { throw new Error(`peer.json is invalid JSON at ${path}: ${(error as Error).message}`) }
+  const host = hostStateSchema.safeParse(parsed)
+  if (host.success) return { state: host.data, fresh: false }
+  const legacy = peerStateSchema.safeParse(parsed)
+  if (legacy.success) {
+    return {
+      state: {
+        hostId: randomUUID(),
+        instanceId: legacy.data.instanceId,
+        healthPort: legacy.data.healthPort,
+        idleUnloadMinutes: legacy.data.idleUnloadMinutes,
+        profile: legacy.data.profile,
+        audit: legacy.data.audit,
+      },
+      legacy: legacy.data,
+      fresh: false,
+    }
+  }
+  const [first] = host.error.issues
+  throw new Error(`peer.json is invalid at ${first?.path.join('.') ?? 'root'}: ${first?.message ?? 'unknown'}`)
+}
+
+/** Read one bridge file. A file this build cannot read is reported, not skipped. */
+export async function loadBridgeState(path: string): Promise<BridgeState> {
+  const raw = await readFile(path, 'utf8')
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) }
+  catch (error) { throw new Error(`bridge state is invalid JSON at ${path}: ${(error as Error).message}`) }
+  const result = bridgeStateSchema.safeParse(parsed)
+  if (!result.success) {
+    const [first] = result.error.issues
+    throw new Error(`bridge state is invalid at ${path} (${first?.path.join('.') ?? 'root'}): ${first?.message ?? 'unknown'}`)
+  }
+  return result.data
+}
+
+/** Every bridge file in the directory, oldest name first. */
+export async function listBridgeStates(directory: string): Promise<{ path: string; state: BridgeState }[]> {
+  let entries: string[]
+  try { entries = await readdir(directory) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+  const states: { path: string; state: BridgeState }[] = []
+  for (const entry of entries.filter(name => name.endsWith('.json')).sort()) {
+    const path = join(directory, entry)
+    const state = await loadBridgeState(path)
+    // The name is the address; a file named for a different session would be
+    // loaded under an id nothing can reach, so it is a refusal.
+    if (`${state.sessionId}.json` !== entry) throw new Error(`bridge state ${path} names session ${state.sessionId}; the file must be named for it`)
+    states.push({ path, state })
+  }
+  return states
+}
+
+/**
+ * Saves are serialized per path and serialized eagerly.
+ *
+ * Two overlapping saves each write their own temporary and rename it; whichever
+ * rename lands last wins, so an older snapshot can overwrite a newer one (a
+ * cancelled schedule's timer reappears after a restart). Serializing the JSON
+ * at call time and queueing the writes makes the last call the last word.
+ */
+const saving = new Map<string, Promise<void>>()
+
+export function saveJson(path: string, value: unknown): Promise<void> {
+  const payload = JSON.stringify(value, null, 2)
+  const previous = saving.get(path) ?? Promise.resolve()
+  const next = previous.catch(() => {}).then(async () => {
+    await mkdir(dirname(path), { recursive: true })
+    const temporary = `${path}.${randomUUID()}.tmp`
+    await writeFile(temporary, payload, 'utf8')
+    await rename(temporary, path)
+  })
+  saving.set(path, next)
+  next.catch(() => {}).finally(() => { if (saving.get(path) === next) saving.delete(path) })
+  return next
+}
+
+/** Kept for the legacy state tests; the host and bridges both use saveJson. */
+export function saveState(path: string, state: PeerState): Promise<void> {
+  return saveJson(path, state)
+}
+
 export async function loadState(path: string, defaults: () => PeerState): Promise<PeerState> {
   let raw: string
   try { raw = await readFile(path, 'utf8') }
@@ -95,32 +293,8 @@ export async function loadState(path: string, defaults: () => PeerState): Promis
   return parsed.data
 }
 
-/**
- * Saves are serialized per path and serialized eagerly.
- *
- * Two overlapping saves each write their own temporary and rename it; whichever
- * rename lands last wins, so an older snapshot can overwrite a newer one (a
- * cancelled schedule's timer reappears after a restart). Serializing the JSON
- * at call time and queueing the writes makes the last call the last word.
- */
-const saving = new Map<string, Promise<void>>()
-
-export function saveState(path: string, state: PeerState): Promise<void> {
-  const payload = JSON.stringify(state, null, 2)
-  const previous = saving.get(path) ?? Promise.resolve()
-  const next = previous.catch(() => {}).then(async () => {
-    await mkdir(dirname(path), { recursive: true })
-    const temporary = `${path}.${randomUUID()}.tmp`
-    await writeFile(temporary, payload, 'utf8')
-    await rename(temporary, path)
-  })
-  saving.set(path, next)
-  next.catch(() => {}).finally(() => { if (saving.get(path) === next) saving.delete(path) })
-  return next
-}
-
 /** Append one audit line, keeping the rolling cap. */
-export function audit(state: PeerState, entry: { op: string; target?: string | null; result: string; messageId?: string | null }): void {
+export function audit(state: { audit: z.infer<typeof auditEntrySchema>[] }, entry: { op: string; target?: string | null; result: string; messageId?: string | null }): void {
   state.audit = [...state.audit, {
     at: new Date().toISOString(),
     op: entry.op.slice(0, 40),
