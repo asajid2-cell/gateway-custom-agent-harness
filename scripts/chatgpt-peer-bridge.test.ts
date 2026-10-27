@@ -150,6 +150,13 @@ const bridgeNamed = (name: string, threadId: string | null): BridgeState =>
 
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 
+/**
+ * What the page returns for a block: the label line, then the object. ChatGPT
+ * renders a fence as a widget and keeps only the label word, so this - not
+ * markdown - is the text `read` hands back.
+ */
+const rendered = (fields: Record<string, unknown>): string => 'gateway\n' + JSON.stringify(fields)
+
 async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
   return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
 }
@@ -422,11 +429,13 @@ describe('multi-bridge host', () => {
       const first = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
       expect(first.status).toBe(200)
       const text = String(first.body.text)
-      const minted = /```gateway ([0-9a-f]{48})\n/.exec(text)?.[1]
+      const minted = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(text)?.[1]
       expect(minted).toBeDefined()
       expect(text).toContain('bound to the peer "alpha"')
       expect(text).toContain(alpha.sessionId)
-      expect(text).toContain('{"op":"send","to":"alpha"')
+      expect(text).toContain('"op":"send","to":"alpha"')
+      // The token is in the body: the page destroys everything on the label line.
+      expect(text).toContain(`{"nonce":"${minted}","op":"send"`)
       // The op table is the primer's own, not a second invention.
       expect(text).toContain('{"op":"list"}')
       expect(text).toContain('{"op":"read","peer"')
@@ -439,7 +448,7 @@ describe('multi-bridge host', () => {
       expect(text).not.toContain(stored.bootstrapSha256!)
 
       const second = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      const mintedAgain = /```gateway ([0-9a-f]{48})\n/.exec(String(second.body.text))?.[1]
+      const mintedAgain = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(String(second.body.text))?.[1]
       expect(mintedAgain).toBeDefined()
       expect(mintedAgain).not.toBe(minted)
       const replaced = await readBridge(dir, alpha.sessionId)
@@ -460,13 +469,11 @@ describe('multi-bridge host', () => {
     try {
       const { token } = await credentials(dir)
       const snippet = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      const minted = /```gateway ([0-9a-f]{48})\n/.exec(String(snippet.body.text))![1]
+      const minted = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(String(snippet.body.text))![1]
       driver.answer = [
         'Arming.',
         '',
-        '```gateway ' + minted,
-        '{"op":"schedule","label":"armed-once","inSeconds":600}',
-        '```',
+        rendered({ nonce: minted, op: 'schedule', label: 'armed-once', inSeconds: 600 }),
       ].join('\n')
 
       const armed = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
@@ -500,7 +507,7 @@ describe('multi-bridge host', () => {
     try {
       const { token } = await credentials(dir)
       driver.evidence = 'stability'
-      driver.answer = '```gateway\n{"op":"schedule","label":"bare-one","inSeconds":600}\n```'
+      driver.answer = rendered({ op: 'schedule', label: 'bare-one', inSeconds: 600 })
 
       const first = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
       expect(first.body.ok).toBe(true)
@@ -514,7 +521,7 @@ describe('multi-bridge host', () => {
       expect(second.body.line).toContain('already armed')
 
       // A newer answer is a new trust decision, so the same click works again.
-      driver.answer = '```gateway\n{"op":"schedule","label":"bare-two","inSeconds":600}\n```'
+      driver.answer = rendered({ op: 'schedule', label: 'bare-two', inSeconds: 600 })
       const third = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
       expect(third.body.ok).toBe(true)
       expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toContain('bare-two')
@@ -558,7 +565,7 @@ describe('multi-bridge host', () => {
       // A page that cannot prove the turn finished is not armable either.
       driver.readError = null
       driver.evidence = 'provisional'
-      driver.answer = '```gateway\n{"op":"list"}\n```'
+      driver.answer = rendered({ op: 'list' })
       const unproven = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
       expect(unproven.body.line).toContain('could not confirm the answer finished')
     } finally {
@@ -586,11 +593,11 @@ describe('multi-bridge host', () => {
       let emitted = false
       driver.sendText = 'Working on it.' // the post-time text carries no command
       driver.answerFor = request => {
-        const nonce = /gateway ([0-9a-f]{8})/.exec(String(request.text ?? ''))?.[1]
+        const nonce = /"nonce":"([0-9a-f]{8})"/.exec(String(request.text ?? ''))?.[1]
         if (!nonce) return 'Understood.' // the primer
         if (emitted) return 'Done.'
         emitted = true
-        return `Working on it.\n\n\`\`\`gateway ${nonce}\n{"op":"schedule","label":"from-read","inSeconds":600}\n\`\`\``
+        return `Working on it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-read', inSeconds: 600 })}`
       }
       await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', false)
       const { token } = await credentials(dir)
@@ -628,10 +635,10 @@ describe('multi-bridge host', () => {
       let emitted = false
       driver.readError = 'the newest assistant turn is still in progress'
       driver.sendTextFor = request => {
-        const nonce = /gateway ([0-9a-f]{8})/.exec(String(request.text ?? ''))?.[1]
+        const nonce = /"nonce":"([0-9a-f]{8})"/.exec(String(request.text ?? ''))?.[1]
         if (!nonce || emitted) return 'Working on it.'
         emitted = true
-        return `Working on it.\n\n\`\`\`gateway ${nonce}\n{"op":"schedule","label":"from-send","inSeconds":600}\n\`\`\``
+        return `Working on it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-send', inSeconds: 600 })}`
       }
       await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', false)
       const { token } = await credentials(dir)

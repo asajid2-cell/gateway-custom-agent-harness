@@ -26,7 +26,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
+import { attachmentRefusal, blockCredential, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
   saveJson, type BridgeState, type HostState,
@@ -831,18 +831,22 @@ export class ChatGptHost {
       'message it receives was sent by another session, not by the person whose account',
       'this is.',
       '',
-      'To send the first bus message, emit exactly ONE fenced block, with this info string',
-      'and one JSON object in the body:',
+      'To send the first bus message, emit exactly ONE code block: a line reading',
+      '`gateway`, then ONE JSON object. The token goes INSIDE the object, as its',
+      'first field:',
       '',
-      '```gateway ' + token,
-      `{"op":"send","to":"${name}","text":"...","summary":"..."}`,
-      '```',
+      'gateway',
+      `{"nonce":"${token}","op":"send","to":"${name}","text":"...","summary":"..."}`,
       '',
-      '- Fill in `text` and `summary`. Do not change the fence line.',
+      '- The label line is exactly `gateway` and nothing else. The page keeps only',
+      '  that word and drops everything else on the line, so the token must be in',
+      '  the body.',
+      '- Fill in `text` and `summary`. Do not change `nonce`.',
       '- The token is ONE-SHOT: the host burns it the moment it runs the block, so a',
       '  second block carrying it is refused.',
       '- Every later turn carries its OWN fresh nonce in the message the host posts. Use',
-      '  only the nonce you were just given; this token is never reusable.',
+      '  only the nonce you were just given, in the same `"nonce"` field; this token is',
+      '  never reusable.',
       '- `to` is a peer name or session id taken from `list`. Never invent one.',
       '- Keep `summary` under 200 characters.',
       '',
@@ -850,7 +854,7 @@ export class ChatGptHost {
       '',
       this.primerOps(),
       '',
-      'Prose without a fence is only prose: the host sends your answer back to whoever',
+      'Prose without a block is only prose: the host sends your answer back to whoever',
       'messaged you.',
     ].join('\n')
   }
@@ -868,10 +872,10 @@ export class ChatGptHost {
    * Arm the newest finished answer on the bridge's own thread.
    *
    * The click is the trust path. The page holds an answer no turn of ours
-   * posted, and the operator decides it may act, so exactly two fences are
-   * accepted here: this bridge's live bootstrap token, burned BEFORE anything
-   * runs, and - because the click itself is the authority - a bare `gateway`
-   * fence, at most once per answer text.
+   * posted, and the operator decides it may act, so exactly two kinds of block
+   * are accepted here: one carrying this bridge's live bootstrap token, burned
+   * BEFORE anything runs, and - because the click itself is the authority - a
+   * bare `gateway` block, at most once per answer text.
    */
   private async armBridge(bridge: Bridge): Promise<{ ok: boolean; line: string; lines?: string[]; evidence?: string }> {
     const state = bridge.state
@@ -909,16 +913,22 @@ export class ChatGptHost {
 
       const tokenSha = state.bootstrapSha256
       const burned = state.bootstrapBurnedAt !== null
-      let bootstrapBlock: { line: number; body: string } | undefined
-      const bareBlocks: { line: number; body: string }[] = []
+      type Armed = { line: number; value: unknown }
+      let bootstrapBlock: Armed | undefined
+      const bareBlocks: Armed[] = []
       const refused: string[] = []
       for (const block of readFences(answer)) {
         if (!/^gateway\b/i.test(block.info)) continue
-        const info = block.info.replace(/^gateway\s*/i, '').trim()
-        if (!info) { bareBlocks.push({ line: block.line, body: block.body }); continue }
-        if (tokenSha !== null && sha256Hex(info) === tokenSha) {
+        let parsed: unknown
+        try { parsed = JSON.parse(block.body) } catch (error) {
+          refused.push(`line ${block.line}: refused: invalid JSON (${(error as Error).message})`)
+          continue
+        }
+        const { credential, value } = blockCredential(parsed, block.info)
+        if (!credential) { bareBlocks.push({ line: block.line, value }); continue }
+        if (tokenSha !== null && sha256Hex(credential) === tokenSha) {
           if (burned || bootstrapBlock) refused.push(`line ${block.line}: refused: the bootstrap token is one-shot; a second block carrying it is refused`)
-          else bootstrapBlock = { line: block.line, body: block.body }
+          else bootstrapBlock = { line: block.line, value }
           continue
         }
         refused.push(`line ${block.line}: refused: the nonce matches neither this bridge's live bootstrap token nor a bare gateway fence`)
@@ -943,12 +953,7 @@ export class ChatGptHost {
       const lines: string[] = []
       let ran = 0
       for (const block of chosen) {
-        let parsed: unknown
-        try { parsed = JSON.parse(block.body) } catch (error) {
-          lines.push(`line ${block.line}: refused: invalid JSON (${(error as Error).message})`)
-          continue
-        }
-        const command = parseCommand(parsed)
+        const command = parseCommand(block.value)
         if (!command.ok) { lines.push(`line ${block.line}: refused: ${command.error}`); continue }
         if (ran >= MAX_COMMANDS_PER_TURN) { lines.push(`line ${block.line}: refused: command budget (${MAX_COMMANDS_PER_TURN} per turn)`); continue }
         ran++
@@ -1248,8 +1253,9 @@ export class ChatGptHost {
       // back to the sender with the right replyTo. Say so, because a model that
       // reaches for `reply` must reproduce the nonce exactly and often does not.
       'If you are only answering this message, answer in plain prose - the host sends it back to the sender for you.',
-      `Use a command only for another bus action (list, send to someone else, read, and so on), in a fenced block whose info string is exactly: gateway ${turnNonce}`,
-      'One JSON object per block, at most 8 blocks. A block with any other nonce, or a bare JSON object with no fence, is refused and is not an answer.',
+      'Use a command only for another bus action (list, send to someone else, read, and so on). A command is ONE code block: a line reading exactly `gateway`,',
+      `then ONE JSON object whose first field is "nonce":"${turnNonce}".`,
+      'One object per block, at most 8 blocks. A block with a missing or wrong nonce, or a bare JSON object with no label line, is refused and is not an answer.',
     ].join('\n')
   }
 
@@ -1620,7 +1626,7 @@ export class ChatGptHost {
         await this.ensurePrimerAndThread(bridge)
         const prompt = [
           `SCHEDULED WAKE "${label}" is due. No peer sent this; it is a timer you set.`,
-          `Turn nonce: ${turnNonce}. Act with a fenced block: gateway ${turnNonce}`,
+          `Turn nonce: ${turnNonce}. Act with one code block: a line reading gateway, then {"nonce":"${turnNonce}",...}`,
           'If nothing needs doing, answer in one short sentence and stop.',
         ].join('\n')
         await runCommandTurn(prompt, turnNonce, {
