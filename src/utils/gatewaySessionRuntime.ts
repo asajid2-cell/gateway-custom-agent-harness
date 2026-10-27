@@ -2,6 +2,7 @@ import { randomUUID, type UUID } from 'crypto'
 import { onSessionWillSwitch } from '../bootstrap/state.js'
 import { join } from 'path'
 import { GatewaySessionTransport, listGatewayPeers } from './gatewaySessionTransport.js'
+import { resolveDurableIdentity } from './gatewaySessionDurability.js'
 import { GatewaySessionDelivery } from './gatewaySessionDelivery.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { logForDebugging } from './debug.js'
@@ -132,6 +133,10 @@ export class GatewaySessionRuntime {
           logForDebugging(`[gateway] compaction counts unavailable for ${this.transport.peer.sessionId} · ${error instanceof Error ? error.message : String(error)}`, { level: 'warn' })
         }
         if (this.closing) return
+        // Durability is computed from the leaf-family index, never inside the
+        // transport. This is the one place the answer can be decided, because
+        // the session's own id is already known here.
+        this.transport.setDurable(await resolveDurableIdentity(this.transport.peer.sessionId))
         await this.transport.start()
         if (this.closing) return
         this.unsubscribeCounts = subscribeSessionCompactionCounts((id, nextCounts) => {

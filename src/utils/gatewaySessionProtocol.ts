@@ -6,6 +6,17 @@ export const MAX_PEER_QUEUE = 50
 export const MAX_PEER_HISTORY = 100
 
 /**
+ * The liveness states a DURABLE peer can render as.
+ *
+ * Deliberately not the live status vocabulary: `open`/`closed`/`unknown` are
+ * answers about whether the process can be entered, while a live status token
+ * (`idle`, `running`, ...) is an answer about what an open process is doing and
+ * comes only from the live registration.
+ */
+export const DURABLE_STATES = ['open', 'closed', 'unknown'] as const
+export type DurableState = (typeof DURABLE_STATES)[number]
+
+/**
  * What a peer message asks of the receiver.
  *
  * `inquiry` is a question or an information handoff: answer it, or note it and
@@ -107,6 +118,28 @@ export const gatewayPeerSchema = z.object({
   // What this session's next model call would spend: the provider and the
   // credential number its pool would select. See `gatewayPeerRouteSchema`.
   route: gatewayPeerRouteSchema.optional(),
+  // Durable registration: this session is the matriarch of a leaf family, so
+  // its registration outlives the process and stays enumerable and addressable
+  // while it is closed. The same file is both the live registration and the
+  // durable entry - there is no sidecar format - and the session id is the
+  // same one it registers under while open.
+  //
+  // Written only where the session's own id is known to be the family's
+  // matriarch (`resolveDurableIdentity`). Absent means NOT durable: the
+  // fail-safe reading, so a build that does not compute it can never make an
+  // ordinary peer immortal.
+  durable: z.boolean().optional(),
+  // The family whose host claim names this session as matriarch. Persisted so
+  // the registry reaper can tell when the family itself is gone without the
+  // transport having to guess a family id from a session id.
+  durableFamilyId: z.string().uuid().optional(),
+  // Liveness computed AT READ TIME for a durable entry, never persisted as a
+  // claim: `open` (pid alive and its endpoint present), `closed` (either is
+  // gone), or `unknown` (the liveness probe itself could not be evaluated).
+  //
+  // Working-vs-idle is NOT here: while open that comes only from the live
+  // registration's `status`, and a closed entry carries no live status at all.
+  durableState: z.enum(DURABLE_STATES).optional(),
 }).strict()
 
 /**
@@ -239,6 +272,24 @@ export const gatewayInboxSchema = z.object({
   policy: z.enum(['accept', 'hold', 'refuse']),
   records: z.array(gatewayInboxRecordSchema).max(MAX_PEER_QUEUE * 2),
   history: z.array(gatewayPeerHistoryEntrySchema).max(MAX_PEER_HISTORY).optional(),
+}).strict()
+
+/**
+ * Mail held for a CLOSED durable peer, in `<sessionId>.mailbox` beside the
+ * inbox.
+ *
+ * It cannot live in the inbox: the transport creates or truncates the inbox at
+ * registration, so a message written there for a session with no process would
+ * be clobbered the moment that session opened. A mailbox is a queue of the same
+ * records the inbox holds, written by a sender that found the peer closed and
+ * merged into the inbox by the peer itself at registration.
+ *
+ * Records carry state `queued`: a closed peer has no reader, so there is no
+ * receipt and no `held` claim that someone will pick it up. Once the peer opens
+ * and merges, the ordinary queued -> held -> delivered lifecycle applies.
+ */
+export const gatewayMailboxSchema = z.object({
+  records: z.array(gatewayInboxRecordSchema).max(MAX_PEER_QUEUE * 2),
 }).strict()
 
 export type GatewayPeerHistoryEntry = z.infer<typeof gatewayPeerHistoryEntrySchema>
@@ -600,8 +651,39 @@ export function appendSessionTopic(existing: readonly string[] | undefined, topi
  *
  * Exported for testing.
  */
-export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'> & Partial<Pick<GatewayPeer, 'compactBoundaryCount' | 'microcompactBoundaryCount'>> & { pid?: number }): string {
+export function formatGatewayPeerLine(peer: Pick<GatewayPeer, 'status' | 'name' | 'purpose' | 'cwd' | 'sessionId' | 'topics'> & Partial<Pick<GatewayPeer, 'compactBoundaryCount' | 'microcompactBoundaryCount' | 'route' | 'durable' | 'durableState'>> & { pid?: number }): string {
   const purpose = peer.purpose.trim() || peer.name.trim() || 'no stated intent'
+  // A DURABLE entry renders its liveness and then stops: the durable row is the
+  // one surface where "closed" has to be said plainly, because the session is
+  // still addressable and a reader must not take silence for a dead address it
+  // should drop. Only the matriarch is durable, and only its own file carries
+  // the marker, so a row without it takes the ordinary path untouched.
+  if (peer.durable) {
+    if (peer.durableState === 'closed') {
+      // The route is DECLARED, not observed: nothing probed it, and a closed
+      // peer's route can never be called unhealthy. `to use` names the exact
+      // next moves rather than leaving the reader to infer them.
+      const route = peer.route ? `    route: ${peer.route.provider}#${peer.route.number} declared, unprobed` : ''
+      return [
+        `[closed] ${purpose}`,
+        `    name: ${peer.name}`,
+        `    id: ${peer.sessionId}`,
+        `    cwd: ${peer.cwd}`,
+        `    durable: closed - no process; mail queues to ${peer.sessionId}.mailbox`,
+        ...(route ? [route] : []),
+        `    to use: gateway-peers open ${peer.sessionId} | gateway-peers send JSON {"toSessionId":"${peer.sessionId}","text":"...","summary":"..."}`,
+      ].join('\n')
+    }
+    // `unknown` is NOT a health verdict and never means dead: the liveness
+    // probe itself could not be evaluated. It is also never produced from a
+    // route-health answer - `health_unavailable` is advisory and belongs, if
+    // anywhere, on a route line.
+    const durableLine = peer.durableState === 'unknown'
+      ? '\n    durable: unknown - liveness probe unavailable; not a claim about the process'
+      : '\n    durable: open'
+    const token = peer.durableState === 'unknown' ? 'unknown' : peer.status
+    return `[${token}] ${purpose}\n    name: ${peer.name}\n    id: ${peer.sessionId}${typeof peer.pid === 'number' ? ` (pid ${peer.pid})` : ''}\n    cwd: ${peer.cwd}${durableLine}`
+  }
   // The opening purpose is a historical anchor, not a description of current
   // work. Surfacing the recent request topics beside it is what lets a peer be
   // found by what it is doing now rather than by what it started as.

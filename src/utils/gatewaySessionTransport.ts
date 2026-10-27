@@ -9,13 +9,14 @@ import { getSessionId } from '../bootstrap/state.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
-  gatewayPeerSchema, gatewayPeerRouteSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage, parseGatewayPeer,
+  gatewayPeerSchema, gatewayPeerRouteSchema, gatewayPeerMessageSchema, gatewayInboxSchema, gatewayMailboxSchema, parsePeerMessage, parseGatewayPeer,
   peerMessageExpectsReply,
   type GatewayPeer, type GatewayPeerRoute, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
 import { readTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
+import { durableLiveness, leafFamilyPaths, probeEndpoint, type DurableIdentity, type EndpointProbe } from './gatewaySessionDurability.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -535,7 +536,18 @@ async function readRegistrationUnchecked(directory: string, sessionId: string): 
   } finally { await handle.close() }
 }
 
-export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]> {
+export type DurableLivenessProbe = (endpoint: string) => Promise<EndpointProbe>
+
+/**
+ * Enumerate the registry.
+ *
+ * A durable entry is listed whether it is open or closed: the point of
+ * durability is that the matriarch stays enumerable and addressable while its
+ * process is gone. Its `durableState` is computed HERE, at read time, from pid
+ * and endpoint - never persisted as a claim, and never from a route-health
+ * answer. Non-durable peers take the ordinary probe path unchanged.
+ */
+export async function listGatewayPeers(directory: string, options: { probeEndpoint?: DurableLivenessProbe } = {}): Promise<GatewayPeer[]> {
   let entries: string[]
   try { entries = await readdir(directory) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
@@ -592,6 +604,15 @@ export async function listGatewayPeers(directory: string): Promise<GatewayPeer[]
     try {
       const registration = await readRegistrationUnchecked(directory, sessionId)
       peer = registration.peer
+      // A durable entry is enumerated while CLOSED. Its liveness is pid AND
+      // endpoint, never a ping: a busy matriarch that misses a probe is still
+      // open, and a dead one is closed rather than a reap reason. Only a family
+      // whose record is gone may reap it.
+      if (peer.durable === true) {
+        if (await reapIfDead(directory, sessionId, peer)) return undefined
+        const state = await durableLiveness(peer, options.probeEndpoint ?? probeEndpoint)
+        return { ...peer, durableState: state }
+      }
       const response = await callGatewayPeer(peer.endpoint, { type: 'ping', token: registration.token }, PROBE_TIMEOUT_MS) as { runtimeId?: string }
       answered = response.runtimeId === peer.runtimeId
     } catch (error) {
@@ -782,19 +803,35 @@ async function readPriorIntent(directory: string, sessionId: string): Promise<{ 
  * record between the probe and the rename (same pid, new runtime) is alive and
  * must not have that record consumed; the reap is abandoned instead.
  */
-async function reapIfDead(directory: string, sessionId: string, peer: GatewayPeer): Promise<void> {
-  if (isProcessRunning(peer.pid)) return
+async function reapIfDead(directory: string, sessionId: string, peer: GatewayPeer): Promise<boolean> {
+  if (peer.durable === true) {
+    // A durable entry is never reaped for liveness: a dead pid or an absent
+    // pipe is the `closed` state, which is exactly what durability exists to
+    // keep enumerable. The ONE answer that retires it is that the family it
+    // belongs to no longer exists - there is then nothing it is the entry
+    // point of.
+    if (!peer.durableFamilyId) return false
+    const familyRecord = leafFamilyPaths(getClaudeConfigHomeDir(), peer.durableFamilyId).familyRecord
+    let familyGone = false
+    try { await stat(familyRecord) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') familyGone = true
+      else return false
+    }
+    if (!familyGone) return false
+  } else if (isProcessRunning(peer.pid)) return false
   const live = join(directory, `${sessionId}.json`)
   try {
     const current = await readRegistrationUnchecked(directory, sessionId)
-    if (current.peer.pid !== peer.pid || current.peer.runtimeId !== peer.runtimeId) return
-  } catch { return }
+    if (current.peer.pid !== peer.pid || current.peer.runtimeId !== peer.runtimeId) return false
+  } catch { return false }
   try {
     await renameWithRetry(live, tombstonePath(directory, sessionId))
-  } catch { return }
+  } catch { return false }
   // The dead session's own registration lock is worthless now; anything that
   // acquires it would be locking a path that no longer holds a live record.
   await rm(`${live}.lock`, { recursive: true, force: true }).catch(() => {})
+  return true
 }
 
 export class GatewaySessionTransport {
@@ -851,6 +888,14 @@ export class GatewaySessionTransport {
     // A peer that is not a harness session has no route to describe; it supplies the one it actually spends.
     route?: GatewayPeerRoute
     policy?: GatewayInboundPolicy
+    /**
+     * Whether this registration outlives the process. Computed by
+     * `resolveDurableIdentity` where the session's own id is known; absent or
+     * false is the fail-safe, so nothing is made immortal by omission.
+     */
+    durable?: boolean
+    /** The family whose host claim names this session as matriarch, when durable. */
+    durableFamilyId?: string
     onInboxChanged?: () => void
     /**
      * Called when a wake timer fires, in this process. The runtime turns it
@@ -871,12 +916,33 @@ export class GatewaySessionTransport {
       pid: process.pid, startedAt: new Date().toISOString(), status: 'idle',
       endpoint: process.platform === 'win32' ? `\\\\.\\pipe\\gateway-${runtimeId}` : join(options.directory, `${runtimeId}.sock`),
       ...(buildId ? { buildId } : {}),
+      ...(options.durable ? { durable: true } : {}),
+      ...(options.durable && options.durableFamilyId ? { durableFamilyId: options.durableFamilyId } : {}),
     })
     this.policy = options.policy ?? 'accept'
   }
 
+  /**
+   * Mark this registration durable before it is published.
+   *
+   * The runtime computes the answer (it is the one place the session's own id
+   * is authoritative) and applies it here; the transport itself never reads
+   * leaf-families. A no-op when not durable, so the fail-safe default stands.
+   */
+  setDurable(identity: DurableIdentity): void {
+    if (!identity.durable) return
+    this.peer.durable = true
+    if (identity.familyId) this.peer.durableFamilyId = identity.familyId
+  }
+
   private get registrationPath(): string { return join(this.options.directory, `${this.peer.sessionId}.json`) }
   private get inboxPath(): string { return join(this.options.directory, `${this.peer.sessionId}.inbox`) }
+  /**
+   * Mail for a durable peer that is CLOSED. It cannot go in the inbox: the
+   * inbox is created or truncated at registration, so a message written there
+   * for a session with no process would be clobbered the moment it opened.
+   */
+  private get mailboxPath(): string { return join(this.options.directory, `${this.peer.sessionId}.mailbox`) }
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     if (this.isClosing) return Promise.reject(new Error('Gateway transport is closing or closed'))
     const next = this.chain.then(operation, operation)
@@ -885,6 +951,57 @@ export class GatewaySessionTransport {
   }
   private async persist(records = this.records, policy = this.policy, history = this.history): Promise<void> {
     await atomicJson(this.inboxPath, { policy, records, history })
+  }
+
+  /**
+   * Hold mail for this session while it is closed.
+   *
+   * The mailbox is written under a lock because a closed peer can have several
+   * senders at once and there is no reader to serialise them. Value is the same
+   * shape as the inbox minus `policy`/`history`: `{ records: [...] }`.
+   */
+  private async queueToMailbox(record: GatewayInboxRecord): Promise<void> {
+    // The mailbox belongs to the RECIPIENT, not to this sender: the sender is
+    // the process that happens to be writing it while the recipient is closed.
+    const mailboxPath = join(this.options.directory, `${record.message.toSessionId}.mailbox`)
+    const release = await lock(mailboxPath, { realpath: false, stale: 10000, retries: { retries: 3, minTimeout: 50, maxTimeout: 200 } })
+    try {
+      let records: GatewayInboxRecord[] = []
+      try {
+        const parsed = gatewayMailboxSchema.safeParse(JSON.parse(await readFile(mailboxPath, 'utf8')))
+        if (parsed.success) records = parsed.data.records
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      if (records.some(item => item.message.id === record.message.id)) return
+      await atomicJson(mailboxPath, { records: [...records, record].slice(-MAX_PEER_QUEUE * 2) })
+    } finally { await release() }
+  }
+
+  /**
+   * Merge held mail into the inbox, then remove it from the mailbox.
+   *
+   * Runs at registration, before the registration is published, so a sender
+   * that resolves this session from the moment it appears finds its mail in the
+   * ordinary inbox. Records already present (a merge interrupted before the
+   * unlink) are not duplicated. The mailbox is removed only after the merged
+   * inbox has been persisted, so an interrupted merge loses nothing.
+   */
+  private async mergeMailbox(): Promise<void> {
+    let incoming: GatewayInboxRecord[]
+    try {
+      const parsed = gatewayMailboxSchema.safeParse(JSON.parse(await readFile(this.mailboxPath, 'utf8')))
+      if (!parsed.success) return
+      incoming = parsed.data.records
+    } catch { return }
+    const known = new Set(this.records.map(record => record.message.id))
+    const fresh = incoming
+      .filter(record => record.message.toSessionId === this.peer.sessionId && !known.has(record.message.id))
+      .map(record => ({ ...record, state: 'queued' as const }))
+    if (fresh.length > 0) {
+      const merged = [...this.records, ...fresh].slice(-MAX_PEER_QUEUE * 2)
+      await this.persist(merged)
+      this.records = merged
+    }
+    await unlink(this.mailboxPath).catch(() => {})
   }
 
   historyEntries(): readonly GatewayPeerHistoryEntry[] { return structuredClone(this.history) }
@@ -1095,7 +1212,10 @@ export class GatewaySessionTransport {
     })
     try {
       const existing = await listGatewayPeers(this.options.directory)
-      if (existing.some(peer => peer.sessionId === this.peer.sessionId)) throw new Error('Gateway session is already running')
+      // A CLOSED durable entry is this session's own registration waiting to be
+      // overwritten, not another live writer. Only an OPEN registration for the
+      // same id blocks a second launch.
+      if (existing.some(peer => peer.sessionId === this.peer.sessionId && peer.durableState !== 'closed')) throw new Error('Gateway session is already running')
       try {
         const handle = await open(this.inboxPath, 'r')
         let raw: unknown
@@ -1121,6 +1241,9 @@ export class GatewaySessionTransport {
         this.policy = inbox.policy
         this.history = inbox.history ?? []
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      // Mail held while this durable entry was closed joins the ordinary inbox
+      // now, before the registration makes the session addressable again.
+      await this.mergeMailbox()
       // A session that restarts keeps the intent it already declared or derived.
       // Without this the registration is rewritten blank on every launch, so a
       // stated purpose silently disappeared the moment the session reconnected.
@@ -1438,8 +1561,17 @@ export class GatewaySessionTransport {
     // gate closes. Only a positive report of exhaustion or rejection withholds;
     // everything else - including an older peer with no advertised route - is
     // `unknown` and delivers.
+    // A CLOSED durable peer has no process to ask, so its declared route is
+    // advisory and is not probed at all. That is deliberate: a durable route
+    // must never be able to withhold delivery, because the route gate is a
+    // statement about an answerable session and there is no session here. An
+    // OPEN durable peer IS the live registration, so its route governs exactly
+    // as every other live peer's does.
+    const durableClosed = target.peer.durable === true && await durableLiveness(target.peer) !== 'open'
     let advertised = target.peer.route
-    let health = await probePeerRoute(advertised)
+    let health: PeerRouteHealth = durableClosed
+      ? { state: 'unknown', reason: 'health_unavailable' }
+      : await probePeerRoute(advertised)
     // A refusal is a claim about a POOL, and a pool changes without this process
     // being told: a key can be injected into the gateway, and the recipient
     // refreshes its advertisement at every turn boundary. So before withholding
@@ -1450,7 +1582,7 @@ export class GatewaySessionTransport {
     // the first. No restart is involved: `/gateway/reload-keys` exits the
     // gateway for a supervisor to respawn, which is not something a send may do,
     // and a probe never fabricates a credential.
-    if (health.state === 'exhausted' || health.state === 'unauthorized') {
+    if (!durableClosed && (health.state === 'exhausted' || health.state === 'unauthorized')) {
       await new Promise(resolve => setTimeout(resolve, ROUTE_RECHECK_DELAY_MS))
       const refreshed = await readRegistration(this.options.directory, toSessionId).catch(() => undefined)
       if (refreshed?.peer.route) advertised = refreshed.peer.route
@@ -1461,6 +1593,28 @@ export class GatewaySessionTransport {
       id: randomUUID(), fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
       toSessionId, text, summary, replyTo, ...(kind ? { kind } : {}), ...(expectReply === undefined ? {} : { expectReply }), createdAt: new Date().toISOString(),
     })
+    // A closed durable peer is queued to its mailbox, never dropped and never
+    // written into an inbox a registration would clobber. There is no reader,
+    // so the honest receipt is `queued` + closed: not `delivered`, and not
+    // `held` (which would imply a reader that is not there).
+    if (durableClosed) {
+      await this.queueToMailbox({ message, senderName: this.peer.name, state: 'queued', receivedAt: new Date().toISOString() })
+      await this.serial(async () => {
+        const history = [...this.history, { direction: 'sent' as const, status: 'queued' as const, message, peerName: target.peer.name, recordedAt: new Date().toISOString() }].slice(-MAX_PEER_HISTORY)
+        await this.persist(this.records, this.policy, history)
+        this.history = history
+      }).catch(() => {})
+      return {
+        ok: true,
+        alive: false,
+        delivered: false,
+        closed: true,
+        state: 'queued',
+        id: message.id,
+        recipient: toSessionId,
+        message: `queued: peer ${toSessionId} is closed; held in ${toSessionId}.mailbox, merged at its next open. Request an open with: gateway-peers open ${toSessionId}`,
+      }
+    }
     // Persist the identity before sending: a lost acknowledgement must not
     // turn a retry into a new task with a different message ID.
     await this.serial(async () => {
@@ -1543,9 +1697,21 @@ export class GatewaySessionTransport {
     }
   }
 
+  /**
+   * Refuse an operation that needs a live process when the target is a closed
+   * durable peer. The answer names the peer as closed - never "unknown peer" -
+   * and points at the only path that may reopen it.
+   */
+  private async requireOpen(target: { peer: GatewayPeer }, sessionId: string, action: string): Promise<void> {
+    if (target.peer.durable !== true) return
+    if (await durableLiveness(target.peer) === 'open') return
+    throw new Error(`Session ${sessionId} is closed (durable): no process is running, so ${action}. Mail queues to ${sessionId}.mailbox; request an open with: gateway-peers open ${sessionId}`)
+  }
+
   async receipt(toSessionId: string, id: string): Promise<unknown> {
     if (!idPattern.test(id)) throw new Error('Invalid message ID')
     const target = await readRegistration(this.options.directory, toSessionId)
+    await this.requireOpen(target, toSessionId, 'a receipt cannot be served')
     const receipt = await callGatewayPeer(target.peer.endpoint, { type: 'receipt', token: target.token, senderToken: this.token, fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId, id }) as any
     if (receipt?.ok !== true || receipt.id !== id || !['unknown', 'held', 'queued', 'delivered', 'refused'].includes(receipt.state)) throw new Error('Invalid receipt')
     if (receipt.state !== 'unknown') await this.serial(async () => {
@@ -1558,6 +1724,7 @@ export class GatewaySessionTransport {
 
   async watchIdle(toSessionId: string): Promise<unknown> {
     const target = await readRegistration(this.options.directory, toSessionId)
+    await this.requireOpen(target, toSessionId, 'idle state cannot be watched')
     return callGatewayPeer(target.peer.endpoint, { type: 'watch_idle', token: target.token, senderToken: this.token, fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId })
   }
 
@@ -1573,6 +1740,7 @@ export class GatewaySessionTransport {
   async readPeer(toSessionId: string, options: { tail?: number; since?: string } = {}): Promise<TranscriptSlice> {
     const target = await readRegistration(this.options.directory, toSessionId)
     if (target.peer.sessionId === this.peer.sessionId) throw new Error('That is this session; its own turns are already in front of you')
+    await this.requireOpen(target, toSessionId, 'the transcript cannot be read')
     const response = await callGatewayPeer(target.peer.endpoint, {
       type: 'read', token: target.token, senderToken: this.token,
       fromSessionId: this.peer.sessionId, fromRuntimeId: this.peer.runtimeId,
@@ -1674,7 +1842,11 @@ export class GatewaySessionTransport {
       await this.chain
       try {
         const current = await readRegistration(this.options.directory, this.peer.sessionId)
-        if (current.peer.runtimeId === this.peer.runtimeId) await unlink(this.registrationPath)
+        // A durable entry IS the family's addressable identity: it is how a
+        // closed session is enumerated and reached. Close must leave it in
+        // place; only the live runtime id is dropped, by the next open
+        // overwriting it. An ordinary peer is unlinked as before.
+        if (this.peer.durable !== true && current.peer.runtimeId === this.peer.runtimeId) await unlink(this.registrationPath)
       } catch (error) {
         // A registration that is already gone is the outcome this is reaching
         // for, not a failure, so it must not be reported as one. The check here
