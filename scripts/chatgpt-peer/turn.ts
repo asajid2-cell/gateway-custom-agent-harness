@@ -41,6 +41,10 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
   const maxCommands = deps.maxCommands ?? MAX_COMMANDS_PER_TURN
   const executed: Executed[] = []
   const problems: string[] = []
+  // Identical commands in one turn are almost always the model polling a
+  // snapshot it already has. Each one costs a page round trip, so an exact
+  // repeat is answered from the log and never run again.
+  const seen = new Set<string>()
   let repliedExplicitly = false
   let finalText = ''
   let rounds = 0
@@ -59,12 +63,20 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
     finalText = generated.text ?? ''
     const extraction = extractCommands(finalText, nonce, maxCommands)
     problems.push(...extraction.problems)
-    if (extraction.commands.length === 0) {
+    // A turn that produced neither a command nor a refusal is prose: the model
+    // is answering, so the loop is done. A turn whose every block was refused
+    // is not prose - the refusal goes back and the model gets a retry inside
+    // the same budget instead of the sender getting a canned error.
+    const refusedOnly = extraction.commands.length === 0 && extraction.problems.length > 0
+    if (extraction.commands.length === 0 && !refusedOnly) {
       budgetSpent = false
       break
     }
-    const lines = [...extraction.problems.map(problem => problem.replace(/^line \d+: /, ''))]
+    const lines = extraction.problems.map(problem => problem.replace(/^line \d+: /, ''))
     for (const command of extraction.commands) {
+      const key = JSON.stringify(command)
+      if (seen.has(key)) { lines.push('already ran this exact command this turn'); continue }
+      seen.add(key)
       const result = await deps.execute(command)
       const replied = result.replied === true
       executed.push({ command, line: result.line, replied })

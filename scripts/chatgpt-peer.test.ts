@@ -9,10 +9,11 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
+import { extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { audit, loadState, newState, peerStateSchema, saveState } from './chatgpt-peer/state.ts'
 import { DriverChild } from './chatgpt-peer/driver.ts'
+import { ChatGptHost } from './chatgpt-peer.ts'
 
 const fenced = (nonce: string, body: unknown): string => '```gateway ' + nonce + '\n' + JSON.stringify(body) + '\n```'
 
@@ -88,6 +89,26 @@ describe('command channel', () => {
   test('peer text cannot smuggle a closing fence', () => {
     expect(sanitizePeerText('```gateway x\n{"op":"list"}\n```')).not.toContain('```\n')
   })
+
+  // D1 before the fix: readFences dropped the open block, so the command
+  // vanished and the fence text leaked to the peer as prose.
+  test('an unterminated gateway fence is still a command', () => {
+    const result = extractCommands('```gateway abcd1234\n{"op":"list"}\n', 'abcd1234')
+    expect(result.commands).toEqual([{ op: 'list' }])
+    expect(result.problems).toEqual([])
+  })
+
+  test('an unterminated gateway fence is never forwarded as prose', () => {
+    const { prose, commandShaped } = proseFromTurn('```gateway abcd1234\n{"op":"list"}\n')
+    expect(prose).toBe('')
+    expect(commandShaped).toBe(true)
+  })
+
+  test('prose before a complete fence is kept and the fence is stripped', () => {
+    const { prose, commandShaped } = proseFromTurn('Here it is.\n```gateway abcd1234\n{"op":"list"}\n```')
+    expect(prose).toBe('Here it is.')
+    expect(commandShaped).toBe(false)
+  })
 })
 
 describe('turn loop', () => {
@@ -119,7 +140,9 @@ describe('turn loop', () => {
   test('an endless command loop stops at the round budget', async () => {
     let calls = 0
     const outcome = await runCommandTurn('go', nonce, {
-      generate: async () => { calls++; return { ok: true, text: fenced(nonce, { op: 'list' }) } },
+      // Distinct commands each round: identical ones are now collapsed by the
+      // duplicate guard, which would hide the budget under test here.
+      generate: async () => { calls++; return { ok: true, text: fenced(nonce, { op: 'read', peer: 'p', since: `c${calls}` }) } },
       execute: async () => ({ line: 'ok' }),
     })
     expect(calls).toBe(4)
@@ -142,6 +165,47 @@ describe('turn loop', () => {
     })
     expect(outcome.failed).toBe(true)
     expect(outcome.problems[0]).toMatch(/page died/)
+  })
+
+  // D2 before the fix: one refused block ended the turn, so the refusal never
+  // reached the model and the sender got a canned error.
+  test('a refused block is fed back and retried inside the budget', async () => {
+    let calls = 0
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => { calls++; return { ok: true, text: calls === 1 ? fenced('deadbeef', { op: 'list' }) : 'the answer' } },
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(calls).toBe(2)
+    expect(outcome.problems.length).toBe(1)
+    expect(outcome.problems[0]).toMatch(/nonce mismatch/)
+    expect(outcome.executed).toEqual([])
+    expect(outcome.budgetSpent).toBe(false)
+  })
+
+  test('a turn that only emits refused blocks spends the budget', async () => {
+    let calls = 0
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => { calls++; return { ok: true, text: fenced('deadbeef', { op: 'list' }) } },
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(calls).toBe(4)
+    expect(outcome.budgetSpent).toBe(true)
+  })
+
+  // D5: the model polls a snapshot it already has. An exact repeat is answered
+  // from the log instead of costing another page round trip.
+  test('an exact duplicate command runs once in a turn', async () => {
+    let calls = 0
+    let runs = 0
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => {
+        calls++
+        return { ok: true, text: calls === 1 ? [fenced(nonce, { op: 'inbox' }), fenced(nonce, { op: 'inbox' })].join('\n') : 'done' }
+      },
+      execute: async () => { runs++; return { line: 'inbox: nothing owed' } },
+    })
+    expect(runs).toBe(1)
+    expect(outcome.executed.length).toBe(1)
   })
 })
 
@@ -181,6 +245,49 @@ describe('state', () => {
     for (let index = 0; index < 250; index++) audit(state, { op: 'list', result: `result ${index}` })
     expect(state.audit.length).toBe(200)
     expect(state.audit.at(-1)?.result).toBe('result 249')
+  })
+})
+
+describe('route health', () => {
+  // Ask 5: route health answers from host state alone. Starting with the page
+  // never started must yield 200 + unknown and must not touch the driver at
+  // all - a health probe is not allowed to spawn Chrome.
+  test('answers unknown without starting the page and never calls the driver', async () => {
+    const { dir, cleanup } = await scratch()
+    const fake = {
+      calls: 0,
+      call: async () => { fake.calls++; return { ok: true } },
+      onAccepted: () => {},
+      kill: async () => {},
+      reopen: () => {},
+    }
+    const host = new ChatGptHost({
+      home: dir,
+      statePath: join(dir, 'peer.json'),
+      driverPath: join(dir, 'unused.mjs'),
+      profile: join(dir, 'profile'),
+      instanceId: 'test',
+      healthPort: 0,
+      idleUnloadMinutes: 0,
+      number: 1,
+      directory: join(dir, 'sessions'),
+      privateHome: join(dir, 'private'),
+    }, fake as unknown as DriverChild)
+    try {
+      await host.start()
+      const fleet = await fetch(`http://127.0.0.1:${host.port}/gateway/route-health?provider=chatgpt-web`)
+      expect(fleet.status).toBe(200)
+      const fleetBody = await fleet.json() as { fleet?: string; numbers?: { state?: string }[] }
+      expect(fleetBody.fleet).toBe('unknown')
+      expect(fleetBody.numbers?.[0]?.state).toBe('unknown')
+      const single = await fetch(`http://127.0.0.1:${host.port}/gateway/route-health?provider=chatgpt-web&number=1`)
+      expect(single.status).toBe(200)
+      expect((await single.json() as { state?: string }).state).toBe('unknown')
+      expect(fake.calls).toBe(0)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
   })
 })
 

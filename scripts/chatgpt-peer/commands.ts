@@ -11,6 +11,8 @@
 export const MAX_COMMANDS_PER_TURN = 8
 export const MAX_MODEL_ROUNDS = 4
 export const MAX_MESSAGE_BYTES = 64 * 1024
+/** The largest file the host will hand to the page, counted on decoded bytes. */
+export const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 
 export const COMMAND_OPS = [
   'list',
@@ -188,6 +190,10 @@ export function readFences(source: string): Block[] {
     }
     open = { info: fence[1].trim(), body: [], line: index + 1 }
   }
+  // A model that forgets the closing fence still emitted a block. Dropping it
+  // silently meant its command vanished and its text leaked as prose, so the
+  // open block runs to end-of-text and is returned like any other.
+  if (open) blocks.push({ info: open.info, body: open.body.join('\n'), line: open.line })
   return blocks
 }
 
@@ -217,6 +223,27 @@ export function extractCommands(source: string, nonce: string, limit = MAX_COMMA
     commands.push(result.command)
   }
   return { commands, problems }
+}
+
+/**
+ * Split a finished turn into the prose a peer may receive and whether the turn
+ * was really an action.
+ *
+ * A command block is never an answer. A complete fence is stripped; so is an
+ * unterminated one, which runs to end-of-text - an open fence is still an
+ * action and must not leak to a peer as prose. `commandShaped` is true when the
+ * only thing left is a fence, or when the page dropped the backticks and left
+ * `gateway <nonce>` over a JSON object, or a bare JSON command object.
+ */
+export function proseFromTurn(source: string): { prose: string; commandShaped: boolean } {
+  const hadFence = /```[ \t]*gateway\b/i.test(source)
+  const visible = source
+    .replace(/```[ \t]*gateway[^\n]*\n?[\s\S]*?```/gi, '')
+    .replace(/```[ \t]*gateway[^\n]*\n?[\s\S]*$/i, '')
+    .trim()
+  const bareAction = /(^|\n)[ \t]*gateway\b[^\n]*\n[ \t]*\{/i.test(source)
+  const jsonAction = visible.trimStart().startsWith('{') && /\{\s*"op"\s*:/.test(visible)
+  return { prose: visible, commandShaped: bareAction || jsonAction || (!visible && hadFence) }
 }
 
 /**

@@ -20,7 +20,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { parseCommand, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
+import { MAX_ATTACHMENT_BYTES, parseCommand, proseFromTurn, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import { audit, loadState, newState, saveState, type PeerState } from './chatgpt-peer/state.ts'
 
 const execFileAsync = promisify(execFile)
@@ -52,6 +52,10 @@ type Config = {
   healthPort: number
   idleUnloadMinutes: number
   number: number
+  /** The bus directory. Overridden in tests so a host never joins the real bus. */
+  directory?: string
+  /** Where instance files live. Overridden in tests. */
+  privateHome?: string
 }
 
 function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
@@ -115,7 +119,7 @@ function one(value: unknown, cap = 200): string {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, cap)
 }
 
-class ChatGptHost {
+export class ChatGptHost {
   private readonly config: Config
   private state!: PeerState
   private readonly driver: DriverChild
@@ -134,11 +138,14 @@ class ChatGptHost {
   // a restart may retry it, a loop may not.
   private readonly handled = new Set<string>()
 
-  constructor(config: Config) {
+  constructor(config: Config, driver?: DriverChild) {
     this.config = config
     this.primer = { text: '', sha: '' }
-    this.driver = new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
+    this.driver = driver ?? new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
   }
+
+  /** The loopback port the host bound. Valid after start(). */
+  get port(): number { return this.state?.healthPort ?? 0 }
 
   private makeLock(): { run<T>(fn: () => Promise<T>): Promise<T> } {
     let chain: Promise<unknown> = Promise.resolve()
@@ -204,7 +211,7 @@ class ChatGptHost {
 
   private async connectTransport(): Promise<void> {
     this.transport = new GatewaySessionTransport({
-      directory: join(getClaudeConfigHomeDir(), 'gateway-sessions'),
+      directory: this.config.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions'),
       sessionId: this.state.sessionId,
       name: NAME,
       cwd: process.cwd(),
@@ -248,7 +255,7 @@ class ChatGptHost {
   }
 
   private async writeInstanceFile(): Promise<void> {
-    const directory = join(PRIVATE_HOME, 'instances')
+    const directory = join(this.config.privateHome ?? PRIVATE_HOME, 'instances')
     await mkdir(directory, { recursive: true })
     await this.restrictToOwner(directory)
     const path = join(directory, `${this.state.instanceId}.json`)
@@ -274,7 +281,7 @@ class ChatGptHost {
   }
 
   private async removeInstanceFile(): Promise<void> {
-    await rm(join(PRIVATE_HOME, 'instances', `${this.state.instanceId}.json`), { force: true }).catch(() => {})
+    await rm(join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.state.instanceId}.json`), { force: true }).catch(() => {})
   }
 
   // --------------------------------------------------------------------- http
@@ -560,12 +567,26 @@ class ChatGptHost {
    * forever, which the bus contract forbids.
    */
   private async recoverOwed(): Promise<void> {
+    // A restart should not buy an unbounded replay: at most three page turns.
+    // Every remaining owed entry gets one error reply so its sender is not
+    // left waiting, and is then marked handled so the loop terminates.
+    let pages = 0
     for (;;) {
       const entry = this.transport.outstandingReplies().find(item => !this.handled.has(item.toMessageId))
       if (!entry) return
       const record = this.transport.inbox().find(item => item.message.id === entry.toMessageId)
       if (!record) { this.handled.add(entry.toMessageId); continue }
+      if (pages >= 3) {
+        this.handled.add(entry.toMessageId)
+        log(`gave up on ${shortId(entry.toMessageId)} after 3 page turns at startup`)
+        await this.replyError(
+          { id: entry.toMessageId, fromSessionId: entry.toSessionId },
+          'the page turn was lost when the host restarted; resend if it still matters',
+        )
+        continue
+      }
       log(`retrying unanswered ${shortId(entry.toMessageId)} from ${shortId(entry.toSessionId)}`)
+      pages++
       await this.handleRecord(record)
     }
   }
@@ -664,17 +685,14 @@ class ChatGptHost {
     if (outcome.budgetSpent) return this.replyError(message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
     // A fence is an action, not an answer. If the only thing the page produced
     // was a command block that was refused (a stale or invented nonce), the
-    // peer gets an error - never the fence text as if it were prose.
-    const visible = outcome.finalText.replace(/```gateway[^\n]*\n[\s\S]*?```/gi, '').trim()
-    // The same judgement without the fence: the page sometimes loses the
-    // backticks and leaves `gateway <nonce>` plus a JSON object. That is still
-    // an action, and it must never reach a peer as if it were an answer.
-    const commandShaped = /(^|\n)[ \t]*gateway\b[^\n]*\n[ \t]*\{/i.test(outcome.finalText)
-      || (visible.trimStart().startsWith('{') && /\{\s*"op"\s*:/.test(visible))
-    if (commandShaped || (!visible && /```gateway/i.test(outcome.finalText))) {
+    // peer gets an error - never the fence text as if it were prose. This also
+    // covers an unterminated fence: it runs to end-of-text and is still an
+    // action.
+    const { prose: visibleText, commandShaped } = proseFromTurn(outcome.finalText)
+    if (commandShaped) {
       return this.replyError(message, 'the page answered with a command block that was refused (missing or stale nonce); nothing was sent')
     }
-    const prose = sanitizePeerText(visible).trim()
+    const prose = sanitizePeerText(visibleText).trim()
     if (!prose) return this.replyError(message, 'no answer was produced for this message')
     const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
     try {
@@ -755,6 +773,16 @@ class ChatGptHost {
    * the only ones that apply, and its refusal comes back as this turn's error.
    */
   private async uploadDocument(name: string, mimeType: string, buffer: Buffer, grantedBy: string, messageId?: string): Promise<void> {
+    // The envelope is counted on the decoded bytes, before base64. A file over
+    // it is refused outright - never truncated - and both numbers are said out
+    // loud in the thread and in the audit.
+    if (buffer.length > MAX_ATTACHMENT_BYTES) {
+      const reason = `attachment refused: ${buffer.length} bytes exceeds the 64 MiB host envelope`
+      await this.pageTurn(`ATTACHMENT REFUSED: ${reason}.`)
+      audit(this.state, { op: 'attachment', target: name, result: reason, messageId: messageId ?? null })
+      await this.persist()
+      throw new Error(reason)
+    }
     const sha = createHash('sha256').update(buffer).digest('hex')
     const note = [
       `ATTACHED DOCUMENT ${name} (granted by ${grantedBy}, ${buffer.length} bytes, sha256 ${sha.slice(0, 16)})`,
@@ -918,11 +946,18 @@ class ChatGptHost {
   private inboxLine(): string {
     const records = this.transport.inbox().filter(record => record.state !== 'refused')
     if (records.length === 0) return 'inbox is empty'
-    return records.slice(-20).map(record => {
+    // Lead with what is owed: the model should not have to read state strings
+    // to learn that nothing is waiting on it.
+    const owed = this.transport.outstandingReplies().length
+    const head = owed === 0
+      ? `inbox: nothing owed; ${records.length} recent record${records.length === 1 ? '' : 's'}, all settled`
+      : `inbox: ${owed} owed`
+    const rows = records.slice(-20).map(record => {
       const message = record.message
       const expect = message.replyTo === undefined && message.expectReply !== false
       return `${message.id} from ${message.fromSessionId.slice(0, 8)} ${message.kind ?? 'inquiry'} expectReply=${expect} state=${record.state} age=${age(record.receivedAt)} "${one(message.summary, 100)}"`
-    }).join('\n')
+    })
+    return [head, ...rows].join('\n')
   }
 
   private async nameOf(sessionId: string): Promise<string> {
@@ -1104,4 +1139,4 @@ async function main(): Promise<void> {
   await host.start()
 }
 
-await main()
+if (import.meta.main) await main()
