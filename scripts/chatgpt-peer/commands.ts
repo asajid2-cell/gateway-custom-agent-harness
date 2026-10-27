@@ -1,11 +1,18 @@
 /**
  * The command channel between the ChatGPT web model and this host.
  *
- * The model acts by emitting fenced blocks whose info string names a nonce the
- * host minted for that turn. Two locks keep a peer from acting through the
- * model: only the newest assistant turn is parsed (the host never parses peer
- * text), and a block carrying any other nonce is refused. A peer that copies a
- * command block out of an older turn therefore holds a dead nonce.
+ * The model acts by emitting a block whose label line is exactly `gateway` and
+ * whose body is one JSON object carrying the nonce in its `nonce` field. The
+ * page renders that as a code-block widget, and the widget keeps only the label
+ * word: the info string and the backticks never reach the transcript. So the
+ * reader accepts the RENDERED shape (`gateway` alone on a line, then the
+ * balanced object) as well as literal fenced markdown, which is still what a
+ * raw driver read returns.
+ *
+ * Two locks keep a peer from acting through the model: only the newest
+ * assistant turn is parsed (the host never parses peer text), and a block
+ * carrying any other nonce is refused. A peer that copies a command block out
+ * of an older turn therefore holds a dead nonce.
  */
 
 export const MAX_COMMANDS_PER_TURN = 8
@@ -184,53 +191,150 @@ export function parseCommand(raw: unknown): ParseResult {
 
 type Block = { info: string; body: string; line: number }
 
-/** Split fenced blocks out of one assistant turn. Returns every block seen. */
-export function readFences(source: string): Block[] {
-  const lines = source.split(/\r?\n/)
-  const blocks: Block[] = []
-  let open: { info: string; body: string[]; line: number } | undefined
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]
-    const fence = /^ {0,3}```(.*)$/.exec(line)
-    if (!fence) {
-      if (open) open.body.push(line)
-      continue
-    }
-    if (open) {
-      blocks.push({ info: open.info, body: open.body.join('\n'), line: open.line })
-      open = undefined
-      continue
-    }
-    open = { info: fence[1].trim(), body: [], line: index + 1 }
+/**
+ * The rendered label line. The page shows a code block as its label over the
+ * body, so a `gateway` block arrives as a line reading exactly `gateway`.
+ * Leading indentation is allowed; anything else on the line is not a label.
+ */
+const GATEWAY_LABEL = /^[ \t]*gateway[ \t]*$/i
+
+type LineSpan = { start: number; end: number }
+
+function linesOf(source: string): Array<LineSpan & { text: string }> {
+  const lines: Array<LineSpan & { text: string }> = []
+  let start = 0
+  for (;;) {
+    const newline = source.indexOf('\n', start)
+    const end = newline < 0 ? source.length : newline
+    lines.push({ start, end, text: source.slice(start, end).replace(/\r$/, '') })
+    if (newline < 0) break
+    start = newline + 1
   }
-  // A model that forgets the closing fence still emitted a block. Dropping it
-  // silently meant its command vanished and its text leaked as prose, so the
-  // open block runs to end-of-text and is returned like any other.
-  if (open) blocks.push({ info: open.info, body: open.body.join('\n'), line: open.line })
-  return blocks
+  return lines
+}
+
+/** The index just past the balanced `{...}` that starts at `start`, or -1. */
+function objectEnd(source: string, start: number): number {
+  if (source[start] !== '{') return -1
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < source.length; index++) {
+    const char = source[index]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') inString = false
+      continue
+    }
+    if (char === '"') { inString = true; continue }
+    if (char === '{') depth++
+    else if (char === '}') {
+      depth--
+      if (depth === 0) return index + 1
+    }
+  }
+  return -1
+}
+
+function firstNonSpace(source: string, from: number): number {
+  let index = from
+  while (index < source.length && /\s/.test(source[index])) index++
+  return index < source.length ? index : -1
+}
+
+/**
+ * Split one assistant turn into blocks, and record the spans a block occupies.
+ *
+ * Two shapes are read: literal fenced markdown, and what the page actually
+ * renders - a line holding only `gateway`, then the balanced JSON object. The
+ * spans exist so prose outside a block can be returned untouched.
+ */
+function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & { gateway: boolean }> } {
+  const lines = linesOf(source)
+  const blocks: Block[] = []
+  const spans: Array<LineSpan & { gateway: boolean }> = []
+  const spanThrough = (first: number, last: number): LineSpan => ({
+    start: lines[first].start,
+    // Drop the line break after the last line too, so two prose lines that
+    // surrounded a block do not collapse onto one.
+    end: lines[last].end < source.length ? lines[last].end + 1 : lines[last].end,
+  })
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]
+    const fence = /^ {0,3}```(.*)$/.exec(line.text)
+    if (fence) {
+      const info = fence[1].trim()
+      let close = index + 1
+      while (close < lines.length && !/^ {0,3}```/.test(lines[close].text)) close++
+      blocks.push({
+        info,
+        body: lines.slice(index + 1, Math.min(close, lines.length)).map(item => item.text).join('\n'),
+        line: index + 1,
+      })
+      spans.push({ ...spanThrough(index, close < lines.length ? close : lines.length - 1), gateway: /^gateway\b/i.test(info) })
+      index = close < lines.length ? close + 1 : lines.length
+      continue
+    }
+    if (GATEWAY_LABEL.test(line.text)) {
+      const objectStart = firstNonSpace(source, line.end < source.length ? line.end + 1 : source.length)
+      const end = objectStart >= 0 ? objectEnd(source, objectStart) : -1
+      if (end > 0) {
+        blocks.push({ info: 'gateway', body: source.slice(objectStart, end), line: index + 1 })
+        // The span stops at the closing brace: prose sharing that line stays.
+        spans.push({ start: line.start, end, gateway: true })
+        while (index + 1 < lines.length && lines[index + 1].start < end) index++
+      }
+      // A lone `gateway` line with no object after it is prose, not a block.
+    }
+    index++
+  }
+  return { blocks, spans }
+}
+
+/** Split the blocks out of one assistant turn. Returns every block seen. */
+export function readFences(source: string): Block[] {
+  return scanBlocks(source).blocks
+}
+
+/**
+ * The credential a block carries, and the object to run once it is removed.
+ *
+ * The page destroys a block's info string, so the nonce lives in the JSON body.
+ * A nonce on a fenced info line is still accepted, because a raw markdown read -
+ * and every block from before the rendered shape existed - carries it there.
+ */
+export function blockCredential(raw: unknown, info: string): { credential?: string; value: unknown } {
+  const object = isRecord(raw) ? raw : undefined
+  const bodyNonce = object && typeof object.nonce === 'string' && object.nonce ? object.nonce : undefined
+  if (object) delete object.nonce
+  const infoNonce = info.replace(/^gateway\s*/i, '').trim()
+  return { credential: bodyNonce ?? (infoNonce || undefined), value: object ?? raw }
 }
 
 /**
  * Read the commands out of one assistant turn.
  *
- * Only fences labelled `gateway` are considered. A `gateway` fence whose nonce
- * does not match becomes one refusal line rather than an exception, so the
- * model learns why nothing happened and the other blocks still run.
+ * Only blocks labelled `gateway` are considered. The credential is the JSON
+ * object's `nonce` field. A mismatch becomes one refusal line rather than an
+ * exception, so the model learns why nothing happened and the other blocks
+ * still run.
  */
 export function extractCommands(source: string, nonce: string, limit = MAX_COMMANDS_PER_TURN): Extraction {
   const commands: Command[] = []
   const problems: string[] = []
-  for (const block of readFences(source)) {
+  for (const block of scanBlocks(source).blocks) {
     if (!/^gateway\b/i.test(block.info)) continue
-    const info = block.info.replace(/^gateway\s*/i, '').trim()
-    if (info !== nonce) {
-      problems.push(`line ${block.line}: refused: nonce mismatch`)
-      continue
-    }
     let parsed: unknown
     try { parsed = JSON.parse(block.body) }
     catch (error) { problems.push(`line ${block.line}: refused: invalid JSON (${(error as Error).message})`); continue }
-    const result = parseCommand(parsed)
+    const { credential, value } = blockCredential(parsed, block.info)
+    if (credential !== nonce) {
+      problems.push(`line ${block.line}: refused: nonce mismatch`)
+      continue
+    }
+    const result = parseCommand(value)
     if (!result.ok) { problems.push(`line ${block.line}: refused: ${result.error}`); continue }
     if (commands.length >= limit) { problems.push(`line ${block.line}: refused: command budget (${limit} per turn)`); continue }
     commands.push(result.command)
@@ -242,32 +346,38 @@ export function extractCommands(source: string, nonce: string, limit = MAX_COMMA
  * Split a finished turn into the prose a peer may receive and whether the turn
  * was really an action.
  *
- * A command block is never an answer. A complete fence is stripped; so is an
- * unterminated one, which runs to end-of-text - an open fence is still an
- * action and must not leak to a peer as prose. `commandShaped` is true when the
- * only thing left is a fence, or when the page dropped the backticks and left
- * `gateway <nonce>` over a JSON object, or a bare JSON command object.
+ * A command block is never an answer. Every gateway block is stripped, in both
+ * the rendered and the fenced shape; other blocks stay, because a code sample
+ * in an answer is prose. `commandShaped` is true when a gateway block was the
+ * only thing in the turn, or when the whole turn is a bare JSON command object.
  */
 export function proseFromTurn(source: string): { prose: string; commandShaped: boolean } {
-  const hadFence = /```[ \t]*gateway\b/i.test(source)
-  const visible = source
-    .replace(/```[ \t]*gateway[^\n]*\n?[\s\S]*?```/gi, '')
-    .replace(/```[ \t]*gateway[^\n]*\n?[\s\S]*$/i, '')
-    .trim()
-  const bareAction = /(^|\n)[ \t]*gateway\b[^\n]*\n[ \t]*\{/i.test(source)
-  const jsonAction = visible.trimStart().startsWith('{') && /\{\s*"op"\s*:/.test(visible)
-  return { prose: visible, commandShaped: bareAction || jsonAction || (!visible && hadFence) }
+  const { blocks, spans } = scanBlocks(source)
+  let visible = ''
+  let cursor = 0
+  for (const span of spans) {
+    if (!span.gateway) continue
+    visible += source.slice(cursor, span.start)
+    cursor = span.end
+  }
+  visible = (visible + source.slice(cursor)).trim()
+  const action = blocks.some(block => /^gateway\b/i.test(block.info))
+  const jsonAction = visible.startsWith('{') && /\{\s*"op"\s*:/.test(visible)
+  return { prose: visible, commandShaped: (action && !visible) || jsonAction }
 }
 
 /**
- * Break any fence a peer smuggled into its own text.
+ * Break any block a peer smuggled into its own text.
  *
  * The nonce already makes such a block unexecutable, but a model can quote it
- * back and a broken fence costs nothing. A zero-width space keeps the text
- * readable while ensuring nothing downstream sees a closing fence.
+ * back and a broken block costs nothing. A zero-width space keeps the text
+ * readable while ensuring nothing downstream sees a closing fence or a label
+ * line of its own.
  */
 export function sanitizePeerText(source: string): string {
-  return source.replace(/```/g, '```\u200b')
+  return source
+    .replace(/```/g, '```\u200b')
+    .replace(/^([ \t]*gateway[ \t]*)$/gim, '$1\u200b')
 }
 
 export function formatResultLines(lines: readonly string[]): string {
