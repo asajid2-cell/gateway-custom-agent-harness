@@ -148,6 +148,9 @@ export function parseCommand(raw: unknown): ParseResult {
   if (op === 'schedule') {
     const label = text(raw.label)
     if (!label) return { ok: false, error: 'schedule requires label' }
+    // state.ts caps a label at 80 characters. Accepting a longer one here would
+    // write a peer.json this host refuses to load on its next start.
+    if (label.length > 80) return { ok: false, error: 'schedule label is limited to 80 characters' }
     const inSeconds = raw.inSeconds
     const at = text(raw.at)
     if (typeof inSeconds !== 'number' && !at) return { ok: false, error: 'schedule requires inSeconds or at' }

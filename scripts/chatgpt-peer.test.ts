@@ -109,6 +109,14 @@ describe('command channel', () => {
     expect(prose).toBe('Here it is.')
     expect(commandShaped).toBe(false)
   })
+
+  // peer.json caps a label at 80 characters, so a longer one would be accepted
+  // here, written to disk, and then make the next start refuse the file.
+  test('a schedule label longer than state allows is refused', () => {
+    expect(parseCommand({ op: 'schedule', label: 'x'.repeat(81), inSeconds: 10 }))
+      .toEqual({ ok: false, error: 'schedule label is limited to 80 characters' })
+    expect(parseCommand({ op: 'schedule', label: 'x'.repeat(80), inSeconds: 10 }).ok).toBe(true)
+  })
 })
 
 describe('turn loop', () => {
@@ -153,9 +161,22 @@ describe('turn loop', () => {
   test('an explicit reply is reported so the host does not answer twice', async () => {
     const outcome = await runCommandTurn('go', nonce, {
       generate: async () => ({ ok: true, text: fenced(nonce, { op: 'reply', toMessageId: 'm1', text: 'here' }) }),
-      execute: async () => ({ line: 'replied', replied: true }),
+      execute: async () => ({ line: 'replied', replied: true, repliedTo: 'm1' }),
     })
     expect(outcome.repliedExplicitly).toBe(true)
+    expect(outcome.repliedTargets).toEqual(['m1'])
+  })
+
+  // A reply to somebody else's older message is not an answer to this inbound.
+  // A single boolean made it look like one, and the real answer was dropped.
+  test('a reply to another message does not count as answering this one', async () => {
+    const inbound = 'this-inbound'
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => ({ ok: true, text: fenced(nonce, { op: 'reply', toMessageId: 'someone-else', text: 'here' }) }),
+      execute: async () => ({ line: 'replied', replied: true, repliedTo: 'someone-else' }),
+    })
+    expect(outcome.repliedTargets).toEqual(['someone-else'])
+    expect(outcome.repliedTargets.includes(inbound)).toBe(false)
   })
 
   test('a failed model turn is reported, not thrown', async () => {
@@ -237,6 +258,23 @@ describe('state', () => {
       state.threadId = '11111111-1111-4111-8111-111111111111'
       await saveState(path, state)
       expect(await loadState(path, () => { throw new Error('should not be used') })).toEqual(state)
+    } finally { await cleanup() }
+  })
+
+  // Two overlapping saves each renamed their own temporary; whichever rename
+  // landed last won, so an older snapshot could overwrite a newer one and a
+  // cancelled schedule came back after a restart.
+  test('the last save wins when saves overlap', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const path = join(dir, 'peer.json')
+      const older = newState({ profile: 'p', healthPort: 123, idleUnloadMinutes: 5 })
+      older.model = 'older'
+      const newer = newState({ profile: 'p', healthPort: 123, idleUnloadMinutes: 5 })
+      newer.model = 'newer'
+      await Promise.all([saveState(path, older), saveState(path, newer)])
+      const loaded = await loadState(path, () => { throw new Error('should not be used') })
+      expect(loaded.model).toBe('newer')
     } finally { await cleanup() }
   })
 
@@ -423,9 +461,9 @@ const rl = readline.createInterface({ input: process.stdin })
 emit({ event: 'ready' })
 rl.on('line', line => {
   const request = JSON.parse(line)
-  if (request.op === 'quit') { emit({ ok: true, op: 'quit' }); process.exit(0) }
-  emit({ event: 'accepted', threadId: 'thread-1' })
-  emit({ ok: true, op: request.op, text: 'echo:' + (request.text || '') })
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); process.exit(0) }
+  emit({ event: 'accepted', threadId: 'thread-1', id: request.id })
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
 })
 `, 'utf8')
     const accepted: string[] = []
@@ -436,6 +474,50 @@ rl.on('line', line => {
       expect(reply.ok).toBe(true)
       expect(reply.text).toBe('echo:hi')
       expect(accepted.length).toBe(1)
+    } finally {
+      await child.kill()
+      await cleanup()
+    }
+  })
+
+  test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'slow-driver.js')
+    // Holds the first request forever, answers everything else, and can be told
+    // to release the held answer - which is what a page finishing a timed-out
+    // turn looks like.
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+let held = null
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); process.exit(0) }
+  if (request.op === 'hold') { held = request; return }
+  if (request.op === 'release') {
+    if (held) emit({ ok: true, op: 'hold', id: held.id, text: 'answer-for-the-abandoned-turn' })
+    held = null
+    emit({ ok: true, op: 'release', id: request.id })
+    return
+  }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      const timedOut = await child.call({ op: 'hold' }, 150)
+      expect(timedOut.ok).toBe(false)
+      const next = await child.call({ op: 'send', text: 'the next inbound' })
+      expect(next.ok).toBe(true)
+      expect(next.text).toBe('echo:the next inbound')
+      // The abandoned turn answers now. It must be dropped, not delivered to
+      // whoever is waiting - here, nobody is, and the call that follows is still
+      // answered with its own line.
+      const released = await child.call({ op: 'release' })
+      expect(released.ok).toBe(true)
+      expect(released.text).toBeUndefined()
     } finally {
       await child.kill()
       await cleanup()

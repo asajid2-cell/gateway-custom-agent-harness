@@ -11,7 +11,7 @@ import {
 } from './commands.ts'
 
 export type GenerateResult = { ok: boolean; text?: string; error?: string }
-export type ExecuteResult = { line: string; replied?: boolean }
+export type ExecuteResult = { line: string; replied?: boolean; repliedTo?: string }
 
 export type TurnDeps = {
   /** One page turn: post the prompt, return the assistant's text. */
@@ -22,7 +22,7 @@ export type TurnDeps = {
   maxCommands?: number
 }
 
-export type Executed = { command: Command; line: string; replied: boolean }
+export type Executed = { command: Command; line: string; replied: boolean; repliedTo?: string }
 
 export type TurnOutcome = {
   rounds: number
@@ -31,6 +31,8 @@ export type TurnOutcome = {
   problems: string[]
   /** True when a `reply`/`send` command already answered for this turn. */
   repliedExplicitly: boolean
+  /** The inbound message ids a `reply` command actually answered. */
+  repliedTargets: string[]
   /** True when commands were still being emitted as the round budget ran out. */
   budgetSpent: boolean
   failed: boolean
@@ -45,6 +47,7 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
   // snapshot it already has. Each one costs a page round trip, so an exact
   // repeat is answered from the log and never run again.
   const seen = new Set<string>()
+  const repliedTargets: string[] = []
   let repliedExplicitly = false
   let finalText = ''
   let rounds = 0
@@ -79,13 +82,18 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
       seen.add(key)
       const result = await deps.execute(command)
       const replied = result.replied === true
-      executed.push({ command, line: result.line, replied })
-      if (replied) repliedExplicitly = true
+      executed.push({ command, line: result.line, replied, ...(result.repliedTo ? { repliedTo: result.repliedTo } : {}) })
+      if (replied) {
+        repliedExplicitly = true
+        // Which inbound was answered matters: a reply to an older message must
+        // not suppress the answer this turn owes.
+        if (result.repliedTo) repliedTargets.push(result.repliedTo)
+      }
       lines.push(result.line)
     }
     prompt = formatResultLines(lines)
     if (rounds >= budget) budgetSpent = true
   }
 
-  return { rounds, finalText, executed, problems, repliedExplicitly, budgetSpent, failed }
+  return { rounds, finalText, executed, problems, repliedExplicitly, repliedTargets, budgetSpent, failed }
 }

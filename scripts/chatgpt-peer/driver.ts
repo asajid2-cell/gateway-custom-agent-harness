@@ -8,13 +8,23 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
-export type DriverReply = { ok: boolean; op?: string; [key: string]: unknown }
+export type DriverReply = { ok: boolean; op?: string; id?: string; [key: string]: unknown }
 
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
-  private pending: ((reply: DriverReply) => void)[] = []
-  private accepted: (() => void) | undefined
+  /**
+   * Responses are matched by request id, never by arrival order.
+   *
+   * A timed-out request is not cancelled: the child keeps working on it and
+   * answers whenever it finishes. With a FIFO queue that late answer would be
+   * handed to whichever request is now waiting - the next inbound would be
+   * settled with the previous inbound's text. An id makes a late reply
+   * identifiable and safe to drop.
+   */
+  private readonly pending = new Map<string, (reply: DriverReply) => void>()
+  private accepted: ((id: string) => void) | undefined
   private closed = false
+  private sequence = 0
 
   constructor(private readonly options: {
     script: string
@@ -23,8 +33,8 @@ export class DriverChild {
     timeoutMs?: number
   }) {}
 
-  /** Called when the page has taken a message into the thread. */
-  onAccepted(handler: (() => void) | undefined): void {
+  /** Called when the page has taken a message into the thread. Carries the request id. */
+  onAccepted(handler: ((id: string) => void) | undefined): void {
     this.accepted = handler
   }
 
@@ -39,10 +49,14 @@ export class DriverChild {
       if (!trimmed) return
       let message: Record<string, unknown>
       try { message = JSON.parse(trimmed) } catch { this.options.log?.(`driver: unparsable line ${trimmed.slice(0, 120)}`); return }
-      if (message.event === 'accepted') { this.accepted?.(); return }
+      const id = typeof message.id === 'string' ? message.id : ''
+      if (message.event === 'accepted') { this.accepted?.(id); return }
       if (message.event) return
-      const resolve = this.pending.shift()
-      if (resolve) resolve(message as DriverReply)
+      if (!id) { this.options.log?.(`driver: reply without a request id: ${trimmed.slice(0, 120)}`); return }
+      const settle = this.pending.get(id)
+      if (!settle) { this.options.log?.(`driver: late reply for ${id} dropped (that request already timed out)`); return }
+      this.pending.delete(id)
+      settle(message as DriverReply)
     })
     createInterface({ input: child.stderr }).on('line', line => {
       if (line.trim()) this.options.log?.(`driver: ${line.trim().slice(0, 400)}`)
@@ -51,7 +65,8 @@ export class DriverChild {
       const reason = `driver exited (code ${code ?? 'null'})`
       this.options.log?.(reason)
       this.child = undefined
-      for (const resolve of this.pending.splice(0)) resolve({ ok: false, error: reason })
+      for (const settle of this.pending.values()) settle({ ok: false, error: reason })
+      this.pending.clear()
     })
     child.stdin.on('error', () => {})
     this.child = child
@@ -60,15 +75,19 @@ export class DriverChild {
 
   async call(request: Record<string, unknown>, timeoutMs = this.options.timeoutMs ?? 600_000): Promise<DriverReply> {
     const child = this.ensure()
+    const id = `r${++this.sequence}`
     return await new Promise<DriverReply>(resolve => {
       const timer = setTimeout(() => {
-        const index = this.pending.indexOf(settle)
-        if (index >= 0) this.pending.splice(index, 1)
-        resolve({ ok: false, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        this.pending.delete(id)
+        resolve({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
       }, timeoutMs)
-      const settle = (reply: DriverReply) => { clearTimeout(timer); resolve(reply) }
-      this.pending.push(settle)
-      child.stdin.write(`${JSON.stringify(request)}\n`)
+      this.pending.set(id, reply => { clearTimeout(timer); resolve(reply) })
+      child.stdin.write(`${JSON.stringify({ ...request, id })}\n`, error => {
+        if (!error) return
+        if (!this.pending.delete(id)) return
+        clearTimeout(timer)
+        resolve({ ok: false, id, error: `could not write to the driver: ${error.message}` })
+      })
     })
   }
 

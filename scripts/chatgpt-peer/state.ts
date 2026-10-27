@@ -36,6 +36,12 @@ export const peerStateSchema = z.object({
   /** Which signed-in browser instance this host owns. Defaults to `default`. */
   instanceId: z.string().regex(INSTANCE_ID_PATTERN),
   threadId: z.string().uuid().nullable(),
+  /**
+   * The thread the recorded primer sha actually belongs to. A thread selected
+   * with `use` has no primer of ours in it, so the sha alone cannot say that
+   * thread is primed - this pairing can.
+   */
+  primedThreadId: z.string().uuid().nullable().default(null),
   model: z.string().max(100).nullable(),
   effort: z.string().max(40).nullable(),
   profile: z.string().max(4096),
@@ -54,6 +60,7 @@ export function newState(options: { profile: string; healthPort: number; idleUnl
     sessionId: randomUUID(),
     instanceId: options.instanceId ?? 'default',
     threadId: null,
+    primedThreadId: null,
     model: null,
     effort: null,
     profile: options.profile,
@@ -88,11 +95,28 @@ export async function loadState(path: string, defaults: () => PeerState): Promis
   return parsed.data
 }
 
-export async function saveState(path: string, state: PeerState): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
-  const temporary = `${path}.${randomUUID()}.tmp`
-  await writeFile(temporary, JSON.stringify(state, null, 2), 'utf8')
-  await rename(temporary, path)
+/**
+ * Saves are serialized per path and serialized eagerly.
+ *
+ * Two overlapping saves each write their own temporary and rename it; whichever
+ * rename lands last wins, so an older snapshot can overwrite a newer one (a
+ * cancelled schedule's timer reappears after a restart). Serializing the JSON
+ * at call time and queueing the writes makes the last call the last word.
+ */
+const saving = new Map<string, Promise<void>>()
+
+export function saveState(path: string, state: PeerState): Promise<void> {
+  const payload = JSON.stringify(state, null, 2)
+  const previous = saving.get(path) ?? Promise.resolve()
+  const next = previous.catch(() => {}).then(async () => {
+    await mkdir(dirname(path), { recursive: true })
+    const temporary = `${path}.${randomUUID()}.tmp`
+    await writeFile(temporary, payload, 'utf8')
+    await rename(temporary, path)
+  })
+  saving.set(path, next)
+  next.catch(() => {}).finally(() => { if (saving.get(path) === next) saving.delete(path) })
+  return next
 }
 
 /** Append one audit line, keeping the rolling cap. */

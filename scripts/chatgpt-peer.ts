@@ -28,7 +28,11 @@ const execFileAsync = promisify(execFile)
 const NAME = 'chatgpt-web'
 const PROVIDER = 'chatgpt-web'
 const PURPOSE = 'A signed-in ChatGPT web thread on the operator\'s account, addressed like any other live session.'
-const TURN_TIMEOUT_MS = 10 * 60_000
+// One page turn can legitimately outlast ten minutes: a large attachment is
+// uploaded first and only then does the model answer. Cutting the turn off
+// mid-upload makes a slow send look like a hang, so the ceiling is generous
+// and overridable.
+const TURN_TIMEOUT_MS = Number(process.env.CHATGPT_TURN_TIMEOUT_MS || 20 * 60_000)
 
 /** Host-private files: where the instance identity is written. */
 const PRIVATE_HOME = process.env.CHATGPT_WEB_PRIVATE_HOME ?? join(homedir(), '.chatgpt-web')
@@ -135,6 +139,8 @@ export class ChatGptHost {
   private health: { state: HealthState; reason?: string; at: string } = { state: 'unknown', reason: 'page_not_started', at: new Date().toISOString() }
   private readonly schedules = new Map<string, NodeJS.Timeout>()
   private idleTimer: NodeJS.Timeout | undefined
+  /** When page work was last submitted; idle unload refuses to run past it. */
+  private lastWorkAt = 0
   private readonly pageLock = this.makeLock()
   private readonly primer: { text: string; sha: string }
   private draining = false
@@ -265,7 +271,7 @@ export class ChatGptHost {
   private async writeInstanceFile(): Promise<void> {
     const directory = join(this.config.privateHome ?? PRIVATE_HOME, 'instances')
     await mkdir(directory, { recursive: true })
-    await this.restrictToOwner(directory)
+    await this.restrictToOwner(directory, 'directory')
     const path = join(directory, `${this.state.instanceId}.json`)
     const body = JSON.stringify({
       port: this.state.healthPort,
@@ -281,8 +287,13 @@ export class ChatGptHost {
   }
 
   /** Best-effort ACL tightening; the bus token is not in this file. */
-  private async restrictToOwner(path: string): Promise<void> {
-    if (process.platform !== 'win32') { await execFileAsync('chmod', ['600', path]).catch(() => {}); return }
+  private async restrictToOwner(path: string, kind: 'file' | 'directory' = 'file'): Promise<void> {
+    if (process.platform !== 'win32') {
+      // A directory needs its execute bit to be entered at all: 600 on it means
+      // the temporary file written inside it fails with EACCES.
+      await execFileAsync('chmod', [kind === 'directory' ? '700' : '600', path]).catch(() => {})
+      return
+    }
     const user = process.env.USERNAME ?? ''
     if (!user) return
     await execFileAsync('icacls', [path, '/inheritance:r', '/grant:r', `${user}:F`]).catch(() => {})
@@ -457,6 +468,7 @@ export class ChatGptHost {
     const action = String(body.action ?? '')
     if (action === 'new') {
       this.state.threadId = null
+      this.state.primedThreadId = null
       await this.persist()
       return 'next turn starts a new thread and re-posts the primer'
     }
@@ -465,9 +477,15 @@ export class ChatGptHost {
       if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('use requires a thread id')
       const reply = await this.driver.call({ op: 'use', threadId }, TURN_TIMEOUT_MS)
       if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not open thread'))
+      const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
+      if (landed.toLowerCase() !== threadId.toLowerCase()) throw new Error(`the page opened ${landed || 'another thread'} instead of ${threadId}`)
       this.state.threadId = threadId
+      // This thread's history was not primed by this host, so the sha recorded
+      // for the previous thread says nothing about it. Clearing the mark makes
+      // the next turn post the primer into it before honouring a command.
+      this.state.primedThreadId = null
       await this.persist()
-      return `using thread ${threadId}`
+      return `using thread ${threadId}; the primer is re-posted on the next turn`
     }
     if (action === 'list') {
       const reply = await this.driver.call({ op: 'threads' }, TURN_TIMEOUT_MS)
@@ -502,18 +520,27 @@ export class ChatGptHost {
    * command table must not be trusted with the current one.
    */
   private async ensurePrimerAndThread(): Promise<void> {
-    if (this.state.threadId && this.state.primerSha256 === this.primer.sha) return
+    // The sha is only evidence for the thread it was recorded against; a
+    // selected thread carries its own history and must be primed itself.
+    if (this.state.threadId && this.state.primedThreadId === this.state.threadId && this.state.primerSha256 === this.primer.sha) return
+    // A changed primer is a different instruction set: start a fresh thread
+    // rather than layering the new table over answers given under the old one.
     if (this.state.primerSha256 !== this.primer.sha) this.state.threadId = null
     if (!this.primer.text.trim()) throw new Error('primer.md is empty or missing')
     const prompt = `${this.primer.text}\n\n---\n\nReply in one short sentence confirming you understand, and do not emit any command block.`
-    const reply = await this.driver.call({ op: 'send', text: prompt, newChat: true }, TURN_TIMEOUT_MS)
+    const selected = this.state.threadId
+    const reply = await this.driver.call({ op: 'send', text: prompt, ...(selected ? { threadId: selected } : { newChat: true }) }, TURN_TIMEOUT_MS)
     if (reply.ok !== true) throw new Error(`could not post the primer: ${one(reply.error, 200)}`)
     const threadId = String(reply.threadId ?? '')
     if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('the page did not return a thread id for the primer')
     this.state.threadId = threadId
+    this.state.primedThreadId = threadId
     this.state.primerSha256 = this.primer.sha
     this.absorbPage(reply)
-    await this.persist()
+    // The thread id is the address every later turn is posted to; if it cannot
+    // be written down, stop here rather than answer into a thread the next
+    // process will not know about.
+    await this.persist(true)
     await this.advertise()
     log(`primed thread ${threadId} (sha ${this.primer.sha.slice(0, 12)})`)
   }
@@ -535,7 +562,13 @@ export class ChatGptHost {
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== this.state.threadId) { this.state.threadId = threadId; await this.persist() }
+    if (threadId && threadId !== this.state.threadId) {
+      // The page landed in a different thread from the primed one, so that
+      // thread has never seen the primer.
+      this.state.threadId = threadId
+      this.state.primedThreadId = null
+      await this.persist()
+    }
     const before = { model: this.state.model, effort: this.state.effort }
     this.absorbPage(reply)
     if (before.model !== this.state.model || before.effort !== this.state.effort) await this.advertise()
@@ -635,16 +668,19 @@ export class ChatGptHost {
         await this.ensurePrimerAndThread()
         const turnNonce = nonce()
         let acknowledged = false
-        this.driver.onAccepted(() => {
-          if (acknowledged) return
-          acknowledged = true
-          void this.transport.acknowledge(message.id).catch(() => {})
-        })
         try {
           // Attachments are read at turn time, not at receipt time, so a
           // sender that writes the file and then sends the message cannot race
-          // the read.
+          // the read. The acceptance handler is installed only afterwards: an
+          // attachment turn or a refusal posts its own message, and if that
+          // acceptance acknowledged this inbound the peer would be told
+          // "delivered" before its own text had been posted.
           await this.injectAttachment(text, message.fromSessionId, message.id)
+          this.driver.onAccepted(() => {
+            if (acknowledged) return
+            acknowledged = true
+            void this.transport.acknowledge(message.id).catch(() => {})
+          })
           const prompt = this.inboundPrompt({ ...message, fromName: name, text }, turnNonce)
           const outcome = await runCommandTurn(prompt, turnNonce, {
             generate: async subject => {
@@ -696,8 +732,9 @@ export class ChatGptHost {
     ].join('\n')
   }
 
-  private async settleReply(message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[] }): Promise<void> {
-    if (outcome.repliedExplicitly) return
+  private async settleReply(message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[] }): Promise<void> {
+    // A reply to some other message is not an answer to this one.
+    if (outcome.repliedTargets.includes(message.id)) return
     if (!expects) return
     if (outcome.failed) return this.replyError(message, `the page could not answer: ${one(outcome.problems.at(-1) ?? 'no answer', 180)}`)
     if (outcome.budgetSpent) return this.replyError(message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
@@ -837,7 +874,13 @@ export class ChatGptHost {
       throw new Error(`the page rejected ${name}: ${reason}`)
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== this.state.threadId) { this.state.threadId = threadId; await this.persist() }
+    if (threadId && threadId !== this.state.threadId) {
+      // The page landed in a different thread from the primed one, so that
+      // thread has never seen the primer.
+      this.state.threadId = threadId
+      this.state.primedThreadId = null
+      await this.persist()
+    }
     this.absorbPage(reply)
     audit(this.state, { op: 'attachment', target: name, result: `uploaded ${buffer.length} bytes sha256 ${sha.slice(0, 16)}`, messageId: messageId ?? null })
     await this.persist()
@@ -862,7 +905,7 @@ export class ChatGptHost {
    * returns a line or throws, so a refusal always reaches the model as a
    * sentence it can act on.
    */
-  private async executeCommand(command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean }> {
+  private async executeCommand(command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
     const target = (command as { to?: string }).to ?? null
     try {
       const result = await this.dispatch(command)
@@ -878,7 +921,7 @@ export class ChatGptHost {
     }
   }
 
-  private async dispatch(command: Command): Promise<{ line: string; replied: boolean }> {
+  private async dispatch(command: Command): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
     if (command.op === 'list') return { line: await this.listLine(), replied: false }
     if (command.op === 'inbox') return { line: this.inboxLine(), replied: false }
     if (command.op === 'receipt') {
@@ -902,7 +945,7 @@ export class ChatGptHost {
         command.summary ?? `Re: ${one(record.message.summary, 180)}`.slice(0, 200),
         command.toMessageId, 'inquiry', false,
       ) as { id?: string; state?: string }
-      return { line: `replied ${receipt.id ?? '?'} to ${record.message.fromSessionId.slice(0, 8)}: ${receipt.state ?? 'queued'}`, replied: true }
+      return { line: `replied ${receipt.id ?? '?'} to ${record.message.fromSessionId.slice(0, 8)}: ${receipt.state ?? 'queued'}`, replied: true, repliedTo: command.toMessageId }
     }
     if (command.op === 'schedule') {
       const at = command.at ? new Date(command.at) : new Date(Date.now() + (command.inSeconds ?? 0) * 1000)
@@ -1003,8 +1046,15 @@ export class ChatGptHost {
   // --------------------------------------------------------------- schedules
 
   private armSchedule(label: string, at: Date): void {
+    const known = this.schedules.has(label) || this.state.schedules.some(schedule => schedule.label === label)
+    // Evicting the oldest entry from state while leaving its timer armed, as a
+    // .slice(-8) does, keeps a wake that can neither be seen nor cancelled.
+    // Refuse the ninth instead.
+    if (!known && this.state.schedules.length >= 8) {
+      throw new Error('eight schedules are already pending; cancel one before adding another')
+    }
     this.cancelSchedule(label)
-    this.state.schedules = [...this.state.schedules.filter(schedule => schedule.label !== label), { label, at: at.toISOString() }].slice(-8)
+    this.state.schedules = [...this.state.schedules.filter(schedule => schedule.label !== label), { label, at: at.toISOString() }]
     const delay = Math.max(0, at.getTime() - Date.now())
     const handle = setTimeout(() => { void this.fireSchedule(label) }, Math.min(delay, 24 * 3600_000))
     handle.unref?.()
@@ -1021,21 +1071,20 @@ export class ChatGptHost {
   }
 
   private rearmSchedules(): void {
-    const live: typeof this.state.schedules = []
-    for (const schedule of this.state.schedules) {
+    for (const schedule of [...this.state.schedules]) {
       const at = Date.parse(schedule.at)
-      if (!Number.isFinite(at) || at < Date.now() - 60_000) continue
-      live.push(schedule)
-      this.armSchedule(schedule.label, new Date(at))
+      // An overdue schedule is late, not void. Firing it on the next turn is
+      // what the model asked for; dropping it silently loses a wake that
+      // nothing else will produce.
+      this.armSchedule(schedule.label, new Date(Number.isFinite(at) ? at : Date.now()))
     }
-    this.state.schedules = live
   }
 
   /** A schedule starts a turn; it never sends anything by itself. */
   private async fireSchedule(label: string): Promise<void> {
-    this.schedules.delete(label)
-    this.state.schedules = this.state.schedules.filter(schedule => schedule.label !== label)
-    await this.persist()
+    // The schedule stays in state until its turn finishes. Removing it first
+    // means a crash mid-turn loses the wake permanently; left in place, a
+    // restart fires it again, and a repeated wake is far cheaper than a lost one.
     this.cancelIdleUnload()
     const turnNonce = nonce()
     try {
@@ -1057,6 +1106,8 @@ export class ChatGptHost {
     } catch (error) {
       log(`scheduled wake "${label}" failed: ${(error as Error).message}`)
     } finally {
+      this.schedules.delete(label)
+      this.state.schedules = this.state.schedules.filter(schedule => schedule.label !== label)
       await this.persist()
       this.scheduleIdleUnload()
     }
@@ -1066,6 +1117,7 @@ export class ChatGptHost {
 
   /** Any page work: serialized, and each turn restarts the idle countdown. */
   private pageWork<T>(work: () => Promise<T>): Promise<T> {
+    this.lastWorkAt = Date.now()
     this.cancelIdleUnload()
     return this.pageLock.run(work).finally(() => this.scheduleIdleUnload())
   }
@@ -1073,7 +1125,11 @@ export class ChatGptHost {
   private scheduleIdleUnload(): void {
     this.cancelIdleUnload()
     if (!(this.config.idleUnloadMinutes > 0)) return
-    const handle = setTimeout(() => { void this.unloadChrome('idle') }, this.config.idleUnloadMinutes * 60_000)
+    // The callback remembers when it was armed. Clearing the timer cannot stop
+    // a callback that has already started, so the callback itself checks for
+    // newer work both before queueing and again once it holds the lock.
+    const armedAt = Date.now()
+    const handle = setTimeout(() => { void this.unloadChrome('idle', armedAt) }, this.config.idleUnloadMinutes * 60_000)
     handle.unref?.()
     this.idleTimer = handle
   }
@@ -1084,12 +1140,24 @@ export class ChatGptHost {
   }
 
   /** Chrome is disposable; the registration and peer.json are not. */
-  private async unloadChrome(reason: string): Promise<void> {
+  private async unloadChrome(reason: string, armedAt = 0): Promise<void> {
+    // Work that arrived after this unload was scheduled cancels it, even if the
+    // timer could not be cleared in time.
+    if (armedAt && this.lastWorkAt > armedAt) return
     // The timer can fire while a turn is in flight; the lock makes the unload
     // wait for it rather than kill Chrome mid-answer.
     try {
-      if (await this.cdpAlive()) {
-        await this.pageLock.run(() => this.driver.call({ op: 'unload' }, 60_000))
+      let unloaded = false
+      const alive = await this.cdpAlive()
+      if (alive) {
+        unloaded = await this.pageLock.run(async () => {
+          // Re-check inside the lock: a turn may have been queued behind us and
+          // finished, and unloading it would waste a launch on the next message.
+          if (armedAt && this.lastWorkAt > armedAt) return false
+          await this.driver.call({ op: 'unload' }, 60_000)
+          return true
+        })
+        if (!unloaded) { this.scheduleIdleUnload(); return }
       }
       this.health = { state: 'unknown', reason: 'page_unloaded', at: now() }
       await this.advertise()
@@ -1125,8 +1193,16 @@ export class ChatGptHost {
       .slice(-50)
   }
 
-  private persist(): Promise<void> {
-    return saveState(this.config.statePath, this.state).catch(error => { log(`could not save peer.json: ${(error as Error).message}`) })
+  /**
+   * Write the state out. `critical` is for transitions the process must not
+   * continue past (a new thread id): a failure there is real, not background
+   * noise, so it is reported to the caller instead of only logged.
+   */
+  private persist(critical = false): Promise<void> {
+    return saveState(this.config.statePath, this.state).catch(error => {
+      log(`could not save peer.json: ${(error as Error).message}`)
+      if (critical) throw error
+    })
   }
 
   async stop(): Promise<void> {
