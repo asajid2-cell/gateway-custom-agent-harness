@@ -12,7 +12,7 @@ import {
   gatewayPeerSchema, gatewayPeerRouteSchema, gatewayPeerMessageSchema, gatewayInboxSchema, gatewayMailboxSchema, parsePeerMessage, parseGatewayPeer,
   peerMessageExpectsReply,
   type GatewayPeer, type GatewayPeerRoute, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
-  type GatewayInboundPolicy, type PeerMessageKind,
+  type GatewayInboundPolicy, type PeerMessageKind, type DurableState,
 } from './gatewaySessionProtocol.js'
 import { readTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
@@ -896,6 +896,13 @@ export class GatewaySessionTransport {
     durable?: boolean
     /** The family whose host claim names this session as matriarch, when durable. */
     durableFamilyId?: string
+    /**
+     * Test seam: how a durable target's liveness is decided. Production uses
+     * `probeEndpoint`; a test drives `unknown` without a machine that can force
+     * a connect to time out. It affects the liveness verdict only - the socket
+     * fallback in `send` always uses the real probe.
+     */
+    durableLivenessProbe?: DurableLivenessProbe
     onInboxChanged?: () => void
     /**
      * Called when a wake timer fires, in this process. The runtime turns it
@@ -1567,9 +1574,19 @@ export class GatewaySessionTransport {
     // statement about an answerable session and there is no session here. An
     // OPEN durable peer IS the live registration, so its route governs exactly
     // as every other live peer's does.
-    const durableClosed = target.peer.durable === true && await durableLiveness(target.peer) !== 'open'
+    // Liveness is decided once, and only a DEFINITE `closed` diverts mail to the
+    // mailbox. `unknown` is "the probe could not be evaluated", not "dead": it
+    // takes the ordinary live-send path, because parking a live matriarch's mail
+    // on a 400 ms connect timeout would hide it until its next open.
+    const liveness: DurableState | undefined = target.peer.durable === true
+      ? await durableLiveness(target.peer, this.options.durableLivenessProbe ?? probeEndpoint)
+      : undefined
+    const durableClosed = liveness === 'closed'
+    // Neither `closed` nor `unknown` may let a route withhold: a durable peer's
+    // declared route is advisory until it is provably open.
+    const durableNotOpen = liveness !== undefined && liveness !== 'open'
     let advertised = target.peer.route
-    let health: PeerRouteHealth = durableClosed
+    let health: PeerRouteHealth = durableNotOpen
       ? { state: 'unknown', reason: 'health_unavailable' }
       : await probePeerRoute(advertised)
     // A refusal is a claim about a POOL, and a pool changes without this process
@@ -1582,7 +1599,7 @@ export class GatewaySessionTransport {
     // the first. No restart is involved: `/gateway/reload-keys` exits the
     // gateway for a supervisor to respawn, which is not something a send may do,
     // and a probe never fabricates a credential.
-    if (!durableClosed && (health.state === 'exhausted' || health.state === 'unauthorized')) {
+    if (!durableNotOpen && (health.state === 'exhausted' || health.state === 'unauthorized')) {
       await new Promise(resolve => setTimeout(resolve, ROUTE_RECHECK_DELAY_MS))
       const refreshed = await readRegistration(this.options.directory, toSessionId).catch(() => undefined)
       if (refreshed?.peer.route) advertised = refreshed.peer.route
@@ -1632,6 +1649,26 @@ export class GatewaySessionTransport {
       // caller is told to check a receipt for a session that cannot have one,
       // and reads the failure as a transport bug rather than an exited peer.
       if ((error as { peerConnected?: boolean }).peerConnected === false) {
+        // A durable peer whose liveness was NOT provably closed can die between
+        // the probe and this call. Park the mail only when the endpoint is NOW
+        // definitely absent; an unanswerable probe stays a failure, never a
+        // false queue. The fallback uses the real endpoint probe, not the
+        // liveness seam, because this question is about the socket, not state.
+        if (target.peer.durable === true) {
+          const now = await probeEndpoint(target.peer.endpoint).catch(() => 'unknown' as const)
+          if (now === 'absent') {
+            await this.queueToMailbox({ message, senderName: this.peer.name, state: 'queued', receivedAt: new Date().toISOString() })
+            await this.serial(async () => {
+              const history = this.history.map(entry => entry.direction === 'sent' && entry.message.id === message.id ? { ...entry, status: 'queued' as const, error: undefined } : entry)
+              await this.persist(this.records, this.policy, history)
+              this.history = history
+            }).catch(() => {})
+            return {
+              ok: true, alive: false, delivered: false, closed: true, state: 'queued', id: message.id, recipient: toSessionId,
+              message: `queued: peer ${toSessionId} is closed; held in ${toSessionId}.mailbox, merged at its next open. Request an open with: gateway-peers open ${toSessionId}`,
+            }
+          }
+        }
         await this.serial(async () => {
           const history = this.history.map(entry => entry.direction === 'sent' && entry.message.id === message.id ? { ...entry, status: 'failed' as const, error: 'Peer is not reachable' } : entry)
           await this.persist(this.records, this.policy, history)
@@ -1704,7 +1741,9 @@ export class GatewaySessionTransport {
    */
   private async requireOpen(target: { peer: GatewayPeer }, sessionId: string, action: string): Promise<void> {
     if (target.peer.durable !== true) return
-    if (await durableLiveness(target.peer) === 'open') return
+    // Refuse only on a DEFINITE closed. `unknown` is not evidence of death, so
+    // the call is attempted and its own result decides.
+    if (await durableLiveness(target.peer, this.options.durableLivenessProbe ?? probeEndpoint) !== 'closed') return
     throw new Error(`Session ${sessionId} is closed (durable): no process is running, so ${action}. Mail queues to ${sessionId}.mailbox; request an open with: gateway-peers open ${sessionId}`)
   }
 

@@ -24,7 +24,7 @@ import { join } from 'node:path'
 import { cleanLeafOwnerEnv } from './deepLink/terminalLauncher.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 import { isProcessRunning } from './genericProcessUtils.js'
-import { parseGatewayPeer, type DurableState, type GatewayPeer } from './gatewaySessionProtocol.js'
+import { parseGatewayPeer, type DurableState, type GatewayPeer, type GatewayPeerRoute } from './gatewaySessionProtocol.js'
 
 /** Where a family's records live, given a config home. */
 export function leafFamilyPaths(configHome: string, familyId: string): {
@@ -121,7 +121,10 @@ export async function probeEndpoint(endpoint: string, timeoutMs = 400): Promise<
     socket.setTimeout(timeoutMs, () => done('unknown'))
     socket.once('connect', () => done('present'))
     socket.once('error', (error: NodeJS.ErrnoException) => {
-      done(error.code === 'ENOENT' || error.code === 'ECONNREFUSED' ? 'absent' : 'absent')
+      // Only a code that names the pipe as gone is proof of absence. Any other
+      // connect error is a probe that could not be evaluated, which is `unknown`
+      // - never evidence that the peer is closed.
+      done(error.code === 'ENOENT' || error.code === 'ECONNREFUSED' ? 'absent' : 'unknown')
     })
   })
 }
@@ -186,7 +189,12 @@ async function readRegistrationPeer(directory: string, sessionId: string): Promi
 
 export type OpenOptions = {
   /** The launcher seam. Tests MUST inject this; the default opens a real tab. */
-  launcher?: (session: { sessionId: string; cwd: string; familyId: string }) => Promise<{ ok: boolean }>
+  launcher?: (session: {
+    sessionId: string
+    cwd: string
+    familyId: string
+    route?: GatewayPeerRoute
+  }) => Promise<{ ok: boolean }>
   configHome?: string
   postOpenTimeoutMs?: number
   pollMs?: number
@@ -288,7 +296,7 @@ export async function requestDurablePeerOpen(
     }
 
     try {
-      await (options.launcher ?? launchDurableSession)({ sessionId, cwd: peer.cwd, familyId })
+      await (options.launcher ?? launchDurableSession)({ sessionId, cwd: peer.cwd, familyId, route: peer.route })
     } catch { /* The post-open checks decide, not the launcher's exit. */ }
 
     return await waitForOpen()
@@ -325,19 +333,47 @@ export async function requestDurablePeerOpen(
 }
 
 /**
+ * The argv for one durable launch, as a pure function.
+ *
+ * It is pure so the pinning can be tested without spawning a terminal, and so
+ * there is exactly one place the shape is written. `-w 0` is the EXISTING
+ * window; `-w new` is never used. `--resume <sessionId>` is always present -
+ * the launched tab IS this session, and that is what makes its registration
+ * authoritative. The route is pinned with `--model`/`--effort` when the peer
+ * advertised them: a resumed session on a default route would spend a different
+ * account than the one the address was resolved against. Absent route fields
+ * add neither flag; no default is invented here.
+ */
+export function durableLaunchArgs(session: {
+  entry: string
+  cwd: string
+  sessionId: string
+  route?: GatewayPeerRoute
+}): string[] {
+  const pinned: string[] = []
+  if (session.route?.model) pinned.push('--model', session.route.model)
+  if (session.route?.effort) pinned.push('--effort', session.route.effort)
+  return ['-w', '0', 'nt', '-d', session.cwd, '--', session.entry, '--resume', session.sessionId, ...pinned]
+}
+
+/**
  * The real launcher: one tab in the EXISTING Windows Terminal window.
  *
- * `-w 0` is the current window; `-w new` is never used, and Start-Process is
- * never used for the `-d` path because it re-quotes and breaks it. The tab
- * inherits the launched session's own cwd, and the leaf-owner variables are
- * removed so the resumed session does not come up as a headless leaf.
+ * The tab inherits the launched session's own cwd, and the leaf-owner
+ * variables are removed so the resumed session does not come up as a headless
+ * leaf. Start-Process is never used for the `-d` path because it re-quotes and
+ * breaks it.
  */
-export async function launchDurableSession(session: { sessionId: string; cwd: string }): Promise<{ ok: boolean }> {
+export async function launchDurableSession(session: {
+  sessionId: string
+  cwd: string
+  route?: GatewayPeerRoute
+}): Promise<{ ok: boolean }> {
   if (process.platform !== 'win32') return { ok: false }
   const entry = process.argv[1]
   if (!entry) return { ok: false }
   return new Promise<{ ok: boolean }>(resolve => {
-    const child = spawn('wt.exe', ['-w', '0', 'nt', '-d', session.cwd, '--', entry, '--resume', session.sessionId], {
+    const child = spawn('wt.exe', durableLaunchArgs({ entry, cwd: session.cwd, sessionId: session.sessionId, route: session.route }), {
       cwd: session.cwd,
       detached: true,
       stdio: 'ignore',

@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { GatewaySessionTransport, listGatewayPeers, probePeerRoute } from '../src/utils/gatewaySessionTransport.ts'
 import {
-  formatOpenOutcome, leafFamilyPaths, requestDurablePeerOpen, resolveDurableIdentity,
+  durableLaunchArgs, formatOpenOutcome, leafFamilyPaths, requestDurablePeerOpen, resolveDurableIdentity,
 } from '../src/utils/gatewaySessionDurability.ts'
 import { formatGatewayPeerLine, GATEWAY_SESSION_PROTOCOL } from '../src/utils/gatewaySessionProtocol.ts'
 import { registerGatewayPeersSkill } from '../src/skills/bundled/gatewayPeers.ts'
@@ -328,6 +328,91 @@ test('mail to a closed durable peer queues to its mailbox, merges into the inbox
 })
 
 // ---------------------------------------------------------------------------
+// 5b. D7: `unknown` is not `closed`; it never parks a live peer's mail
+// ---------------------------------------------------------------------------
+
+test('an injected `unknown` liveness does not divert mail from a live durable peer', async () => {
+  const sessions = join(configHome, 'gateway-sessions')
+  const familyId = randomUUID()
+  await writeFamilyRecord(familyId)
+  const targetId = randomUUID()
+  const target = new GatewaySessionTransport({ directory: sessions, sessionId: targetId, name: 'Durable', cwd: configHome, durable: true, durableFamilyId: familyId })
+  await target.start()
+  const sender = new GatewaySessionTransport({
+    directory: sessions, sessionId: randomUUID(), name: 'Sender', cwd: configHome,
+    // The probe cannot be evaluated. That is NOT evidence the peer is dead, so
+    // the ordinary live-send path must be taken.
+    durableLivenessProbe: async () => 'unknown',
+  })
+  await sender.start()
+  try {
+    const receipt = (await sender.send(targetId, 'live?', 'live?')) as { ok?: boolean; closed?: boolean; state?: string }
+    assert.notEqual(receipt.closed, true, 'unknown must never be reported as closed')
+    assert.equal(receipt.ok, true)
+    assert.equal(await fileExists(join(sessions, `${targetId}.mailbox`)), false, 'a live peer\'s mail is not parked in a mailbox')
+    assert.equal(target.inbox().length, 1, 'the message reached the live peer instead')
+  } finally {
+    await sender.close()
+    await target.close()
+  }
+})
+
+test('an injected `unknown` whose send then finds the pipe absent queues to the mailbox with the closed line', async () => {
+  await withRegistry(async sessions => {
+    const familyId = randomUUID()
+    await writeFamilyRecord(familyId)
+    const targetId = randomUUID()
+    // A live pid but no listener: only the REAL endpoint probe can prove the
+    // pipe is gone, and that is what licenses the fallback queue.
+    await writeRegistration(sessions, { sessionId: targetId, pid: process.pid, durable: true, durableFamilyId: familyId })
+    const sender = new GatewaySessionTransport({
+      directory: sessions, sessionId: randomUUID(), name: 'Sender', cwd: configHome,
+      durableLivenessProbe: async () => 'unknown',
+    })
+    await sender.start()
+    try {
+      const receipt = (await sender.send(targetId, 'park me', 'park me')) as { ok?: boolean; closed?: boolean; state?: string; message?: string }
+      assert.equal(receipt.ok, true)
+      assert.equal(receipt.closed, true, 'a failed connect plus an absent pipe is proof of closed')
+      assert.equal(receipt.state, 'queued')
+      assert.equal(
+        receipt.message,
+        `queued: peer ${targetId} is closed; held in ${targetId}.mailbox, merged at its next open. Request an open with: gateway-peers open ${targetId}`,
+      )
+      const mailbox = JSON.parse(await readFile(join(sessions, `${targetId}.mailbox`), 'utf8')) as { records: Array<{ message: { toSessionId: string }; state: string }> }
+      assert.equal(mailbox.records.length, 1, 'the mail is parked in the recipient mailbox')
+      assert.equal(mailbox.records[0]!.message.toSessionId, targetId)
+      assert.equal(mailbox.records[0]!.state, 'queued')
+    } finally { await sender.close() }
+  })
+})
+
+test('requireOpen does not call an `unknown` durable peer closed', async () => {
+  await withRegistry(async sessions => {
+    const familyId = randomUUID()
+    await writeFamilyRecord(familyId)
+    const targetId = randomUUID()
+    await writeRegistration(sessions, { sessionId: targetId, pid: process.pid, durable: true, durableFamilyId: familyId })
+    const sender = new GatewaySessionTransport({
+      directory: sessions, sessionId: randomUUID(), name: 'Sender', cwd: configHome,
+      durableLivenessProbe: async () => 'unknown',
+    })
+    await sender.start()
+    try {
+      // The call is ATTEMPTED (and fails at the socket), so the error is the
+      // transport's, never the durable "is closed" refusal.
+      await assert.rejects(
+        () => sender.receipt(targetId, randomUUID()),
+        (error: unknown) => {
+          assert.doesNotMatch(String((error as Error)?.message ?? error), /is closed \(durable\)/i)
+          return true
+        },
+      )
+    } finally { await sender.close() }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 6. Explicit open: three truthful outcomes, and delivery never opens
 // ---------------------------------------------------------------------------
 
@@ -593,10 +678,42 @@ test('durability never registers an autostart: there is no RunOnce, scheduled ta
     const source = await readFile(path, 'utf8')
     assert.doesNotMatch(source, forbidden, `${path} must not start sessions automatically`)
   }
-  // The only launch path is the explicit `wt.exe -w 0 nt -d <cwd>` tab.
+  // The only launch path is the explicit `wt.exe -w 0 nt -d <cwd>` tab, whose
+  // argv is built by the pure function tested below.
   const durability = await readFile(sources[0]!, 'utf8')
-  assert.match(durability, /wt\.exe'?, ?\['-w', '0', 'nt', '-d'/, 'the launcher is one tab in the current window')
+  assert.match(durability, /spawn\('wt\.exe', durableLaunchArgs\(/, 'the launcher is one tab in the current window')
   assert.doesNotMatch(durability, /-w',? ?'new'/, 'never opens a new window')
+})
+
+test('durableLaunchArgs pins the model route and always resumes the session', () => {
+  const entry = 'C:\\app\\cli.js'
+  const cwd = 'C:\\work'
+  const sessionId = randomUUID()
+
+  const pinned = durableLaunchArgs({
+    entry, cwd, sessionId,
+    route: { provider: 'testprov', number: 1, baseUrl: 'http://127.0.0.1:1', model: 'claude-opus-4-6', effort: 'high' },
+  })
+  assert.deepEqual(pinned, [
+    '-w', '0', 'nt', '-d', cwd, '--', entry, '--resume', sessionId, '--model', 'claude-opus-4-6', '--effort', 'high',
+  ], 'a route with model and effort pins both')
+
+  const bare = durableLaunchArgs({ entry, cwd, sessionId })
+  assert.deepEqual(bare, ['-w', '0', 'nt', '-d', cwd, '--', entry, '--resume', sessionId], 'no route means no pinned flags')
+  assert.equal(bare.includes('--model'), false, 'no default model is invented')
+  assert.equal(bare.includes('--effort'), false, 'no default effort is invented')
+
+  // A route with neither field still pins neither.
+  const routeNoModel = durableLaunchArgs({ entry, cwd, sessionId, route: { provider: 'p', number: 2, baseUrl: 'http://127.0.0.1:1' } })
+  assert.deepEqual(routeNoModel, bare)
+
+  // `--resume <id>` is always present, whatever the route carries.
+  for (const args of [bare, pinned, durableLaunchArgs({ entry, cwd, sessionId, route: { provider: 'p', number: 2, baseUrl: 'http://127.0.0.1:1', model: 'm' } })]) {
+    const at = args.indexOf('--resume')
+    assert.ok(at >= 0, '--resume is always present')
+    assert.equal(args[at + 1], sessionId, 'it is followed by the session id')
+    assert.deepEqual(args.slice(0, 4), ['-w', '0', 'nt', '-d'], 'one tab in the current window')
+  }
 })
 
 // ---------------------------------------------------------------------------
