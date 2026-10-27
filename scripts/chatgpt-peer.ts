@@ -1,10 +1,16 @@
 /**
  * A ChatGPT web thread as a live session on the Gateway peer bus.
  *
- * The host is the durable half: it owns the registration, the inbox, peer.json
- * and the operator surface, and it speaks the real transport. Chrome is the
- * disposable half, driven as a line-JSON child (`chatgpt.mjs serve`) so that
- * nothing about the page's DOM or Playwright enters this repository.
+ * One host owns one Chrome profile, one page and one operator surface. Each
+ * bridged thread is its OWN bus peer: it has its own bridge-minted session id,
+ * name and `GatewaySessionTransport`. That is why the transport needs no new
+ * envelope field - a thread is just another registration - and why starting or
+ * removing one bridge never disturbs another.
+ *
+ * Chrome is the disposable half, driven as a line-JSON child (`chatgpt.mjs
+ * serve`) so that nothing about the page's DOM or Playwright enters this
+ * repository. All page work stays on the host's single page lock: per-thread
+ * addresses do not imply concurrent tabs.
  *
  * Run it with bun: `bun run scripts/chatgpt-peer.ts`.
  */
@@ -21,7 +27,10 @@ import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { attachmentRefusal, MAX_ATTACHMENT_BYTES, parseCommand, proseFromTurn, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
-import { audit, loadState, newState, saveState, type PeerState } from './chatgpt-peer/state.ts'
+import {
+  audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
+  saveJson, type BridgeState, type HostState,
+} from './chatgpt-peer/state.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -64,6 +73,19 @@ type Config = {
   maxAttachmentBytes?: number
   /** File operations. Overridden in tests so a refusal can be proved before a read. */
   files?: { stat: typeof stat; readFile: typeof readFile }
+}
+
+/** One bridged thread: its durable memory and its live transport. */
+type Bridge = {
+  state: BridgeState
+  path: string
+  transport: GatewaySessionTransport | undefined
+  /** Handling is once per process for this bridge (see the old drain note). */
+  handled: Set<string>
+  schedules: Map<string, NodeJS.Timeout>
+  draining: boolean
+  stopping: boolean
+  removed: boolean
 }
 
 function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
@@ -127,28 +149,28 @@ function one(value: unknown, cap = 200): string {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, cap)
 }
 
+/** A thread title as a single address token, or '' when it has no usable words. */
+function slug(value: string | null | undefined, cap = 40): string {
+  const text = String(value ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return text.slice(0, cap).replace(/-+$/g, '')
+}
+
 export class ChatGptHost {
   private readonly config: Config
   private readonly files: { stat: typeof stat; readFile: typeof readFile }
   private readonly maxAttachmentBytes: number
-  private state!: PeerState
+  private hostState!: HostState
   private readonly driver: DriverChild
-  private transport!: GatewaySessionTransport
+  private readonly bridges = new Map<string, Bridge>()
   private server: ReturnType<typeof createServer> | undefined
   private operatorToken = randomBytes(32).toString('hex')
   private health: { state: HealthState; reason?: string; at: string } = { state: 'unknown', reason: 'page_not_started', at: new Date().toISOString() }
-  private readonly schedules = new Map<string, NodeJS.Timeout>()
   private idleTimer: NodeJS.Timeout | undefined
   /** When page work was last submitted; idle unload refuses to run past it. */
   private lastWorkAt = 0
   private readonly pageLock = this.makeLock()
   private readonly primer: { text: string; sha: string }
-  private draining = false
   private stopping = false
-  // A record that fails before acknowledge() stays `queued` in the transport,
-  // so drain would pick it up again forever. Handling is once per process:
-  // a restart may retry it, a loop may not.
-  private readonly handled = new Set<string>()
 
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
@@ -159,7 +181,12 @@ export class ChatGptHost {
   }
 
   /** The loopback port the host bound. Valid after start(). */
-  get port(): number { return this.state?.healthPort ?? 0 }
+  get port(): number { return this.hostState?.healthPort ?? 0 }
+
+  /** Where the per-bridge files live: one durable file per bus peer. */
+  private get bridgeDirectory(): string { return join(this.config.home, 'bridges') }
+
+  private bridgePath(sessionId: string): string { return join(this.bridgeDirectory, `${sessionId}.json`) }
 
   private makeLock(): { run<T>(fn: () => Promise<T>): Promise<T> } {
     let chain: Promise<unknown> = Promise.resolve()
@@ -174,72 +201,196 @@ export class ChatGptHost {
 
   async start(): Promise<void> {
     await mkdir(this.config.home, { recursive: true })
-    this.state = await loadState(this.config.statePath, () => newState({
+    const loaded = await loadHostState(this.config.statePath, () => newHostState({
       profile: this.config.profile,
       healthPort: this.config.healthPort,
       idleUnloadMinutes: this.config.idleUnloadMinutes,
       instanceId: this.config.instanceId,
     }))
-    // One peer.json is one instance. Launching it under a different slug would
+    this.hostState = loaded.state
+    // One host file is one instance. Launching it under a different slug would
     // put two hosts behind one session id, so it is refused rather than
     // rewritten; the fix is a different --state file, not a silent rename.
-    if (this.state.instanceId !== this.config.instanceId) {
-      throw new Error(`peer.json belongs to instance "${this.state.instanceId}" but --instance is "${this.config.instanceId}"; use a different --state file`)
+    if (this.hostState.instanceId !== this.config.instanceId) {
+      throw new Error(`peer.json belongs to instance "${this.hostState.instanceId}" but --instance is "${this.config.instanceId}"; use a different --state file`)
     }
-    // The thread lives in the Chrome profile. Starting under a different one
-    // would advertise a thread the page cannot open, so it is a refusal, not a
-    // silent switch.
-    if (!samePath(this.state.profile, this.config.profile)) {
-      throw new Error(`peer.json was created with profile "${this.state.profile}" but --profile is "${this.config.profile}"; use the same profile or a different --state file`)
+    // The threads live in the Chrome profile. Starting under a different one
+    // would advertise threads the page cannot open, so it is a refusal.
+    if (!samePath(this.hostState.profile, this.config.profile)) {
+      throw new Error(`peer.json was created with profile "${this.hostState.profile}" but --profile is "${this.config.profile}"; use the same profile or a different --state file`)
     }
 
-    const loaded = await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8').catch(() => '')
-    this.primer.text = loaded
-    this.primer.sha = createHash('sha256').update(loaded, 'utf8').digest('hex')
+    const loadedPrimer = await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8').catch(() => '')
+    this.primer.text = loadedPrimer
+    this.primer.sha = createHash('sha256').update(loadedPrimer, 'utf8').digest('hex')
+
+    // Migration happens BEFORE the host file is rewritten: the legacy thread
+    // and address must exist on disk as a bridge first, or a crash between the
+    // two writes would forget the thread. Writing an existing bridge file is
+    // skipped - it is newer truth than the legacy snapshot.
+    if (loaded.legacy) {
+      const migrated = bridgeFromLegacy(loaded.legacy, NAME)
+      const path = this.bridgePath(migrated.sessionId)
+      const exists = await stat(path).then(() => true).catch(() => false)
+      if (!exists) {
+        await mkdir(this.bridgeDirectory, { recursive: true })
+        await saveJson(path, migrated)
+        log(`migrated peer.json into bridge ${shortId(migrated.sessionId)} (${migrated.name})`)
+      }
+    }
 
     await this.listen()
-    await this.connectTransport()
+    await this.loadBridges()
+    // A host that has never run before is today's single bridge: one peer with
+    // a minted address and the name `chatgpt-web`. A host whose bridges were
+    // all removed on purpose is NOT repopulated.
+    if (loaded.fresh && this.bridges.size === 0) {
+      const state = newBridgeState({ sessionId: randomUUID(), name: this.uniqueName(NAME, null, NAME) })
+      await saveJson(this.bridgePath(state.sessionId), state)
+      this.registerBridge(state)
+    }
+
+    for (const bridge of this.bridges.values()) await this.startBridgeTransport(bridge)
     await this.writeInstanceFile()
-    await this.advertise()
-    this.rearmSchedules()
+    for (const bridge of this.bridges.values()) {
+      await this.advertise(bridge)
+      this.rearmSchedules(bridge)
+    }
     // A Chrome left running from an earlier host is still disposable.
     this.scheduleIdleUnload()
-    log(`registered as ${NAME} (${this.state.sessionId}) on 127.0.0.1:${this.state.healthPort}`)
-    void this.drain()
-    // A message accepted into the thread and then killed mid-turn is still
-    // owed an answer. The transport knows which ones; run them once, now.
-    void this.recoverOwed()
+    if (this.bridges.size === 0) log('registered no bridges (none adopted; use the operator page)')
+    for (const bridge of this.bridges.values()) {
+      log(`bridge "${bridge.state.name}" (${shortId(bridge.state.sessionId)}) on 127.0.0.1:${this.hostState.healthPort} thread ${bridge.state.threadId ? shortId(bridge.state.threadId) : '(none)'}`)
+      void this.drain(bridge)
+      // A message accepted into a thread and then killed mid-turn is still owed
+      // an answer. Each bridge knows which of its own messages those are.
+      void this.recoverOwed(bridge)
+    }
   }
 
-  // --------------------------------------------------------------- transport
+  // ------------------------------------------------------------------ bridges
 
-  private route(): { provider: string; number: number; baseUrl: string; model?: string; effort?: string } {
+  private registerBridge(state: BridgeState): Bridge {
+    const existing = this.bridges.get(state.sessionId)
+    if (existing) return existing
+    const bridge: Bridge = {
+      state,
+      path: this.bridgePath(state.sessionId),
+      transport: undefined,
+      handled: new Set(),
+      schedules: new Map(),
+      draining: false,
+      stopping: false,
+      removed: false,
+    }
+    this.bridges.set(state.sessionId, bridge)
+    return bridge
+  }
+
+  private async loadBridges(): Promise<void> {
+    await mkdir(this.bridgeDirectory, { recursive: true })
+    for (const { state } of await listBridgeStates(this.bridgeDirectory)) this.registerBridge(state)
+  }
+
+  private async startBridgeTransport(bridge: Bridge): Promise<void> {
+    const transport = new GatewaySessionTransport({
+      directory: this.config.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions'),
+      sessionId: bridge.state.sessionId,
+      name: bridge.state.name,
+      cwd: process.cwd(),
+      purpose: this.purposeFor(bridge),
+      route: this.route(bridge),
+      policy: 'accept',
+      onInboxChanged: () => { void this.drain(bridge) },
+    })
+    bridge.transport = transport
+    try { await transport.start() }
+    catch (error) { bridge.transport = undefined; throw error }
+  }
+
+  private purposeFor(bridge: Bridge): string {
+    const title = bridge.state.title ? ` Bridged thread: "${one(bridge.state.title, 160)}".` : ''
+    return `${PURPOSE}${title}`.slice(0, 1000)
+  }
+
+  private route(bridge: Bridge): { provider: string; number: number; baseUrl: string; model?: string; effort?: string } {
     return {
       provider: PROVIDER,
       number: this.config.number,
-      baseUrl: `http://127.0.0.1:${this.state.healthPort}`,
-      ...(this.state.model ? { model: this.state.model } : {}),
-      ...(this.state.effort ? { effort: this.state.effort } : {}),
+      baseUrl: `http://127.0.0.1:${this.hostState.healthPort}`,
+      ...(bridge.state.model ? { model: bridge.state.model } : {}),
+      ...(bridge.state.effort ? { effort: bridge.state.effort } : {}),
     }
   }
 
-  private async connectTransport(): Promise<void> {
-    this.transport = new GatewaySessionTransport({
-      directory: this.config.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions'),
-      sessionId: this.state.sessionId,
-      name: NAME,
-      cwd: process.cwd(),
-      purpose: PURPOSE,
-      route: this.route(),
-      onInboxChanged: () => { void this.drain() },
-    })
-    await this.transport.start()
+  /** Re-publish the route after the page's model or effort changed. */
+  private async advertise(bridge: Bridge): Promise<void> {
+    if (!bridge.transport || bridge.removed) return
+    try { await bridge.transport.update({ route: this.route(bridge), purpose: this.purposeFor(bridge) }) }
+    catch (error) { log(`could not re-advertise "${bridge.state.name}": ${(error as Error).message}`) }
   }
 
-  /** Re-publish the route after the page's model or effort changed. */
-  private async advertise(): Promise<void> {
-    try { await this.transport.update({ route: this.route(), purpose: PURPOSE }) }
-    catch (error) { log(`could not re-advertise route: ${(error as Error).message}`) }
+  /** Resolve a bridge by session id or name; no selector means the first one. */
+  private bridgeFor(value: unknown): Bridge | undefined {
+    const key = typeof value === 'string' ? value.trim() : ''
+    if (!key) return this.bridges.values().next().value as Bridge | undefined
+    return this.bridges.get(key) ?? [...this.bridges.values()].find(bridge => bridge.state.name === key)
+  }
+
+  private nameTaken(name: string): boolean {
+    for (const bridge of this.bridges.values()) if (bridge.state.name.toLowerCase() === name.toLowerCase()) return true
+    return false
+  }
+
+  /** An operator name is used as-is or refused; a derived one is made unique. */
+  private uniqueName(requested: string | undefined, title: string | null | undefined, fallback: string): string {
+    const explicit = String(requested ?? '').trim()
+    if (explicit) {
+      if (!BRIDGE_NAME_PATTERN.test(explicit)) throw new Error('bridge name must be a single token (letters, digits, dot, underscore, hyphen; 1-64 characters)')
+      if (this.nameTaken(explicit)) throw new Error(`a bridge named "${explicit}" already exists`)
+      return explicit
+    }
+    const base = slug(title) || fallback
+    let candidate = base
+    for (let suffix = 2; this.nameTaken(candidate); suffix++) candidate = `${base}-${suffix}`.slice(0, 64)
+    return candidate
+  }
+
+  /** The line an operator pastes into another session to address this peer. */
+  private sendLine(sessionId: string): string {
+    return `gateway-peers send JSON ${JSON.stringify({ toSessionId: sessionId, text: '...', summary: '...' })}`
+  }
+
+  private async createBridge(state: BridgeState): Promise<Bridge> {
+    await mkdir(this.bridgeDirectory, { recursive: true })
+    await saveJson(this.bridgePath(state.sessionId), state)
+    return this.registerBridge(state)
+  }
+
+  private async activateBridge(bridge: Bridge): Promise<void> {
+    await this.startBridgeTransport(bridge)
+    await this.advertise(bridge)
+    this.rearmSchedules(bridge)
+  }
+
+  /** Roll back a bridge that never became usable. The thread is untouched. */
+  private async discardBridge(bridge: Bridge): Promise<void> {
+    bridge.stopping = true
+    bridge.removed = true
+    this.bridges.delete(bridge.state.sessionId)
+    for (const handle of bridge.schedules.values()) clearTimeout(handle)
+    bridge.schedules.clear()
+    await bridge.transport?.close().catch(error => log(`bridge close failed: ${(error as Error).message}`))
+    await rm(bridge.path, { force: true }).catch(() => {})
+  }
+
+  private async removeBridge(bridge: Bridge): Promise<string> {
+    const name = bridge.state.name
+    await this.discardBridge(bridge)
+    audit(this.hostState, { op: 'remove', target: bridge.state.sessionId, result: `removed bridge "${name}"; its ChatGPT thread was not deleted` })
+    await this.persistHostState()
+    await this.writeInstanceFile()
+    return `removed bridge "${name}" (${shortId(bridge.state.sessionId)}); its ChatGPT thread was not deleted`
   }
 
   // ----------------------------------------------------------------- tunnels
@@ -254,30 +405,35 @@ export class ChatGptHost {
       server.once('listening', onListening)
       server.listen(port, '127.0.0.1')
     })
-    try { await bind(this.state.healthPort || 0) }
+    try { await bind(this.hostState.healthPort || 0) }
     catch (error) {
       // A stored port can be taken by another process after a crash. The route
       // is re-advertised on start, so moving is safe; failing to start is not.
       if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error
-      log(`port ${this.state.healthPort} is in use; taking an ephemeral one`)
+      log(`port ${this.hostState.healthPort} is in use; taking an ephemeral one`)
       await bind(0)
     }
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('health server has no port')
-    this.state.healthPort = address.port
-    await saveState(this.config.statePath, this.state)
+    this.hostState.healthPort = address.port
+    await this.persistHostState()
   }
 
   private async writeInstanceFile(): Promise<void> {
     const directory = join(this.config.privateHome ?? PRIVATE_HOME, 'instances')
     await mkdir(directory, { recursive: true })
     await this.restrictToOwner(directory, 'directory')
-    const path = join(directory, `${this.state.instanceId}.json`)
+    const path = join(directory, `${this.hostState.instanceId}.json`)
+    const first = this.bridges.values().next().value as Bridge | undefined
     const body = JSON.stringify({
-      port: this.state.healthPort,
+      port: this.hostState.healthPort,
       token: this.operatorToken,
-      sessionId: this.state.sessionId,
-      instanceId: this.state.instanceId,
+      hostId: this.hostState.hostId,
+      instanceId: this.hostState.instanceId,
+      // Kept for callers that predate host identity: the first bridge's
+      // address. `sessionIds` is the authoritative full list.
+      sessionId: first?.state.sessionId ?? null,
+      sessionIds: [...this.bridges.keys()],
       startedAt: now(),
     })
     const temporary = `${path}.${randomUUID()}.tmp`
@@ -300,7 +456,7 @@ export class ChatGptHost {
   }
 
   private async removeInstanceFile(): Promise<void> {
-    await rm(join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.state.instanceId}.json`), { force: true }).catch(() => {})
+    await rm(join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.hostState.instanceId}.json`), { force: true }).catch(() => {})
   }
 
   // --------------------------------------------------------------------- http
@@ -308,11 +464,12 @@ export class ChatGptHost {
   private async handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     // DNS rebinding: the only Host a request may carry is the loopback name we
     // were reached on. Anything else is a browser being aimed at us.
-    const expected = `127.0.0.1:${this.state.healthPort}`
+    const expected = `127.0.0.1:${this.hostState.healthPort}`
     if (request.headers.host !== expected) { this.send(response, 421, { error: 'unexpected host' }); return }
 
     const url = new URL(request.url ?? '/', `http://${expected}`)
     if (request.method === 'GET' && url.pathname === '/gateway/route-health') return this.routeHealth(url, response)
+    if (request.method === 'GET' && (url.pathname === '/operator' || url.pathname === '/operator/')) return this.sendHtml(response, 200, this.operatorPageHtml())
     if (request.method === 'GET' && url.pathname === '/operator/state') {
       if (!this.authorized(request)) return this.send(response, 401, { error: 'unauthorized' })
       return this.send(response, 200, this.operatorState())
@@ -330,6 +487,11 @@ export class ChatGptHost {
     response.end(text)
   }
 
+  private sendHtml(response: ServerResponse, status: number, html: string): void {
+    response.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html), 'cache-control': 'no-store' })
+    response.end(html)
+  }
+
   private authorized(request: IncomingMessage): boolean {
     const header = request.headers.authorization
     if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false
@@ -341,8 +503,9 @@ export class ChatGptHost {
   /**
    * Answer in whichever shape the caller asks.
    *
-   * A fleet question names the pool; a single question names one credential.
-   * This host has exactly one credential - the page - so both describe it.
+   * The page is one credential shared by every bridge, so route health is a
+   * host-level answer. It reads memory only and never wakes the browser: the
+   * route gate asks about a peer whose page may be unloaded.
    */
   private routeHealth(url: URL, response: ServerResponse): void {
     if ((url.searchParams.get('provider') ?? '') !== PROVIDER) { this.send(response, 404, { error: 'unknown provider' }); return }
@@ -370,27 +533,54 @@ export class ChatGptHost {
     })
   }
 
+  private inboxView(bridge: Bridge): unknown[] {
+    return (bridge.transport?.inbox() ?? []).map(record => ({
+      id: record.message.id,
+      from: record.message.fromSessionId,
+      summary: record.message.summary,
+      kind: record.message.kind ?? 'inquiry',
+      expectReply: record.message.expectReply !== false,
+      state: record.state,
+      receivedAt: record.receivedAt,
+    }))
+  }
+
+  private bridgeView(bridge: Bridge): unknown {
+    return {
+      sessionId: bridge.state.sessionId,
+      name: bridge.state.name,
+      title: bridge.state.title ?? null,
+      threadId: bridge.state.threadId,
+      primedThreadId: bridge.state.primedThreadId,
+      model: bridge.state.model,
+      effort: bridge.state.effort,
+      createdAt: bridge.state.createdAt,
+      route: this.route(bridge),
+      status: bridge.transport?.peer.status ?? 'idle',
+      inbox: this.inboxView(bridge),
+      owed: bridge.state.owed,
+      schedules: bridge.state.schedules,
+    }
+  }
+
   private operatorState(): unknown {
+    const bridgeList = [...this.bridges.values()]
+    const first = bridgeList[0]
     return {
       name: NAME,
-      sessionId: this.state.sessionId,
-      instanceId: this.state.instanceId,
+      hostId: this.hostState.hostId,
+      instanceId: this.hostState.instanceId,
       health: this.health,
-      route: this.route(),
-      threadId: this.state.threadId,
-      status: this.transport.peer.status,
-      inbox: this.transport.inbox().map(record => ({
-        id: record.message.id,
-        from: record.message.fromSessionId,
-        summary: record.message.summary,
-        kind: record.message.kind ?? 'inquiry',
-        expectReply: record.message.expectReply !== false,
-        state: record.state,
-        receivedAt: record.receivedAt,
-      })),
-      owed: this.state.owed,
-      schedules: this.state.schedules,
-      audit: this.state.audit.slice(-20),
+      bridges: bridgeList.map(bridge => this.bridgeView(bridge)),
+      // Single-bridge compatibility mirror: the first bridge, when there is one.
+      sessionId: first?.state.sessionId ?? null,
+      threadId: first?.state.threadId ?? null,
+      route: first ? this.route(first) : null,
+      status: first?.transport?.peer.status ?? 'idle',
+      inbox: first ? this.inboxView(first) : [],
+      owed: first?.state.owed ?? [],
+      schedules: first?.state.schedules ?? [],
+      audit: this.hostState.audit.slice(-20),
     }
   }
 
@@ -403,19 +593,48 @@ export class ChatGptHost {
     const body = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>
     const op = String(body.op ?? '')
     try {
+      // --- bridge lifecycle (host-level) -------------------------------------
+      if (op === 'threads') {
+        const threads = await this.pageWork(() => this.listThreads())
+        return this.send(response, 200, { ok: true, op, threads })
+      }
+      if (op === 'adopt') {
+        const result = await this.adoptThread(body)
+        return this.send(response, 200, { ok: true, op, ...result })
+      }
+      if (op === 'newBridge') {
+        const result = await this.createNewBridge(body)
+        return this.send(response, 200, { ok: true, op, ...result })
+      }
+      if (op === 'remove') {
+        const bridge = this.bridgeFor(body.sessionId ?? body.name ?? body.bridge)
+        if (!bridge) return this.send(response, 400, { ok: false, error: 'no such bridge' })
+        const line = await this.removeBridge(bridge)
+        return this.send(response, 200, { ok: true, op, line })
+      }
+
+      // --- everything below acts through one bridge --------------------------
+      const bridge = this.bridgeFor(body.bridge)
+      if (!bridge) {
+        return this.send(response, 400, {
+          ok: false,
+          error: this.bridges.size === 0 ? 'no bridges are configured; adopt a thread or create one first' : 'unknown bridge',
+        })
+      }
       if (op === 'prompt') {
         const text = one(body.text, 64 * 1024)
         if (!text) return this.send(response, 400, { ok: false, error: 'prompt requires text' })
         const answer = await this.pageWork(async () => {
-          await this.ensurePrimerAndThread()
-          return this.pageTurn(String(body.text))
+          await this.ensurePrimerAndThread(bridge)
+          return this.pageTurn(bridge, String(body.text))
         })
         return this.send(response, 200, { ok: true, op, line: 'page answered', text: answer })
       }
       if (op === 'thread') {
-        const line = await this.pageWork(() => this.operatorThread(body))
-        audit(this.state, { op: 'thread', target: String(body.threadId ?? body.action ?? ''), result: line })
-        await this.persist()
+        const line = await this.pageWork(() => this.operatorThread(bridge, body))
+        audit(this.hostState, { op: 'thread', target: String(body.threadId ?? body.action ?? ''), result: line })
+        await this.persistBridgeState(bridge)
+        await this.persistHostState()
         return this.send(response, 200, { ok: true, op, line })
       }
       // The two grants. Both are pushes the operator issues from the page.
@@ -425,8 +644,8 @@ export class ChatGptHost {
         const resolved = await resolveGatewayPeer(peer)
         if ('error' in resolved) return this.send(response, 400, { ok: false, error: resolved.error })
         const granted = await this.pageWork(async () => {
-          await this.ensurePrimerAndThread()
-          return this.grantTranscript(resolved.sessionId, 'operator')
+          await this.ensurePrimerAndThread(bridge)
+          return this.grantTranscript(bridge, resolved.sessionId, 'operator')
         })
         if (!granted.ok) return this.send(response, 502, { ok: false, op, error: granted.error })
         return this.send(response, 200, { ok: true, op, line: `attached the transcript of ${resolved.label}` })
@@ -436,62 +655,137 @@ export class ChatGptHost {
         if (!file) return this.send(response, 400, { ok: false, error: 'attachFile requires path' })
         const info = await this.files.stat(file).catch(() => undefined)
         if (!info || !info.isFile()) return this.send(response, 400, { ok: false, error: 'not a regular file' })
-        const name = basename(file)
+        const fileBasename = basename(file)
         const mimeType = MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'
         // Refuse on the stat size, before the file is opened. A 2 GB file must
         // not be pulled into memory just to discover it is too large.
         const refusal = attachmentRefusal(info.size, this.maxAttachmentBytes)
         if (refusal) {
           await this.pageWork(async () => {
-            await this.ensurePrimerAndThread()
-            await this.refuseAttachment(name, refusal)
+            await this.ensurePrimerAndThread(bridge)
+            await this.refuseAttachment(bridge, fileBasename, refusal)
           })
           return this.send(response, 413, { ok: false, op, error: refusal })
         }
         const buffer = await this.files.readFile(file)
         await this.pageWork(async () => {
-          await this.ensurePrimerAndThread()
-          await this.uploadDocument(name, mimeType, buffer, 'operator')
+          await this.ensurePrimerAndThread(bridge)
+          await this.uploadDocument(bridge, fileBasename, mimeType, buffer, 'operator')
         })
-        return this.send(response, 200, { ok: true, op, line: `attached ${name} (${buffer.length} bytes)` })
+        return this.send(response, 200, { ok: true, op, line: `attached ${fileBasename} (${buffer.length} bytes)` })
       }
       const command = parseCommand(body)
       if (!command.ok) return this.send(response, 400, { ok: false, error: command.error })
-      const result = await this.executeCommand(command.command, 'operator')
+      const result = await this.executeCommand(bridge, command.command, 'operator')
       return this.send(response, 200, { ok: true, op, line: result.line })
     } catch (error) {
       return this.send(response, 500, { ok: false, error: (error as Error).message })
     }
   }
 
-  private async operatorThread(body: Record<string, unknown>): Promise<string> {
+  // ------------------------------------------------------- operator lifecycle
+
+  private async listThreads(): Promise<{ id: string; title: string }[]> {
+    const reply = await this.driver.call({ op: 'threads' }, TURN_TIMEOUT_MS)
+    if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not list threads'))
+    const threads = Array.isArray(reply.threads) ? reply.threads : []
+    return threads
+      .filter((thread): thread is { id: string } => typeof (thread as { id?: unknown })?.id === 'string')
+      .map(thread => ({ id: thread.id, title: one((thread as { title?: unknown }).title, 200) }))
+  }
+
+  /** Bind an existing thread: mint a peer, adopt the tab, post the primer. */
+  private async adoptThread(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; title: string; line: string }> {
+    const wanted = String(body.threadId ?? '')
+    if (!UUID.test(wanted)) throw new Error('adopt requires a threadId (uuid)')
+    let bridge: Bridge | undefined
+    let chosen: { id: string; title: string } | undefined
+    try {
+      // Listing threads is page work, and the whole adopt is one page job: the
+      // list, the tab selection and the primer must not interleave with a turn
+      // on another bridge.
+      await this.pageWork(async () => {
+        const threads = await this.listThreads()
+        const found = threads.find(candidate => candidate.id.toLowerCase() === wanted.toLowerCase())
+        if (!found) throw new Error(`no thread ${wanted} on the account`)
+        chosen = found
+        const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, found.title, `chatgpt-${randomUUID().slice(0, 8)}`)
+        const created = await this.createBridge(newBridgeState({
+          sessionId: randomUUID(),
+          name,
+          threadId: found.id,
+          ...(found.title ? { title: found.title } : {}),
+        }))
+        bridge = created
+        const reply = await this.driver.call({ op: 'use', threadId: found.id }, TURN_TIMEOUT_MS)
+        if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not open the thread'))
+        const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
+        if (landed.toLowerCase() !== found.id.toLowerCase()) throw new Error(`the page opened ${landed || 'another thread'} instead of ${found.id}`)
+        await this.ensurePrimerAndThread(created)
+      })
+      await this.activateBridge(bridge!)
+    } catch (error) {
+      if (bridge) await this.discardBridge(bridge)
+      throw error
+    }
+    const adopted = bridge!
+    const thread = chosen!
+    audit(this.hostState, { op: 'adopt', target: thread.id, result: `bridge "${adopted.state.name}" (${shortId(adopted.state.sessionId)})` })
+    await this.persistHostState()
+    await this.writeInstanceFile()
+    return {
+      sessionId: adopted.state.sessionId,
+      name: adopted.state.name,
+      threadId: thread.id,
+      title: thread.title,
+      line: this.sendLine(adopted.state.sessionId),
+    }
+  }
+
+  /** Mint a peer and a brand-new ChatGPT thread for it. */
+  private async createNewBridge(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; line: string }> {
+    const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, null, `chatgpt-${randomUUID().slice(0, 8)}`)
+    const bridge = await this.createBridge(newBridgeState({ sessionId: randomUUID(), name }))
+    try {
+      await this.pageWork(() => this.ensurePrimerAndThread(bridge))
+      await this.activateBridge(bridge)
+    } catch (error) {
+      await this.discardBridge(bridge)
+      throw error
+    }
+    const threadId = bridge.state.threadId ?? ''
+    audit(this.hostState, { op: 'newBridge', target: threadId, result: `bridge "${name}" (${shortId(bridge.state.sessionId)})` })
+    await this.persistHostState()
+    await this.writeInstanceFile()
+    return { sessionId: bridge.state.sessionId, name, threadId, line: this.sendLine(bridge.state.sessionId) }
+  }
+
+  private async operatorThread(bridge: Bridge, body: Record<string, unknown>): Promise<string> {
     const action = String(body.action ?? '')
     if (action === 'new') {
-      this.state.threadId = null
-      this.state.primedThreadId = null
-      await this.persist()
+      bridge.state.threadId = null
+      bridge.state.primedThreadId = null
+      await this.persistBridgeState(bridge)
       return 'next turn starts a new thread and re-posts the primer'
     }
     if (action === 'use') {
       const threadId = String(body.threadId ?? '')
-      if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('use requires a thread id')
+      if (!UUID.test(threadId)) throw new Error('use requires a thread id')
       const reply = await this.driver.call({ op: 'use', threadId }, TURN_TIMEOUT_MS)
       if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not open thread'))
       const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
       if (landed.toLowerCase() !== threadId.toLowerCase()) throw new Error(`the page opened ${landed || 'another thread'} instead of ${threadId}`)
-      this.state.threadId = threadId
+      bridge.state.threadId = threadId
       // This thread's history was not primed by this host, so the sha recorded
       // for the previous thread says nothing about it. Clearing the mark makes
       // the next turn post the primer into it before honouring a command.
-      this.state.primedThreadId = null
-      await this.persist()
+      bridge.state.primedThreadId = null
+      await this.persistBridgeState(bridge)
       return `using thread ${threadId}; the primer is re-posted on the next turn`
     }
     if (action === 'list') {
-      const reply = await this.driver.call({ op: 'threads' }, TURN_TIMEOUT_MS)
-      if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not list threads'))
-      const threads = Array.isArray(reply.threads) ? reply.threads : []
-      return threads.length === 0 ? 'no threads on the account' : threads.map((thread: any) => `${thread.id} "${one(thread.title, 80)}"`).join('; ').slice(0, 900)
+      const threads = await this.listThreads()
+      return threads.length === 0 ? 'no threads on the account' : threads.map(thread => `${thread.id} "${one(thread.title, 80)}"`).join('; ').slice(0, 900)
     }
     throw new Error(`unknown thread action ${action || '(missing)'}`)
   }
@@ -515,63 +809,64 @@ export class ChatGptHost {
   /**
    * Post the primer into a fresh thread, or re-post it when it changed.
    *
-   * The primer is versioned by its sha256. A changed primer starts a new thread
-   * rather than editing an old one: a thread whose model was primed by an older
-   * command table must not be trusted with the current one.
+   * The primer is versioned by its sha256. A thread THIS HOST primed with an
+   * older command table is abandoned for a new thread rather than layering the
+   * new table over answers given under the old one. A thread this host did not
+   * prime (adopted, or selected with `use`) is kept and primed in place: it has
+   * no primer of ours to be stale.
    */
-  private async ensurePrimerAndThread(): Promise<void> {
-    // The sha is only evidence for the thread it was recorded against; a
-    // selected thread carries its own history and must be primed itself.
-    if (this.state.threadId && this.state.primedThreadId === this.state.threadId && this.state.primerSha256 === this.primer.sha) return
-    // A changed primer is a different instruction set: start a fresh thread
-    // rather than layering the new table over answers given under the old one.
-    if (this.state.primerSha256 !== this.primer.sha) this.state.threadId = null
+  private async ensurePrimerAndThread(bridge: Bridge): Promise<void> {
+    const state = bridge.state
+    // The sha is only evidence for the thread it was recorded against.
+    if (state.threadId && state.primedThreadId === state.threadId && state.primerSha256 === this.primer.sha) return
+    const primedByUs = state.primedThreadId !== null && state.primedThreadId === state.threadId
+    if (primedByUs && state.primerSha256 !== this.primer.sha) state.threadId = null
     if (!this.primer.text.trim()) throw new Error('primer.md is empty or missing')
     const prompt = `${this.primer.text}\n\n---\n\nReply in one short sentence confirming you understand, and do not emit any command block.`
-    const selected = this.state.threadId
+    const selected = state.threadId
     const reply = await this.driver.call({ op: 'send', text: prompt, ...(selected ? { threadId: selected } : { newChat: true }) }, TURN_TIMEOUT_MS)
     if (reply.ok !== true) throw new Error(`could not post the primer: ${one(reply.error, 200)}`)
     const threadId = String(reply.threadId ?? '')
-    if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('the page did not return a thread id for the primer')
-    this.state.threadId = threadId
-    this.state.primedThreadId = threadId
-    this.state.primerSha256 = this.primer.sha
-    this.absorbPage(reply)
+    if (!UUID.test(threadId)) throw new Error('the page did not return a thread id for the primer')
+    state.threadId = threadId
+    state.primedThreadId = threadId
+    state.primerSha256 = this.primer.sha
+    this.absorbPage(bridge, reply)
     // The thread id is the address every later turn is posted to; if it cannot
     // be written down, stop here rather than answer into a thread the next
     // process will not know about.
-    await this.persist(true)
-    await this.advertise()
-    log(`primed thread ${threadId} (sha ${this.primer.sha.slice(0, 12)})`)
+    await this.persistBridgeState(bridge, true)
+    await this.advertise(bridge)
+    log(`primed thread ${shortId(threadId)} for "${state.name}" (sha ${this.primer.sha.slice(0, 12)})`)
   }
 
-  private absorbPage(reply: DriverReply): void {
-    if (typeof reply.model === 'string' && reply.model) this.state.model = reply.model
-    if (typeof reply.effort === 'string' && reply.effort) this.state.effort = reply.effort
+  private absorbPage(bridge: Bridge, reply: DriverReply): void {
+    if (typeof reply.model === 'string' && reply.model) bridge.state.model = reply.model
+    if (typeof reply.effort === 'string' && reply.effort) bridge.state.effort = reply.effort
   }
 
-  /** One page turn: post the prompt into the current thread and return its text. */
-  private async pageTurn(text: string): Promise<string> {
+  /** One page turn for one bridge: post the prompt and return the answer text. */
+  private async pageTurn(bridge: Bridge, text: string): Promise<string> {
     const reply = await this.driver.call({
       op: 'send',
       text,
-      ...(this.state.threadId ? { threadId: this.state.threadId } : { newChat: true }),
+      ...(bridge.state.threadId ? { threadId: bridge.state.threadId } : { newChat: true }),
     }, TURN_TIMEOUT_MS)
     if (reply.ok !== true) {
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== this.state.threadId) {
+    if (threadId && threadId !== bridge.state.threadId) {
       // The page landed in a different thread from the primed one, so that
       // thread has never seen the primer.
-      this.state.threadId = threadId
-      this.state.primedThreadId = null
-      await this.persist()
+      bridge.state.threadId = threadId
+      bridge.state.primedThreadId = null
+      await this.persistBridgeState(bridge)
     }
-    const before = { model: this.state.model, effort: this.state.effort }
-    this.absorbPage(reply)
-    if (before.model !== this.state.model || before.effort !== this.state.effort) await this.advertise()
+    const before = { model: bridge.state.model, effort: bridge.state.effort }
+    this.absorbPage(bridge, reply)
+    if (before.model !== bridge.state.model || before.effort !== bridge.state.effort) await this.advertise(bridge)
     this.health = { state: 'serving', at: now() }
     return typeof reply.text === 'string' ? reply.text : ''
   }
@@ -586,25 +881,28 @@ export class ChatGptHost {
 
   // --------------------------------------------------------------------- turn
 
-  private async drain(): Promise<void> {
-    if (this.draining || this.stopping) return
-    this.draining = true
+  private async drain(bridge: Bridge): Promise<void> {
+    if (bridge.draining || bridge.stopping || bridge.removed) return
+    bridge.draining = true
     try {
       for (;;) {
-        const record = this.transport.inbox().find(item => item.state === 'queued' && !this.handled.has(item.message.id))
+        const transport = bridge.transport
+        if (!transport) break
+        const record = transport.inbox().find(item => item.state === 'queued' && !bridge.handled.has(item.message.id))
         if (!record) break
-        await this.handleRecord(record)
+        await this.handleRecord(bridge, record)
       }
     } catch (error) {
-      log(`drain failed: ${(error as Error).message}`)
+      log(`drain for "${bridge.state.name}" failed: ${(error as Error).message}`)
     } finally {
-      this.draining = false
-      this.refreshOwed()
+      bridge.draining = false
+      this.refreshOwed(bridge)
       // A push that arrived while this drain was running found `draining`
       // true and returned at the top. Re-check once so that wakeup is not
       // lost - otherwise the record waits for the next message or a restart.
-      if (!this.stopping && this.transport.inbox().some(item => item.state === 'queued' && !this.handled.has(item.message.id))) {
-        setTimeout(() => { void this.drain() }, 0).unref?.()
+      const transport = bridge.transport
+      if (!bridge.stopping && !bridge.removed && transport && transport.inbox().some(item => item.state === 'queued' && !bridge.handled.has(item.message.id))) {
+        setTimeout(() => { void this.drain(bridge) }, 0).unref?.()
       }
     }
   }
@@ -617,47 +915,49 @@ export class ChatGptHost {
    * this, a crash between acknowledge and reply leaves the sender waiting
    * forever, which the bus contract forbids.
    */
-  private async recoverOwed(): Promise<void> {
-    // A restart should not buy an unbounded replay: at most three page turns.
-    // Every remaining owed entry gets one error reply so its sender is not
-    // left waiting, and is then marked handled so the loop terminates.
+  private async recoverOwed(bridge: Bridge): Promise<void> {
+    const transport = bridge.transport
+    if (!transport) return
+    // A restart should not buy an unbounded replay: at most three page turns
+    // per bridge. Every remaining owed entry gets one error reply so its sender
+    // is not left waiting, and is then marked handled so the loop terminates.
     let pages = 0
     for (;;) {
-      const entry = this.transport.outstandingReplies().find(item => !this.handled.has(item.toMessageId))
+      const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId))
       if (!entry) return
-      const record = this.transport.inbox().find(item => item.message.id === entry.toMessageId)
-      if (!record) { this.handled.add(entry.toMessageId); continue }
+      const record = transport.inbox().find(item => item.message.id === entry.toMessageId)
+      if (!record) { bridge.handled.add(entry.toMessageId); continue }
       if (pages >= 3) {
-        this.handled.add(entry.toMessageId)
+        bridge.handled.add(entry.toMessageId)
         log(`gave up on ${shortId(entry.toMessageId)} after 3 page turns at startup`)
-        await this.replyError(
-          { id: entry.toMessageId, fromSessionId: entry.toSessionId },
-          'the page turn was lost when the host restarted; resend if it still matters',
-        )
+        await this.replyError(bridge, { id: entry.toMessageId, fromSessionId: entry.toSessionId },
+          'the page turn was lost when the host restarted; resend if it still matters')
         continue
       }
-      log(`retrying unanswered ${shortId(entry.toMessageId)} from ${shortId(entry.toSessionId)}`)
+      log(`retrying unanswered ${shortId(entry.toMessageId)} from ${shortId(entry.toSessionId)} on "${bridge.state.name}"`)
       pages++
-      await this.handleRecord(record)
+      await this.handleRecord(bridge, record)
     }
   }
 
-  private async handleRecord(record: { message: { id: string; fromSessionId: string; summary: string; text: string; kind?: string; expectReply?: boolean; replyTo?: string } }): Promise<void> {
+  private async handleRecord(bridge: Bridge, record: { message: { id: string; fromSessionId: string; summary: string; text: string; kind?: string; expectReply?: boolean; replyTo?: string } }): Promise<void> {
+    const transport = bridge.transport
+    if (!transport) return
     const message = record.message
-    this.handled.add(message.id)
-    log(`turn ${shortId(message.id)} from ${shortId(message.fromSessionId)}`)
+    bridge.handled.add(message.id)
+    log(`turn ${shortId(message.id)} from ${shortId(message.fromSessionId)} on "${bridge.state.name}"`)
     const expects = message.replyTo === undefined && message.expectReply !== false
     // Record the inbound before the turn: a turn that emits no command and no
     // reply would otherwise leave no trace at all, and the id is what a receipt
     // or a later audit is joined on.
-    audit(this.state, {
+    audit(this.hostState, {
       op: 'inbound',
       target: message.fromSessionId,
-      result: `${message.kind ?? 'inquiry'} expectReply=${expects} ${one(message.summary, 120)}`,
+      result: `${message.kind ?? 'inquiry'} expectReply=${expects} ${one(message.summary, 120)} [${bridge.state.name}]`,
       messageId: message.id,
     })
     this.cancelIdleUnload()
-    await this.transport.update({ status: 'running' }).catch(() => {})
+    await transport.update({ status: 'running' }).catch(() => {})
     try {
       const name = await this.nameOf(message.fromSessionId)
       const text = sanitizePeerText(message.text)
@@ -665,7 +965,8 @@ export class ChatGptHost {
       // so the inbound is acknowledged when ITS text reaches the thread, not
       // when the primer does.
       await this.pageLock.run(async () => {
-        await this.ensurePrimerAndThread()
+        if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
+        await this.ensurePrimerAndThread(bridge)
         const turnNonce = nonce()
         let acknowledged = false
         try {
@@ -675,21 +976,21 @@ export class ChatGptHost {
           // attachment turn or a refusal posts its own message, and if that
           // acceptance acknowledged this inbound the peer would be told
           // "delivered" before its own text had been posted.
-          await this.injectAttachment(text, message.fromSessionId, message.id)
+          await this.injectAttachment(bridge, text, message.fromSessionId, message.id)
           this.driver.onAccepted(() => {
             if (acknowledged) return
             acknowledged = true
-            void this.transport.acknowledge(message.id).catch(() => {})
+            void bridge.transport?.acknowledge(message.id).catch(() => {})
           })
           const prompt = this.inboundPrompt({ ...message, fromName: name, text }, turnNonce)
           const outcome = await runCommandTurn(prompt, turnNonce, {
             generate: async subject => {
-              try { return { ok: true, text: await this.pageTurn(subject) } }
+              try { return { ok: true, text: await this.pageTurn(bridge, subject) } }
               catch (error) { return { ok: false, error: (error as Error).message } }
             },
-            execute: command => this.executeCommand(command, 'model', message.id),
+            execute: command => this.executeCommand(bridge, command, 'model', message.id),
           })
-          await this.settleReply(message, expects, outcome)
+          await this.settleReply(bridge, message, expects, outcome)
         } finally {
           this.driver.onAccepted(undefined)
         }
@@ -697,12 +998,13 @@ export class ChatGptHost {
     } catch (error) {
       const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
       log(`turn for ${message.id} failed: ${reason}`)
-      audit(this.state, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
-      if (expects) await this.replyError(message, `the ChatGPT page could not complete a turn: ${reason}`)
+      audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
+      if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
     } finally {
-      await this.transport.update({ status: 'idle' }).catch(() => {})
-      this.refreshOwed()
-      await this.persist()
+      await bridge.transport?.update({ status: 'idle' }).catch(() => {})
+      this.refreshOwed(bridge)
+      await this.persistBridgeState(bridge)
+      await this.persistHostState()
       this.scheduleIdleUnload()
     }
   }
@@ -732,12 +1034,12 @@ export class ChatGptHost {
     ].join('\n')
   }
 
-  private async settleReply(message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[] }): Promise<void> {
+  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[] }): Promise<void> {
     // A reply to some other message is not an answer to this one.
     if (outcome.repliedTargets.includes(message.id)) return
     if (!expects) return
-    if (outcome.failed) return this.replyError(message, `the page could not answer: ${one(outcome.problems.at(-1) ?? 'no answer', 180)}`)
-    if (outcome.budgetSpent) return this.replyError(message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
+    if (outcome.failed) return this.replyError(bridge, message, `the page could not answer: ${one(outcome.problems.at(-1) ?? 'no answer', 180)}`)
+    if (outcome.budgetSpent) return this.replyError(bridge, message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
     // A fence is an action, not an answer. If the only thing the page produced
     // was a command block that was refused (a stale or invented nonce), the
     // peer gets an error - never the fence text as if it were prose. This also
@@ -745,16 +1047,16 @@ export class ChatGptHost {
     // action.
     const { prose: visibleText, commandShaped } = proseFromTurn(outcome.finalText)
     if (commandShaped) {
-      return this.replyError(message, 'the page answered with a command block that was refused (missing or stale nonce); nothing was sent')
+      return this.replyError(bridge, message, 'the page answered with a command block that was refused (missing or stale nonce); nothing was sent')
     }
     const prose = sanitizePeerText(visibleText).trim()
-    if (!prose) return this.replyError(message, 'no answer was produced for this message')
+    if (!prose) return this.replyError(bridge, message, 'no answer was produced for this message')
     const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
     try {
-      await this.transport.send(message.fromSessionId, prose, summary, message.id, 'inquiry', false)
-      audit(this.state, { op: 'reply', target: message.fromSessionId, result: 'prose answer sent', messageId: message.id })
+      await bridge.transport?.send(message.fromSessionId, prose, summary, message.id, 'inquiry', false)
+      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: 'prose answer sent', messageId: message.id })
     } catch (error) {
-      audit(this.state, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
+      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
     }
   }
 
@@ -765,33 +1067,33 @@ export class ChatGptHost {
    * other session id is a pull-by-proxy and is refused - the operator is the
    * only other authority, and only from the page.
    */
-  private async injectAttachment(text: string, fromSessionId: string, messageId: string): Promise<void> {
+  private async injectAttachment(bridge: Bridge, text: string, fromSessionId: string, messageId: string): Promise<void> {
     const match = /^[ \t]*attachment:[ \t]*session[ \t]+(\S+)[ \t]*$/im.exec(text)
     if (!match) return
     const requested = match[1]!
     if (!UUID.test(requested)) {
-      await this.pageTurn('ATTACHMENT REFUSED: a peer may grant only its own transcript, named as: attachment: session <its own session id>.')
-      audit(this.state, { op: 'attachment', target: requested, result: 'refused: not a session id', messageId })
-      await this.persist()
+      await this.pageTurn(bridge, 'ATTACHMENT REFUSED: a peer may grant only its own transcript, named as: attachment: session <its own session id>.')
+      audit(this.hostState, { op: 'attachment', target: requested, result: 'refused: not a session id', messageId })
+      await this.persistBridgeState(bridge)
       return
     }
     if (requested !== fromSessionId) {
-      await this.pageTurn('ATTACHMENT REFUSED: only the owner or the operator may grant that transcript.')
-      audit(this.state, { op: 'attachment', target: requested, result: "refused: not the sender's own transcript", messageId })
-      await this.persist()
+      await this.pageTurn(bridge, 'ATTACHMENT REFUSED: only the owner or the operator may grant that transcript.')
+      audit(this.hostState, { op: 'attachment', target: requested, result: "refused: not the sender's own transcript", messageId })
+      await this.persistBridgeState(bridge)
       return
     }
-    await this.grantTranscript(requested, `peer ${requested.slice(0, 8)}`, messageId)
+    await this.grantTranscript(bridge, requested, `peer ${requested.slice(0, 8)}`, messageId)
     // A refusal already told the model, in the thread, what happened.
   }
 
   /** Resolve one rollout and upload it, whole, as a real file. */
-  private async grantTranscript(sessionId: string, grantedBy: string, messageId?: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  private async grantTranscript(bridge: Bridge, sessionId: string, grantedBy: string, messageId?: string): Promise<{ ok: true } | { ok: false; error: string }> {
     const resolved = await this.resolveTranscript(sessionId)
     if (!resolved.ok) {
-      await this.pageTurn(`ATTACHMENT REFUSED: ${resolved.error}.`)
-      audit(this.state, { op: 'attachment', target: sessionId, result: `refused: ${one(resolved.error, 200)}`, messageId: messageId ?? null })
-      await this.persist()
+      await this.pageTurn(bridge, `ATTACHMENT REFUSED: ${resolved.error}.`)
+      audit(this.hostState, { op: 'attachment', target: sessionId, result: `refused: ${one(resolved.error, 200)}`, messageId: messageId ?? null })
+      await this.persistBridgeState(bridge)
       return { ok: false, error: resolved.error }
     }
     const name = `${sessionId}-transcript.txt`
@@ -799,12 +1101,12 @@ export class ChatGptHost {
     // envelope is enforced before the file is opened.
     const refusal = attachmentRefusal(resolved.size, this.maxAttachmentBytes)
     if (refusal) {
-      await this.refuseAttachment(name, refusal, messageId)
+      await this.refuseAttachment(bridge, name, refusal, messageId)
       return { ok: false, error: refusal }
     }
     const buffer = await this.files.readFile(resolved.path)
     try {
-      await this.uploadDocument(name, 'text/plain', buffer, grantedBy, messageId)
+      await this.uploadDocument(bridge, name, 'text/plain', buffer, grantedBy, messageId)
       return { ok: true }
     } catch (error) {
       return { ok: false, error: (error as Error).message }
@@ -830,10 +1132,10 @@ export class ChatGptHost {
   }
 
   /** Say no in the thread, the audit and to the caller in one sentence. */
-  private async refuseAttachment(name: string, reason: string, messageId?: string): Promise<void> {
-    await this.pageTurn(`ATTACHMENT REFUSED: ${reason}.`)
-    audit(this.state, { op: 'attachment', target: name, result: reason, messageId: messageId ?? null })
-    await this.persist()
+  private async refuseAttachment(bridge: Bridge, name: string, reason: string, messageId?: string): Promise<void> {
+    await this.pageTurn(bridge, `ATTACHMENT REFUSED: ${reason}.`)
+    audit(this.hostState, { op: 'attachment', target: name, result: reason, messageId: messageId ?? null })
+    await this.persistBridgeState(bridge)
   }
 
   /**
@@ -843,14 +1145,14 @@ export class ChatGptHost {
    * path and never through the disk. ChatGPT's own limits - type, size - are
    * the only ones that apply, and its refusal comes back as this turn's error.
    */
-  private async uploadDocument(name: string, mimeType: string, buffer: Buffer, grantedBy: string, messageId?: string): Promise<void> {
+  private async uploadDocument(bridge: Bridge, name: string, mimeType: string, buffer: Buffer, grantedBy: string, messageId?: string): Promise<void> {
     // A last check on the decoded bytes, before base64. The callers gate on the
     // stat size so an oversized file is declined before it is ever opened; this
     // catches a caller that somehow reached here anyway, and is never a
     // truncation.
     const refusal = attachmentRefusal(buffer.length, this.maxAttachmentBytes)
     if (refusal) {
-      await this.refuseAttachment(name, refusal, messageId)
+      await this.refuseAttachment(bridge, name, refusal, messageId)
       throw new Error(refusal)
     }
     const sha = createHash('sha256').update(buffer).digest('hex')
@@ -862,85 +1164,89 @@ export class ChatGptHost {
     const reply = await this.driver.call({
       op: 'send',
       text: note,
-      ...(this.state.threadId ? { threadId: this.state.threadId } : { newChat: true }),
+      ...(bridge.state.threadId ? { threadId: bridge.state.threadId } : { newChat: true }),
       attach: { name, mimeType, base64: buffer.toString('base64') },
     }, TURN_TIMEOUT_MS)
     if (reply.ok !== true) throw new Error(one(reply.error, 300) || 'the page did not accept the attachment')
     const attachment = reply.attachment as { state?: string; reason?: string } | undefined
     if (attachment && attachment.state === 'rejected') {
       const reason = one(attachment.reason, 200) || 'the page rejected the attachment'
-      audit(this.state, { op: 'attachment', target: name, result: `rejected by page: ${reason}`, messageId: messageId ?? null })
-      await this.persist()
+      audit(this.hostState, { op: 'attachment', target: name, result: `rejected by page: ${reason}`, messageId: messageId ?? null })
+      await this.persistBridgeState(bridge)
       throw new Error(`the page rejected ${name}: ${reason}`)
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== this.state.threadId) {
+    if (threadId && threadId !== bridge.state.threadId) {
       // The page landed in a different thread from the primed one, so that
       // thread has never seen the primer.
-      this.state.threadId = threadId
-      this.state.primedThreadId = null
-      await this.persist()
+      bridge.state.threadId = threadId
+      bridge.state.primedThreadId = null
+      await this.persistBridgeState(bridge)
     }
-    this.absorbPage(reply)
-    audit(this.state, { op: 'attachment', target: name, result: `uploaded ${buffer.length} bytes sha256 ${sha.slice(0, 16)}`, messageId: messageId ?? null })
-    await this.persist()
-    await this.advertise()
+    this.absorbPage(bridge, reply)
+    audit(this.hostState, { op: 'attachment', target: name, result: `uploaded ${buffer.length} bytes sha256 ${sha.slice(0, 16)}`, messageId: messageId ?? null })
+    await this.persistBridgeState(bridge)
+    await this.advertise(bridge)
   }
 
-  private async replyError(message: { id: string; fromSessionId: string }, reason: string): Promise<void> {
+  private async replyError(bridge: Bridge, message: { id: string; fromSessionId: string }, reason: string): Promise<void> {
     try {
-      await this.transport.send(message.fromSessionId, `[${NAME}] ${reason}`, 'Turn could not be completed', message.id, 'inquiry', false)
-      audit(this.state, { op: 'reply', target: message.fromSessionId, result: `error reply: ${one(reason, 180)}`, messageId: message.id })
+      await bridge.transport?.send(message.fromSessionId, `[${bridge.state.name}] ${reason}`, 'Turn could not be completed', message.id, 'inquiry', false)
+      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `error reply: ${one(reason, 180)}`, messageId: message.id })
     } catch (error) {
-      audit(this.state, { op: 'reply', target: message.fromSessionId, result: `error reply failed: ${one((error as Error).message, 160)}`, messageId: message.id })
+      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `error reply failed: ${one((error as Error).message, 160)}`, messageId: message.id })
     }
   }
 
   // ---------------------------------------------------------------- commands
 
   /**
-   * Run one validated command and return its one-line result.
+   * Run one validated command for one bridge and return its one-line result.
    *
    * `undefined` means the op is not one this host knows; every known op either
    * returns a line or throws, so a refusal always reaches the model as a
    * sentence it can act on.
    */
-  private async executeCommand(command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
+  private async executeCommand(bridge: Bridge, command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
     const target = (command as { to?: string }).to ?? null
     try {
-      const result = await this.dispatch(command)
-      audit(this.state, { op: command.op, target, result: one(result.line, 300), messageId: messageId ?? null })
-      await this.persist()
+      const result = await this.dispatch(bridge, command)
+      audit(this.hostState, { op: command.op, target, result: one(result.line, 300), messageId: messageId ?? null })
+      await this.persistBridgeState(bridge)
+      await this.persistHostState()
       return result
     } catch (error) {
       const line = `${command.op} failed: ${one((error as Error).message, 240)}`
-      audit(this.state, { op: command.op, target, result: one(line, 300), messageId: messageId ?? null })
-      await this.persist()
+      audit(this.hostState, { op: command.op, target, result: one(line, 300), messageId: messageId ?? null })
+      await this.persistBridgeState(bridge)
+      await this.persistHostState()
       if (by === 'operator') throw error
       return { line, replied: false }
     }
   }
 
-  private async dispatch(command: Command): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
+  private async dispatch(bridge: Bridge, command: Command): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
+    const transport = bridge.transport
+    if (!transport) throw new Error(`bridge "${bridge.state.name}" is not connected`)
     if (command.op === 'list') return { line: await this.listLine(), replied: false }
-    if (command.op === 'inbox') return { line: this.inboxLine(), replied: false }
+    if (command.op === 'inbox') return { line: this.inboxLine(bridge), replied: false }
     if (command.op === 'receipt') {
       const resolved = await resolveGatewayPeer(command.to)
       if ('error' in resolved) throw new Error(resolved.error)
-      const reply = await this.transport.receipt(resolved.sessionId, command.messageId) as { state?: string }
+      const reply = await transport.receipt(resolved.sessionId, command.messageId) as { state?: string }
       return { line: `receipt for ${command.messageId} at ${resolved.label}: ${reply.state ?? 'unknown'}`, replied: false }
     }
     if (command.op === 'send') {
       const resolved = await resolveGatewayPeer(command.to)
       if ('error' in resolved) throw new Error(resolved.error)
-      if (resolved.sessionId === this.state.sessionId) throw new Error('that is this session; use reply for an inbound message')
-      const receipt = await this.transport.send(resolved.sessionId, sanitizePeerText(command.text), command.summary, undefined, command.kind, command.expectReply) as { id?: string; state?: string }
+      if (resolved.sessionId === bridge.state.sessionId) throw new Error('that is this session; use reply for an inbound message')
+      const receipt = await transport.send(resolved.sessionId, sanitizePeerText(command.text), command.summary, undefined, command.kind, command.expectReply) as { id?: string; state?: string }
       return { line: `sent ${receipt.id ?? '?'} to ${resolved.label}: ${receipt.state ?? 'queued'}`, replied: false }
     }
     if (command.op === 'reply') {
-      const record = this.transport.inbox().find(item => item.message.id === command.toMessageId)
+      const record = transport.inbox().find(item => item.message.id === command.toMessageId)
       if (!record) throw new Error(`no inbound message ${command.toMessageId} in this inbox`)
-      const receipt = await this.transport.send(
+      const receipt = await transport.send(
         record.message.fromSessionId, sanitizePeerText(command.text),
         command.summary ?? `Re: ${one(record.message.summary, 180)}`.slice(0, 200),
         command.toMessageId, 'inquiry', false,
@@ -949,36 +1255,36 @@ export class ChatGptHost {
     }
     if (command.op === 'schedule') {
       const at = command.at ? new Date(command.at) : new Date(Date.now() + (command.inSeconds ?? 0) * 1000)
-      this.armSchedule(command.label, at)
+      this.armSchedule(bridge, command.label, at)
       return { line: `scheduled "${command.label}" at ${at.toISOString()}`, replied: false }
     }
     if (command.op === 'cancelSchedule') {
-      const existed = this.cancelSchedule(command.label)
+      const existed = this.cancelSchedule(bridge, command.label)
       return { line: existed ? `cancelled "${command.label}"` : `no schedule labelled "${command.label}"`, replied: false }
     }
     if (command.op === 'watchIdle') {
       const resolved = await resolveGatewayPeer(command.to)
       if ('error' in resolved) throw new Error(resolved.error)
-      await this.transport.watchIdle(resolved.sessionId)
+      await transport.watchIdle(resolved.sessionId)
       return { line: `watching ${resolved.label} for idle`, replied: false }
     }
     if (command.op === 'requestContext') {
       const summary = `context request: ${one(command.topic, 180)}`.slice(0, 200)
       if (command.to === 'operator') {
-        audit(this.state, { op: 'requestContext', target: 'operator', result: `topic: ${one(command.topic, 160)}` })
+        audit(this.hostState, { op: 'requestContext', target: 'operator', result: `topic: ${one(command.topic, 160)}` })
         return { line: 'context request recorded for the operator; nothing arrives unless it is granted', replied: false }
       }
       const resolved = await resolveGatewayPeer(command.to)
       if ('error' in resolved) throw new Error(resolved.error)
-      if (resolved.sessionId === this.state.sessionId) throw new Error('that is this session')
-      const receipt = await this.transport.send(resolved.sessionId, sanitizePeerText(command.question), summary, undefined, 'inquiry', true) as { id?: string; state?: string }
+      if (resolved.sessionId === bridge.state.sessionId) throw new Error('that is this session')
+      const receipt = await transport.send(resolved.sessionId, sanitizePeerText(command.question), summary, undefined, 'inquiry', true) as { id?: string; state?: string }
       return { line: `context request ${receipt.id ?? '?'} sent to ${resolved.label}: ${receipt.state ?? 'queued'} (granted or refused, once)`, replied: false }
     }
     if (command.op === 'read') {
       const resolved = await resolveGatewayPeer(command.peer)
       if ('error' in resolved) throw new Error(resolved.error)
-      if (resolved.sessionId === this.state.sessionId) throw new Error('that is this session; its turns are already in the thread')
-      const slice = await this.transport.readPeer(resolved.sessionId, {
+      if (resolved.sessionId === bridge.state.sessionId) throw new Error('that is this session; its turns are already in the thread')
+      const slice = await transport.readPeer(resolved.sessionId, {
         ...(command.tail ? { tail: command.tail } : {}),
         ...(command.since ? { since: command.since } : {}),
       })
@@ -1019,12 +1325,14 @@ export class ChatGptHost {
     }).join('\n')
   }
 
-  private inboxLine(): string {
-    const records = this.transport.inbox().filter(record => record.state !== 'refused')
+  private inboxLine(bridge: Bridge): string {
+    const transport = bridge.transport
+    if (!transport) return 'this bridge is not connected'
+    const records = transport.inbox().filter(record => record.state !== 'refused')
     if (records.length === 0) return 'inbox is empty'
     // Lead with what is owed: the model should not have to read state strings
     // to learn that nothing is waiting on it.
-    const owed = this.transport.outstandingReplies().length
+    const owed = transport.outstandingReplies().length
     const head = owed === 0
       ? `inbox: nothing owed; ${records.length} recent record${records.length === 1 ? '' : 's'}, all settled`
       : `inbox: ${owed} owed`
@@ -1045,43 +1353,43 @@ export class ChatGptHost {
 
   // --------------------------------------------------------------- schedules
 
-  private armSchedule(label: string, at: Date): void {
-    const known = this.schedules.has(label) || this.state.schedules.some(schedule => schedule.label === label)
+  private armSchedule(bridge: Bridge, label: string, at: Date): void {
+    const known = bridge.schedules.has(label) || bridge.state.schedules.some(schedule => schedule.label === label)
     // Evicting the oldest entry from state while leaving its timer armed, as a
     // .slice(-8) does, keeps a wake that can neither be seen nor cancelled.
     // Refuse the ninth instead.
-    if (!known && this.state.schedules.length >= 8) {
+    if (!known && bridge.state.schedules.length >= 8) {
       throw new Error('eight schedules are already pending; cancel one before adding another')
     }
-    this.cancelSchedule(label)
-    this.state.schedules = [...this.state.schedules.filter(schedule => schedule.label !== label), { label, at: at.toISOString() }]
+    this.cancelSchedule(bridge, label)
+    bridge.state.schedules = [...bridge.state.schedules.filter(schedule => schedule.label !== label), { label, at: at.toISOString() }]
     const delay = Math.max(0, at.getTime() - Date.now())
-    const handle = setTimeout(() => { void this.fireSchedule(label) }, Math.min(delay, 24 * 3600_000))
+    const handle = setTimeout(() => { void this.fireSchedule(bridge, label) }, Math.min(delay, 24 * 3600_000))
     handle.unref?.()
-    this.schedules.set(label, handle)
+    bridge.schedules.set(label, handle)
   }
 
-  private cancelSchedule(label: string): boolean {
-    const handle = this.schedules.get(label)
+  private cancelSchedule(bridge: Bridge, label: string): boolean {
+    const handle = bridge.schedules.get(label)
     if (handle) clearTimeout(handle)
-    this.schedules.delete(label)
-    const before = this.state.schedules.length
-    this.state.schedules = this.state.schedules.filter(schedule => schedule.label !== label)
-    return handle !== undefined || this.state.schedules.length !== before
+    bridge.schedules.delete(label)
+    const before = bridge.state.schedules.length
+    bridge.state.schedules = bridge.state.schedules.filter(schedule => schedule.label !== label)
+    return handle !== undefined || bridge.state.schedules.length !== before
   }
 
-  private rearmSchedules(): void {
-    for (const schedule of [...this.state.schedules]) {
+  private rearmSchedules(bridge: Bridge): void {
+    for (const schedule of [...bridge.state.schedules]) {
       const at = Date.parse(schedule.at)
       // An overdue schedule is late, not void. Firing it on the next turn is
       // what the model asked for; dropping it silently loses a wake that
       // nothing else will produce.
-      this.armSchedule(schedule.label, new Date(Number.isFinite(at) ? at : Date.now()))
+      this.armSchedule(bridge, schedule.label, new Date(Number.isFinite(at) ? at : Date.now()))
     }
   }
 
   /** A schedule starts a turn; it never sends anything by itself. */
-  private async fireSchedule(label: string): Promise<void> {
+  private async fireSchedule(bridge: Bridge, label: string): Promise<void> {
     // The schedule stays in state until its turn finishes. Removing it first
     // means a crash mid-turn loses the wake permanently; left in place, a
     // restart fires it again, and a repeated wake is far cheaper than a lost one.
@@ -1089,7 +1397,8 @@ export class ChatGptHost {
     const turnNonce = nonce()
     try {
       await this.pageLock.run(async () => {
-        await this.ensurePrimerAndThread()
+        if (bridge.removed || bridge.stopping) return
+        await this.ensurePrimerAndThread(bridge)
         const prompt = [
           `SCHEDULED WAKE "${label}" is due. No peer sent this; it is a timer you set.`,
           `Turn nonce: ${turnNonce}. Act with a fenced block: gateway ${turnNonce}`,
@@ -1097,18 +1406,18 @@ export class ChatGptHost {
         ].join('\n')
         await runCommandTurn(prompt, turnNonce, {
           generate: async subject => {
-            try { return { ok: true, text: await this.pageTurn(subject) } }
+            try { return { ok: true, text: await this.pageTurn(bridge, subject) } }
             catch (error) { return { ok: false, error: (error as Error).message } }
           },
-          execute: command => this.executeCommand(command, 'model'),
+          execute: command => this.executeCommand(bridge, command, 'model'),
         })
       })
     } catch (error) {
-      log(`scheduled wake "${label}" failed: ${(error as Error).message}`)
+      log(`scheduled wake "${label}" on "${bridge.state.name}" failed: ${(error as Error).message}`)
     } finally {
-      this.schedules.delete(label)
-      this.state.schedules = this.state.schedules.filter(schedule => schedule.label !== label)
-      await this.persist()
+      bridge.schedules.delete(label)
+      bridge.state.schedules = bridge.state.schedules.filter(schedule => schedule.label !== label)
+      await this.persistBridgeState(bridge)
       this.scheduleIdleUnload()
     }
   }
@@ -1124,12 +1433,12 @@ export class ChatGptHost {
 
   private scheduleIdleUnload(): void {
     this.cancelIdleUnload()
-    if (!(this.config.idleUnloadMinutes > 0)) return
+    if (!(this.hostState.idleUnloadMinutes > 0)) return
     // The callback remembers when it was armed. Clearing the timer cannot stop
     // a callback that has already started, so the callback itself checks for
     // newer work both before queueing and again once it holds the lock.
     const armedAt = Date.now()
-    const handle = setTimeout(() => { void this.unloadChrome('idle', armedAt) }, this.config.idleUnloadMinutes * 60_000)
+    const handle = setTimeout(() => { void this.unloadChrome('idle', armedAt) }, this.hostState.idleUnloadMinutes * 60_000)
     handle.unref?.()
     this.idleTimer = handle
   }
@@ -1139,7 +1448,7 @@ export class ChatGptHost {
     this.idleTimer = undefined
   }
 
-  /** Chrome is disposable; the registration and peer.json are not. */
+  /** Chrome is disposable; the registrations and the state files are not. */
   private async unloadChrome(reason: string, armedAt = 0): Promise<void> {
     // Work that arrived after this unload was scheduled cancels it, even if the
     // timer could not be cleared in time.
@@ -1160,9 +1469,8 @@ export class ChatGptHost {
         if (!unloaded) { this.scheduleIdleUnload(); return }
       }
       this.health = { state: 'unknown', reason: 'page_unloaded', at: now() }
-      await this.advertise()
-      await this.persist()
-      log(`unloaded Chrome (${reason}); still registered`)
+      await this.persistHostState()
+      log(`unloaded Chrome (${reason}); ${this.bridges.size} bridge(s) still registered`)
     } catch (error) {
       log(`unload failed: ${(error as Error).message}`)
     }
@@ -1179,9 +1487,11 @@ export class ChatGptHost {
 
   // ------------------------------------------------------------------ state
 
-  private refreshOwed(): void {
-    const owed = new Map(this.transport.outstandingReplies().map(entry => [entry.toMessageId, entry]))
-    this.state.owed = this.transport.inbox()
+  private refreshOwed(bridge: Bridge): void {
+    const transport = bridge.transport
+    if (!transport) { bridge.state.owed = []; return }
+    const owed = new Map(transport.outstandingReplies().map(entry => [entry.toMessageId, entry]))
+    bridge.state.owed = transport.inbox()
       .filter(record => owed.has(record.message.id))
       .map(record => ({
         messageId: record.message.id,
@@ -1194,13 +1504,22 @@ export class ChatGptHost {
   }
 
   /**
-   * Write the state out. `critical` is for transitions the process must not
-   * continue past (a new thread id): a failure there is real, not background
-   * noise, so it is reported to the caller instead of only logged.
+   * Write one host or bridge file out. `critical` is for transitions the
+   * process must not continue past (a new thread id): a failure there is real,
+   * not background noise, so it is reported to the caller instead of only
+   * logged.
    */
-  private persist(critical = false): Promise<void> {
-    return saveState(this.config.statePath, this.state).catch(error => {
+  private persistHostState(critical = false): Promise<void> {
+    return saveJson(this.config.statePath, this.hostState).catch(error => {
       log(`could not save peer.json: ${(error as Error).message}`)
+      if (critical) throw error
+    })
+  }
+
+  private persistBridgeState(bridge: Bridge, critical = false): Promise<void> {
+    if (bridge.removed) return Promise.resolve()
+    return saveJson(bridge.path, bridge.state).catch(error => {
+      log(`could not save bridge ${shortId(bridge.state.sessionId)}: ${(error as Error).message}`)
       if (critical) throw error
     })
   }
@@ -1209,13 +1528,91 @@ export class ChatGptHost {
     if (this.stopping) return
     this.stopping = true
     this.cancelIdleUnload()
-    for (const handle of this.schedules.values()) clearTimeout(handle)
-    this.schedules.clear()
-    await this.persist()
+    for (const bridge of this.bridges.values()) {
+      bridge.stopping = true
+      for (const handle of bridge.schedules.values()) clearTimeout(handle)
+      bridge.schedules.clear()
+      await this.persistBridgeState(bridge)
+    }
+    await this.persistHostState()
     await this.driver.kill().catch(() => {})
     await this.removeInstanceFile()
     await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
-    await this.transport.close().catch(error => log(`transport close failed: ${(error as Error).message}`))
+    for (const bridge of this.bridges.values()) {
+      await bridge.transport?.close().catch(error => log(`transport close failed: ${(error as Error).message}`))
+    }
+  }
+
+  // ---------------------------------------------------------- operator page
+
+  private operatorPageHtml(): string {
+    return `<!doctype html>
+<meta charset="utf-8">
+<title>${NAME} bridges</title>
+<style>
+ body{font:14px system-ui,sans-serif;margin:24px;max-width:960px}
+ h1{font-size:18px} h2{font-size:15px;margin-top:24px}
+ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #ddd;padding:4px 6px;text-align:left;vertical-align:top}
+ code,pre{background:#f4f4f4;padding:2px 4px;border-radius:3px} pre{padding:8px;white-space:pre-wrap}
+ button{margin-right:6px} input{width:220px;margin-right:6px}
+ #out{margin-top:16px}
+</style>
+<h1>${NAME}</h1>
+<p><label>Operator token <input id="token" type="password" size="48"></label> <button id="saveToken">Use token</button></p>
+<h2>Bridges</h2>
+<table><thead><tr><th>name</th><th>session</th><th>thread</th><th>model</th><th>status</th><th>owed</th><th></th></tr></thead><tbody id="bridges"></tbody></table>
+<h2>Adopt a thread</h2>
+<p><button id="loadThreads">Load threads</button> <select id="threads"></select> <input id="adoptName" placeholder="name (optional)"> <button id="adopt">Adopt</button></p>
+<h2>New bridge</h2>
+<p><input id="newName" placeholder="name (optional)"> <button id="newBridge">New bridge</button></p>
+<div id="out"></div>
+<script>
+const $ = id => document.getElementById(id)
+$('token').value = localStorage.getItem('chatgpt-operator-token') || ''
+$('saveToken').onclick = () => { localStorage.setItem('chatgpt-operator-token', $('token').value.trim()); show('token saved'); refresh() }
+function show(text){ $('out').innerHTML = '<pre></pre>'; $('out').firstChild.textContent = text }
+async function api(op, extra){
+  const token = $('token').value.trim()
+  const response = await fetch('/operator', {method:'POST', headers:{authorization:'Bearer '+token,'content-type':'application/json'}, body: JSON.stringify(Object.assign({op}, extra || {}))})
+  return {status: response.status, body: await response.json()}
+}
+async function refresh(){
+  const token = $('token').value.trim()
+  const response = await fetch('/operator/state', {headers:{authorization:'Bearer '+token}})
+  if(!response.ok) return
+  const state = await response.json()
+  const rows = $('bridges'); rows.textContent = ''
+  for(const b of state.bridges || []){
+    const tr = document.createElement('tr')
+    for(const value of [b.name, b.sessionId, b.threadId || '-', (b.model||'?')+(b.effort?'/'+b.effort:''), b.status, (b.owed||[]).length]){
+      const td = document.createElement('td'); td.textContent = String(value); tr.appendChild(td)
+    }
+    const td = document.createElement('td')
+    const button = document.createElement('button'); button.textContent = 'Remove'
+    button.onclick = async () => { if(!confirm('Remove bridge '+b.name+'? The ChatGPT thread is not deleted.')) return; const r = await api('remove', {sessionId:b.sessionId}); show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh() }
+    td.appendChild(button); tr.appendChild(td); rows.appendChild(tr)
+  }
+}
+$('loadThreads').onclick = async () => {
+  const r = await api('threads'); if(r.status !== 200) return show(r.body.error || 'could not list threads')
+  const select = $('threads'); select.textContent = ''
+  for(const t of r.body.threads || []){ const option = document.createElement('option'); option.value = t.id; option.textContent = t.title ? t.title + ' (' + t.id + ')' : t.id; select.appendChild(option) }
+  show('loaded ' + ((r.body.threads||[]).length) + ' thread(s)')
+}
+$('adopt').onclick = async () => {
+  const threadId = $('threads').value; if(!threadId) return show('choose a thread first')
+  const name = $('adoptName').value.trim()
+  const r = await api('adopt', name ? {threadId, name} : {threadId})
+  show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh()
+}
+$('newBridge').onclick = async () => {
+  const name = $('newName').value.trim()
+  const r = await api('newBridge', name ? {name} : {})
+  show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh()
+}
+refresh()
+</script>
+`
   }
 }
 
@@ -1223,18 +1620,20 @@ async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2))
   if (parsed.help) {
     process.stdout.write([
-      'chatgpt-peer - a ChatGPT web thread on the Gateway peer bus',
+      'chatgpt-peer - ChatGPT web threads on the Gateway peer bus',
       '',
       '  bun run scripts/chatgpt-peer.ts [options]',
       '',
       '  --home <dir>        state root (default ~/chatgpt-web)',
-      '  --state <file>      peer.json path',
+      '  --state <file>      host peer.json path',
       '  --driver <file>     the page driver (chatgpt.mjs)',
       '  --profile <dir>     Chrome profile directory',
       '  --instance <id>     instance slug (default "default")',
-      '  --health-port <n>   loopback port for /gateway/route-health (0 = ephemeral)',
+      '  --health-port <n>   loopback port for the operator page and route health (0 = ephemeral)',
       '  --idle-minutes <n>  unload Chrome after this long idle (0 = never)',
       '  --number <n>        route credential number this page answers as (default 1)',
+      '',
+      'Bridges are adopted or created from the operator page at /operator.',
     ].join('\n') + '\n')
     return
   }
