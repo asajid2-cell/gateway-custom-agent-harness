@@ -14,6 +14,16 @@ export const MAX_MESSAGE_BYTES = 64 * 1024
 /** The largest file the host will hand to the page, counted on decoded bytes. */
 export const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 
+/**
+ * The one sentence for an over-envelope attachment, or undefined when it fits.
+ *
+ * Both numbers are named so the thread, the audit and the HTTP reply agree, and
+ * the caller can refuse on the stat size before the file is ever opened.
+ */
+export function attachmentRefusal(size: number, max = MAX_ATTACHMENT_BYTES): string | undefined {
+  return size > max ? `attachment refused: ${size} bytes exceeds the 64 MiB host envelope` : undefined
+}
+
 export const COMMAND_OPS = [
   'list',
   'inbox',

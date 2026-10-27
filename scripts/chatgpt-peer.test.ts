@@ -6,10 +6,10 @@
  * file's durability, and the driver child's line protocol.
  */
 import { describe, expect, test } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
+import { attachmentRefusal, extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { audit, loadState, newState, peerStateSchema, saveState } from './chatgpt-peer/state.ts'
 import { DriverChild } from './chatgpt-peer/driver.ts'
@@ -288,6 +288,127 @@ describe('route health', () => {
       await host.stop()
       await cleanup()
     }
+  })
+})
+
+describe('attachment envelope (D6)', () => {
+  const ENVELOPE = 64 * 1024 * 1024
+
+  const fakeDriver = () => {
+    const state = { calls: 0 }
+    const driver = {
+      state,
+      call: async (request: { op?: string }) => {
+        state.calls++
+        return { ok: true, op: request.op, threadId: '11111111-1111-4111-8111-111111111111', text: 'ok', model: 'm', effort: 'e' }
+      },
+      onAccepted: () => {},
+      kill: async () => {},
+      reopen: () => {},
+    }
+    return driver
+  }
+
+  const credentials = async (privateHome: string): Promise<{ token: string; sessionId: string }> => {
+    const body = JSON.parse(await readFile(join(privateHome, 'instances', 'test.json'), 'utf8')) as { token: string; sessionId: string }
+    return { token: body.token, sessionId: body.sessionId }
+  }
+
+  test('the operator file path refuses on the stat size and never opens the file', async () => {
+    const { dir, cleanup } = await scratch()
+    let reads = 0
+    const files = {
+      stat: async () => ({ isFile: () => true, size: 2_000_000_000 }),
+      readFile: async () => { reads++; return Buffer.from('x') },
+    }
+    const driver = fakeDriver()
+    const privateHome = join(dir, 'private')
+    const host = new ChatGptHost({
+      home: dir,
+      statePath: join(dir, 'peer.json'),
+      driverPath: join(dir, 'unused.mjs'),
+      profile: join(dir, 'profile'),
+      instanceId: 'test',
+      healthPort: 0,
+      idleUnloadMinutes: 0,
+      number: 1,
+      directory: join(dir, 'sessions'),
+      privateHome,
+      files: files as never,
+    }, driver as unknown as DriverChild)
+    try {
+      await host.start()
+      const { token } = await credentials(privateHome)
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'attachFile', path: 'C:/somewhere/huge.bin' }),
+      })
+      expect(response.status).toBe(413)
+      const body = await response.json() as { error?: string }
+      expect(body.error).toBe(`attachment refused: 2000000000 bytes exceeds the 64 MiB host envelope`)
+      expect(reads).toBe(0)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('the transcript path refuses on the size carried by its stat and never opens the file', async () => {
+    const { dir, cleanup } = await scratch()
+    const claude = join(dir, 'claude')
+    // Do not pre-create gateway-sessions: the transport secures that directory
+    // itself, and a pre-made one keeps the inherited ACL it then refuses.
+    await mkdir(join(claude, 'projects', 'p'), { recursive: true })
+    const previous = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = claude
+    let reads = 0
+    // The stat report is fake; the rollout file is real but small. What is
+    // proved is that the size the stat carried is gated before any read.
+    const files = {
+      stat: async () => ({ isFile: () => true, size: 20 }),
+      readFile: async () => { reads++; return Buffer.from('x') },
+    }
+    const driver = fakeDriver()
+    const privateHome = join(dir, 'private')
+    const host = new ChatGptHost({
+      home: dir,
+      statePath: join(dir, 'peer.json'),
+      driverPath: join(dir, 'unused.mjs'),
+      profile: join(dir, 'profile'),
+      instanceId: 'test',
+      healthPort: 0,
+      idleUnloadMinutes: 0,
+      number: 1,
+      directory: join(claude, 'gateway-sessions'),
+      privateHome,
+      maxAttachmentBytes: 10,
+      files: files as never,
+    }, driver as unknown as DriverChild)
+    try {
+      await host.start()
+      const { token, sessionId } = await credentials(privateHome)
+      await writeFile(join(claude, 'projects', 'p', `${sessionId}.jsonl`), 'x'.repeat(20), 'utf8')
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'attachTranscript', peer: sessionId }),
+      })
+      expect(response.status).toBe(502)
+      const body = await response.json() as { error?: string }
+      expect(body.error).toBe('attachment refused: 20 bytes exceeds the 64 MiB host envelope')
+      expect(reads).toBe(0)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previous
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a file within the envelope is not refused', async () => {
+    expect(attachmentRefusal(ENVELOPE)).toBeUndefined()
+    expect(attachmentRefusal(ENVELOPE + 1)).toBe('attachment refused: 67108865 bytes exceeds the 64 MiB host envelope')
   })
 })
 

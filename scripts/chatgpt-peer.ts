@@ -20,7 +20,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { MAX_ATTACHMENT_BYTES, parseCommand, proseFromTurn, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
+import { attachmentRefusal, MAX_ATTACHMENT_BYTES, parseCommand, proseFromTurn, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import { audit, loadState, newState, saveState, type PeerState } from './chatgpt-peer/state.ts'
 
 const execFileAsync = promisify(execFile)
@@ -56,6 +56,10 @@ type Config = {
   directory?: string
   /** Where instance files live. Overridden in tests. */
   privateHome?: string
+  /** The attachment envelope. Overridden in tests; never widened in production. */
+  maxAttachmentBytes?: number
+  /** File operations. Overridden in tests so a refusal can be proved before a read. */
+  files?: { stat: typeof stat; readFile: typeof readFile }
 }
 
 function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
@@ -121,6 +125,8 @@ function one(value: unknown, cap = 200): string {
 
 export class ChatGptHost {
   private readonly config: Config
+  private readonly files: { stat: typeof stat; readFile: typeof readFile }
+  private readonly maxAttachmentBytes: number
   private state!: PeerState
   private readonly driver: DriverChild
   private transport!: GatewaySessionTransport
@@ -141,6 +147,8 @@ export class ChatGptHost {
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
     this.primer = { text: '', sha: '' }
+    this.files = config.files ?? { stat, readFile }
+    this.maxAttachmentBytes = config.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES
     this.driver = driver ?? new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
   }
 
@@ -415,11 +423,21 @@ export class ChatGptHost {
       if (op === 'attachFile') {
         const file = String(body.path ?? '')
         if (!file) return this.send(response, 400, { ok: false, error: 'attachFile requires path' })
-        const info = await stat(file).catch(() => undefined)
+        const info = await this.files.stat(file).catch(() => undefined)
         if (!info || !info.isFile()) return this.send(response, 400, { ok: false, error: 'not a regular file' })
-        const buffer = await readFile(file)
         const name = basename(file)
         const mimeType = MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'
+        // Refuse on the stat size, before the file is opened. A 2 GB file must
+        // not be pulled into memory just to discover it is too large.
+        const refusal = attachmentRefusal(info.size, this.maxAttachmentBytes)
+        if (refusal) {
+          await this.pageWork(async () => {
+            await this.ensurePrimerAndThread()
+            await this.refuseAttachment(name, refusal)
+          })
+          return this.send(response, 413, { ok: false, op, error: refusal })
+        }
+        const buffer = await this.files.readFile(file)
         await this.pageWork(async () => {
           await this.ensurePrimerAndThread()
           await this.uploadDocument(name, mimeType, buffer, 'operator')
@@ -739,9 +757,17 @@ export class ChatGptHost {
       await this.persist()
       return { ok: false, error: resolved.error }
     }
-    const buffer = await readFile(resolved.path)
+    const name = `${sessionId}-transcript.txt`
+    // The stat that proved the rollout exists also carried its size, so the
+    // envelope is enforced before the file is opened.
+    const refusal = attachmentRefusal(resolved.size, this.maxAttachmentBytes)
+    if (refusal) {
+      await this.refuseAttachment(name, refusal, messageId)
+      return { ok: false, error: refusal }
+    }
+    const buffer = await this.files.readFile(resolved.path)
     try {
-      await this.uploadDocument(`${sessionId}-transcript.txt`, 'text/plain', buffer, grantedBy, messageId)
+      await this.uploadDocument(name, 'text/plain', buffer, grantedBy, messageId)
       return { ok: true }
     } catch (error) {
       return { ok: false, error: (error as Error).message }
@@ -749,20 +775,28 @@ export class ChatGptHost {
   }
 
   /** Exactly one rollout, or a refusal. Never a guess between candidates. */
-  private async resolveTranscript(sessionId: string): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
+  private async resolveTranscript(sessionId: string): Promise<{ ok: true; path: string; size: number } | { ok: false; error: string }> {
     if (!UUID.test(sessionId)) return { ok: false, error: 'that is not a session id' }
     const root = join(getClaudeConfigHomeDir(), 'projects')
     let directories: string[]
     try { directories = await readdir(root) }
     catch { return { ok: false, error: `there is no projects directory at ${root}` } }
-    const matches: string[] = []
+    const matches: { path: string; size: number }[] = []
     for (const directory of directories) {
       const candidate = join(root, directory, `${sessionId}.jsonl`)
-      if (await stat(candidate).then(entry => entry.isFile()).catch(() => false)) matches.push(candidate)
+      const info = await this.files.stat(candidate).catch(() => undefined)
+      if (info?.isFile()) matches.push({ path: candidate, size: info.size })
     }
     if (matches.length === 0) return { ok: false, error: `no rollout for session ${sessionId}` }
     if (matches.length > 1) return { ok: false, error: `${matches.length} rollouts match session ${sessionId}; refusing to guess` }
-    return { ok: true, path: matches[0]! }
+    return { ok: true, path: matches[0]!.path, size: matches[0]!.size }
+  }
+
+  /** Say no in the thread, the audit and to the caller in one sentence. */
+  private async refuseAttachment(name: string, reason: string, messageId?: string): Promise<void> {
+    await this.pageTurn(`ATTACHMENT REFUSED: ${reason}.`)
+    audit(this.state, { op: 'attachment', target: name, result: reason, messageId: messageId ?? null })
+    await this.persist()
   }
 
   /**
@@ -773,15 +807,14 @@ export class ChatGptHost {
    * the only ones that apply, and its refusal comes back as this turn's error.
    */
   private async uploadDocument(name: string, mimeType: string, buffer: Buffer, grantedBy: string, messageId?: string): Promise<void> {
-    // The envelope is counted on the decoded bytes, before base64. A file over
-    // it is refused outright - never truncated - and both numbers are said out
-    // loud in the thread and in the audit.
-    if (buffer.length > MAX_ATTACHMENT_BYTES) {
-      const reason = `attachment refused: ${buffer.length} bytes exceeds the 64 MiB host envelope`
-      await this.pageTurn(`ATTACHMENT REFUSED: ${reason}.`)
-      audit(this.state, { op: 'attachment', target: name, result: reason, messageId: messageId ?? null })
-      await this.persist()
-      throw new Error(reason)
+    // A last check on the decoded bytes, before base64. The callers gate on the
+    // stat size so an oversized file is declined before it is ever opened; this
+    // catches a caller that somehow reached here anyway, and is never a
+    // truncation.
+    const refusal = attachmentRefusal(buffer.length, this.maxAttachmentBytes)
+    if (refusal) {
+      await this.refuseAttachment(name, refusal, messageId)
+      throw new Error(refusal)
     }
     const sha = createHash('sha256').update(buffer).digest('hex')
     const note = [
