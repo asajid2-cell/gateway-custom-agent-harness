@@ -94,6 +94,24 @@ export const bridgeStateSchema = z.object({
   threadId: z.string().uuid().nullable(),
   primedThreadId: z.string().uuid().nullable(),
   primerSha256: z.string().max(64).nullable(),
+  /**
+   * The one-shot bootstrap token, kept only as its sha256.
+   *
+   * The token itself exists in exactly two places: the paste text the operator
+   * asked for, and the thread the human pasted it into. This file can prove a
+   * fence carries the right token, never reconstruct it, and a file that leaks
+   * cannot hand out a join.
+   */
+  bootstrapSha256: z.string().max(64).nullable().default(null),
+  /** Set the moment a bootstrap fence is accepted, before anything runs. */
+  bootstrapBurnedAt: z.string().nullable().default(null),
+  /**
+   * The sha256 of the last answer armed without a token.
+   *
+   * A bare `gateway` fence is accepted only because the operator clicked, so
+   * the click must not become a way to re-run the same answer over and over.
+   */
+  lastArmedSha256: z.string().max(64).nullable().default(null),
   owed: z.array(owedEntrySchema).max(50),
   schedules: z.array(scheduleSchema).max(8),
   model: z.string().max(100).nullable(),
@@ -148,6 +166,9 @@ export function newBridgeState(options: {
     threadId: options.threadId ?? null,
     primedThreadId: null,
     primerSha256: null,
+    bootstrapSha256: null,
+    bootstrapBurnedAt: null,
+    lastArmedSha256: null,
     owed: [],
     schedules: [],
     model: options.model ?? null,
@@ -165,6 +186,11 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     threadId: legacy.threadId,
     primedThreadId: legacy.primedThreadId,
     primerSha256: legacy.primerSha256,
+    // A legacy single-bridge host never had a join token, so the migrated
+    // bridge starts without one: the operator mints one with `snippet`.
+    bootstrapSha256: null,
+    bootstrapBurnedAt: null,
+    lastArmedSha256: null,
     owed: legacy.owed,
     schedules: legacy.schedules,
     model: legacy.model,

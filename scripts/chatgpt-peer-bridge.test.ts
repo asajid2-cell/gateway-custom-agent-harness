@@ -7,7 +7,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
@@ -25,6 +25,16 @@ class FakeDriver {
   readonly calls: Call[] = []
   threads = [{ id: THREAD_A, title: 'Existing work' }, { id: THREAD_B, title: 'Other work' }]
   killed = false
+  /** What the newest assistant turn holds - what `read` returns. */
+  answer = 'answered on the page'
+  /** What `send` returns at post time; may differ from what the page settles on. */
+  sendText = 'answered on the page'
+  sendTextFor: ((request: Call) => string) | undefined
+  evidence = 'state-complete'
+  readError: string | null = null
+  readCalls = 0
+  /** Derive the settled answer from the prompt that was just sent. */
+  answerFor: ((request: Call) => string | undefined) | undefined
   private accepted: ((id: string) => void) | undefined
   private current: string | null = null
 
@@ -48,8 +58,14 @@ class FakeDriver {
       const threadId = requested ?? (request.newChat ? randomUUID() : this.current)
       if (!threadId) return { ok: false, op, error: 'no thread is open' }
       this.current = threadId
+      this.answer = this.answerFor?.(request) ?? this.answer
       this.accepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: 'answered on the page', threadId, model: 'GPT-6', effort: 'High' }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+    }
+    if (op === 'read') {
+      this.readCalls++
+      if (this.readError) return { ok: false, op, error: this.readError }
+      return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') return { ok: true, op, threadId: this.current, model: 'GPT-6', effort: 'High' }
@@ -131,6 +147,12 @@ async function waitFor<T>(probe: () => Promise<T | undefined>, timeoutMs = 10_00
 
 const bridgeNamed = (name: string, threadId: string | null): BridgeState =>
   newBridgeState({ sessionId: randomUUID(), name, threadId })
+
+const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
+
+async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
+  return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
+}
 
 describe('multi-bridge host', () => {
   test('N bridges register N distinct session ids, each with the page route', async () => {
@@ -346,6 +368,282 @@ describe('multi-bridge host', () => {
       // Startup never wakes the page.
       expect(driver.calls.length).toBe(0)
     } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  // ------------------------------------------------------------- increment 2
+
+  test('a bridge file written before the join token existed still loads', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    // Exactly the increment-1 shape: no bootstrap fields at all.
+    await seedHost(dir, [{
+      sessionId: alpha.sessionId,
+      name: 'alpha',
+      threadId: THREAD_A,
+      primedThreadId: THREAD_A,
+      primerSha256: 'a'.repeat(64),
+      owed: [],
+      schedules: [],
+      model: 'GPT-6',
+      effort: 'High',
+      createdAt: alpha.createdAt,
+    } as unknown as BridgeState])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      expect(await exists(join(sessionsDir(dir), `${alpha.sessionId}.json`))).toBe(true)
+      const { token } = await credentials(dir)
+      const state = await operatorState(host, token)
+      expect(state.bridges.length).toBe(1)
+      expect(state.bridges[0].sessionId).toBe(alpha.sessionId)
+      // The old file is readable, and the next write normalises it: the three
+      // token fields exist as null rather than being rejected as unknown.
+      const snippet = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
+      expect(snippet.status).toBe(200)
+      const normalized = await readBridge(dir, alpha.sessionId)
+      expect(normalized.bootstrapBurnedAt).toBeNull()
+      expect(normalized.lastArmedSha256).toBeNull()
+      expect(normalized.bootstrapSha256).toMatch(/^[0-9a-f]{64}$/)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('snippet reveals a one-shot token once and stores only its sha', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const first = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
+      expect(first.status).toBe(200)
+      const text = String(first.body.text)
+      const minted = /```gateway ([0-9a-f]{48})\n/.exec(text)?.[1]
+      expect(minted).toBeDefined()
+      expect(text).toContain('bound to the peer "alpha"')
+      expect(text).toContain(alpha.sessionId)
+      expect(text).toContain('{"op":"send","to":"alpha"')
+      // The op table is the primer's own, not a second invention.
+      expect(text).toContain('{"op":"list"}')
+      expect(text).toContain('{"op":"read","peer"')
+      expect(text).toContain('ONE-SHOT')
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.bootstrapSha256).toBe(sha256(minted!))
+      expect(stored.bootstrapBurnedAt).toBeNull()
+      // The sha is the only form on disk, and it is never echoed to the page.
+      expect(text).not.toContain(stored.bootstrapSha256!)
+
+      const second = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
+      const mintedAgain = /```gateway ([0-9a-f]{48})\n/.exec(String(second.body.text))?.[1]
+      expect(mintedAgain).toBeDefined()
+      expect(mintedAgain).not.toBe(minted)
+      const replaced = await readBridge(dir, alpha.sessionId)
+      expect(replaced.bootstrapSha256).toBe(sha256(mintedAgain!))
+      expect(replaced.bootstrapBurnedAt).toBeNull()
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('arm burns the bootstrap token before it runs the command', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const snippet = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
+      const minted = /```gateway ([0-9a-f]{48})\n/.exec(String(snippet.body.text))![1]
+      driver.answer = [
+        'Arming.',
+        '',
+        '```gateway ' + minted,
+        '{"op":"schedule","label":"armed-once","inSeconds":600}',
+        '```',
+      ].join('\n')
+
+      const armed = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(armed.status).toBe(200)
+      expect(armed.body.ok).toBe(true)
+      expect(armed.body.evidence).toBe('state-complete')
+      // The tab was taken deliberately and the page read once.
+      expect(driver.calls.some(call => call.op === 'use' && call.threadId === THREAD_A)).toBe(true)
+      expect(driver.readCalls).toBe(1)
+
+      const after = await readBridge(dir, alpha.sessionId)
+      expect(after.bootstrapBurnedAt).not.toBeNull()
+      expect(after.schedules.map(schedule => schedule.label)).toContain('armed-once')
+
+      // The same answer cannot be armed twice through a dead token.
+      const again = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(again.body.ok).toBe(false)
+      expect(again.body.line).toContain('one-shot')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a bare gateway fence is armed once per answer text', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      driver.evidence = 'stability'
+      driver.answer = '```gateway\n{"op":"schedule","label":"bare-one","inSeconds":600}\n```'
+
+      const first = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(first.body.ok).toBe(true)
+      expect(first.body.evidence).toBe('stability')
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.lastArmedSha256).toBe(sha256(driver.answer))
+      expect(stored.schedules.map(schedule => schedule.label)).toContain('bare-one')
+
+      const second = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(second.body.ok).toBe(false)
+      expect(second.body.line).toContain('already armed')
+
+      // A newer answer is a new trust decision, so the same click works again.
+      driver.answer = '```gateway\n{"op":"schedule","label":"bare-two","inSeconds":600}\n```'
+      const third = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(third.body.ok).toBe(true)
+      expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toContain('bare-two')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('arm refuses with the literal line for every condition', async () => {
+    const { dir, cleanup } = await scratch()
+    const unbound = bridgeNamed('unbound', null)
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [unbound, alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+
+      const noThread = await operator(host, token, { op: 'arm', bridge: unbound.sessionId })
+      expect(noThread.body.ok).toBe(false)
+      expect(noThread.body.line).toBe('no thread yet: this bridge is not bound to a ChatGPT thread; adopt a thread or create a bridge first')
+
+      driver.answer = 'Just prose, no fence anywhere.'
+      const noFence = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(noFence.body.ok).toBe(false)
+      expect(noFence.body.line).toBe('nothing to arm: the newest assistant answer contains no gateway command block')
+
+      driver.readError = 'the newest assistant turn is still in progress'
+      const writing = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(writing.body.line).toBe('the answer is still being written; wait for it to finish, then click "Arm last answer" again')
+
+      driver.readError = 'no assistant turn is on the page'
+      const empty = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(empty.body.line).toBe('nothing to arm: the page holds no finished assistant answer')
+
+      driver.readError = 'no thread is open'
+      const closed = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(closed.body.line).toBe('nothing to arm: the page holds no finished assistant answer')
+
+      // A page that cannot prove the turn finished is not armable either.
+      driver.readError = null
+      driver.evidence = 'provisional'
+      driver.answer = '```gateway\n{"op":"list"}\n```'
+      const unproven = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
+      expect(unproven.body.line).toContain('could not confirm the answer finished')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an inbound turn extracts commands from the page read, never the send text', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', null)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir),
+      sessionId: randomUUID(),
+      name: 'sender',
+      cwd: dir,
+      purpose: 'test sender',
+      policy: 'accept',
+    })
+    try {
+      await sender.start()
+      let emitted = false
+      driver.sendText = 'Working on it.' // the post-time text carries no command
+      driver.answerFor = request => {
+        const nonce = /gateway ([0-9a-f]{8})/.exec(String(request.text ?? ''))?.[1]
+        if (!nonce) return 'Understood.' // the primer
+        if (emitted) return 'Done.'
+        emitted = true
+        return `Working on it.\n\n\`\`\`gateway ${nonce}\n{"op":"schedule","label":"from-read","inSeconds":600}\n\`\`\``
+      }
+      await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', false)
+      const { token } = await credentials(dir)
+      const armed = await waitFor(async () => {
+        const state = await operatorState(host, token)
+        const bridge = state.bridges.find((item: any) => item.sessionId === alpha.sessionId)
+        return bridge?.schedules?.some((schedule: any) => schedule.label === 'from-read') ? bridge : undefined
+      })
+      expect(armed.schedules.map((schedule: any) => schedule.label)).toContain('from-read')
+      expect(driver.readCalls).toBeGreaterThanOrEqual(1)
+      expect(driver.sendText).not.toContain('from-read')
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a failed read falls back to the send text and is logged', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', null)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir),
+      sessionId: randomUUID(),
+      name: 'sender',
+      cwd: dir,
+      purpose: 'test sender',
+      policy: 'accept',
+    })
+    try {
+      await sender.start()
+      let emitted = false
+      driver.readError = 'the newest assistant turn is still in progress'
+      driver.sendTextFor = request => {
+        const nonce = /gateway ([0-9a-f]{8})/.exec(String(request.text ?? ''))?.[1]
+        if (!nonce || emitted) return 'Working on it.'
+        emitted = true
+        return `Working on it.\n\n\`\`\`gateway ${nonce}\n{"op":"schedule","label":"from-send","inSeconds":600}\n\`\`\``
+      }
+      await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', false)
+      const { token } = await credentials(dir)
+      const armed = await waitFor(async () => {
+        const state = await operatorState(host, token)
+        const bridge = state.bridges.find((item: any) => item.sessionId === alpha.sessionId)
+        return bridge?.schedules?.some((schedule: any) => schedule.label === 'from-send') ? bridge : undefined
+      })
+      expect(armed.schedules.map((schedule: any) => schedule.label)).toContain('from-send')
+      expect(driver.readCalls).toBeGreaterThanOrEqual(1)
+    } finally {
+      await sender.close().catch(() => {})
       await host.stop()
       await cleanup()
     }
