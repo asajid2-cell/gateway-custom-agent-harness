@@ -9,14 +9,13 @@ import { getSessionId } from '../bootstrap/state.js'
 import { lock } from './lockfile.js'
 import {
   GATEWAY_SESSION_PROTOCOL, MAX_PEER_MESSAGE_BYTES, MAX_PEER_QUEUE, MAX_PEER_HISTORY,
-  gatewayPeerSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage, parseGatewayPeer,
+  gatewayPeerSchema, gatewayPeerRouteSchema, gatewayPeerMessageSchema, gatewayInboxSchema, parsePeerMessage, parseGatewayPeer,
   peerMessageExpectsReply,
-  type GatewayPeer, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
+  type GatewayPeer, type GatewayPeerRoute, type GatewayPeerMessage, type GatewayInboxRecord, type GatewayPeerHistoryEntry,
   type GatewayInboundPolicy, type PeerMessageKind,
 } from './gatewaySessionProtocol.js'
 import { readTranscriptSlice, type TranscriptSlice } from './transcriptRead.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
-import type { GatewayPeerRoute } from './gatewaySessionProtocol.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -849,6 +848,8 @@ export class GatewaySessionTransport {
     name: string
     cwd: string
     purpose?: string
+    // A peer that is not a harness session has no route to describe; it supplies the one it actually spends.
+    route?: GatewayPeerRoute
     policy?: GatewayInboundPolicy
     onInboxChanged?: () => void
     /**
@@ -1196,8 +1197,10 @@ export class GatewaySessionTransport {
       })
       // Advertise the route before publishing. A registration is what a sender
       // reads to decide whether a message can be answered, and a peer that
-      // appears without a route is one every sender has to treat as unknown.
-      const route = await describeOwnRoute()
+      // appears without a route is one every sender has to treat as unknown. A
+      // supplied route is validated by the same schema, so a malformed one fails
+      // the start instead of publishing a registration senders cannot read.
+      const route = this.options.route === undefined ? await describeOwnRoute() : gatewayPeerRouteSchema.parse(this.options.route)
       if (route) this.peer.route = route
       await atomicJson(this.registrationPath, { peer: this.peer, token: this.token })
     } catch (error) {
@@ -1621,14 +1624,15 @@ export class GatewaySessionTransport {
     }
   }
 
-  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics' | 'compactBoundaryCount' | 'microcompactBoundaryCount'>>): Promise<void> {
+  async update(values: Partial<Pick<GatewayPeer, 'name' | 'purpose' | 'status' | 'topics' | 'compactBoundaryCount' | 'microcompactBoundaryCount' | 'route'>>): Promise<void> {
     // A session that switches model or account mid-life spends on the new route,
     // and a registration that keeps advertising the launch-time credential
     // would let a sender withhold mail for a key that is no longer in use. A
     // status change is the ordinary boundary at which that can be true - it
     // happens at every turn start and end - so it is where the advertisement is
-    // refreshed.
-    const route = await describeOwnRoute()
+    // refreshed. A supplied-route peer advertises only what it was given;
+    // re-describing it here is Claude-only and would clobber the host's route.
+    const route = this.options.route === undefined ? await describeOwnRoute() : undefined
     const subscribers = await this.serial(async () => {
       const next = gatewayPeerSchema.parse({ ...this.peer, ...(route ? { route } : {}), ...values })
       await atomicJson(this.registrationPath, { peer: next, token: this.token })
