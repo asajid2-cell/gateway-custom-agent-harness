@@ -26,7 +26,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { attachmentRefusal, MAX_ATTACHMENT_BYTES, parseCommand, proseFromTurn, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
+import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
   saveJson, type BridgeState, type HostState,
@@ -46,6 +46,10 @@ const TURN_TIMEOUT_MS = Number(process.env.CHATGPT_TURN_TIMEOUT_MS || 20 * 60_00
 /** Host-private files: where the instance identity is written. */
 const PRIVATE_HOME = process.env.CHATGPT_WEB_PRIVATE_HOME ?? join(homedir(), '.chatgpt-web')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+/** The only form in which a join token is ever written down. */
+const sha256Hex = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex')
+/** A bootstrap token is shown once and never stored: 24 random bytes. */
+const BOOTSTRAP_BYTES = 24
 
 /** Only the operator's local-file picker needs a guess; transcripts are text. */
 const MIME: Record<string, string> = {
@@ -637,6 +641,21 @@ export class ChatGptHost {
         await this.persistHostState()
         return this.send(response, 200, { ok: true, op, line })
       }
+      // The join path: a brand-new thread gets one paste-ready snippet. The
+      // token is revealed here and nowhere else, and only its sha is kept.
+      if (op === 'snippet') {
+        const text = await this.snippetFor(bridge)
+        audit(this.hostState, { op: 'snippet', target: bridge.state.name, result: 'minted a one-shot bootstrap token' })
+        await this.persistHostState()
+        return this.send(response, 200, { ok: true, op, line: 'paste the snippet into the thread', text })
+      }
+      // The operator's click is the trust path: it may run what the page
+      // already answered, without any turn of ours having posted it.
+      if (op === 'arm') {
+        const result = await this.armBridge(bridge)
+        await this.persistHostState()
+        return this.send(response, 200, { op, ...result })
+      }
       // The two grants. Both are pushes the operator issues from the page.
       if (op === 'attachTranscript') {
         const peer = String(body.peer ?? '')
@@ -788,6 +807,168 @@ export class ChatGptHost {
       return threads.length === 0 ? 'no threads on the account' : threads.map(thread => `${thread.id} "${one(thread.title, 80)}"`).join('; ').slice(0, 900)
     }
     throw new Error(`unknown thread action ${action || '(missing)'}`)
+  }
+
+  /**
+   * The paste-ready teaching snippet for one bridge.
+   *
+   * The token exists in this response and in the thread the human pastes it
+   * into. The file keeps only the sha, and calling this again mints a NEW
+   * token - the previous snippet stops matching the sha on disk immediately,
+   * whether or not it was ever used.
+   */
+  private async snippetFor(bridge: Bridge): Promise<string> {
+    const token = randomBytes(BOOTSTRAP_BYTES).toString('hex')
+    bridge.state.bootstrapSha256 = sha256Hex(token)
+    bridge.state.bootstrapBurnedAt = null
+    await this.persistBridgeState(bridge, true)
+    const name = bridge.state.name
+    return [
+      `# Join the local session bus as "${name}"`,
+      '',
+      `This thread is already bound to the peer "${name}", session id ${bridge.state.sessionId}.`,
+      'That peer is one participant in a bus of live agent sessions on ONE machine. Each',
+      'message it receives was sent by another session, not by the person whose account',
+      'this is.',
+      '',
+      'To send the first bus message, emit exactly ONE fenced block, with this info string',
+      'and one JSON object in the body:',
+      '',
+      '```gateway ' + token,
+      `{"op":"send","to":"${name}","text":"...","summary":"..."}`,
+      '```',
+      '',
+      '- Fill in `text` and `summary`. Do not change the fence line.',
+      '- The token is ONE-SHOT: the host burns it the moment it runs the block, so a',
+      '  second block carrying it is refused.',
+      '- Every later turn carries its OWN fresh nonce in the message the host posts. Use',
+      '  only the nonce you were just given; this token is never reusable.',
+      '- `to` is a peer name or session id taken from `list`. Never invent one.',
+      '- Keep `summary` under 200 characters.',
+      '',
+      '## Operations',
+      '',
+      this.primerOps(),
+      '',
+      'Prose without a fence is only prose: the host sends your answer back to whoever',
+      'messaged you.',
+    ].join('\n')
+  }
+
+  /** The operation list exactly as primer.md defines it - never a second table. */
+  private primerOps(): string {
+    const lines = this.primer.text.split(/\r?\n/)
+    const start = lines.findIndex(line => /^## Operations\s*$/.test(line))
+    if (start < 0) return COMMAND_OPS.map(op => `- {"op":"${op}"}`).join('\n')
+    const end = lines.findIndex((line, index) => index > start && /^## /.test(line))
+    return lines.slice(start + 1, end < 0 ? undefined : end).join('\n').trim()
+  }
+
+  /**
+   * Arm the newest finished answer on the bridge's own thread.
+   *
+   * The click is the trust path. The page holds an answer no turn of ours
+   * posted, and the operator decides it may act, so exactly two fences are
+   * accepted here: this bridge's live bootstrap token, burned BEFORE anything
+   * runs, and - because the click itself is the authority - a bare `gateway`
+   * fence, at most once per answer text.
+   */
+  private async armBridge(bridge: Bridge): Promise<{ ok: boolean; line: string; lines?: string[]; evidence?: string }> {
+    const state = bridge.state
+    const threadId = state.threadId
+    if (!threadId) {
+      return { ok: false, line: 'no thread yet: this bridge is not bound to a ChatGPT thread; adopt a thread or create a bridge first' }
+    }
+    return await this.pageWork(async () => {
+      // Take the tab this bridge posts to and prove the page landed on it. The
+      // same check operatorThread makes: arming the wrong tab would run an
+      // answer that belongs to another peer.
+      const used = await this.driver.call({ op: 'use', threadId }, TURN_TIMEOUT_MS)
+      if (used.ok !== true) return { ok: false, line: `could not open the bridge thread: ${one(used.error, 200) || 'the page refused'}` }
+      const landed = typeof used.threadId === 'string' ? used.threadId : ''
+      if (landed.toLowerCase() !== threadId.toLowerCase()) {
+        return { ok: false, line: `the page opened ${landed || 'another thread'} instead of the bridge thread ${threadId}` }
+      }
+      const read = await this.driver.call({ op: 'read' }, TURN_TIMEOUT_MS)
+      if (read.ok !== true) {
+        const reason = one(read.error, 240) || 'the page did not answer'
+        if (/still in progress/i.test(reason)) {
+          return { ok: false, line: 'the answer is still being written; wait for it to finish, then click "Arm last answer" again' }
+        }
+        if (/no assistant turn|no thread is open/i.test(reason)) {
+          return { ok: false, line: 'nothing to arm: the page holds no finished assistant answer' }
+        }
+        return { ok: false, line: `could not read the page: ${reason}` }
+      }
+      const evidence = typeof read.evidence === 'string' ? read.evidence : ''
+      if (evidence !== 'state-complete' && evidence !== 'stability') {
+        return { ok: false, line: `nothing to arm: the page could not confirm the answer finished (evidence: ${evidence || 'none'}); wait and click "Arm last answer" again` }
+      }
+      const answer = typeof read.text === 'string' ? read.text : ''
+      if (!answer.trim()) return { ok: false, line: 'nothing to arm: the newest assistant answer is empty' }
+
+      const tokenSha = state.bootstrapSha256
+      const burned = state.bootstrapBurnedAt !== null
+      let bootstrapBlock: { line: number; body: string } | undefined
+      const bareBlocks: { line: number; body: string }[] = []
+      const refused: string[] = []
+      for (const block of readFences(answer)) {
+        if (!/^gateway\b/i.test(block.info)) continue
+        const info = block.info.replace(/^gateway\s*/i, '').trim()
+        if (!info) { bareBlocks.push({ line: block.line, body: block.body }); continue }
+        if (tokenSha !== null && sha256Hex(info) === tokenSha) {
+          if (burned || bootstrapBlock) refused.push(`line ${block.line}: refused: the bootstrap token is one-shot; a second block carrying it is refused`)
+          else bootstrapBlock = { line: block.line, body: block.body }
+          continue
+        }
+        refused.push(`line ${block.line}: refused: the nonce matches neither this bridge's live bootstrap token nor a bare gateway fence`)
+      }
+      if (!bootstrapBlock && bareBlocks.length === 0) {
+        return { ok: false, line: refused[0] ?? 'nothing to arm: the newest assistant answer contains no gateway command block', lines: refused }
+      }
+
+      const answerSha = sha256Hex(answer)
+      if (!bootstrapBlock && state.lastArmedSha256 === answerSha) {
+        return { ok: false, line: 'already armed: this answer was armed before; arm a newer answer', lines: refused }
+      }
+      const chosen = bootstrapBlock ? [bootstrapBlock] : bareBlocks
+      if (bootstrapBlock) {
+        // Burn first and persist it, then run: a crash between the two must not
+        // leave a token that still works.
+        state.bootstrapBurnedAt = now()
+        await this.persistBridgeState(bridge, true)
+        if (bareBlocks.length > 0) refused.push(`not run: ${bareBlocks.length} bare gateway fence(s) were ignored because the bootstrap token was used`)
+      }
+
+      const lines: string[] = []
+      let ran = 0
+      for (const block of chosen) {
+        let parsed: unknown
+        try { parsed = JSON.parse(block.body) } catch (error) {
+          lines.push(`line ${block.line}: refused: invalid JSON (${(error as Error).message})`)
+          continue
+        }
+        const command = parseCommand(parsed)
+        if (!command.ok) { lines.push(`line ${block.line}: refused: ${command.error}`); continue }
+        if (ran >= MAX_COMMANDS_PER_TURN) { lines.push(`line ${block.line}: refused: command budget (${MAX_COMMANDS_PER_TURN} per turn)`); continue }
+        ran++
+        try {
+          const result = await this.executeCommand(bridge, command.command, 'operator')
+          lines.push(result.line)
+        } catch (error) {
+          lines.push(`${command.command.op} failed: ${one((error as Error).message, 240)}`)
+        }
+      }
+      lines.push(...refused)
+      if (!bootstrapBlock) state.lastArmedSha256 = answerSha
+      await this.persistBridgeState(bridge)
+      return {
+        ok: ran > 0,
+        line: ran > 0 ? `armed ${ran} command${ran === 1 ? '' : 's'} from the answer` : (lines[0] ?? 'nothing to arm'),
+        lines,
+        evidence,
+      }
+    })
   }
 
   private readBody(request: IncomingMessage): Promise<string | undefined> {
@@ -985,8 +1166,10 @@ export class ChatGptHost {
           const prompt = this.inboundPrompt({ ...message, fromName: name, text }, turnNonce)
           const outcome = await runCommandTurn(prompt, turnNonce, {
             generate: async subject => {
-              try { return { ok: true, text: await this.pageTurn(bridge, subject) } }
-              catch (error) { return { ok: false, error: (error as Error).message } }
+              try {
+                const sent = await this.pageTurn(bridge, subject)
+                return { ok: true, text: await this.readCompletedAnswer(bridge, sent) }
+              } catch (error) { return { ok: false, error: (error as Error).message } }
             },
             execute: command => this.executeCommand(bridge, command, 'model', message.id),
           })
@@ -1007,6 +1190,42 @@ export class ChatGptHost {
       await this.persistHostState()
       this.scheduleIdleUnload()
     }
+  }
+
+  /**
+   * The answer a turn actually landed on the page.
+   *
+   * `send` returns what the driver saw when it posted; a completed turn is what
+   * the page now holds, and commands must be extracted from that - a send that
+   * returns before the model finished would otherwise let a stale turn be
+   * parsed. ONE read per page turn, immediately after the send: no polling and
+   * no timer. A read that fails, names another thread, returns nothing, or
+   * cannot prove completion falls back to the send text and says so in the log.
+   */
+  private async readCompletedAnswer(bridge: Bridge, sent: string): Promise<string> {
+    const threadId = bridge.state.threadId
+    if (!threadId) return sent
+    const reply = await this.driver.call({ op: 'read' }, TURN_TIMEOUT_MS)
+    if (reply.ok !== true) {
+      log(`read after send on "${bridge.state.name}" failed: ${one(reply.error, 200)}; using the send text`)
+      return sent
+    }
+    const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
+    if (landed && landed.toLowerCase() !== threadId.toLowerCase()) {
+      log(`read after send landed on ${shortId(landed)} instead of ${shortId(threadId)}; using the send text`)
+      return sent
+    }
+    const text = typeof reply.text === 'string' ? reply.text : ''
+    if (!text.trim()) {
+      log(`read after send on "${bridge.state.name}" returned no text; using the send text`)
+      return sent
+    }
+    const evidence = typeof reply.evidence === 'string' ? reply.evidence : ''
+    if (evidence !== 'state-complete' && evidence !== 'stability') {
+      log(`read after send on "${bridge.state.name}" could not prove the turn finished (${evidence || 'none'}); using the send text`)
+      return sent
+    }
+    return text
   }
 
   private inboundPrompt(message: { id: string; fromSessionId: string; fromName?: string; summary: string; text: string; kind?: string; expectReply?: boolean; replyTo?: string }, turnNonce: string): string {
@@ -1588,9 +1807,13 @@ async function refresh(){
       const td = document.createElement('td'); td.textContent = String(value); tr.appendChild(td)
     }
     const td = document.createElement('td')
+    const snippet = document.createElement('button'); snippet.textContent = 'Snippet'
+    snippet.onclick = async () => { const r = await api('snippet', {bridge:b.sessionId}); show(r.body.text || r.body.error || JSON.stringify(r.body)) }
+    const arm = document.createElement('button'); arm.textContent = 'Arm last answer'
+    arm.onclick = async () => { const r = await api('arm', {bridge:b.sessionId}); show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh() }
     const button = document.createElement('button'); button.textContent = 'Remove'
     button.onclick = async () => { if(!confirm('Remove bridge '+b.name+'? The ChatGPT thread is not deleted.')) return; const r = await api('remove', {sessionId:b.sessionId}); show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh() }
-    td.appendChild(button); tr.appendChild(td); rows.appendChild(tr)
+    td.appendChild(snippet); td.appendChild(arm); td.appendChild(button); tr.appendChild(td); rows.appendChild(tr)
   }
 }
 $('loadThreads').onclick = async () => {
