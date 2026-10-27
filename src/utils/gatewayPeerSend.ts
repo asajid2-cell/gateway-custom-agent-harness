@@ -27,6 +27,12 @@ export type GatewayPeerSendResult = {
    */
   delivered?: boolean
   /**
+   * True when the target is a durable peer that is not open. The message was
+   * queued to that peer's mailbox and the result line says so; this is not a
+   * delivery and must never be rendered as one.
+   */
+  closed?: boolean
+  /**
    * Whether the recipient session itself answered.
    *
    * The liveness axis, kept apart from `routeState` because the two are
@@ -411,6 +417,21 @@ export async function sendViaGatewayPeer(
   } catch (error) {
     const reason = error instanceof Error ? error.message.replace(/\s+/g, ' ').trim().slice(0, 300) : ''
     return { ok: false, message: `Delivery to ${resolved.label} failed: ${reason || 'transport error'}` }
+  }
+  // A closed durable peer is not a liveness failure to re-address: the mail is
+  // held for its next open. Carry the transport's queued line verbatim rather
+  // than inventing a second one here.
+  if (receipt?.closed === true) {
+    return {
+      ok: true,
+      alive: false,
+      delivered: false,
+      closed: true,
+      message: String(receipt.message),
+      messageId: typeof receipt.id === 'string' ? receipt.id : undefined,
+      state: 'queued',
+      recipient: resolved.sessionId,
+    }
   }
   if (receipt?.ok === false && receipt.reason === 'route_unavailable') {
     return routeUnavailableRefusal(resolved.label, resolved.sessionId, receipt, await peerBuildNote(resolved.sessionId))
