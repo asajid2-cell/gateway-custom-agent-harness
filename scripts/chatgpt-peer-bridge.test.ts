@@ -768,4 +768,89 @@ describe('multi-bridge host', () => {
       await cleanup()
     }
   })
+
+  test('the operator page sets the credential cookie; no hand-typed token remains', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`)
+      expect(response.status).toBe(200)
+      const cookie = response.headers.get('set-cookie') ?? ''
+      expect(cookie).toContain(`chatgpt-operator=${token}`)
+      expect(cookie).toContain('HttpOnly')
+      expect(cookie).toContain('SameSite=Strict')
+      expect(cookie).toContain('Path=/')
+      const html = await response.text()
+      expect(html).not.toContain('Use token')
+      expect(html).not.toContain('localStorage')
+      expect(html).toContain('Scripts can use the bearer token in')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('the state call accepts the cookie alone, with no Authorization header', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator/state`, {
+        headers: { cookie: `chatgpt-operator=${token}` },
+      })
+      expect(response.status).toBe(200)
+      const state = await response.json() as any
+      expect(state.bridges.map((bridge: any) => bridge.sessionId)).toEqual([alpha.sessionId])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a cookie write from a foreign origin is refused and changes nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { cookie: `chatgpt-operator=${token}`, origin: 'http://127.0.0.1:1', 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'remove', sessionId: alpha.sessionId }),
+      })
+      expect(response.status).toBe(403)
+      expect(await response.json()).toEqual({ error: 'cross-origin request refused' })
+      const state = await operatorState(host, token)
+      expect(state.bridges.map((bridge: any) => bridge.sessionId)).toEqual([alpha.sessionId])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a cookie write from this exact origin works', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { cookie: `chatgpt-operator=${token}`, origin: `http://127.0.0.1:${host.port}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'remove', sessionId: alpha.sessionId }),
+      })
+      expect(response.status).toBe(200)
+      const state = await operatorState(host, token)
+      expect(state.bridges).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
 })

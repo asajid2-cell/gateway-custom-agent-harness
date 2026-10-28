@@ -36,6 +36,8 @@ const execFileAsync = promisify(execFile)
 
 const NAME = 'chatgpt-web'
 const PROVIDER = 'chatgpt-web'
+/** The cookie the operator page carries its instance credential in. */
+const OPERATOR_COOKIE = 'chatgpt-operator'
 const PURPOSE = 'A signed-in ChatGPT web thread on the operator\'s account, addressed like any other live session.'
 // One page turn can legitimately outlast ten minutes: a large attachment is
 // uploaded first and only then does the model answer. Cutting the turn off
@@ -480,13 +482,21 @@ export class ChatGptHost {
 
     const url = new URL(request.url ?? '/', `http://${expected}`)
     if (request.method === 'GET' && url.pathname === '/gateway/route-health') return this.routeHealth(url, response)
-    if (request.method === 'GET' && (url.pathname === '/operator' || url.pathname === '/operator/')) return this.sendHtml(response, 200, this.operatorPageHtml())
+    if (request.method === 'GET' && (url.pathname === '/operator' || url.pathname === '/operator/')) return this.sendOperatorPage(response)
     if (request.method === 'GET' && url.pathname === '/operator/state') {
-      if (!this.authorized(request)) return this.send(response, 401, { error: 'unauthorized' })
+      if (!this.authorizedBy(request)) return this.send(response, 401, { error: 'unauthorized' })
       return this.send(response, 200, this.operatorState())
     }
     if (request.method === 'POST' && url.pathname === '/operator') {
-      if (!this.authorized(request)) return this.send(response, 401, { error: 'unauthorized' })
+      const via = this.authorizedBy(request)
+      if (!via) return this.send(response, 401, { error: 'unauthorized' })
+      // A cookie is ambient authority, so a write carrying one must name this
+      // exact origin: another page on this machine is same-site, not same-origin,
+      // and must not drive the host. Bearer callers are explicit already.
+      const origin = request.headers.origin
+      if (via === 'cookie' && typeof origin === 'string' && origin !== `http://${expected}`) {
+        return this.send(response, 403, { error: 'cross-origin request refused' })
+      }
       return this.operator(request, response)
     }
     this.send(response, 404, { error: 'not found' })
@@ -498,17 +508,52 @@ export class ChatGptHost {
     response.end(text)
   }
 
-  private sendHtml(response: ServerResponse, status: number, html: string): void {
-    response.writeHead(status, { 'content-type': 'text/html; charset=utf-8', 'content-length': Buffer.byteLength(html), 'cache-control': 'no-store' })
+  /**
+   * Serve the page and hand the browser the instance credential as a cookie.
+   *
+   * Loopback is not an authentication boundary: any page in any browser on this
+   * machine can POST to this port. The real guards are the Host pin (DNS
+   * rebinding) and the Origin check on writes; the cookie only carries the
+   * credential so a human never copies it. SameSite=Strict keeps a foreign page
+   * from sending it and there are no CORS headers, so that page cannot read us.
+   *
+   * Session cookie (no Max-Age): every page load re-sets it, which also picks up
+   * the credential that is regenerated on every host start.
+   */
+  private sendOperatorPage(response: ServerResponse): void {
+    const html = this.operatorPageHtml()
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': Buffer.byteLength(html),
+      'cache-control': 'no-store',
+      'set-cookie': `${OPERATOR_COOKIE}=${this.operatorToken}; HttpOnly; SameSite=Strict; Path=/`,
+    })
     response.end(html)
   }
 
-  private authorized(request: IncomingMessage): boolean {
+  private authorizedBy(request: IncomingMessage): 'bearer' | 'cookie' | null {
     const header = request.headers.authorization
-    if (typeof header !== 'string' || !header.startsWith('Bearer ')) return false
-    const given = Buffer.from(header.slice(7), 'utf8')
+    if (typeof header === 'string' && header.startsWith('Bearer ') && this.matchesToken(header.slice(7))) return 'bearer'
+    const cookie = this.operatorCookie(request)
+    if (cookie !== undefined && this.matchesToken(cookie)) return 'cookie'
+    return null
+  }
+
+  private matchesToken(given: string): boolean {
+    const offered = Buffer.from(given, 'utf8')
     const expected = Buffer.from(this.operatorToken, 'utf8')
-    return given.length === expected.length && timingSafeEqual(given, expected)
+    return offered.length === expected.length && timingSafeEqual(offered, expected)
+  }
+
+  private operatorCookie(request: IncomingMessage): string | undefined {
+    const header = request.headers.cookie
+    if (typeof header !== 'string') return undefined
+    for (const part of header.split(';')) {
+      const index = part.indexOf('=')
+      if (index < 0) continue
+      if (part.slice(0, index).trim() === OPERATOR_COOKIE) return part.slice(index + 1).trim()
+    }
+    return undefined
   }
 
   /**
@@ -1788,59 +1833,106 @@ export class ChatGptHost {
   // ---------------------------------------------------------- operator page
 
   private operatorPageHtml(): string {
+    const tokenFile = join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.config.instanceId}.json`)
     return `<!doctype html>
 <meta charset="utf-8">
 <title>${NAME} bridges</title>
 <style>
- body{font:14px system-ui,sans-serif;margin:24px;max-width:960px}
- h1{font-size:18px} h2{font-size:15px;margin-top:24px}
- table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #ddd;padding:4px 6px;text-align:left;vertical-align:top}
+ body{font:14px system-ui,sans-serif;margin:24px;max-width:960px;line-height:1.45}
+ h1{font-size:18px} h2{font-size:15px;margin-top:28px}
+ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left;vertical-align:top}
  code,pre{background:#f4f4f4;padding:2px 4px;border-radius:3px} pre{padding:8px;white-space:pre-wrap}
  button{margin-right:6px} input{width:220px;margin-right:6px}
+ .note{color:#555;margin:6px 0}
+ #health{background:#f4f4f4;padding:8px;border-radius:3px}
  #out{margin-top:16px}
 </style>
 <h1>${NAME}</h1>
-<p><label>Operator token <input id="token" type="password" size="48"></label> <button id="saveToken">Use token</button></p>
+<p>This page is the local control surface for the ChatGPT bridge host on this machine. Conversations happen in the ChatGPT window next to it - this page never talks to ChatGPT itself. A <b>bridge</b> is one ChatGPT thread registered on the peer bus under a name, so other sessions can message it by that name. Nothing is written into a thread on its own: a bridge only acts when another session messages it, or when you click a button here.</p>
+<p id="health">Route state: checking...</p>
 <h2>Bridges</h2>
-<table><thead><tr><th>name</th><th>session</th><th>thread</th><th>model</th><th>status</th><th>owed</th><th></th></tr></thead><tbody id="bridges"></tbody></table>
-<h2>Adopt a thread</h2>
+<table><thead><tr><th>Name</th><th>ChatGPT thread</th><th>Model / effort</th><th>State</th><th>Pending</th><th>Actions</th></tr></thead><tbody id="bridges"></tbody></table>
+<p id="empty" class="note" hidden>No bridges yet - choose a ChatGPT thread under 'Adopt an existing thread', or start a fresh one with 'New bridge'.</p>
+<p class="note">Snippet - paste-ready instructions that hand a thread its one-shot token. Arm last answer - run the newest answer already on that thread because you clicked. Remove - unregister the bridge and leave the ChatGPT conversation alone.</p>
+<h2>Adopt an existing ChatGPT thread</h2>
+<p class="note">The thread becomes a bus peer under the name you give it, and the teaching primer is posted into that same conversation.</p>
 <p><button id="loadThreads">Load threads</button> <select id="threads"></select> <input id="adoptName" placeholder="name (optional)"> <button id="adopt">Adopt</button></p>
-<h2>New bridge</h2>
+<h2>Start a new ChatGPT thread</h2>
+<p class="note">Mints a peer and a fresh ChatGPT conversation.</p>
 <p><input id="newName" placeholder="name (optional)"> <button id="newBridge">New bridge</button></p>
 <div id="out"></div>
+<p class="note">Scripts can use the bearer token in <code>${tokenFile}</code>.</p>
 <script>
 const $ = id => document.getElementById(id)
-$('token').value = localStorage.getItem('chatgpt-operator-token') || ''
-$('saveToken').onclick = () => { localStorage.setItem('chatgpt-operator-token', $('token').value.trim()); show('token saved'); refresh() }
 function show(text){ $('out').innerHTML = '<pre></pre>'; $('out').firstChild.textContent = text }
-async function api(op, extra){
-  const token = $('token').value.trim()
-  const response = await fetch('/operator', {method:'POST', headers:{authorization:'Bearer '+token,'content-type':'application/json'}, body: JSON.stringify(Object.assign({op}, extra || {}))})
-  return {status: response.status, body: await response.json()}
+function describe(body){
+  if(body && typeof body === 'object') return body.error || body.line || JSON.stringify(body)
+  return String(body)
 }
-async function refresh(){
-  const token = $('token').value.trim()
-  const response = await fetch('/operator/state', {headers:{authorization:'Bearer '+token}})
-  if(!response.ok) return
-  const state = await response.json()
+async function fetchJson(url, init){
+  try{
+    const response = await fetch(url, init)
+    const text = await response.text()
+    let body = null
+    try{ body = text ? JSON.parse(text) : null }catch{ body = { error: text } }
+    return { ok: response.ok, status: response.status, body }
+  }catch(error){ return { ok: false, status: 0, body: { error: String((error && error.message) || error) } } }
+}
+function report(r){
+  if(r.status === 401){ show('Not authorized. Reload this page (the host sets an access cookie on load).'); return true }
+  if(r.status === 0){ show('network error: ' + describe(r.body)); return true }
+  if(!r.ok){ show(r.status + ' ' + describe(r.body)); return true }
+  return false
+}
+async function api(op, extra){
+  return fetchJson('/operator', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(Object.assign({op}, extra || {}))})
+}
+function threadLabel(b){
+  if(b.title) return b.title
+  if(b.threadId) return 'thread ' + String(b.threadId).slice(0, 8)
+  return 'no thread yet'
+}
+function renderHealth(state){
+  const el = $('health')
+  if(!state){ el.textContent = 'Route state: unknown - the host did not answer the state call.'; return }
+  const health = state.health || {}
+  const count = (state.bridges || []).length
+  const reason = health.reason ? ' (' + health.reason + ')' : ''
+  el.textContent = 'Route state: ' + (health.state || 'unknown') + reason + ' - ' + count + ' bridge' + (count === 1 ? '' : 's') + ' registered.'
+}
+function renderBridges(bridges){
   const rows = $('bridges'); rows.textContent = ''
-  for(const b of state.bridges || []){
+  for(const b of bridges){
     const tr = document.createElement('tr')
-    for(const value of [b.name, b.sessionId, b.threadId || '-', (b.model||'?')+(b.effort?'/'+b.effort:''), b.status, (b.owed||[]).length]){
+    for(const value of [b.name, threadLabel(b), (b.model||'?') + (b.effort ? ' / ' + b.effort : ''), b.status || 'unknown', (b.owed||[]).length]){
       const td = document.createElement('td'); td.textContent = String(value); tr.appendChild(td)
     }
     const td = document.createElement('td')
     const snippet = document.createElement('button'); snippet.textContent = 'Snippet'
-    snippet.onclick = async () => { const r = await api('snippet', {bridge:b.sessionId}); show(r.body.text || r.body.error || JSON.stringify(r.body)) }
+    snippet.title = 'Paste-ready instructions that hand this thread its one-shot token.'
+    snippet.onclick = async () => { const r = await api('snippet', {bridge:b.sessionId}); if(report(r)) return; show(r.body.text || r.body.line || JSON.stringify(r.body)) }
     const arm = document.createElement('button'); arm.textContent = 'Arm last answer'
-    arm.onclick = async () => { const r = await api('arm', {bridge:b.sessionId}); show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh() }
-    const button = document.createElement('button'); button.textContent = 'Remove'
-    button.onclick = async () => { if(!confirm('Remove bridge '+b.name+'? The ChatGPT thread is not deleted.')) return; const r = await api('remove', {sessionId:b.sessionId}); show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh() }
-    td.appendChild(snippet); td.appendChild(arm); td.appendChild(button); tr.appendChild(td); rows.appendChild(tr)
+    arm.title = 'Run the newest answer already on this thread because you clicked.'
+    arm.onclick = async () => { const r = await api('arm', {bridge:b.sessionId}); if(report(r)) return; show(r.body.line || JSON.stringify(r.body)); refresh() }
+    const remove = document.createElement('button'); remove.textContent = 'Remove'
+    remove.title = 'Unregister the bridge; the ChatGPT conversation is left alone.'
+    remove.onclick = async () => {
+      if(!confirm('Remove bridge ' + b.name + '? This only unregisters it here; the ChatGPT conversation is left alone.')) return
+      const r = await api('remove', {sessionId:b.sessionId}); if(report(r)) return; show(r.body.line || JSON.stringify(r.body)); refresh()
+    }
+    td.appendChild(snippet); td.appendChild(arm); td.appendChild(remove); tr.appendChild(td); rows.appendChild(tr)
   }
+  $('empty').hidden = bridges.length > 0
+}
+async function refresh(){
+  const r = await fetchJson('/operator/state')
+  if(report(r)){ renderHealth(null); return }
+  const state = r.body || {}
+  renderHealth(state)
+  renderBridges(state.bridges || [])
 }
 $('loadThreads').onclick = async () => {
-  const r = await api('threads'); if(r.status !== 200) return show(r.body.error || 'could not list threads')
+  const r = await api('threads'); if(report(r)) return
   const select = $('threads'); select.textContent = ''
   for(const t of r.body.threads || []){ const option = document.createElement('option'); option.value = t.id; option.textContent = t.title ? t.title + ' (' + t.id + ')' : t.id; select.appendChild(option) }
   show('loaded ' + ((r.body.threads||[]).length) + ' thread(s)')
@@ -1849,12 +1941,14 @@ $('adopt').onclick = async () => {
   const threadId = $('threads').value; if(!threadId) return show('choose a thread first')
   const name = $('adoptName').value.trim()
   const r = await api('adopt', name ? {threadId, name} : {threadId})
-  show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh()
+  if(report(r)) return
+  show(r.body.line || JSON.stringify(r.body)); refresh()
 }
 $('newBridge').onclick = async () => {
   const name = $('newName').value.trim()
   const r = await api('newBridge', name ? {name} : {})
-  show(r.body.line || r.body.error || JSON.stringify(r.body)); refresh()
+  if(report(r)) return
+  show(r.body.line || JSON.stringify(r.body)); refresh()
 }
 refresh()
 </script>
