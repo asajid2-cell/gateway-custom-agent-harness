@@ -208,6 +208,65 @@ describe('command channel', () => {
   })
 })
 
+/**
+ * The third block shape: `<CodeBlock language="gateway">{...}</CodeBlock>`.
+ *
+ * Found live: the model answered with that markup instead of a fence. The page
+ * rendered it as a real gateway block, but the text the host reads back holds
+ * the tag, so `readFences` saw nothing and the block was invisible.
+ */
+describe('CodeBlock markup', () => {
+  test('a gateway block written as markup is a gateway block', () => {
+    const source = '<CodeBlock language="gateway">{"uplink":true,"to":"x","text":"hi","summary":"s"}</CodeBlock>'
+    const blocks = readFences(source)
+    expect(blocks.length).toBe(1)
+    expect(blocks[0]!.info).toBe('gateway')
+    expect(JSON.parse(blocks[0]!.body)).toEqual({ uplink: true, to: 'x', text: 'hi', summary: 's' })
+  })
+
+  test('a markup block carries a command exactly as a fence does', () => {
+    const source = '<CodeBlock language="gateway">{"nonce":"abcd1234","op":"list"}</CodeBlock>'
+    expect(extractCommands(source, 'abcd1234').commands).toEqual([{ op: 'list' }])
+    expect(proseFromTurn(source).prose).toBe('')
+    expect(proseFromTurn('Before.\n' + source + '\nAfter.').prose).toBe('Before.\n\nAfter.')
+  })
+
+  test('another language is a code sample, never a gateway block', () => {
+    for (const language of ['json', 'python']) {
+      const source = `<CodeBlock language="${language}">{"nonce":"abcd1234","op":"list"}</CodeBlock>`
+      expect(readFences(source).map(block => block.info)).toEqual([language])
+      expect(extractCommands(source, 'abcd1234').commands).toEqual([])
+      expect(proseFromTurn(source).prose).toBe(source)
+    }
+  })
+
+  test('an unclosed tag is not a block and the rest of the answer is left alone', () => {
+    const source = 'Before.\n<CodeBlock language="gateway">{"nonce":"abcd1234","op":"list"}\nAfter, with no close.'
+    expect(readFences(source)).toEqual([])
+    expect(proseFromTurn(source).prose).toBe(source)
+    expect(extractCommands(source, 'abcd1234').commands).toEqual([])
+  })
+
+  test('a nested tag is skipped in favour of the inner one, and a balanced block after it still reads', () => {
+    const nested = '<CodeBlock language="gateway"><CodeBlock language="json">{"a":1}</CodeBlock></CodeBlock>'
+    expect(readFences(nested).map(block => block.info)).toEqual(['json'])
+    const afterUnclosed = '<CodeBlock language="gateway">{"nonce":"abcd1234","op":"list"}\n<CodeBlock language="gateway">{"nonce":"abcd1234","op":"inbox"}</CodeBlock>'
+    expect(extractCommands(afterUnclosed, 'abcd1234').commands).toEqual([{ op: 'inbox' }])
+  })
+
+  test('markup inside a fenced block stays part of that fence', () => {
+    const source = '```text\n<CodeBlock language="gateway">{"nonce":"abcd1234","op":"list"}</CodeBlock>\n```'
+    const blocks = readFences(source)
+    expect(blocks.map(block => block.info)).toEqual(['text'])
+    expect(extractCommands(source, 'abcd1234').commands).toEqual([])
+  })
+
+  test('the rendered and literal fence shapes are unchanged', () => {
+    expect(extractCommands(rendered('abcd1234', { op: 'list' }), 'abcd1234').commands).toEqual([{ op: 'list' }])
+    expect(extractCommands('```gateway abcd1234\n{"op":"list"}\n```', 'abcd1234').commands).toEqual([{ op: 'list' }])
+  })
+})
+
 describe('turn loop', () => {
   const nonce = 'abcd1234'
 
