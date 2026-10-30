@@ -383,8 +383,10 @@ describe('route health', () => {
     const { dir, cleanup } = await scratch()
     const fake = {
       calls: 0,
-      call: async () => { fake.calls++; return { ok: true } },
-      onAccepted: () => {},
+      // `ping` is liveness, not page work: the host sends it at boot to bring
+      // the child (and its event channel) up, so it is not counted here.
+      call: async (request: { op?: string }) => { if (request.op === 'ping') return { ok: true }; fake.calls++; return { ok: true } },
+      onEvent: () => () => {},
       kill: async () => {},
       reopen: () => {},
     }
@@ -429,7 +431,7 @@ describe('attachment envelope (D6)', () => {
         state.calls++
         return { ok: true, op: request.op, threadId: '11111111-1111-4111-8111-111111111111', text: 'ok', model: 'm', effort: 'e' }
       },
-      onAccepted: () => {},
+      onEvent: () => () => {},
       kill: async () => {},
       reopen: () => {},
     }
@@ -557,9 +559,8 @@ rl.on('line', line => {
 `, 'utf8')
     const accepted: string[] = []
     const child = new DriverChild({ script, log: () => {} })
-    child.onAccepted(() => accepted.push('yes'))
     try {
-      const reply = await child.call({ op: 'send', text: 'hi' })
+      const reply = await child.call({ op: 'send', text: 'hi' }, { onAccepted: id => accepted.push(id) })
       expect(reply.ok).toBe(true)
       expect(reply.text).toBe('echo:hi')
       expect(accepted.length).toBe(1)

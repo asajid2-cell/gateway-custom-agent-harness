@@ -39,7 +39,7 @@ class FakeDriver {
   sendError: string | null = null
   /** Derive the settled answer from the prompt that was just sent. */
   answerFor: ((request: Call) => string | undefined) | undefined
-  private accepted: ((id: string) => void) | undefined
+  private readonly listeners = new Set<(event: Record<string, unknown>) => void>()
   private current: string | null = null
   /** Serve the read-only thread ops from an in-memory tree shaped like /backend-api/conversation. */
   observable = false
@@ -85,10 +85,21 @@ class FakeDriver {
   /** The newest node on the branch - what a cursor points at after a turn. */
   newestId(threadId: string): string { return this.treeOf(threadId).current }
 
-  onAccepted(handler: ((id: string) => void) | undefined): void { this.accepted = handler }
+  /** Subscribe to page pushes, as the real child does. */
+  onEvent(handler: (event: Record<string, unknown>) => void): () => void {
+    this.listeners.add(handler)
+    return () => { this.listeners.delete(handler) }
+  }
 
-  async call(request: Call): Promise<DriverReply> {
+  /** Push one page event at the host. */
+  emit(event: Record<string, unknown>): void { for (const listener of this.listeners) listener(event) }
+
+  async call(request: Call, options?: number | { onAccepted?: (id: string) => void }): Promise<DriverReply> {
+    // `ping` is liveness, not page work: the host sends it at boot to bring the
+    // child (and its event channel) up, so it is not recorded as a page call.
+    if (String(request.op ?? '') === 'ping') return { ok: true, op: 'ping' }
     this.calls.push({ ...request })
+    const onAccepted = typeof options === 'object' && options ? options.onAccepted : undefined
     const op = String(request.op ?? '')
     if (op === 'threads') return { ok: true, op, threadId: this.current, threads: this.threads }
     if (op === 'use') {
@@ -109,7 +120,7 @@ class FakeDriver {
       this.answer = this.answerFor?.(request) ?? this.answer
       this.grow(threadId, 'user', String(request.text ?? ''))
       this.grow(threadId, 'assistant', this.answer)
-      this.accepted?.(String(request.id ?? ''))
+      onAccepted?.(String(request.id ?? ''))
       return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
@@ -170,6 +181,7 @@ async function startHost(dir: string, driver: FakeDriver, options: { idleUnloadM
     idleUnloadMinutes: options.idleUnloadMinutes ?? 0,
     number: 1,
     pollSeconds: 0,
+    titlesEvery: 0,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -907,8 +919,8 @@ describe('thread watcher', () => {
     try {
       await host.pollOnce()
       driver.threads[0]!.title = 'Renamed on the page'
-      // The list is walked every tenth tick, not every tick.
-      for (let tick = 0; tick < 10; tick++) await host.pollOnce()
+      // The list walk is its own timer now, not a rider on observation ticks.
+      await host.pollTitles()
       expect((await readBridge(dir, alpha.sessionId)).title).toBe('Renamed on the page')
 
       driver.deleted.add(THREAD_A)
@@ -972,20 +984,31 @@ describe('observation is not work', () => {
   })
 })
 
-describe('poll budget', () => {
-  test('the default is a minute, and the title walk is a tenth of the reads', async () => {
+describe('observation budget', () => {
+  test('the reconcile interval defaults to five minutes and the title walk to two', async () => {
     const { resolveConfig } = await import('./chatgpt-peer.ts')
-    const saved = process.env.CHATGPT_WEB_POLL_SECONDS
+    const saved = { observe: process.env.CHATGPT_WEB_OBSERVE_EVERY, titles: process.env.CHATGPT_WEB_TITLES_EVERY, poll: process.env.CHATGPT_WEB_POLL_SECONDS }
+    delete process.env.CHATGPT_WEB_OBSERVE_EVERY
+    delete process.env.CHATGPT_WEB_TITLES_EVERY
     delete process.env.CHATGPT_WEB_POLL_SECONDS
-    try { expect(resolveConfig({}).pollSeconds).toBe(60) }
-    finally { if (saved !== undefined) process.env.CHATGPT_WEB_POLL_SECONDS = saved }
+    try {
+      const config = resolveConfig({})
+      expect(config.observeEvery).toBe(300)
+      expect(config.titlesEvery).toBe(120)
+      // --poll-seconds still means the reconcile interval.
+      expect(resolveConfig({ pollSeconds: 30 }).observeEvery).toBe(30)
+    } finally {
+      if (saved.observe !== undefined) process.env.CHATGPT_WEB_OBSERVE_EVERY = saved.observe
+      if (saved.titles !== undefined) process.env.CHATGPT_WEB_TITLES_EVERY = saved.titles
+      if (saved.poll !== undefined) process.env.CHATGPT_WEB_POLL_SECONDS = saved.poll
+    }
   })
 
   test('a failed pass doubles the delay to a five-minute cap, and one clean pass resets it', async () => {
     const { pollDelayMs } = await import('./chatgpt-peer.ts')
-    expect(pollDelayMs(60_000, 0)).toBe(60_000)
+    expect(pollDelayMs(300_000, 0)).toBe(300_000)
+    expect(pollDelayMs(300_000, 1)).toBe(300_000)
     expect(pollDelayMs(60_000, 1)).toBe(120_000)
-    expect(pollDelayMs(60_000, 2)).toBe(240_000)
     expect(pollDelayMs(60_000, 3)).toBe(300_000)
     expect(pollDelayMs(60_000, 40)).toBe(300_000)
     expect(pollDelayMs(60_000, 0)).toBe(60_000)
@@ -994,9 +1017,7 @@ describe('poll budget', () => {
 })
 
 describe('unowned threads', () => {
-  const tickToTitleWalk = async (host: ChatGptHost): Promise<void> => {
-    for (let tick = 0; tick < 10; tick++) await host.pollOnce()
-  }
+  const tickToTitleWalk = async (host: ChatGptHost): Promise<void> => { await host.pollTitles() }
 
   test('a thread no bridge owns is noted when it appears and when it vanishes; a bound one is not', async () => {
     const { dir, cleanup } = await scratch()
@@ -1011,7 +1032,7 @@ describe('unowned threads', () => {
     const stranger = '33333333-3333-4333-8333-333333333333'
     try {
       // The first walk is the baseline: THREAD_B and THREAD_A are not "new".
-      await host.pollOnce()
+      await host.pollTitles()
       expect((await hostAudit(dir)).filter(entry => entry.result.includes('unowned')).length).toBe(0)
 
       driver.threads.push({ id: stranger, title: 'Somebody else' })

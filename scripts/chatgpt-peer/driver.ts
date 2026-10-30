@@ -4,25 +4,39 @@
  * Playwright stays out of this repository: the child owns Chrome and the
  * selectors, and speaks one JSON object per line. The host keeps the bus, which
  * is the part that must not drift from the harness.
+ *
+ * Three kinds of line arrive on stdout:
+ *
+ * - a reply, carrying the `id` of the request it answers;
+ * - `{event:'accepted', id}`, saying a page turn took that request's message;
+ * - `{event:...}` of any other kind, a push the page volunteered.
+ *
+ * They are routed by ID, never by arrival order. A timed-out request is not
+ * cancelled: the child keeps working on it and answers whenever it finishes.
+ * With a FIFO queue that late answer would be handed to whichever request is
+ * now waiting - the next inbound would be settled with the previous inbound's
+ * text. An id makes a late reply identifiable and safe to drop, and it keeps
+ * an event from ever settling a request that is not its own.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
 export type DriverReply = { ok: boolean; op?: string; id?: string; [key: string]: unknown }
+export type DriverEvent = { event: string; [key: string]: unknown }
+export type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => void }
 
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
-  /**
-   * Responses are matched by request id, never by arrival order.
-   *
-   * A timed-out request is not cancelled: the child keeps working on it and
-   * answers whenever it finishes. With a FIFO queue that late answer would be
-   * handed to whichever request is now waiting - the next inbound would be
-   * settled with the previous inbound's text. An id makes a late reply
-   * identifiable and safe to drop.
-   */
   private readonly pending = new Map<string, (reply: DriverReply) => void>()
-  private accepted: ((id: string) => void) | undefined
+  /**
+   * The acceptor for a request is held until that request's `accepted` line
+   * arrives, so two sends in flight each hear about their own message. An id
+   * with no live waiter (a request that already timed out, or a turn from a
+   * previous turn that is still finishing) is dropped rather than handed to
+   * whoever happens to be waiting now.
+   */
+  private readonly acceptors = new Map<string, (id: string) => void>()
+  private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
 
@@ -33,9 +47,17 @@ export class DriverChild {
     timeoutMs?: number
   }) {}
 
-  /** Called when the page has taken a message into the thread. Carries the request id. */
-  onAccepted(handler: ((id: string) => void) | undefined): void {
-    this.accepted = handler
+  /**
+   * Called for every non-`accepted` event line. Returns an unsubscribe so a
+   * reloading host does not stack handlers.
+   */
+  onEvent(handler: (event: DriverEvent) => void): () => void {
+    this.listeners.add(handler)
+    return () => { this.listeners.delete(handler) }
+  }
+
+  private log(line: string): void {
+    this.options.log?.(line)
   }
 
   private ensure(): ChildProcessWithoutNullStreams {
@@ -44,49 +66,98 @@ export class DriverChild {
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    createInterface({ input: child.stdout }).on('line', line => {
-      const trimmed = line.trim()
-      if (!trimmed) return
-      let message: Record<string, unknown>
-      try { message = JSON.parse(trimmed) } catch { this.options.log?.(`driver: unparsable line ${trimmed.slice(0, 120)}`); return }
-      const id = typeof message.id === 'string' ? message.id : ''
-      if (message.event === 'accepted') { this.accepted?.(id); return }
-      if (message.event) return
-      if (!id) { this.options.log?.(`driver: reply without a request id: ${trimmed.slice(0, 120)}`); return }
-      const settle = this.pending.get(id)
-      if (!settle) { this.options.log?.(`driver: late reply for ${id} dropped (that request already timed out)`); return }
-      this.pending.delete(id)
-      settle(message as DriverReply)
-    })
+    createInterface({ input: child.stdout }).on('line', line => this.handleLine(line))
     createInterface({ input: child.stderr }).on('line', line => {
-      if (line.trim()) this.options.log?.(`driver: ${line.trim().slice(0, 400)}`)
+      if (line.trim()) this.log(`driver: ${line.trim().slice(0, 400)}`)
     })
     child.on('exit', code => {
       const reason = `driver exited (code ${code ?? 'null'})`
-      this.options.log?.(reason)
+      this.log(reason)
       this.child = undefined
       for (const settle of this.pending.values()) settle({ ok: false, error: reason })
       this.pending.clear()
+      this.acceptors.clear()
     })
     child.stdin.on('error', () => {})
     this.child = child
     return child
   }
 
-  async call(request: Record<string, unknown>, timeoutMs = this.options.timeoutMs ?? 600_000): Promise<DriverReply> {
+  private handleLine(line: string): void {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    let message: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        this.log(`driver: line is not an object ${trimmed.slice(0, 120)}`)
+        return
+      }
+      message = parsed as Record<string, unknown>
+    } catch {
+      this.log(`driver: unparsable line ${trimmed.slice(0, 120)}`)
+      return
+    }
+    const id = typeof message.id === 'string' ? message.id : ''
+    const event = typeof message.event === 'string' ? message.event : ''
+    if (event) {
+      if (event === 'accepted') {
+        const accept = id ? this.acceptors.get(id) : undefined
+        if (!accept) {
+          this.log(`driver: accepted for ${id || 'no id'} has no live waiter; dropped`)
+          return
+        }
+        this.acceptors.delete(id)
+        try { accept(id) } catch (error) { this.log(`driver: accepted handler threw: ${(error as Error).message}`) }
+        return
+      }
+      this.dispatch({ ...message, event })
+      return
+    }
+    if (!id) {
+      this.log(`driver: reply without a request id: ${trimmed.slice(0, 120)}`)
+      return
+    }
+    const settle = this.pending.get(id)
+    if (!settle) {
+      this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
+      return
+    }
+    // `finish` owns the cleanup: it deletes the pending entry and the acceptor
+    // together, so a request is settled exactly once from either path.
+    this.acceptors.delete(id)
+    settle(message as DriverReply)
+  }
+
+  private dispatch(event: DriverEvent): void {
+    for (const listener of this.listeners) {
+      try { listener(event) } catch (error) { this.log(`driver: event handler threw: ${(error as Error).message}`) }
+    }
+  }
+
+  async call(request: Record<string, unknown>, options: number | CallOptions = this.options.timeoutMs ?? 600_000): Promise<DriverReply> {
+    const settings = typeof options === 'number' ? { timeoutMs: options } : options
+    const timeoutMs = settings.timeoutMs ?? this.options.timeoutMs ?? 600_000
     const child = this.ensure()
     const id = `r${++this.sequence}`
     return await new Promise<DriverReply>(resolve => {
+      let done = false
+      const finish = (reply: DriverReply): void => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        if (!this.pending.delete(id)) return
+        this.acceptors.delete(id)
+        resolve(reply)
+      }
       const timer = setTimeout(() => {
-        this.pending.delete(id)
-        resolve({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
       }, timeoutMs)
-      this.pending.set(id, reply => { clearTimeout(timer); resolve(reply) })
+      this.pending.set(id, finish)
+      if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)
       child.stdin.write(`${JSON.stringify({ ...request, id })}\n`, error => {
         if (!error) return
-        if (!this.pending.delete(id)) return
-        clearTimeout(timer)
-        resolve({ ok: false, id, error: `could not write to the driver: ${error.message}` })
+        finish({ ok: false, id, error: `could not write to the driver: ${error.message}` })
       })
     })
   }
@@ -98,7 +169,9 @@ export class DriverChild {
     this.closed = true
     if (!child || child.exitCode !== null) return
     await new Promise<void>(resolve => {
-      const timer = setTimeout(() => { child.kill(); resolve() }, 5_000)
+      // The child refuses new requests and lets its queue drain before it
+      // quits, so the budget here is larger than a single page turn.
+      const timer = setTimeout(() => { child.kill(); resolve() }, 10_000)
       child.once('exit', () => { clearTimeout(timer); resolve() })
       try { child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`) } catch { child.kill() }
     })
