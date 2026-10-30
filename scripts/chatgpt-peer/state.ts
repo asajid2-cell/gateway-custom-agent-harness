@@ -126,10 +126,46 @@ export type HostState = z.infer<typeof hostStateSchema>
  * The pair is the identity: the page may re-state the same node's parts on
  * every read, and a node's index order never changes, so `(nodeId, index)` is
  * what makes a file at-most-once. It is written BEFORE the bus send.
+ *
+ * `bytes` is the size we actually recorded. A `null` is UNKNOWN, never zero: a
+ * state file written before this field was recorded carries no size, and a
+ * node whose prior total is unknown must be treated as already at the cap
+ * rather than as empty (N3a).
  */
-export const deliveredFileSchema = z.object({ nodeId: z.string().max(64), index: z.number().int().min(0), bytes: z.number().int().min(0).default(0) }).strict()
+export const deliveredFileSchema = z.object({ nodeId: z.string().max(64), index: z.number().int().min(0), bytes: z.number().int().min(0).nullable().default(null) }).strict()
 
+export type DeliveredFile = z.infer<typeof deliveredFileSchema>
+
+/**
+ * The per-file detail is a rolling window. It bounds the audit trail, never
+ * the at-most-once set or the per-node byte total: those live in
+ * `deliveredNodes`, which outlives this window (N3b).
+ */
 export const DELIVERED_FILES_MAX = 200
+
+/**
+ * One node's durable delivery ledger.
+ *
+ * `bytes` is the total ever delivered from the node; `null` means at least one
+ * delivery recorded no size, so the total cannot be proven. `indexes` is the
+ * delivered set needed for at-most-once, kept apart from the 200-entry
+ * `deliveredFiles` window so revisiting an evicted node still dedups and still
+ * counts against the cumulative cap.
+ *
+ * The node list is bounded only to keep one state file finite; the bound is
+ * orders of magnitude larger than the per-file window it replaces.
+ */
+export const DELIVERED_NODES_MAX = 4096
+/** One node's delivered indexes. The per-node file cap is 5, so this is slack. */
+export const DELIVERED_NODE_INDEXES_MAX = 256
+
+export const deliveredNodeSchema = z.object({
+  nodeId: z.string().max(64),
+  bytes: z.number().int().min(0).nullable().default(null),
+  indexes: z.array(z.number().int().min(0)).max(DELIVERED_NODE_INDEXES_MAX).default([]),
+}).strict()
+
+export type DeliveredNode = z.infer<typeof deliveredNodeSchema>
 
 /**
  * A durable receipt for one model command, written BEFORE the side effect.
@@ -259,6 +295,11 @@ export const bridgeStateSchema = z.object({
    * a restart does not post the same file twice.
    */
   deliveredFiles: z.array(deliveredFileSchema).max(DELIVERED_FILES_MAX).default([]),
+  /**
+   * The durable per-node delivery ledger. It survives the `deliveredFiles`
+   * window and is what dedup and the cumulative byte cap are decided from.
+   */
+  deliveredNodes: z.array(deliveredNodeSchema).max(DELIVERED_NODES_MAX).default([]),
   /** Inbound turns posted but not yet answered; see `pendingTurnSchema`. */
   pendingTurns: z.array(pendingTurnSchema).max(PENDING_TURNS_MAX).default([]),
   /** Turn keys already answered, written BEFORE the reply goes out. */
@@ -339,6 +380,7 @@ export function newBridgeState(options: {
     uplinkTimes: [],
     uplinkNodeIds: [],
     deliveredFiles: [],
+    deliveredNodes: [],
     pendingTurns: [],
     answeredTurns: [],
     commandReceipts: [],
@@ -367,11 +409,38 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     uplinkTimes: [],
     uplinkNodeIds: [],
     deliveredFiles: [],
+    deliveredNodes: [],
     pendingTurns: [],
     answeredTurns: [],
     commandReceipts: [],
     inboundRuns: [],
   }
+}
+
+/**
+ * Fold the rolling per-file window into the durable per-node ledger.
+ *
+ * A bridge file written before the ledger existed has only `deliveredFiles`;
+ * a file written by this build has both, consistently. For each file record
+ * whose `(nodeId, index)` the ledger does not already hold, add it - and its
+ * bytes, or `null` when the record carries no size. An entry the ledger
+ * already holds is not counted twice.
+ */
+function foldDeliveredLedger(state: BridgeState): BridgeState {
+  if (state.deliveredFiles.length === 0) return state
+  const ledger = new Map(state.deliveredNodes.map(node => [node.nodeId, { nodeId: node.nodeId, bytes: node.bytes, indexes: [...node.indexes] }]))
+  for (const entry of state.deliveredFiles) {
+    const node = ledger.get(entry.nodeId)
+    if (!node) {
+      ledger.set(entry.nodeId, { nodeId: entry.nodeId, bytes: entry.bytes, indexes: [entry.index] })
+      continue
+    }
+    if (node.indexes.includes(entry.index)) continue
+    node.indexes.push(entry.index)
+    node.bytes = node.bytes === null || entry.bytes === null ? null : node.bytes + entry.bytes
+  }
+  state.deliveredNodes = [...ledger.values()].slice(-DELIVERED_NODES_MAX)
+  return state
 }
 
 /**
@@ -430,7 +499,7 @@ export async function loadBridgeState(path: string): Promise<BridgeState> {
     const [first] = result.error.issues
     throw new Error(`bridge state is invalid at ${path} (${first?.path.join('.') ?? 'root'}): ${first?.message ?? 'unknown'}`)
   }
-  return result.data
+  return foldDeliveredLedger(result.data)
 }
 
 /**

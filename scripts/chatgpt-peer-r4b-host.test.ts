@@ -47,6 +47,8 @@ class FakeDriver {
   fileBytes: number | null = null
   /** Answer the next file op with EEXIST, as a stale target on disk would. */
   fileExistsOnce = false
+  /** Delay every file write, so two requests for the same entry overlap. */
+  fileDelayMs = 0
   /** Succeed without naming the file in the reply, so the caller must know its own path. */
   omitFilePath = false
   stallFor: ((request: Call) => boolean) | undefined
@@ -201,6 +203,7 @@ class FakeDriver {
     if (op === 'file') {
       this.fileCalls.push({ fileId: request.fileId as string | undefined, sandboxPath: request.sandboxPath as string | undefined, outPath: request.outPath as string | undefined })
       if (!request.fileId && !(request.threadId && request.messageId && request.sandboxPath)) return { ok: false, op, reason: 'bad-id' }
+      if (this.fileDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.fileDelayMs))
       if (this.fileExistsOnce) { this.fileExistsOnce = false; return { ok: false, op, reason: 'exists' } }
       const outPath = String(request.outPath ?? '')
       const body = `bytes of ${String(request.fileId ?? request.sandboxPath)}`
@@ -775,4 +778,179 @@ describe('R1-F9: a regenerated replay cannot double a side effect', () => {
       await cleanup()
     }
   }, 40_000)
+})
+
+
+// ---------------------------------------------------------------------------
+// Round 5: NEW-1 (two concurrent file requests) and N3 (migrated/evicted
+// delivered records). The page is the same in-memory fake.
+// ---------------------------------------------------------------------------
+
+const MIB = 1024 * 1024
+
+const attachmentsFor = (count: number, bytes: number, tag: string): { id: string; name: string; mime: string; size: number }[] =>
+  Array.from({ length: count }, (_, index) => ({
+    // The page's attachment id shape: file_ followed by hex only.
+    id: `file_${randomUUID().replace(/-/g, '')}`,
+    name: `${tag}-${index}.bin`,
+    mime: 'application/octet-stream',
+    size: bytes,
+  }))
+
+/**
+ * Deliver `count` nodes of five files each through the real operator path.
+ *
+ * Five is the per-node file cap, so 40 such nodes write 200 records - enough
+ * to roll the 200-entry detail window past an earlier node's records.
+ */
+async function fillWindow(host: ChatGptHost, token: string, bridgeId: string, driver: FakeDriver, count: number): Promise<void> {
+  for (let n = 0; n < count; n++) {
+    const node = driver.pageNode(THREAD_A, `filler ${n}`, attachmentsFor(5, 10, `f${n}`))
+    const result = await operator(host, token, { op: 'files', bridge: bridgeId, to: 'listener', nodeId: node, indexes: [0, 1, 2, 3, 4] })
+    if (result.body.files.length !== 5) throw new Error(`filler ${n}: ${JSON.stringify(result.body.refused)}`)
+  }
+}
+
+describe('NEW-1: two concurrent file requests deliver (nodeId,index) once', () => {
+  test('the second request reports already-delivered instead of writing a sibling', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const driver = new FakeDriver()
+    driver.observable = true
+    // Both requests must be past the dedup check before either writes, so the
+    // download is held long enough for the second to arrive.
+    driver.fileDelayMs = 400
+    const node = driver.pageNode(THREAD_A, 'one file', attachmentsFor(1, 10, 'race'))
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const body = { op: 'files', bridge: alpha.sessionId, to: 'listener', nodeId: node, indexes: [0] }
+      const [first, second] = await Promise.all([operator(host, token, body), operator(host, token, body)])
+
+      const delivered = [first, second].filter(result => result.body.files.length === 1)
+      const refused = [first, second].filter(result => result.body.files.length === 0)
+      // Exactly one delivery, and the other request is told the entry already
+      // went out - never a second file at a sibling path.
+      expect(delivered.length).toBe(1)
+      expect(refused.length).toBe(1)
+      expect(refused[0]!.body.refused.join(' ')).toContain('already delivered')
+      expect(listener.inbox().length).toBe(1)
+
+      // One durable receipt and one audit receipt, not two.
+      const state = await readBridge(dir, alpha.sessionId)
+      expect(state.deliveredFiles.filter(entry => entry.nodeId === node && entry.index === 0).length).toBe(1)
+      const audit = await hostAudit(dir)
+      expect(audit.filter(entry => entry.op === 'file' && /sent 1 file\(s\)/.test(entry.result)).length).toBe(1)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+describe('N3a: a migrated record with no byte count is not treated as zero', () => {
+  test('a node whose prior deliveries have unknown size is refused, not given another 15 MiB', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.fileBytes = 15 * MIB
+    const node = driver.pageNode(THREAD_A, 'two big files', attachmentsFor(3, 15 * MIB, 'legacy'))
+    // The pre-ledger shape: two deliveries recorded without a `bytes` field, in
+    // reality 30 MiB. The schema must read that as UNKNOWN, not as zero.
+    const legacy = alpha as unknown as Record<string, unknown>
+    legacy.deliveredFiles = [{ nodeId: node, index: 0 }, { nodeId: node, index: 1 }]
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const result = (await operator(host, token, { op: 'files', bridge: alpha.sessionId, to: 'listener', nodeId: node, indexes: [2] })).body
+      // Ignoring the missing size would let the real total reach 45 MiB. The
+      // honest answer is a refusal, and it happens before any download.
+      expect(result.files.length).toBe(0)
+      expect(result.refused.join(' ')).toMatch(/no recorded size|unknown/i)
+      expect(driver.fileCalls.length).toBe(0)
+      expect(listener.inbox().length).toBe(0)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+describe('N3b: the node ledger outlives the 200-entry file window', () => {
+  /**
+   * Deliver node A's two 15 MiB files, then roll 200 other file records
+   * through the detail window so node A's records are evicted from it. The
+   * durable per-node ledger is what must still remember node A.
+   */
+  async function evictNodeA(host: ChatGptHost, token: string, bridgeId: string, driver: FakeDriver): Promise<string> {
+    const node = driver.pageNode(THREAD_A, 'two big files', attachmentsFor(3, 15 * MIB, 'big'))
+    driver.fileBytes = 15 * MIB
+    const delivered = await operator(host, token, { op: 'files', bridge: bridgeId, to: 'listener', nodeId: node, indexes: [0, 1] })
+    if (delivered.body.files.length !== 2) throw new Error(`setup: ${JSON.stringify(delivered.body.refused)}`)
+    driver.fileBytes = null
+    await fillWindow(host, token, bridgeId, driver, 40)
+    return node
+  }
+
+  test('a repeated (nodeId,index) is still refused after its detail record is evicted', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const node = await evictNodeA(host, token, alpha.sessionId, driver)
+      // The detail window has rolled past node A.
+      const state = await readBridge(dir, alpha.sessionId)
+      expect(state.deliveredFiles.some(entry => entry.nodeId === node)).toBe(false)
+
+      const before = listener.inbox().length
+      const fileCallsBefore = driver.fileCalls.length
+      const again = (await operator(host, token, { op: 'files', bridge: alpha.sessionId, to: 'listener', nodeId: node, indexes: [0] })).body
+      expect(again.files.length).toBe(0)
+      expect(again.refused.join(' ')).toContain('already delivered')
+      expect(driver.fileCalls.length).toBe(fileCallsBefore)
+      expect(listener.inbox().length).toBe(before)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('the cumulative cap still counts bytes once the detail record is evicted', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const node = await evictNodeA(host, token, alpha.sessionId, driver)
+      const state = await readBridge(dir, alpha.sessionId)
+      expect(state.deliveredFiles.some(entry => entry.nodeId === node)).toBe(false)
+
+      // 30 MiB already left this node; another 15 MiB would be 45 MiB.
+      driver.fileBytes = 15 * MIB
+      const third = (await operator(host, token, { op: 'files', bridge: alpha.sessionId, to: 'listener', nodeId: node, indexes: [2] })).body
+      expect(third.files.length).toBe(0)
+      expect(third.refused.join(' ')).toContain('cap')
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 60_000)
 })
