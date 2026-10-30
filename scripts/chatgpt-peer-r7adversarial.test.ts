@@ -491,66 +491,91 @@ describe('R7-1: settlePostedTurn is symmetric with resumePendingTurns', () => {
   }, 60_000)
 })
 
+/**
+ * R7-2 builds its crash state ORGANICALLY: no durable JSON is hand-written.
+ *
+ * The shape a real host leaves at this boundary is whatever `markAnswered`
+ * leaves, and that differs across the fix (#45 keeps the pending turn; the base
+ * deletes it). Seeding one of those shapes would make the test permanently red
+ * on the tree that cannot produce it, so the host's own write-ahead step is
+ * called instead and the test then asks the restart to do the right thing with
+ * whatever is on disk.
+ */
 describe('R7-2: a crash after markAnswered but before the reply', () => {
-  test('a mark with no pending turn and no sent reply is settled from the page, never re-typed', async () => {
+  test('the state markAnswered leaves is settled from the page on restart, never re-typed', async () => {
     const { dir, cleanup } = await scratch()
     const { alpha } = await primedBridge()
     await seedHost(dir, [alpha])
     const sender = await busPeer(dir, 'sender')
+    const prompt = 'marked but unsent'
+    const ANSWER = 'the answer obtained before the crash'
     const driverA = new FakeDriver()
     driverA.observable = true
+    // The page never finishes on its own in host A: the signal stays streaming,
+    // so the turn cannot settle between the mark and the stop and the crash
+    // window under test is not a race with the host's own completion.
     driverA.stallFor = () => true
+    const hostA = await startHost(dir, driverA, { turnTimeoutMs: 60_000 })
     let messageId = ''
-    let turn: any = null
+    let userNodeId = ''
     try {
-      const crashed = await crashMidTurn(dir, alpha, driverA, 'marked but unsent', sender)
-      messageId = crashed.messageId
-      turn = crashed.turn
+      const receipt = await sender.send(alpha.sessionId, prompt, prompt, undefined, 'inquiry', true) as { id: string }
+      messageId = receipt.id
+      const turn = await waitFor(async () => {
+        const state = await readBridge(dir, alpha.sessionId)
+        const found = state.pendingTurns.find(item => item.messageId === messageId)
+        return found && found.postedAt !== null && found.userNodeId !== null ? found : undefined
+      }, 15_000)
+      userNodeId = turn.userNodeId as string
+      // The ack keeps the record out of the drain path; recoverOwed is the path
+      // under test.
+      await waitFor(async () => (await acknowledged(dir, alpha.sessionId, messageId) ? true : undefined), 10_000)
+      // Build the crash state the way the code builds it. markAnswered is the
+      // host's own write-ahead step between "the answer was obtained" and
+      // "settleReply sends"; TypeScript `private` is compile-time only, so the
+      // real method runs against the real bridge and persists through the real
+      // persistBridgeState.
+      const internals = hostA as unknown as {
+        bridges: Map<string, { state: { pendingTurns: { messageId: string }[] } }>
+        markAnswered: (bridge: unknown, job: unknown) => Promise<void>
+      }
+      const bridge = internals.bridges.get(alpha.sessionId)!
+      const job = bridge.state.pendingTurns.find(item => item.messageId === messageId)
+      await internals.markAnswered(bridge, job)
     } finally {
-      await new Promise(resolve => setTimeout(resolve, 200))
+      await hostA.stop()
+      driverA.dead = true
+      // Let the interrupted turn's finally write once before the restart reads.
+      await new Promise(resolve => setTimeout(resolve, 300))
     }
     try {
+      // Precondition: host A never sent, so this is the crash window itself and
+      // not a host that settled the turn before it was stopped.
+      expect(await sentReplyIds(dir, alpha.sessionId)).not.toContain(messageId)
+      expect(sendCount(driverA)).toBe(1)
+      // Same page state at restart: the completed answer under the job's node.
       const driverB = new FakeDriver()
       driverB.observable = true
-      // The page holds the answer the crashed host obtained and marked.
-      driverB.seedUserTurn(THREAD_A, turn.userNodeId, turn.ourText, 'the answer obtained before the crash')
-      const durable = await readBridge(dir, alpha.sessionId)
-      // The reviewer's exact durable state: markAnswered writes the keys and
-      // DELETES the pending turn (chatgpt-peer.ts:3376-3379) before settleReply
-      // sends, so a crash in between leaves the mark, no turn and no sent reply.
-      // (Seeding "pending turn present" is a state this code cannot produce: it
-      // was why the earlier version passed for the wrong reason.)
-      await writeBridge(dir, {
-        ...durable,
-        answeredTurns: [...durable.answeredTurns, `m:${messageId}`, `u:${turn.userNodeId}`],
-        pendingTurns: [],
-      })
-      // Preconditions made explicit, so a later edit cannot silently recreate
-      // the unreachable shape or slip a sent reply in.
-      const seeded = await readBridge(dir, alpha.sessionId)
-      expect(seeded.pendingTurns.some(item => item.messageId === messageId)).toBe(false)
-      expect(await sentReplyIds(dir, alpha.sessionId)).not.toContain(messageId)
-
+      driverB.seedUserTurn(THREAD_A, userNodeId, prompt, ANSWER)
       const hostB = await startHost(dir, driverB)
       try {
         const replies = () => sender.inbox().filter(record => replyToOf(record) === messageId)
         await waitFor(() => (replies().length >= 1 ? true : undefined), 20_000)
         await new Promise(resolve => setTimeout(resolve, 400))
         expect(replies().length).toBe(1)
-        // RED on d9836b6: with no job record, recoverOwed falls to handleRecord
-        // and types the prompt a second time for a question the page already
-        // answered. The sender is handed the re-typed turn's answer instead of
-        // the completed one on the page.
+        // RED on d9836b6: markAnswered deleted the pending turn, so recoverOwed
+        // has no job, falls to handleRecord, and types the prompt a second time
+        // for a question the page already answered.
         expect(sendCount(driverB)).toBe(0)
         // Which answer, not just how many: the fix must deliver the completed
-        // answer already on the page, never the re-typed turn's answer. Asserting
-        // only the count would pass vacuously against a fix that posts nothing
-        // and never delivers the existing answer either.
+        // answer already on the page, never the re-typed turn's answer. A bare
+        // count would pass vacuously against a fix that posts nothing and never
+        // delivers the existing answer either.
         const delivered = textOf(replies()[0]!)
-        expect(delivered).toContain('the answer obtained before the crash')
-        expect(delivered).not.toContain('marked but unsent')
+        expect(delivered).toContain(ANSWER)
+        expect(delivered).not.toContain(prompt)
         // Exactly one delivery of that answer, and the outstanding inbound is
-        // settled: the re-post path would leave a second sent entry behind.
+        // settled: a re-post path would leave a second sent entry behind.
         expect((await sentReplyIds(dir, alpha.sessionId)).filter(id => id === messageId).length).toBe(1)
         // The turn is retired - the answered record is kept, the job is gone.
         expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === messageId)).toBe(false)
