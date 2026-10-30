@@ -7,7 +7,7 @@
  * host, not this module, decides what to do about a missing reply.
  */
 import {
-  extractCommands, formatResultLines, MAX_COMMANDS_PER_TURN, MAX_MODEL_ROUNDS, type Command,
+  extractCommands, formatResultLines, MAX_COMMANDS_PER_TURN, MAX_MODEL_ROUNDS, proseFromTurn, type Command,
 } from './commands.ts'
 
 export type GenerateResult = { ok: boolean; text?: string; error?: string }
@@ -27,8 +27,19 @@ export type Executed = { command: Command; line: string; replied: boolean; repli
 export type TurnOutcome = {
   rounds: number
   finalText: string
+  /** Every command that ran, in order, with the one-line result it produced: the turn's receipts. */
   executed: Executed[]
   problems: string[]
+  /**
+   * Commands the model emitted on the turn's last round that never ran, with
+   * the reason each was refused. `executed` is the other half of the account:
+   * a turn cut off by the round budget after a command ran has already
+   * committed that side effect, so the host must not tell the sender "nothing
+   * was run" (a retry would duplicate a send) any more than it may re-run the
+   * turn itself. Empty when the turn ended in prose or everything it asked for
+   * ran.
+   */
+  unresolved: string[]
   /** True when a `reply`/`send` command already answered for this turn. */
   repliedExplicitly: boolean
   /** The inbound message ids a `reply` command actually answered. */
@@ -53,6 +64,7 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
   let rounds = 0
   let budgetSpent = false
   let failed = false
+  let unresolved: string[] = []
   let prompt = initialPrompt
 
   while (rounds < budget) {
@@ -69,13 +81,21 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
     // A turn that produced neither a command nor a refusal is prose: the model
     // is answering, so the loop is done. A turn whose every block was refused
     // is not prose - the refusal goes back and the model gets a retry inside
-    // the same budget instead of the sender getting a canned error.
-    const refusedOnly = extraction.commands.length === 0 && extraction.problems.length > 0
+    // the same budget instead of the sender getting a canned error. Substantive
+    // prose beside a refused block is an answer, though: the model explained
+    // something and quoted an example, and retrying it would only spend the
+    // budget and lose the explanation.
+    const refusedOnly = extraction.commands.length === 0 && extraction.problems.length > 0 && proseFromTurn(finalText).prose.length === 0
     if (extraction.commands.length === 0 && !refusedOnly) {
       budgetSpent = false
+      unresolved = []
       break
     }
-    const lines = extraction.problems.map(problem => problem.replace(/^line \d+: /, ''))
+    const refusalLines = extraction.problems.map(problem => problem.replace(/^line \d+: /, ''))
+    // What this round asked for and never ran. The last round to run wins: an
+    // earlier refusal that was retried successfully is not unresolved any more.
+    unresolved = refusalLines
+    const lines = [...refusalLines]
     for (const command of extraction.commands) {
       const key = JSON.stringify(command)
       if (seen.has(key)) { lines.push('already ran this exact command this turn'); continue }
@@ -95,5 +115,5 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
     if (rounds >= budget) budgetSpent = true
   }
 
-  return { rounds, finalText, executed, problems, repliedExplicitly, repliedTargets, budgetSpent, failed }
+  return { rounds, finalText, executed, problems, unresolved, repliedExplicitly, repliedTargets, budgetSpent, failed }
 }

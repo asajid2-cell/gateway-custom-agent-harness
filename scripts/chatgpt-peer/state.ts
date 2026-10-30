@@ -308,8 +308,20 @@ export async function loadBridgeState(path: string): Promise<BridgeState> {
   return result.data
 }
 
-/** Every bridge file in the directory, oldest name first. */
-export async function listBridgeStates(directory: string): Promise<{ path: string; state: BridgeState }[]> {
+/**
+ * Every readable bridge file in the directory, oldest name first.
+ *
+ * One bad file must not stop the others: a truncated write, a future schema, or
+ * a file named for a session it does not contain is quarantined (reported and
+ * skipped) so every healthy bridge still registers and only the affected
+ * identity is refused. `onQuarantine` receives each rejected path; by default
+ * the reason goes to stderr, because the host loads every bridge through here
+ * at startup and a silent skip would hide the broken file.
+ */
+export async function listBridgeStates(
+  directory: string,
+  onQuarantine?: (problem: { path: string; error: Error }) => void,
+): Promise<{ path: string; state: BridgeState }[]> {
   let entries: string[]
   try { entries = await readdir(directory) }
   catch (error) {
@@ -319,11 +331,17 @@ export async function listBridgeStates(directory: string): Promise<{ path: strin
   const states: { path: string; state: BridgeState }[] = []
   for (const entry of entries.filter(name => name.endsWith('.json')).sort()) {
     const path = join(directory, entry)
-    const state = await loadBridgeState(path)
-    // The name is the address; a file named for a different session would be
-    // loaded under an id nothing can reach, so it is a refusal.
-    if (`${state.sessionId}.json` !== entry) throw new Error(`bridge state ${path} names session ${state.sessionId}; the file must be named for it`)
-    states.push({ path, state })
+    try {
+      const state = await loadBridgeState(path)
+      // The name is the address; a file named for a different session would be
+      // loaded under an id nothing can reach, so it is a refusal.
+      if (`${state.sessionId}.json` !== entry) throw new Error(`bridge state ${path} names session ${state.sessionId}; the file must be named for it`)
+      states.push({ path, state })
+    } catch (error) {
+      const problem = { path, error: error instanceof Error ? error : new Error(String(error)) }
+      if (onQuarantine) onQuarantine(problem)
+      else console.error(`bridge state quarantined: ${problem.path}: ${problem.error.message}`)
+    }
   }
   return states
 }

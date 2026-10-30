@@ -93,6 +93,12 @@ function turnsAfter(conversation: Conversation, cursor: string): Turn[] {
  * has handled. A cursor that is no longer on the current branch (a human
  * edited an earlier message) is replaced by its create_time. No cursor means
  * the thread was just adopted: history is not replayed.
+ *
+ * A turn is only live - answered `null` - when nothing follows it on the
+ * branch. If a later turn exists and this one has no finished answer, the page
+ * moved on without ever finishing it (the person stopped it, or it failed);
+ * reporting `null` would make the host wait on an answer that will never come
+ * and never reach the later turns, so an abandoned turn is left to be skipped.
  */
 export function pendingHumanTurns(conversation: Conversation, state: { ours: ReadonlySet<string>; cursor: string | null }): HumanTurn[] {
   if (!state.cursor) return []
@@ -101,11 +107,12 @@ export function pendingHumanTurns(conversation: Conversation, state: { ours: Rea
   after.forEach((turn, i) => {
     if (turn.role !== 'user' || state.ours.has(turn.id)) return
     const next = after[i + 1]
-    result.push({
-      userNodeId: turn.id,
-      userText: turn.text,
-      answer: next && next.role === 'assistant' ? { nodeId: next.id, text: next.text } : null,
-    })
+    if (next && next.role === 'assistant') {
+      result.push({ userNodeId: turn.id, userText: turn.text, answer: { nodeId: next.id, text: next.text } })
+      return
+    }
+    if (next) return
+    result.push({ userNodeId: turn.id, userText: turn.text, answer: null })
   })
   return result
 }
@@ -114,10 +121,32 @@ export function pendingHumanTurns(conversation: Conversation, state: { ours: Rea
 export type PageAnswer = { nodeId: string; text: string; userNodeId: string | null; userText: string | null }
 
 /**
+ * The nearest user node above `nodeId`, however many assistant nodes sit
+ * between it and the answer.
+ *
+ * A finished answer is not always parented directly by the question: the page
+ * inserts assistant nodes with `end_turn` unset (thoughts, reasoning recaps)
+ * on the chain, so `user -> assistant -> assistant(end_turn)` is a real shape.
+ * Looking only at the immediate parent misses the question and misreads an
+ * answer to the host's own send as the page speaking on its own.
+ */
+function governingUser(conversation: Conversation, nodeId: string): ConversationNode | undefined {
+  const seen = new Set<string>()
+  let id = conversation.mapping[nodeId]?.parent
+  while (id && conversation.mapping[id] && !seen.has(id)) {
+    seen.add(id)
+    const node = conversation.mapping[id]!
+    if (node.message?.author.role === 'user') return node
+    id = node.parent
+  }
+  return undefined
+}
+
+/**
  * Finished answers after the cursor that the page produced on its own.
  *
- * "Ours" is by node id: an answer whose parent user node is one the host
- * posted belongs to a turn the host started, and the turn loop already owns it.
+ * "Ours" is by node id: an answer governed by a user node the host posted
+ * belongs to a turn the host started, and the turn loop already owns it.
  * Everything else - an answer to something a person typed, or an answer with
  * no user turn in front of it - is the page speaking for itself, and that is
  * the only thing the uplink path may relay.
@@ -127,18 +156,16 @@ export function newPageAnswers(conversation: Conversation, state: { ours: Readon
   return turnsAfter(conversation, state.cursor)
     .filter(turn => turn.role === 'assistant' && !state.ours.has(turn.id))
     .filter(turn => {
-      const parent = conversation.mapping[turn.id]?.parent
-      return !parent || !state.ours.has(parent)
+      const user = governingUser(conversation, turn.id)
+      return !user || !state.ours.has(user.id)
     })
     .map(turn => {
-      const parent = conversation.mapping[turn.id]?.parent
-      const asked = parent ? conversation.mapping[parent] : undefined
-      const human = asked && asked.message?.author.role === 'user'
+      const user = governingUser(conversation, turn.id)
       return {
         nodeId: turn.id,
         text: turn.text,
-        userNodeId: human ? parent : null,
-        userText: human ? textOf(asked) : null,
+        userNodeId: user ? user.id : null,
+        userText: user ? textOf(user) : null,
       }
     })
 }
@@ -146,17 +173,26 @@ export function newPageAnswers(conversation: Conversation, state: { ours: Readon
 /**
  * Which new user nodes our send created.
  *
- * `before` is the node ids the thread had before we typed. Normally exactly
- * one user node appears and it is ours. If a human typed in the same window,
- * the node whose text is exactly what we sent is ours and the rest are human;
- * if none matches, the newest is taken as ours.
+ * `before` is the node ids the thread had before we typed. A node is ours only
+ * if its text is exactly what we sent; identity by text is checked for a single
+ * new node too, because a person can type while our own send is still missing
+ * from the page's read - calling their node ours would skip their question and
+ * hand the page our primer as if they had asked. An unmatched node is left for
+ * the pending-attribution path (which adopts by text within the send window).
+ *
+ * When a human typed in the same window, the node carrying exactly our text is
+ * ours and the rest are human; if none matches, the newest is taken as ours so
+ * a lost snapshot still ends up with one owned node.
  */
 export function attributeSend(before: ReadonlySet<string>, after: Conversation, sentText: string): { ours: string[]; human: string[] } {
   const fresh = Object.values(after.mapping)
     .filter(n => !before.has(n.id) && n.message?.author.role === 'user')
     .sort((a, b) => (a.message?.create_time ?? 0) - (b.message?.create_time ?? 0))
-  if (fresh.length <= 1) return { ours: fresh.map(n => n.id), human: [] }
+  if (fresh.length === 0) return { ours: [], human: [] }
   const matching = fresh.filter(n => textOf(n).trim() === sentText.trim())
+  if (fresh.length === 1) {
+    return matching.length === 1 ? { ours: [fresh[0]!.id], human: [] } : { ours: [], human: [] }
+  }
   const ours = matching.length > 0 ? [matching[matching.length - 1]!] : [fresh[fresh.length - 1]!]
   return { ours: ours.map(n => n.id), human: fresh.filter(n => !ours.includes(n)).map(n => n.id) }
 }
