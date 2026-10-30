@@ -542,7 +542,18 @@ describe('R7-2: a crash after markAnswered but before the reply', () => {
         // answered. The sender is handed the re-typed turn's answer instead of
         // the completed one on the page.
         expect(sendCount(driverB)).toBe(0)
-        expect(textOf(replies()[0]!)).toContain('the answer obtained before the crash')
+        // Which answer, not just how many: the fix must deliver the completed
+        // answer already on the page, never the re-typed turn's answer. Asserting
+        // only the count would pass vacuously against a fix that posts nothing
+        // and never delivers the existing answer either.
+        const delivered = textOf(replies()[0]!)
+        expect(delivered).toContain('the answer obtained before the crash')
+        expect(delivered).not.toContain('marked but unsent')
+        // Exactly one delivery of that answer, and the outstanding inbound is
+        // settled: the re-post path would leave a second sent entry behind.
+        expect((await sentReplyIds(dir, alpha.sessionId)).filter(id => id === messageId).length).toBe(1)
+        // The turn is retired - the answered record is kept, the job is gone.
+        expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === messageId)).toBe(false)
       } finally {
         await hostB.stop()
       }
