@@ -70,6 +70,20 @@ export function nodeIdsOf(conversation: Conversation): Set<string> {
   return new Set(Object.keys(conversation.mapping))
 }
 
+/** The turns strictly after `cursor` on the visible branch, oldest first. */
+function turnsAfter(conversation: Conversation, cursor: string): Turn[] {
+  const path = pathOf(conversation)
+  const turns = chainOf(conversation)
+  const index = path.indexOf(cursor)
+  if (index >= 0) {
+    const later = new Set(path.slice(index + 1))
+    return turns.filter(t => later.has(t.id))
+  }
+  const at = conversation.mapping[cursor]?.message?.create_time
+  if (typeof at !== 'number') return []
+  return turns.filter(t => typeof t.createTime === 'number' && t.createTime > at)
+}
+
 /**
  * User turns the host did not send, after the cursor, each with its finished
  * answer or `null` while the answer is still being written.
@@ -82,18 +96,7 @@ export function nodeIdsOf(conversation: Conversation): Set<string> {
  */
 export function pendingHumanTurns(conversation: Conversation, state: { ours: ReadonlySet<string>; cursor: string | null }): HumanTurn[] {
   if (!state.cursor) return []
-  const path = pathOf(conversation)
-  const turns = chainOf(conversation)
-  let after: Turn[]
-  const index = path.indexOf(state.cursor)
-  if (index >= 0) {
-    const later = new Set(path.slice(index + 1))
-    after = turns.filter(t => later.has(t.id))
-  } else {
-    const at = conversation.mapping[state.cursor]?.message?.create_time
-    if (typeof at !== 'number') return []
-    after = turns.filter(t => typeof t.createTime === 'number' && t.createTime > at)
-  }
+  const after = turnsAfter(conversation, state.cursor)
   const result: HumanTurn[] = []
   after.forEach((turn, i) => {
     if (turn.role !== 'user' || state.ours.has(turn.id)) return
@@ -105,6 +108,39 @@ export function pendingHumanTurns(conversation: Conversation, state: { ours: Rea
     })
   })
   return result
+}
+
+/** A finished answer the host has not handled, with the person's question when there was one. */
+export type PageAnswer = { nodeId: string; text: string; userNodeId: string | null; userText: string | null }
+
+/**
+ * Finished answers after the cursor that the page produced on its own.
+ *
+ * "Ours" is by node id: an answer whose parent user node is one the host
+ * posted belongs to a turn the host started, and the turn loop already owns it.
+ * Everything else - an answer to something a person typed, or an answer with
+ * no user turn in front of it - is the page speaking for itself, and that is
+ * the only thing the uplink path may relay.
+ */
+export function newPageAnswers(conversation: Conversation, state: { ours: ReadonlySet<string>; cursor: string | null }): PageAnswer[] {
+  if (!state.cursor) return []
+  return turnsAfter(conversation, state.cursor)
+    .filter(turn => turn.role === 'assistant' && !state.ours.has(turn.id))
+    .filter(turn => {
+      const parent = conversation.mapping[turn.id]?.parent
+      return !parent || !state.ours.has(parent)
+    })
+    .map(turn => {
+      const parent = conversation.mapping[turn.id]?.parent
+      const asked = parent ? conversation.mapping[parent] : undefined
+      const human = asked && asked.message?.author.role === 'user'
+      return {
+        nodeId: turn.id,
+        text: turn.text,
+        userNodeId: human ? parent : null,
+        userText: human ? textOf(asked) : null,
+      }
+    })
 }
 
 /**

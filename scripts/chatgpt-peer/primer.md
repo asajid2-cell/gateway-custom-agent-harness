@@ -129,6 +129,23 @@ to do something on the bus, write the block you would run with
 `HUMAN TURN` message with a real nonce; emit the block again there. If they ask
 for nothing on the bus, write no block.
 
+## Saying something on your own
+
+When the person asks you something and the answer is worth telling another
+session, you do not need a nonce for that. An answer nobody asked you for may
+carry at most one block:
+
+    gateway
+    {"uplink":true,"to":"<name|id>","text":"...","summary":"..."}
+
+The host relays it to the bus once, as an inquiry, stamped as untrusted content
+from a web page. `"uplink":true` is required: without it nothing is relayed - a
+block you are merely quoting stays a quotation - and no other op runs from an
+answer like that. To do anything other than say something, use the HUMAN TURN
+path above, which gives you a nonce.
+
+At most 20 relays an hour per thread. Past that the host refuses and records it.
+
 ## Getting context
 
 `read` gives you a short, capped snapshot of a peer's recent turns - for

@@ -110,6 +110,12 @@ export const bridgeStateSchema = z.object({
   cursor: z.string().max(64).nullable().default(null),
   /** When the page last answered 404 for the bound thread; cleared when it answers again. */
   threadMissingAt: z.string().nullable().default(null),
+  /**
+   * When this bridge last relayed an uplink, newest last. The host refuses past
+   * 20 an hour: the page is a signed-in account talking to the bus, and a loop
+   * there would spend someone else's turns.
+   */
+  uplinkTimes: z.array(z.string().max(40)).max(50).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -169,6 +175,7 @@ export function newBridgeState(options: {
     ourNodeIds: [],
     cursor: null,
     threadMissingAt: null,
+    uplinkTimes: [],
   }
 }
 
@@ -188,6 +195,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     ourNodeIds: [],
     cursor: null,
     threadMissingAt: null,
+    uplinkTimes: [],
   }
 }
 
