@@ -29,6 +29,12 @@
  *       `threadGone` (see the D4 test); it is deliberately NOT the literal
  *       `recordOurs` persist path, whose non-critical persist swallows save
  *       errors at eac9038 and so cannot throw.
+ *   D6  the live shape: the cursor has already moved PAST the pending send node
+ *       (it was mis-classified as a human turn on an earlier pass), so every
+ *       anchored matcher misses it by construction. The finished answer is
+ *       never solicited; the page drops it as plain prose, and the TTL branch
+ *       later tells the sender the question failed. Unlike D1/D2, whose anchor
+ *       is BEFORE the send node, here it is after.
  *
  * F4 is driver-side and belongs to lane #44; its host-side consequence cannot be
  * asserted without editing the driver, so no test is written for it here.
@@ -96,28 +102,36 @@ class FakeDriver {
     return tree
   }
 
-  /** Append one node. `createTime: null` reproduces a page node with no time. */
-  appendNode(threadId: string, role: 'user' | 'assistant', text: string, options: { id?: string; createTime?: number | null } = {}): string {
+  /**
+   * Append one node. `createTime: null` reproduces a page node with no time.
+   * `parent` attaches under an explicit node WITHOUT moving the branch tip (a
+   * regeneration sibling); omit it to append at the tip and advance it.
+   */
+  appendNode(threadId: string, role: 'user' | 'assistant', text: string, options: { id?: string; createTime?: number | null; parent?: string; endTurn?: boolean } = {}): string {
     const tree = this.treeOf(threadId)
     const id = options.id ?? randomUUID()
     const createTime = 'createTime' in options ? options.createTime : this.clock++
+    const parent = options.parent ?? tree.current
     tree.mapping[id] = {
       id,
-      parent: tree.current,
+      parent,
       children: [],
       message: {
         id,
         author: { role },
         create_time: createTime,
-        end_turn: role === 'assistant' ? true : null,
+        end_turn: role === 'assistant' ? (options.endTurn ?? true) : null,
         status: 'finished_successfully',
         content: { content_type: 'text', parts: [text] },
       },
     }
-    tree.mapping[tree.current]!.children.push(id)
-    tree.current = id
+    tree.mapping[parent]!.children.push(id)
+    if (options.parent === undefined) tree.current = id
     return id
   }
+
+  /** Point the visible branch at a chosen node (e.g. a regenerated sibling). */
+  setCurrent(threadId: string, id: string): void { this.treeOf(threadId).current = id }
 
   /** A page user node under a chosen id, with its finished answer beneath it. */
   seedUserTurn(threadId: string, userId: string, text: string, answer: string): string {
@@ -325,6 +339,10 @@ async function busPeer(dir: string, name: string): Promise<GatewaySessionTranspo
   await transport.start()
   return transport
 }
+
+/** The session id a transport registered under (its `options` is private only at compile time). */
+const sessionIdOf = (transport: GatewaySessionTransport): string =>
+  (transport as unknown as { options: { sessionId: string } }).options.sessionId
 
 const sendCount = (driver: FakeDriver): number => driver.calls.filter(call => call.op === 'send').length
 const textOf = (record: { message: unknown }): string => String((record.message as { text?: unknown }).text ?? '')
@@ -730,6 +748,108 @@ describe('R8-D4: a generic exception after acceptance still clears postedAt', ()
       const delivered = textOf(replies()[0]!)
       expect(delivered).toContain(ANSWER)
       expect(delivered).not.toContain('a re-typed answer')
+    } finally {
+      await hostB.stop()
+    }
+
+    await sender.close()
+    await cleanup()
+  }, 60_000)
+})
+
+// --------------------------------------------------------------------- D6
+
+/**
+ * The live shape, told from the durable bridge (bridge 3b362ea4 at eac9038):
+ *
+ *   pendingTurns[0]  messageId 3846f0da, postedAt set, userNodeId null,
+ *                    ourText 4,096 chars (the capped matcher), text 9,644
+ *                    chars (the whole envelope + prompt).
+ *   page              user node aaee556a carries that exact 9,644-char text but
+ *                    with `create_time: null`; its first answer f4432464 is an
+ *                    abandoned branch, and the answer the page kept is the
+ *                    regenerated sibling 5c04999d (plain prose).
+ *   cursor           f4432464 - the send node's first assistant successor,
+ *                    i.e. AFTER aaee556a. An earlier pass had wrongly classed
+ *                    aaee556a as a human turn and moved the cursor onto its
+ *                    answer (pendingHumanTurns, threads.ts:331-346), so the
+ *                    whole-text/anchored matchers miss the send node by
+ *                    construction.
+ *
+ * D1/D2 exercise a cursor BEFORE the send node, where the positional branch
+ * accepts the node. Here the cursor is already past it - the live shape.
+ *
+ * Expected (green against #45's fix): exactly one solicited reply with
+ * replyTo=3846f0da carrying the answer, nothing typed into the page, no outbound
+ * whose text is the answer without that replyTo, and the turn retired.
+ * Red at 984e03a: no such reply exists and the turn stays owed.
+ *
+ * The TTL line ("no completed answer within 6h") is NOT asserted. Driving it
+ * needs a postedAt already past the 6h TTL, but that same pass retires the turn
+ * on the failure line, which contradicts the "turn stays owed" fact; and the
+ * brief forbids sleeping. The two delivery facts above are the failure mode.
+ */
+describe('R8-D6: a cursor past the send node makes recovery unrecoverable', () => {
+  test('the finished answer is solicited with replyTo, never typed again', async () => {
+    const D6_USER = 'aaee556a-0000-4000-8000-000000000000'
+    const D6_FIRST = 'f4432464-0000-4000-8000-000000000000'
+    const D6_ANSWER_NODE = '5c04999d-0000-4000-8000-000000000000'
+    const D6_MESSAGE = '3846f0da-0000-4000-8000-000000000000'
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const sender = await busPeer(dir, 'sender')
+    const ANSWER = 'the page finished this long prompt before the cursor ran past it'
+    // Exactly the live envelope length: >4096 so ourText is the 4,096 prefix.
+    const USER_TEXT = `D6-live-shape ${'y'.repeat(9644 - 'D6-live-shape '.length)}`
+
+    const driverB = new FakeDriver()
+    driverB.observable = true
+    driverB.appendNode(THREAD_A, 'assistant', 'history before the turn')
+    driverB.appendNode(THREAD_A, 'user', USER_TEXT, { id: D6_USER, createTime: null })
+    // The first answer, now an abandoned branch: this is what the cursor names.
+    driverB.appendNode(THREAD_A, 'assistant', 'an abandoned first answer the page replaced', { id: D6_FIRST, parent: D6_USER })
+    // The answer the page kept, a regenerated sibling on the visible branch.
+    const kept = driverB.appendNode(THREAD_A, 'assistant', ANSWER, { id: D6_ANSWER_NODE, parent: D6_USER })
+    driverB.setCurrent(THREAD_A, kept)
+
+    // The durable shape: cursor already past the send node, our node unknown.
+    const durable = await readBridge(dir, alpha.sessionId)
+    await writeBridge(dir, {
+      ...durable,
+      ourNodeIds: [],
+      answeredTurns: [],
+      cursor: D6_FIRST,
+      pendingTurns: [{
+        threadId: THREAD_A,
+        userNodeId: null,
+        ourText: USER_TEXT.slice(0, 4096),
+        text: USER_TEXT,
+        senderSessionId: sessionIdOf(sender),
+        messageId: D6_MESSAGE,
+        kind: 'inquiry',
+        postedAt: new Date().toISOString(),
+      }],
+    })
+
+    const hostB = await startHost(dir, driverB)
+    try {
+      await hostB.pollOnce()
+      await delay(300)
+      const replies = sender.inbox().filter(record => replyToOf(record) === D6_MESSAGE)
+      // RED at 984e03a: no solicited reply is ever sent - the anchored matcher
+      // misses aaee556a (null create_time, cursor past it) and the page answer
+      // is dropped as plain prose.
+      expect(replies.length).toBe(1)
+      expect(textOf(replies[0]!)).toContain(ANSWER)
+      // Nothing is typed into the page: recovery must never re-post the prompt.
+      expect(sendCount(driverB)).toBe(0)
+      // The failure is a wrong or missing delivery, never page speech carrying
+      // the answer without this turn's replyTo.
+      const bare = sender.inbox().filter(record => replyToOf(record) !== D6_MESSAGE && textOf(record).includes(ANSWER))
+      expect(bare).toEqual([])
+      // The turn is retired once delivered, not left owed for the TTL branch.
+      expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === D6_MESSAGE)).toBe(false)
     } finally {
       await hostB.stop()
     }
