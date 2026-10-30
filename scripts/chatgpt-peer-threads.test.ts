@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  answerAfter,
   attributeSend,
   chainOf,
   diffThreadList,
@@ -194,5 +195,34 @@ describe('listAllThreads', () => {
     const items = await listAllThreads(async () => ({ items: n++ < 50 ? all.slice(0, 100) : [] }), 100)
     expect(items.length).toBe(100)
     expect(n).toBeLessThan(5)
+  })
+})
+
+describe('answerAfter (R2-F9)', () => {
+  test('walks past a thoughts node to the finished answer', () => {
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'question' },
+      { id: 'th2', parent: 'u2', role: 'assistant', t: 21, ctype: 'thoughts' },
+      { id: 'a2', parent: 'th2', role: 'assistant', t: 22, end: true, text: 'the answer' }]
+    expect(answerAfter(conversation('a2', specs), 'u2')?.id).toBe('a2')
+  })
+
+  test('the nearest user node owns the answer: a later question does not leak upward', () => {
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'first' },
+      { id: 'a2', parent: 'u2', role: 'assistant', t: 21, end: true, text: 'one' },
+      { id: 'u3', parent: 'a2', role: 'user', t: 22, text: 'second' },
+      { id: 'a3', parent: 'u3', role: 'assistant', t: 23, end: true, text: 'two' }]
+    const c = conversation('a3', specs)
+    expect(answerAfter(c, 'u2')?.id).toBe('a2')
+    expect(answerAfter(c, 'u3')?.id).toBe('a3')
+  })
+
+  test('the visible branch wins over a regenerated sibling answer', () => {
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'q' },
+      { id: 'a2old', parent: 'u2', role: 'assistant', t: 21, end: true, text: 'old' },
+      { id: 'a2new', parent: 'u2', role: 'assistant', t: 25, end: true, text: 'new' }]
+    expect(answerAfter(conversation('a2new', specs), 'u2')?.id).toBe('a2new')
   })
 })

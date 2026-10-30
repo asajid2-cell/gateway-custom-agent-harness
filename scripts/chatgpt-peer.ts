@@ -106,7 +106,7 @@ const WAIT_POLL_MS = 2000
  */
 class GeneratingTurn extends Error {
   constructor(readonly threadId: string | null) {
-    super(`still generating${threadId ? ` in thread ${threadId}` : ''}; the turn is running, not refused`)
+    super(`the page was still generating${threadId ? ` in thread ${threadId}` : ''} when the host stopped watching; the turn was not refused and is not a model failure`)
   }
 }
 
@@ -402,6 +402,26 @@ export class ChatGptHost {
    * forbids. After a restart the set is empty, so the pass takes them over.
    */
   private readonly attachedTurns = new Set<string>()
+
+  /**
+   * When each unresolved send was first observed with the page STOPPED.
+   *
+   * The expiry clock for a pending attribution is measured from completion, not
+   * from the send: a turn may legitimately run past the TTL, and its user node
+   * is still recognised afterwards. Keyed by the record's content so it follows
+   * the entry across a persist/reload without changing the on-disk shape.
+   */
+  private readonly attributionDoneAt = new Map<string, number>()
+
+  /**
+   * When a bridge was bound to the thread it now observes (R1-F10).
+   *
+   * Without it, a null cursor is baselined to the LAST node on the first
+   * observation - and a message a person typed between the bind and that first
+   * read is then "history" that is never handled. Only explicit binds set this;
+   * a bridge loaded from disk keeps its persisted cursor instead.
+   */
+  private readonly boundAt = new WeakMap<Bridge, number>()
 
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
@@ -1069,6 +1089,9 @@ export class ChatGptHost {
           ...(chosen.title ? { title: chosen.title } : {}),
         }))
         bridge = created
+        // Adopting binds this peer to an existing conversation right now; a
+        // message typed while the primer is being posted is work, not history.
+        this.boundAt.set(created, Date.now())
         // `use` adopts a tab that already shows the thread without reloading
         // it, and validates that the page really landed there otherwise.
         const reply = await this.driver.call({ op: 'use', threadId: chosen.id }, TURN_TIMEOUT_MS)
@@ -1290,6 +1313,33 @@ export class ChatGptHost {
   }
 
   /**
+   * The user node an answer to THIS turn hangs from.
+   *
+   * A known node id (the page's own post-send snapshot) is exact and is used
+   * as-is. With no id - the snapshot read was rate-limited - the text we sent,
+   * seen within the post-accept window, names the node: the same equality the
+   * pending-attribution path uses. No text, or no post-accept anchor, means the
+   * node cannot be identified and there is no answer this turn may accept.
+   */
+  private answerUserOf(
+    conversation: Conversation,
+    known: string | null,
+    hint: { acceptedAt?: number; sentText?: string },
+  ): string | null {
+    if (known) return conversation.mapping[known] ? known : null
+    const sent = hint.sentText?.trim()
+    const since = hint.acceptedAt
+    if (!sent || !Number.isFinite(since)) return null
+    const match = chainOf(conversation)
+      .filter(turn => turn.role === 'user'
+        && turn.text.trim() === sent
+        && typeof turn.createTime === 'number'
+        && turn.createTime * 1000 >= (since as number) - PENDING_WINDOW_BEFORE_MS)
+      .at(-1)
+    return match?.id ?? null
+  }
+
+  /**
    * Wait for one posted turn's answer WITHOUT holding the page lock.
    *
    * Completion is read from the thread itself (`status` is thread-addressed and
@@ -1297,10 +1347,16 @@ export class ChatGptHost {
    * to show. A failure chip is evidence and ends the wait; a node still marked
    * `in_progress` is not, because this build leaves them behind forever.
    */
-  private async awaitAnswer(bridge: Bridge, userNodeId: string | null, timeoutMs = this.turnTimeout): Promise<{ text: string; nodeId: string }> {
+  private async awaitAnswer(
+    bridge: Bridge,
+    userNodeId: string | null,
+    hint: { acceptedAt?: number; sentText?: string } = {},
+  ): Promise<{ text: string; nodeId: string }> {
     const threadId = bridge.state.threadId
     if (!threadId) throw new Error('the page posted nothing into a thread')
-    const deadline = Date.now() + timeoutMs
+    let deadline = Date.now() + this.turnTimeout
+    let progress = ''
+    let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null }
     // A proof read is licensed by a new page signal, and re-attempted on a
     // bounded clock regardless: a page that never pushes again must not hold
     // this turn - and every inbound queued behind it - until the timeout.
@@ -1309,7 +1365,21 @@ export class ChatGptHost {
     let proofAt = 0
     let domUnproven = false
     for (;;) {
+      if (this.stopping || bridge.stopping) throw new GeneratingTurn(threadId)
       const cheap = await this.cheapStatus(threadId)
+      last = cheap
+      // R-LIVE-4: progress is the page's own signal MOVING, not the state name.
+      // A page that keeps pushing a new signal is working, so the clock is
+      // pushed forward. A page that says `generating` while its signal never
+      // advances has stalled - nothing is happening - and only that may end the
+      // wait, as "still generating", never as a model failure. (Extending on the
+      // bare word `generating` would mean a stuck page holds the turn, and
+      // every inbound queued behind it, forever.)
+      const mark = `${cheap.state}|${cheap.at ?? ''}|${cheap.phase ?? ''}`
+      if (mark !== progress) {
+        progress = mark
+        deadline = Date.now() + this.turnTimeout
+      }
       if (cheap.state === 'failed') {
         throw new Error('the page reported a problem: the page rendered a failure message')
       }
@@ -1318,13 +1388,40 @@ export class ChatGptHost {
         // own word that the turn stopped is what licenses the expensive read.
         const key = cheap.at ?? ''
         const due = deepFor !== key || Date.now() - proofAt >= proofRetryMs
-        if (due) {
+        // Chronology (N1): an `idle` signal pushed BEFORE this turn was accepted
+        // is the previous turn's word, not ours. It may not license a proof
+        // read - the last completed answer is still on the branch, and taking
+        // it would settle this turn with somebody else's answer. A driver that
+        // supplies no clock leaves identity below as the guard.
+        const signalAt = cheap.at ? Date.parse(cheap.at) : Number.NaN
+        const postAccept = !Number.isFinite(hint.acceptedAt)
+          || !Number.isFinite(signalAt)
+          || signalAt >= (hint.acceptedAt as number) - PENDING_WINDOW_BEFORE_MS
+        if (due && postAccept) {
           deepFor = key
           proofAt = Date.now()
           const read = await this.readConversation(threadId)
           if (read && 'conversation' in read) {
-            const answer = userNodeId ? answerAfter(read.conversation, userNodeId) : latestAssistantOf(read.conversation)
-            if (answer && nodeComplete(answer)) return { text: nodeTextOf(answer), nodeId: answer.id }
+            // An answer belongs to a USER NODE, never to "the newest assistant
+            // node". When the send's own node could not be recorded (a 429 on
+            // the post-send read), identify it from the text we sent within the
+            // post-accept window; with no identifiable node there is no answer
+            // to accept, so the turn keeps waiting (N1). There is deliberately
+            // no uncorrelated latest-assistant fallback here.
+            const resolved = this.answerUserOf(read.conversation, userNodeId, hint)
+            if (resolved) {
+              if (resolved !== userNodeId) {
+                // Adopt it now: an owned user node is never read back as a
+                // person typing while this turn is still in flight.
+                bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== resolved), resolved].slice(-200)
+                if (hint.sentText) this.dropPending(bridge, hint.sentText)
+                await this.persistBridgeState(bridge)
+              }
+              const answer = answerAfter(read.conversation, resolved)
+              if (answer && nodeComplete(answer) && askerOf(read.conversation, answer.id) === resolved) {
+                return { text: nodeTextOf(answer), nodeId: answer.id }
+              }
+            }
           } else if (this.observes === false) {
             // This driver has no conversation op, so the thread tree cannot
             // prove anything here: the page's own DOM read is the only proof
@@ -1343,7 +1440,15 @@ export class ChatGptHost {
           }
         }
       }
-      if (Date.now() >= deadline) throw new GeneratingTurn(threadId)
+      if (Date.now() >= deadline) {
+        // The clock only reaches here when the page's signal has not advanced
+        // across a real interval. Those two conclusions are different and are
+        // reported differently: a page whose last word was `generating` when it
+        // stopped moving is still generating (never a model failure), and a
+        // page that stopped without a readable answer is unproven.
+        if (last.state === 'generating') throw new GeneratingTurn(threadId)
+        throw new PageUnproven('not-complete', 'the page said the turn stopped but no finished answer could be read')
+      }
       await new Promise(resolve => setTimeout(resolve, this.waitPoll))
     }
   }
@@ -2002,14 +2107,15 @@ export class ChatGptHost {
    * back as a person typing, so the answer is treated as page speech and a
    * re-ask prompts the page to run our own message. So the write is critical -
    * if it cannot be recorded, the send does not happen. A text too long to hold
-   * exactly cannot be matched by equality, so it is not recorded and the
-   * snapshot path is left to do what it can; that is logged rather than silent.
+   * exactly cannot be matched by equality, and the snapshot path may then fail
+   * too (a 429 on the post-send read), leaving the node unattributable forever
+   * (R1-F4). Such a send is REFUSED before the page is called rather than
+   * posted with no way to own it.
    */
   private async notePendingSend(bridge: Bridge, text: string, threadId: string | null): Promise<void> {
     const entry: PendingAttribution = { text, sentAt: now(), threadId }
     if (entry.text.length > PENDING_ATTRIBUTION_TEXT_MAX) {
-      log(`not recording a pending attribution for "${bridge.state.name}": the text is too long to match exactly (${entry.text.length} chars)`)
-      return
+      throw new Error(`refusing a ${entry.text.length}-char send to "${bridge.state.name}": it is longer than ${PENDING_ATTRIBUTION_TEXT_MAX} chars, so its user node could never be attributed`)
     }
     bridge.state.pendingAttribution = [...bridge.state.pendingAttribution, entry].slice(-PENDING_ATTRIBUTION_MAX)
     await this.persistBridgeState(bridge, true)
@@ -2043,40 +2149,60 @@ export class ChatGptHost {
     const nowMs = Date.now()
     const kept: PendingAttribution[] = []
     let changed = false
+    const keyOf = (entry: PendingAttribution): string =>
+      createHash('sha256').update(`${entry.sentAt}\u0000${entry.threadId ?? ''}\u0000${entry.text}`).digest('hex')
     for (const entry of entries) {
       const sentMs = Date.parse(entry.sentAt)
-      // Expiry is a statement about a FINISHED send: while the page is still
-      // running the turn, the node may simply not have been rendered yet, and
-      // dropping the record there loses our own user node to a later read that
-      // calls it a person typing. A turn may take 20 minutes; the TTL is not a
-      // turn timeout, so it only counts once the page has stopped.
-      if (!generating && (!Number.isFinite(sentMs) || nowMs - sentMs > PENDING_ATTRIBUTION_TTL_MS)) {
-        audit(this.hostState, {
-          op: 'attribution',
-          target: entry.threadId,
-          result: `expired: no user node matched within ${Math.round(PENDING_ATTRIBUTION_TTL_MS / 60_000)} min: "${one(entry.text, 60)}" [${bridge.state.name}]`,
-        })
-        changed = true
-        continue
-      }
       const from = sentMs / 1000 - PENDING_WINDOW_BEFORE_MS / 1000
       const to = sentMs / 1000 + PENDING_WINDOW_AFTER_MS / 1000
+      // Match FIRST, whatever the age of the record: a page may finish a turn
+      // after any number of minutes and its user node is still ours. Expiring
+      // before this lookup is what discarded a node that was already present,
+      // so it later read back as a person typing (R1-F3).
       const match = chain.find(turn => turn.role === 'user'
         && !ours.has(turn.id)
         && turn.text.trim() === entry.text.trim()
         && typeof turn.createTime === 'number'
         && turn.createTime >= from && turn.createTime <= to)
-      if (!match) { kept.push(entry); continue }
-      ours.add(match.id)
-      bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== match.id), match.id].slice(-200)
+      if (match) {
+        ours.add(match.id)
+        bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== match.id), match.id].slice(-200)
+        audit(this.hostState, {
+          op: 'attribution',
+          target: match.id,
+          result: `resolved late: the send's own node, seen after the snapshot: "${one(entry.text, 60)}" [${bridge.state.name}]`,
+        })
+        changed = true
+        continue
+      }
+      // While the page is still running, the node may simply not have been
+      // rendered yet; keep the record.
+      if (generating) { kept.push(entry); continue }
+      // Grace is measured from when the page was first seen to have STOPPED,
+      // not from the send: a long turn may only now have finished, and its node
+      // can still appear on the next read. Only a send that stays unmatched for
+      // a full TTL AFTER completion is expired.
+      const key = keyOf(entry)
+      const done = this.attributionDoneAt.get(key)
+      if (done === undefined) {
+        this.attributionDoneAt.set(key, nowMs)
+        kept.push(entry)
+        continue
+      }
+      if (nowMs - done <= PENDING_ATTRIBUTION_TTL_MS) { kept.push(entry); continue }
+      this.attributionDoneAt.delete(key)
       audit(this.hostState, {
         op: 'attribution',
-        target: match.id,
-        result: `resolved late: the send's own node, seen after the snapshot: "${one(entry.text, 60)}" [${bridge.state.name}]`,
+        target: entry.threadId,
+        result: `expired: no user node matched within ${Math.round(PENDING_ATTRIBUTION_TTL_MS / 60_000)} min of the page stopping: "${one(entry.text, 60)}" [${bridge.state.name}]`,
       })
       changed = true
     }
     bridge.state.pendingAttribution = kept
+    if (this.attributionDoneAt.size > 0) {
+      const live = new Set(kept.map(keyOf))
+      for (const key of this.attributionDoneAt.keys()) if (!live.has(key)) this.attributionDoneAt.delete(key)
+    }
     if (!changed) return
     await this.persistBridgeState(bridge)
     await this.persistHostState()
@@ -2276,6 +2402,10 @@ export class ChatGptHost {
    * first send into a fresh chat all pass through here, so they cannot diverge.
    */
   private setThread(bridge: Bridge, threadId: string | null): void {
+    // A bind to a real thread leaves a time anchor: the first observation must
+    // tell history from what was typed after the bind (R1-F10).
+    if (threadId) this.boundAt.set(bridge, Date.now())
+    else this.boundAt.delete(bridge)
     const state = bridge.state
     state.threadId = threadId
     state.primedThreadId = null
@@ -2370,10 +2500,23 @@ export class ChatGptHost {
     await this.resumePendingTurns(bridge, conversation)
     await this.resumeDeferredTurns(bridge)
     if (!bridge.state.cursor) {
-      // Adopted or never observed: what is already there is history, not work.
-      bridge.state.cursor = chainOf(conversation).at(-1)?.id ?? pathOf(conversation).at(-1) ?? null
+      const bound = this.boundAt.get(bridge)
+      if (bound === undefined) {
+        // Loaded with no cursor and no bind anchor: what is already there is
+        // history, not work.
+        bridge.state.cursor = chainOf(conversation).at(-1)?.id ?? pathOf(conversation).at(-1) ?? null
+        await this.persistBridgeState(bridge)
+        return
+      }
+      // Bound to this thread at `bound`: everything created before it is
+      // history, everything after it is work this host still owes. Baselining
+      // to the last node would swallow a message a person typed between the
+      // bind and this first observation (R1-F10).
+      const history = chainOf(conversation).filter(turn =>
+        typeof turn.createTime === 'number' && turn.createTime * 1000 < bound - PENDING_WINDOW_BEFORE_MS)
+      bridge.state.cursor = history.at(-1)?.id ?? pathOf(conversation)[0] ?? null
       await this.persistBridgeState(bridge)
-      return
+      if (!bridge.state.cursor) return
     }
     const ours = new Set(bridge.state.ourNodeIds)
     const pending = pendingHumanTurns(conversation, { ours, cursor: bridge.state.cursor })
@@ -2754,11 +2897,20 @@ export class ChatGptHost {
           try {
             if (seededAnswer) {
               seededAnswer = false
-              const answer = await this.awaitAnswer(bridge, job!.userNodeId)
+              const answer = await this.awaitAnswer(bridge, job!.userNodeId, {
+                acceptedAt: job!.postedAt ? Date.parse(job!.postedAt) : undefined,
+                sentText: job!.text,
+              })
               return { ok: true, text: answer.text }
             }
             return { ok: true, text: await this.generateRound(bridge, job!, subject, acknowledge) }
-          } catch (error) { return { ok: false, error: (error as Error).message } }
+          } catch (error) {
+            // "Still generating" is a state, never a failed generation: let it
+            // out so the turn loop leaves the job pending instead of reporting
+            // a model failure the page never produced (R-LIVE-4).
+            if (error instanceof GeneratingTurn || error instanceof PageUnproven) throw error
+            return { ok: false, error: (error as Error).message }
+          }
         },
         execute: command => this.executeCommand(bridge, command, 'model', message.id),
       })
@@ -2767,6 +2919,31 @@ export class ChatGptHost {
       await this.markAnswered(bridge, job)
       await this.settleReply(bridge, message, expects, outcome)
     } catch (error) {
+      // R-LIVE-4: the page's signal stopped advancing while it still said it
+      // was generating. This is NOT a model failure and must not be worded as
+      // one - the line says the page was still generating when watching
+      // stopped. Nothing is refused. A live-generating page never reaches here
+      // (its signal keeps moving, which extends the wait), so this is only the
+      // genuinely stuck page, and giving up on it is the honest outcome.
+      if (error instanceof GeneratingTurn) {
+        const line = error.message
+        log(`turn ${shortId(message.id)}: ${line}; left for the observation pass`)
+        if (this.stopping || bridge.stopping) {
+          // Shutting down: nothing is sent, the persisted job is finished by
+          // the next host.
+          return
+        }
+        audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
+        if (job) await this.deliverSolicitedFailure(bridge, job, line)
+        else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not answer: ${line}`)
+        await this.persistHostState()
+        return
+      }
+      if (this.stopping || bridge.stopping) {
+        // Shutting down: the persisted job is finished by the next host.
+        log(`turn ${shortId(message.id)}: host stopping; the job stays pending`)
+        return
+      }
       const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
       log(`turn for ${message.id} failed: ${reason}`)
       audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
@@ -2801,7 +2978,10 @@ export class ChatGptHost {
     const posted = await this.postPendingTurn(bridge, job, 120_000)
     if (!posted) throw new Error('the page stayed mid-turn; this round was not posted')
     acknowledge()
-    const answer = await this.awaitAnswer(bridge, job.userNodeId)
+    const answer = await this.awaitAnswer(bridge, job.userNodeId, {
+      acceptedAt: job.postedAt ? Date.parse(job.postedAt) : undefined,
+      sentText: job.text,
+    })
     return answer.text
   }
 

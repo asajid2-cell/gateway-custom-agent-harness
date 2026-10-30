@@ -1903,6 +1903,11 @@ describe('pending attribution', () => {
     const stale = pending('never showed up', new Date(Date.now() - 11 * 60_000))
     const { host, alpha } = await primedBridge(dir, driver, { cursor, pendingAttribution: [stale] })
     try {
+      // R1-F3: the grace runs from when the page was first seen to have
+      // STOPPED, not from the send. A record that has already stayed unmatched
+      // for a full TTL after completion is the one that expires.
+      const key = createHash('sha256').update(`${stale.sentAt}\u0000${stale.threadId ?? ''}\u0000${stale.text}`).digest('hex')
+      ;(host as any).attributionDoneAt.set(key, Date.now() - 11 * 60_000)
       await host.pollOnce()
       const stored = await readBridge(dir, alpha.sessionId)
       expect(stored.pendingAttribution).toEqual([])
