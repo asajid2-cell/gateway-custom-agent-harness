@@ -2792,6 +2792,8 @@ export class ChatGptHost {
       const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
       log(`turn for ${message.id} failed: ${reason}`)
       audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
+      // A removed or stopping bridge is cancelled: it types nothing more into
+      // the page and tells nobody about a turn it is no longer running.
       if (bridge.removed || bridge.stopping) return
       if (job) await this.deliverSolicitedFailure(bridge, job, reason)
       else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
