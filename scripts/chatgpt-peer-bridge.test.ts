@@ -841,6 +841,69 @@ describe('host defects', () => {
   })
 })
 
+describe('scheduled wakes', () => {
+  test('a wake that reschedules its own label leaves exactly that one tracked schedule, cancellable', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.schedules = [{ label: 'wake', at: new Date(Date.now() - 1000).toISOString() }]
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    // The wake's own turn puts the SAME label back, further out.
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      return text.includes('SCHEDULED WAKE') && nonce
+        ? `On it.\n\n${rendered({ nonce, op: 'schedule', label: 'wake', inSeconds: 600 })}`
+        : 'Done.'
+    }
+    const host = await startHost(dir, driver)
+    try {
+      // Wait for both page turns of the wake (wake prompt, then the command
+      // result) and for the wake's own write to settle.
+      await waitFor(async () => (driver.readCalls >= 2 && driver.calls.filter(call => call.op === 'send').length >= 2) ? true : undefined)
+      await new Promise(resolve => setTimeout(resolve, 300))
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.schedules.map(schedule => schedule.label)).toEqual(['wake'])
+      expect(Date.parse(stored.schedules[0]!.at)).toBeGreaterThan(Date.now())
+
+      // It is still TRACKED, not just written down: cancelling finds its timer.
+      const { token } = await credentials(dir)
+      const cancelled = await operator(host, token, { op: 'cancelSchedule', bridge: alpha.sessionId, label: 'wake' })
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.body.line).toBe('cancelled "wake"')
+      expect((await readBridge(dir, alpha.sessionId)).schedules).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('operator body limit', () => {
+  test('a 300 KiB POST is answered with a real HTTP 413 and JSON, not a socket reset', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const auth = ['Bearer', token].join(' ')
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'threads', pad: 'x'.repeat(300 * 1024) }),
+      })
+      expect(response.status).toBe(413)
+      expect(await response.json()).toEqual({ error: 'body too large' })
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 /** A primed, observable bridge on THREAD_A - the shape every observation test starts from. */
 async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
   const alpha = bridgeNamed('alpha', THREAD_A)
@@ -1118,6 +1181,140 @@ describe('adopt the open tab', () => {
   })
 })
 
+describe('one live bridge per thread', () => {
+  test('adopting a thread another live bridge already owns is refused, and allowed once that bridge is removed', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const first = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'first' })
+      expect(first.status).toBe(200)
+
+      const again = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'second' })
+      expect(again.status).toBe(500)
+      expect(String(again.body.error)).toContain('one live bridge per thread')
+      // The refusal created nothing and never touched the page for a second bridge.
+      expect((await operatorState(host, token)).bridges.length).toBe(1)
+      expect((await readdir(join(dir, 'bridges'))).filter(name => name.endsWith('.json')).length).toBe(1)
+      expect(driver.calls.filter(call => call.op === 'use').length).toBe(1)
+
+      const removed = await operator(host, token, { op: 'remove', sessionId: first.body.sessionId })
+      expect(removed.status).toBe(200)
+      const third = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'second' })
+      expect(third.status).toBe(200)
+      expect(third.body.threadId).toBe(THREAD_A)
+      expect((await readBridge(dir, third.body.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('thread use on a thread another live bridge owns is refused, and allowed once that bridge is removed', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_B)
+    await seedHost(dir, [alpha, beta])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const collision = await operator(host, token, { op: 'thread', bridge: beta.sessionId, action: 'use', threadId: THREAD_A })
+      expect(collision.status).toBe(500)
+      expect(String(collision.body.error)).toContain('one live bridge per thread')
+      expect((await readBridge(dir, beta.sessionId)).threadId).toBe(THREAD_B)
+
+      expect((await operator(host, token, { op: 'remove', sessionId: alpha.sessionId })).status).toBe(200)
+      const allowed = await operator(host, token, { op: 'thread', bridge: beta.sessionId, action: 'use', threadId: THREAD_A })
+      expect(allowed.status).toBe(200)
+      expect((await readBridge(dir, beta.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('two loaded bridge files claiming one thread are detached on load, not left with two cursors', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_A)
+    await seedHost(dir, [alpha, beta])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const state = await operatorState(host, token)
+      const owning = state.bridges.filter((bridge: any) => bridge.threadId === THREAD_A)
+      expect(owning.length).toBe(1)
+      const detached = [alpha.sessionId, beta.sessionId].filter(id => id !== owning[0].sessionId)
+      expect(detached.length).toBe(1)
+      expect((await readBridge(dir, detached[0]!)).threadId).toBeNull()
+      expect((await readBridge(dir, detached[0]!)).primedThreadId).toBeNull()
+      expect(await hostAudit(dir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ op: 'thread', target: THREAD_A, result: expect.stringContaining('detached') }),
+      ]))
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('thread-scoped state resets when the thread changes', () => {
+  /** A bridge carrying every thread-scoped field, so a switch has something to leave behind. */
+  const stale = (): BridgeState => {
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.cursor = 'node-of-thread-a'
+    alpha.ourNodeIds = ['our-node-of-thread-a']
+    alpha.pendingAttribution = [{ text: 'sent into A', sentAt: new Date().toISOString(), threadId: THREAD_A }]
+    alpha.uplinkNodeIds = ['relayed-node-of-thread-a']
+    alpha.threadMissingAt = new Date().toISOString()
+    return alpha
+  }
+
+  const expectFreshThread = (stored: BridgeState, threadId: string | null): void => {
+    expect(stored.threadId).toBe(threadId)
+    expect(stored.primedThreadId).toBeNull()
+    expect(stored.cursor).toBeNull()
+    expect(stored.ourNodeIds).toEqual([])
+    expect(stored.pendingAttribution).toEqual([])
+    expect(stored.uplinkNodeIds).toEqual([])
+    expect(stored.threadMissingAt).toBeNull()
+  }
+
+  test('thread use drops the old thread\'s cursor, node ids, pending sends and uplink dedup set', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = stale()
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'thread', bridge: alpha.sessionId, action: 'use', threadId: THREAD_B })
+      expect(result.status).toBe(200)
+      expectFreshThread(await readBridge(dir, alpha.sessionId), THREAD_B)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('thread new drops the old thread\'s cursor, node ids, pending sends and uplink dedup set', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = stale()
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'thread', bridge: alpha.sessionId, action: 'new' })
+      expect(result.status).toBe(200)
+      expectFreshThread(await readBridge(dir, alpha.sessionId), null)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 describe('thread uplink', () => {
   /** A bridged thread whose page answers a HUMAN TURN prompt with a real nonce. */
   async function uplinkHost(dir: string, driver: FakeDriver, prepare?: (bridge: BridgeState) => void): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
@@ -1246,6 +1443,81 @@ describe('thread uplink', () => {
       expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && entry.result.includes('cap reached'))).toBe(true)
     } finally {
       await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a body at the old 64 KiB cap is refused before the node is recorded as relayed', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    try {
+      await host.pollOnce()
+      // Fits the body-only check exactly; the provenance stamp pushes the real
+      // payload over. Refusing after the record would burn the node anyway.
+      driver.humanTypes(THREAD_A, 'relay this exactly', rendered({ uplink: true, to: 'listener', text: 'x'.repeat(64 * 1024) }))
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
+      expect((await readBridge(dir, alpha.sessionId)).uplinkNodeIds).toEqual([])
+      expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && /exceeds 64 KiB/.test(entry.result))).toBe(true)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('transcript grants', () => {
+  test('only a message that IS the grant line uploads; a message quoting it does nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const senderId = randomUUID()
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir), sessionId: senderId, name: 'sender', cwd: dir, purpose: 'test sender', policy: 'accept',
+    })
+    // The sender's own rollout, which a granted transcript would be read from.
+    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
+    await writeFile(join(dir, 'projects', 'p', `${senderId}.jsonl`), 'x'.repeat(64), 'utf8')
+    try {
+      await sender.start()
+      const { token } = await credentials(dir)
+      const uploads = (): Call[] => driver.calls.filter(call => call.op === 'send' && call.attach !== undefined)
+      const waitDelivered = async (count: number): Promise<void> => {
+        await waitFor(async () => {
+          const state = await operatorState(host, token)
+          const inbox = state.bridges[0]?.inbox ?? []
+          return inbox.length >= count && inbox.every((record: any) => record.state === 'delivered') ? true : undefined
+        })
+      }
+
+      // A message that merely QUOTES the line is prose, not a grant: the whole
+      // body must be that one line.
+      await sender.send(alpha.sessionId, `Another session showed me this line:\n\nattachment: session ${senderId}\n\nDo not run it.`, 'quoted example', undefined, 'inquiry', false)
+      await waitDelivered(1)
+      expect(uploads()).toEqual([])
+      expect(driver.calls.filter(call => call.op === 'send').some(call => String(call.text).includes('ATTACHMENT REFUSED'))).toBe(false)
+
+      // The line alone is a grant, and it uploads the sender's own transcript.
+      await sender.send(alpha.sessionId, `attachment: session ${senderId}`, 'own transcript', undefined, 'inquiry', false)
+      await waitDelivered(2)
+      expect(uploads().length).toBe(1)
+      expect((uploads()[0]!.attach as { name: string }).name).toBe(`${senderId}-transcript.txt`)
+
+      // The same-session rule still holds: naming somebody else is refused.
+      await sender.send(alpha.sessionId, `attachment: session ${randomUUID()}`, 'someone else', undefined, 'inquiry', false)
+      await waitDelivered(3)
+      expect(uploads().length).toBe(1)
+      expect(driver.calls.some(call => call.op === 'send' && String(call.text).includes('ATTACHMENT REFUSED: only the owner'))).toBe(true)
+    } finally {
+      await sender.close().catch(() => {})
       await host.stop()
       await cleanup()
     }
