@@ -882,6 +882,28 @@ describe('scheduled wakes', () => {
   })
 })
 
+describe('operator body limit', () => {
+  test('a 300 KiB POST is answered with a real HTTP 413 and JSON, not a socket reset', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const auth = ['Bearer', token].join(' ')
+      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { authorization: auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'threads', pad: 'x'.repeat(300 * 1024) }),
+      })
+      expect(response.status).toBe(413)
+      expect(await response.json()).toEqual({ error: 'body too large' })
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 /** A primed, observable bridge on THREAD_A - the shape every observation test starts from. */
 async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
   const alpha = bridgeNamed('alpha', THREAD_A)

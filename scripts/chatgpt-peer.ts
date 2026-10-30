@@ -995,12 +995,21 @@ export class ChatGptHost {
     return new Promise(resolve => {
       let size = 0
       const chunks: Buffer[] = []
+      let overflowed = false
       request.on('data', (chunk: Buffer) => {
+        if (overflowed) return
         size += chunk.length
-        if (size > 256 * 1024) { resolve(undefined); request.destroy(); return }
+        if (size > 256 * 1024) {
+          // Stop accumulating, but keep listening: the 413 is written on this
+          // same socket, and destroying the request turns the intended answer
+          // into a reset the caller never gets to read.
+          overflowed = true
+          chunks.length = 0
+          return
+        }
         chunks.push(chunk)
       })
-      request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+      request.on('end', () => resolve(overflowed ? undefined : Buffer.concat(chunks).toString('utf8')))
       request.on('error', () => resolve(undefined))
     })
   }
