@@ -15,14 +15,20 @@
  *       text matcher can never match the page's node, so recovery re-posts.
  *   D2a the whole-text matcher misses a live node whose text differs from ours
  *       only the way a page may alter it (an appended footer). The host's own
- *       node then reads back as a person typing.
+ *       node then reads back as a person typing. This is a robustness
+ *       requirement, NOT the live cause: the live turn's node was nominally
+ *       text-identical, so the open question is the null `create_time` (D2b).
  *   D2b the same visible failure from a different cause: the node's
  *       `create_time` is null, which both matchers require to be a number but
- *       the human-turn pass does not.
+ *       the human-turn pass does not. This is the live-cause candidate.
  *   D3  a failed SECOND conversation read turns a verified answer into a false
  *       terminal reply ("a command block only; nothing was sent").
  *   D4  a generic exception after the page accepted, but before `posted` was
- *       assigned, clears `postedAt`, so a restart types the prompt again.
+ *       assigned, clears `postedAt`, so a restart types the prompt again. The
+ *       finding names "any post-acceptance error", so this raises the host's own
+ *       `threadGone` (see the D4 test); it is deliberately NOT the literal
+ *       `recordOurs` persist path, whose non-critical persist swallows save
+ *       errors at eac9038 and so cannot throw.
  *
  * F4 is driver-side and belongs to lane #44; its host-side consequence cannot be
  * asserted without editing the driver, so no test is written for it here.
@@ -668,6 +674,10 @@ describe('R8-D4: a generic exception after acceptance still clears postedAt', ()
     // The page accepts the send but lands on a DIFFERENT thread, so the host's
     // own landed callback throws a generic threadGone error - after reply.ok was
     // true and after the user node was created, before `posted` is assigned.
+    // This is a reachable generic post-acceptance error, which is what the
+    // finding names. It is NOT the literal `recordOurs` persist path: that
+    // persist is non-critical and swallows save errors at eac9038, so it could
+    // not throw here.
     driverA.landOn = THREAD_B
     const hostA = await startHost(dir, driverA, { turnTimeoutMs: 3_000 })
     const internals = internalsOf(hostA)
