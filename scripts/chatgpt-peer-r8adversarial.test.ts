@@ -21,8 +21,10 @@
  *   D2b the same visible failure from a different cause: the node's
  *       `create_time` is null, which both matchers require to be a number but
  *       the human-turn pass does not. This is the live-cause candidate.
- *   D3  a failed SECOND conversation read turns a verified answer into a false
- *       terminal reply ("a command block only; nothing was sent").
+ *   D3  a follow-up conversation read must not turn a verified answer into a
+ *       false terminal reply ("a command block only; nothing was sent"). The
+ *       F2 contract: the answer is delivered exactly once from the node the
+ *       observation pass already read, with NO second read.
  *   D4  a generic exception after the page accepted, but before `posted` was
  *       assigned, clears `postedAt`, so a restart types the prompt again. The
  *       finding names "any post-acceptance error", so this raises the host's own
@@ -605,8 +607,8 @@ describe('R8-D2b: a null create_time hides the node from both matchers', () => {
 
 // --------------------------------------------------------------------- D3
 
-describe('R8-D3: a failed second read turns a verified answer into a false line', () => {
-  test('the sender is never told "a command block only" and the turn stays owed', async () => {
+describe('R8-D3: a follow-up read must not turn a verified answer into a false line', () => {
+  test('the verified answer is delivered once, with no second read to fabricate a false line', async () => {
     const { dir, cleanup } = await scratch()
     const { alpha } = await primedBridge()
     await seedHost(dir, [alpha])
@@ -621,19 +623,19 @@ describe('R8-D3: a failed second read turns a verified answer into a false line'
     const hostA = await startHost(dir, driverA, { turnTimeoutMs: 60_000 })
     let messageId = ''
     let typed = ''
-    let userId = ''
     try {
       // expectReply false: startup recovery leaves the record to the observation
-      // pass this test drives.
+      // pass this test drives. We only need the durable record the host wrote
+      // (posted + its text); its live attribution timing is not relied on - the
+      // "our node was already seen" crash state is modelled explicitly below.
       const receipt = await sender.send(alpha.sessionId, BODY, 'r8 probe', undefined, 'inquiry', false) as { id: string }
       messageId = receipt.id
       const turn = await waitFor(async () => {
         const state = await readBridge(dir, alpha.sessionId)
         const found = state.pendingTurns.find(item => item.messageId === messageId)
-        return found && found.postedAt !== null && found.userNodeId !== null ? found : undefined
+        return found && found.postedAt !== null ? found : undefined
       }, 15_000)
       typed = turn.text as string
-      userId = turn.userNodeId as string
       await internalsOf(hostA).bridges.get(alpha.sessionId)!.transport!.acknowledge(messageId)
       expect(await acknowledged(dir, alpha.sessionId, messageId)).toBe(true)
     } finally {
@@ -644,10 +646,24 @@ describe('R8-D3: a failed second read turns a verified answer into a false line'
 
     const driverB = new FakeDriver()
     driverB.observable = true
-    driverB.seedUserTurn(THREAD_A, userId, typed, ANSWER)
-    // The pass's own conversation read (attempt 1) succeeds and carries the
-    // finished answer; the immediately following read inside answerNodeById
-    // (attempt 2) is rate-limited.
+    // The page holds our user node with the answer beneath it. This is the crash
+    // state AFTER the host had seen its own node (userNodeId known), so nothing
+    // here depends on the whole-text matcher - D3 is about the follow-up read.
+    const nodeId = randomUUID()
+    driverB.seedUserTurn(THREAD_A, nodeId, typed, ANSWER)
+    const durable = await readBridge(dir, alpha.sessionId)
+    const record = durable.pendingTurns.find(item => item.messageId === messageId)!
+    await writeBridge(dir, {
+      ...durable,
+      cursor: null,
+      ourNodeIds: [nodeId],
+      pendingTurns: [{ ...record, userNodeId: nodeId, postedAt: new Date().toISOString() }],
+    })
+    // F2 contract: the verified answer is delivered from the node the pass has
+    // ALREADY read, with no follow-up read. eac9038 reads a SECOND time inside
+    // answerNodeById, so attempt 2 is rate-limited to expose that read; a
+    // correct fix never makes this attempt. The answer is short, so shapeAnswer
+    // does not spill and performs no read of its own.
     driverB.conversationFailAt = 2
 
     const hostB = await startHost(dir, driverB)
@@ -655,19 +671,18 @@ describe('R8-D3: a failed second read turns a verified answer into a false line'
       const replies = () => sender.inbox().filter(record => replyToOf(record) === messageId)
       await hostB.pollOnce()
       await delay(300)
-      // RED at eac9038: deliverSolicited got the answer from the pass read, then
-      // answerNodeById's second read fails, node is null, and the delivery path
-      // sends the false "command block only; nothing was sent" terminal line.
+      // (a) RED at eac9038: the follow-up read fails, the node is null, and the
+      // false "command block only; nothing was sent" terminal line is sent.
       expect(replies().some(record => /command block only/.test(textOf(record)))).toBe(false)
-      // RED: that false line is recorded as a sent reply, so the turn is retired
-      // and the real answer is lost.
-      expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === messageId)).toBe(true)
-
-      // A later pass (the fault gone) must deliver the page's real answer once.
-      driverB.conversationFailAt = 0
-      await hostB.pollOnce()
-      await waitFor(() => (replies().some(record => textOf(record).includes(ANSWER)) ? true : undefined), 10_000)
+      // (b) RED: the real answer is never delivered - attempt 1 had it and the
+      // failed second read threw it away.
       expect(replies().filter(record => textOf(record).includes(ANSWER)).length).toBe(1)
+      // (d) RED: exactly ONE conversation read for the pass proves there is no
+      // second read at all. eac9038 reads twice here (pass + answerNodeById).
+      expect(driverB.conversationAttempts).toBe(1)
+      // (c) The record is gone - retired because the answer was DELIVERED (b),
+      // not because a false line was recorded as a reply.
+      expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === messageId)).toBe(false)
     } finally {
       await hostB.stop()
     }
