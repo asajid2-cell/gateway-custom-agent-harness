@@ -130,7 +130,12 @@ type Bridge = {
   transport: GatewaySessionTransport | undefined
   /** Handling is once per process for this bridge (see the old drain note). */
   handled: Set<string>
-  schedules: Map<string, NodeJS.Timeout>
+  /**
+   * Armed timers, one per label. The generation names the arm that owns the
+   * label: a wake deletes only the generation that actually fired, so a label
+   * the wake itself rescheduled keeps its NEW timer tracked and cancellable.
+   */
+  schedules: Map<string, { generation: number; handle: NodeJS.Timeout }>
   draining: boolean
   stopping: boolean
   removed: boolean
@@ -296,6 +301,8 @@ export class ChatGptHost {
   private detachEvents: (() => void) | undefined
   /** Failed thread reads, bumped inside readConversation and read by pollOnce. */
   private readErrors = 0
+  /** Monotonic arm identity; a wake compares it to tell a replacement from its own timer. */
+  private scheduleGeneration = 0
   /** The thread list as last walked (id -> title), for the unbridged-thread diff. */
   private knownThreads = new Map<string, string>()
   /** The first walk is the baseline: every existing thread is "new" to it. */
@@ -559,7 +566,7 @@ export class ChatGptHost {
     bridge.stopping = true
     bridge.removed = true
     this.bridges.delete(bridge.state.sessionId)
-    for (const handle of bridge.schedules.values()) clearTimeout(handle)
+    for (const { handle } of bridge.schedules.values()) clearTimeout(handle)
     bridge.schedules.clear()
     await bridge.transport?.close().catch(error => log(`bridge close failed: ${(error as Error).message}`))
     await rm(bridge.path, { force: true }).catch(() => {})
@@ -2254,19 +2261,20 @@ export class ChatGptHost {
     }
     this.cancelSchedule(bridge, label)
     bridge.state.schedules = [...bridge.state.schedules.filter(schedule => schedule.label !== label), { label, at: at.toISOString() }]
+    const generation = ++this.scheduleGeneration
     const delay = Math.max(0, at.getTime() - Date.now())
-    const handle = setTimeout(() => { void this.fireSchedule(bridge, label) }, Math.min(delay, 24 * 3600_000))
+    const handle = setTimeout(() => { void this.fireSchedule(bridge, label, generation) }, Math.min(delay, 24 * 3600_000))
     handle.unref?.()
-    bridge.schedules.set(label, handle)
+    bridge.schedules.set(label, { generation, handle })
   }
 
   private cancelSchedule(bridge: Bridge, label: string): boolean {
-    const handle = bridge.schedules.get(label)
-    if (handle) clearTimeout(handle)
+    const entry = bridge.schedules.get(label)
+    if (entry) clearTimeout(entry.handle)
     bridge.schedules.delete(label)
     const before = bridge.state.schedules.length
     bridge.state.schedules = bridge.state.schedules.filter(schedule => schedule.label !== label)
-    return handle !== undefined || bridge.state.schedules.length !== before
+    return entry !== undefined || bridge.state.schedules.length !== before
   }
 
   private rearmSchedules(bridge: Bridge): void {
@@ -2280,7 +2288,7 @@ export class ChatGptHost {
   }
 
   /** A schedule starts a turn; it never sends anything by itself. */
-  private async fireSchedule(bridge: Bridge, label: string): Promise<void> {
+  private async fireSchedule(bridge: Bridge, label: string, generation: number): Promise<void> {
     // The schedule stays in state until its turn finishes. Removing it first
     // means a crash mid-turn loses the wake permanently; left in place, a
     // restart fires it again, and a repeated wake is far cheaper than a lost one.
@@ -2308,9 +2316,17 @@ export class ChatGptHost {
     } catch (error) {
       log(`scheduled wake "${label}" on "${bridge.state.name}" failed: ${(error as Error).message}`)
     } finally {
-      bridge.schedules.delete(label)
-      bridge.state.schedules = bridge.state.schedules.filter(schedule => schedule.label !== label)
-      await this.persistBridgeState(bridge)
+      // Delete only the arm that actually fired. The wake may have scheduled
+      // its own label again during the turn; that replacement is a NEW timer
+      // and its state entry is newer truth. Deleting the label unconditionally
+      // would drop the only reference to it: cancelSchedule could not find it
+      // and a restart would lose it.
+      const current = bridge.schedules.get(label)
+      if (current?.generation === generation) {
+        bridge.schedules.delete(label)
+        bridge.state.schedules = bridge.state.schedules.filter(schedule => schedule.label !== label)
+        await this.persistBridgeState(bridge)
+      }
       this.scheduleIdleUnload()
     }
   }
@@ -2444,7 +2460,7 @@ export class ChatGptHost {
     this.detachEvents = undefined
     for (const bridge of this.bridges.values()) {
       bridge.stopping = true
-      for (const handle of bridge.schedules.values()) clearTimeout(handle)
+      for (const { handle } of bridge.schedules.values()) clearTimeout(handle)
       bridge.schedules.clear()
       await this.persistBridgeState(bridge)
     }

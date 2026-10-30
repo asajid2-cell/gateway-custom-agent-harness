@@ -841,6 +841,47 @@ describe('host defects', () => {
   })
 })
 
+describe('scheduled wakes', () => {
+  test('a wake that reschedules its own label leaves exactly that one tracked schedule, cancellable', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.schedules = [{ label: 'wake', at: new Date(Date.now() - 1000).toISOString() }]
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    // The wake's own turn puts the SAME label back, further out.
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      return text.includes('SCHEDULED WAKE') && nonce
+        ? `On it.\n\n${rendered({ nonce, op: 'schedule', label: 'wake', inSeconds: 600 })}`
+        : 'Done.'
+    }
+    const host = await startHost(dir, driver)
+    try {
+      // Wait for both page turns of the wake (wake prompt, then the command
+      // result) and for the wake's own write to settle.
+      await waitFor(async () => (driver.readCalls >= 2 && driver.calls.filter(call => call.op === 'send').length >= 2) ? true : undefined)
+      await new Promise(resolve => setTimeout(resolve, 300))
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.schedules.map(schedule => schedule.label)).toEqual(['wake'])
+      expect(Date.parse(stored.schedules[0]!.at)).toBeGreaterThan(Date.now())
+
+      // It is still TRACKED, not just written down: cancelling finds its timer.
+      const { token } = await credentials(dir)
+      const cancelled = await operator(host, token, { op: 'cancelSchedule', bridge: alpha.sessionId, label: 'wake' })
+      expect(cancelled.status).toBe(200)
+      expect(cancelled.body.line).toBe('cancelled "wake"')
+      expect((await readBridge(dir, alpha.sessionId)).schedules).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 /** A primed, observable bridge on THREAD_A - the shape every observation test starts from. */
 async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
   const alpha = bridgeNamed('alpha', THREAD_A)
