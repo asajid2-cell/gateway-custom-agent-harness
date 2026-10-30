@@ -38,6 +38,39 @@ export const owedEntrySchema = z.object({
 
 export const scheduleSchema = z.object({ label: z.string().max(80), at: z.string() }).strict()
 
+/**
+ * The longest send text a pending record can hold. Longer text cannot be
+ * matched by equality, so it is not recorded at all (the host logs that);
+ * the snapshot path still has it.
+ */
+export const PENDING_ATTRIBUTION_TEXT_MAX = 65536
+
+/**
+ * A send the page had not shown us yet when we looked for it.
+ *
+ * The snapshot path - the node ids before a send versus after it - is exact,
+ * but it depends on the page's own conversation read being up to date. When
+ * that read lags, our user node is missing from both snapshots, so it is never
+ * recorded as ours and later reads back as a person typing (which asks the page
+ * to run our own prompt). This record is written BEFORE the page is called, so
+ * it survives a failed snapshot AND a host that dies mid-send: the next
+ * observation that sees a user node with this exact text, created within the
+ * window, adopts it as ours.
+ */
+export const pendingAttributionSchema = z.object({
+  /** Exactly what we sent; the match is by text. */
+  text: z.string().max(PENDING_ATTRIBUTION_TEXT_MAX),
+  /** When the page was asked, ISO. The match window and the expiry are from here. */
+  sentAt: z.string(),
+  /** The thread we sent into, for the audit line. Null for a brand-new chat. */
+  threadId: z.string().uuid().nullable(),
+}).strict()
+
+export type PendingAttribution = z.infer<typeof pendingAttributionSchema>
+
+/** How many unresolved sends one bridge may hold; a send is rare, so this is slack. */
+export const PENDING_ATTRIBUTION_MAX = 16
+
 /** A slug, not a sentence: it names one browser instance on disk. */
 export const INSTANCE_ID_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/
 /** A single token: the address another peer types. Never a display label. */
@@ -106,6 +139,12 @@ export const bridgeStateSchema = z.object({
    * "INBOUND from ..." is still a person.
    */
   ourNodeIds: z.array(z.string().max(64)).max(200).default([]),
+  /**
+   * Sends whose own user node we have not seen yet, oldest first. Written
+   * before each send and resolved by text on the next observation; see
+   * `pendingAttributionSchema`.
+   */
+  pendingAttribution: z.array(pendingAttributionSchema).max(PENDING_ATTRIBUTION_MAX).default([]),
   /** The last node of the thread the host has handled; null until first observed. */
   cursor: z.string().max(64).nullable().default(null),
   /** When the page last answered 404 for the bound thread; cleared when it answers again. */
@@ -180,6 +219,7 @@ export function newBridgeState(options: {
     createdAt: options.createdAt ?? new Date().toISOString(),
     ...(options.title ? { title: options.title } : {}),
     ourNodeIds: [],
+    pendingAttribution: [],
     cursor: null,
     threadMissingAt: null,
     uplinkTimes: [],
@@ -201,6 +241,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     effort: legacy.effort,
     createdAt,
     ourNodeIds: [],
+    pendingAttribution: [],
     cursor: null,
     threadMissingAt: null,
     uplinkTimes: [],

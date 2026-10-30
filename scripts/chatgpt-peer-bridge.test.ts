@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import { ChatGptHost } from './chatgpt-peer.ts'
 import type { DriverChild, DriverReply } from './chatgpt-peer/driver.ts'
-import { newBridgeState, newHostState, newState, saveJson, saveState, type BridgeState } from './chatgpt-peer/state.ts'
+import { newBridgeState, newHostState, newState, PENDING_ATTRIBUTION_MAX, saveJson, saveState, type BridgeState } from './chatgpt-peer/state.ts'
 
 const THREAD_A = '11111111-1111-4111-8111-111111111111'
 const THREAD_B = '22222222-2222-4222-8222-222222222222'
@@ -45,7 +45,8 @@ class FakeDriver {
   observable = false
   readonly deleted = new Set<string>()
   private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
-  private clock = 1000
+  /** Real epoch seconds: the pending-attribution window is measured against the wall clock. */
+  private clock = Math.floor(Date.now() / 1000)
 
   private treeOf(threadId: string): { current: string; mapping: Record<string, any> } {
     let tree = this.trees.get(threadId)
@@ -70,6 +71,20 @@ class FakeDriver {
   humanTypes(threadId: string, text: string, answer: string): string {
     const id = this.grow(threadId, 'user', text)
     this.grow(threadId, 'assistant', answer)
+    return id
+  }
+
+  /**
+   * When true, `send` is accepted but the tree never shows its node: the page's
+   * own conversation read lags the send. `showSentNode` then plays the node
+   * appearing later, which is the race the pending attribution covers.
+   */
+  lags = false
+
+  /** The page finally shows a send it accepted earlier. Returns the user node id. */
+  showSentNode(threadId: string, text: string, answer?: string): string {
+    const id = this.grow(threadId, 'user', text)
+    if (answer !== undefined) this.grow(threadId, 'assistant', answer)
     return id
   }
 
@@ -118,8 +133,10 @@ class FakeDriver {
       if (!threadId) return { ok: false, op, error: 'no thread is open' }
       this.current = threadId
       this.answer = this.answerFor?.(request) ?? this.answer
-      this.grow(threadId, 'user', String(request.text ?? ''))
-      this.grow(threadId, 'assistant', this.answer)
+      if (!this.lags) {
+        this.grow(threadId, 'user', String(request.text ?? ''))
+        this.grow(threadId, 'assistant', this.answer)
+      }
       onAccepted?.(String(request.id ?? ''))
       return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
     }
@@ -824,25 +841,26 @@ describe('host defects', () => {
   })
 })
 
-describe('thread watcher', () => {
-  async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    alpha.primedThreadId = THREAD_A
-    alpha.primerSha256 = await primerSha()
-    alpha.title = 'Existing work'
-    await seedHost(dir, [alpha])
-    driver.observable = true
-    driver.answerFor = request => {
-      const text = String(request.text ?? '')
-      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
-      if (text.includes('HUMAN TURN') && nonce) return rendered({ nonce, op: 'schedule', label: 'human-asked', inSeconds: 600 })
-      return 'Done.'
-    }
-    return { host: await startHost(dir, driver), alpha }
+/** A primed, observable bridge on THREAD_A - the shape every observation test starts from. */
+async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
+  const alpha = bridgeNamed('alpha', THREAD_A)
+  alpha.primedThreadId = THREAD_A
+  alpha.primerSha256 = await primerSha()
+  alpha.title = 'Existing work'
+  await seedHost(dir, [alpha])
+  driver.observable = true
+  driver.answerFor = request => {
+    const text = String(request.text ?? '')
+    const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+    if (text.includes('HUMAN TURN') && nonce) return rendered({ nonce, op: 'schedule', label: 'human-asked', inSeconds: 600 })
+    return 'Done.'
   }
+  return { host: await startHost(dir, driver), alpha }
+}
 
-  const sends = (driver: FakeDriver): string[] => driver.calls.filter(call => call.op === 'send').map(call => String(call.text))
+const sends = (driver: FakeDriver): string[] => driver.calls.filter(call => call.op === 'send').map(call => String(call.text))
 
+describe('thread watcher', () => {
   test('history is not replayed: the first look only places the cursor', async () => {
     const { dir, cleanup } = await scratch()
     const driver = new FakeDriver()
@@ -1308,6 +1326,175 @@ describe('every send is attributed', () => {
       expect(listener.transport.inbox().length).toBe(0)
     } finally {
       await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+/**
+ * D4: a send whose own user node the page had not shown us yet.
+ *
+ * Live, at 12:59:24.875, the cnow bridge logged our own operator prompt as a
+ * HUMAN TURN because the page's conversation read lagged the send: the
+ * before/after snapshot held no new node, attribution returned nothing, and the
+ * node then read back as a person typing - which asks the page to run our own
+ * prompt. A send now leaves a record of its exact text before the page is
+ * called, and the next observation adopts a matching node as ours.
+ */
+describe('pending attribution', () => {
+  /** A primed, observable bridge whose state carries extra fields before the host starts. */
+  async function primedBridge(dir: string, driver: FakeDriver, patch: Partial<BridgeState>): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    Object.assign(alpha, patch)
+    await seedHost(dir, [alpha])
+    driver.observable = true
+    return { host: await startHost(dir, driver), alpha }
+  }
+
+  const pending = (text: string, sentAt = new Date(), threadId: string | null = THREAD_A) =>
+    ({ text, sentAt: sentAt.toISOString(), threadId })
+
+  const attributionLines = async (dir: string) => (await hostAudit(dir)).filter(entry => entry.op === 'attribution')
+
+  test('a send the snapshot missed is adopted on the next look, and is never a human turn', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      const { token } = await credentials(dir)
+      driver.lags = true
+      expect((await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'operator prompt one' })).status).toBe(200)
+
+      const afterSend = await readBridge(dir, alpha.sessionId)
+      expect(afterSend.pendingAttribution.map(entry => entry.text)).toEqual(['operator prompt one'])
+      expect(afterSend.ourNodeIds).toEqual([])
+
+      driver.lags = false
+      const node = driver.showSentNode(THREAD_A, 'operator prompt one', 'answered.')
+      await host.pollOnce()
+
+      const resolved = await readBridge(dir, alpha.sessionId)
+      expect(resolved.ourNodeIds).toEqual([node])
+      expect(resolved.pendingAttribution).toEqual([])
+      expect((await attributionLines(dir)).filter(entry => /resolved late/.test(entry.result)).length).toBe(1)
+      expect((await hostAudit(dir)).filter(entry => entry.op === 'human').length).toBe(0)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('the same node is never adopted twice', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.humanTypes(THREAD_A, 'earlier question', 'earlier answer')
+    const cursor = driver.newestId(THREAD_A)
+    const node = driver.showSentNode(THREAD_A, 'lagged text')
+    const { host, alpha } = await primedBridge(dir, driver, { cursor, pendingAttribution: [pending('lagged text')] })
+    try {
+      await host.pollOnce()
+      const once = await readBridge(dir, alpha.sessionId)
+      await host.pollOnce()
+      const twice = await readBridge(dir, alpha.sessionId)
+      expect(once.ourNodeIds).toEqual([node])
+      expect(twice.ourNodeIds).toEqual([node])
+      expect(once.pendingAttribution).toEqual([])
+      expect((await attributionLines(dir)).length).toBe(1)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a person typing different words at the same time is still a human turn', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.humanTypes(THREAD_A, 'earlier question', 'earlier answer')
+    const cursor = driver.newestId(THREAD_A)
+    const human = driver.humanTypes(THREAD_A, 'a different question', 'sure')
+    const { host, alpha } = await primedBridge(dir, driver, { cursor, pendingAttribution: [pending('our words')] })
+    try {
+      await host.pollOnce()
+      const audit = await hostAudit(dir)
+      expect(audit.some(entry => entry.op === 'human' && entry.target === human)).toBe(true)
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.ourNodeIds).toEqual([])
+      // The unmatched record is still waiting: it expires or resolves, never vanishes.
+      expect(stored.pendingAttribution.map(entry => entry.text)).toEqual(['our words'])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an entry that expires is audited and dropped, never left silently', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.humanTypes(THREAD_A, 'earlier question', 'earlier answer')
+    const cursor = driver.newestId(THREAD_A)
+    const stale = pending('never showed up', new Date(Date.now() - 11 * 60_000))
+    const { host, alpha } = await primedBridge(dir, driver, { cursor, pendingAttribution: [stale] })
+    try {
+      await host.pollOnce()
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.pendingAttribution).toEqual([])
+      const lines = await attributionLines(dir)
+      expect(lines.length).toBe(1)
+      expect(lines[0]!.result).toMatch(/expired/)
+      expect(lines[0]!.result).toContain('never showed up')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a host that dies mid-send resolves from the record the next process loads', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    const { token } = await credentials(dir)
+    try {
+      await host.pollOnce()
+      driver.lags = true
+      await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'survives a crash' })
+      await host.stop()
+
+      driver.lags = false
+      const node = driver.showSentNode(THREAD_A, 'survives a crash', 'answered after the restart')
+      const again = await startHost(dir, driver)
+      try {
+        await again.pollOnce()
+        const stored = await readBridge(dir, alpha.sessionId)
+        expect(stored.ourNodeIds).toEqual([node])
+        expect(stored.pendingAttribution).toEqual([])
+        expect((await attributionLines(dir)).filter(entry => /resolved late/.test(entry.result)).length).toBe(1)
+        expect((await hostAudit(dir)).filter(entry => entry.op === 'human').length).toBe(0)
+      } finally {
+        await again.stop()
+      }
+    } finally {
+      await cleanup()
+    }
+  })
+
+  test('the pending list is capped, oldest evicted first', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.lags = true
+    const entries = Array.from({ length: PENDING_ATTRIBUTION_MAX }, (_, index) => pending(`old send ${index}`))
+    const { host, alpha } = await primedBridge(dir, driver, { pendingAttribution: entries })
+    try {
+      const { token } = await credentials(dir)
+      expect((await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'the newest send' })).status).toBe(200)
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.pendingAttribution.length).toBe(PENDING_ATTRIBUTION_MAX)
+      expect(stored.pendingAttribution[0]!.text).toBe('old send 1')
+      expect(stored.pendingAttribution.at(-1)!.text).toBe('the newest send')
+    } finally {
       await host.stop()
       await cleanup()
     }

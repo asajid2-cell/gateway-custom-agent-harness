@@ -244,15 +244,28 @@ function firstNonSpace(source: string, from: number): number {
 }
 
 /**
+ * The markup an answer can carry instead of a fence: `<CodeBlock language="gateway">`.
+ *
+ * The page renders this as a real code block, so the model can write it and
+ * mean it - but the text we read back holds the tag, not a fence, and the
+ * body is the inner text.
+ */
+const CODEBLOCK_TAG = /<CodeBlock\b([^>]*)>/gi
+const CODEBLOCK_CLOSE = '</codeblock>'
+
+/**
  * Split one assistant turn into blocks, and record the spans a block occupies.
  *
- * Two shapes are read: literal fenced markdown, and what the page actually
- * renders - a line holding only `gateway`, then the balanced JSON object. The
- * spans exist so prose outside a block can be returned untouched.
+ * Three shapes are read: literal fenced markdown, what the page actually
+ * renders - a line holding only `gateway`, then the balanced JSON object - and
+ * `<CodeBlock language="...">...</CodeBlock>` markup. The spans exist so prose
+ * outside a block can be returned untouched.
  */
 function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & { gateway: boolean }> } {
   const lines = linesOf(source)
-  const blocks: Block[] = []
+  // Blocks carry the offset they start at, so the three shapes can be put back
+  // in reading order once all of them are found.
+  const placed: Array<{ block: Block; start: number }> = []
   const spans: Array<LineSpan & { gateway: boolean }> = []
   const spanThrough = (first: number, last: number): LineSpan => ({
     start: lines[first].start,
@@ -268,10 +281,13 @@ function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & 
       const info = fence[1].trim()
       let close = index + 1
       while (close < lines.length && !/^ {0,3}```/.test(lines[close].text)) close++
-      blocks.push({
-        info,
-        body: lines.slice(index + 1, Math.min(close, lines.length)).map(item => item.text).join('\n'),
-        line: index + 1,
+      placed.push({
+        block: {
+          info,
+          body: lines.slice(index + 1, Math.min(close, lines.length)).map(item => item.text).join('\n'),
+          line: index + 1,
+        },
+        start: line.start,
       })
       spans.push({ ...spanThrough(index, close < lines.length ? close : lines.length - 1), gateway: /^gateway\b/i.test(info) })
       index = close < lines.length ? close + 1 : lines.length
@@ -281,7 +297,7 @@ function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & 
       const objectStart = firstNonSpace(source, line.end < source.length ? line.end + 1 : source.length)
       const end = objectStart >= 0 ? objectEnd(source, objectStart) : -1
       if (end > 0) {
-        blocks.push({ info: 'gateway', body: source.slice(objectStart, end), line: index + 1 })
+        placed.push({ block: { info: 'gateway', body: source.slice(objectStart, end), line: index + 1 }, start: line.start })
         // The span stops at the closing brace: prose sharing that line stays.
         spans.push({ start: line.start, end, gateway: true })
         while (index + 1 < lines.length && lines[index + 1].start < end) index++
@@ -290,7 +306,38 @@ function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & 
     }
     index++
   }
-  return { blocks, spans }
+  // Third shape: `<CodeBlock language="...">body</CodeBlock>`. A tag with no
+  // close is not a block and the rest of the answer is left alone; a tag that
+  // opens another before its own close is unbalanced and skipped in favour of
+  // the inner one; a tag already inside a fence is part of that fence's body.
+  const lower = source.toLowerCase()
+  const lineAt = (offset: number): number => {
+    let at = 1
+    for (let cursor = 0; cursor < offset; cursor++) if (source[cursor] === '\n') at++
+    return at
+  }
+  CODEBLOCK_TAG.lastIndex = 0
+  for (let tag = CODEBLOCK_TAG.exec(source); tag !== null; tag = CODEBLOCK_TAG.exec(source)) {
+    const start = tag.index
+    const bodyStart = start + tag[0].length
+    const closeAt = lower.indexOf(CODEBLOCK_CLOSE, bodyStart)
+    if (closeAt < 0) continue
+    const nestedAt = lower.indexOf('<codeblock', bodyStart)
+    if (nestedAt >= 0 && nestedAt < closeAt) continue
+    const end = closeAt + CODEBLOCK_CLOSE.length
+    if (spans.some(span => start < span.end && end > span.start)) {
+      CODEBLOCK_TAG.lastIndex = end
+      continue
+    }
+    const attribute = /(?:^|\s)language\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag[1])
+    const info = (attribute?.[1] ?? attribute?.[2] ?? '').trim()
+    placed.push({ block: { info, body: source.slice(bodyStart, closeAt), line: lineAt(start) }, start })
+    spans.push({ start, end, gateway: /^gateway\b/i.test(info) })
+    CODEBLOCK_TAG.lastIndex = end
+  }
+  placed.sort((left, right) => left.start - right.start)
+  spans.sort((left, right) => left.start - right.start)
+  return { blocks: placed.map(item => item.block), spans }
 }
 
 /** Split the blocks out of one assistant turn. Returns every block seen. */

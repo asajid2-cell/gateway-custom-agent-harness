@@ -30,7 +30,7 @@ import { attributeSend, chainOf, diffThreadList, listAllThreads, newPageAnswers,
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
-  saveJson, type BridgeState, type HostState,
+  PENDING_ATTRIBUTION_MAX, PENDING_ATTRIBUTION_TEXT_MAX, saveJson, type BridgeState, type HostState, type PendingAttribution,
 } from './chatgpt-peer/state.ts'
 
 const execFileAsync = promisify(execFile)
@@ -53,6 +53,19 @@ const PURPOSE = 'A signed-in ChatGPT web thread on this machine\'s account, addr
 const POLL_MAX_BACKOFF_MS = 300_000
 /** A burst of page events collapses into one observation pass. */
 const TRIGGER_DEBOUNCE_MS = 300
+
+/**
+ * How long an unanswered send is remembered, and how wide a create_time window
+ * counts as "this node is that send".
+ *
+ * The late side is five minutes because the lag we are covering is the page's
+ * own conversation read, measured in seconds; the early side is 30 s for clock
+ * skew between the page and the host. Ten minutes is the outer bound: past that
+ * the page has either shown the node or it never will.
+ */
+const PENDING_ATTRIBUTION_TTL_MS = 10 * 60_000
+const PENDING_WINDOW_BEFORE_MS = 30_000
+const PENDING_WINDOW_AFTER_MS = 300_000
 
 /** The page may put at most this many messages on the bus per hour. */
 const UPLINK_PER_HOUR = 20
@@ -1090,6 +1103,10 @@ export class ChatGptHost {
       onAccepted?: () => void
     },
   ): Promise<DriverReply> {
+    // The record goes down BEFORE the page is asked, so it exists even if the
+    // snapshot read below fails or this host dies mid-send. The snapshot path
+    // is exact; this is what covers it when the page's own read lags.
+    await this.notePendingSend(bridge, text, options.threadId)
     const before = await this.snapshotBeforeSend(options.threadId)
     const reply = await this.driver.call({
       op: 'send',
@@ -1114,7 +1131,90 @@ export class ChatGptHost {
     bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => !ours.includes(id)), ...ours].slice(-200)
     // A thread seen for the first time through our own send starts after it.
     if (!bridge.state.cursor) bridge.state.cursor = ours[ours.length - 1]!
+    this.dropPending(bridge, sent)
     await this.persistBridgeState(bridge)
+  }
+
+  /**
+   * Remember one send until its own user node has actually been seen.
+   *
+   * A send whose attribution is lost is the expensive mistake: the node reads
+   * back as a person typing, so the answer is treated as page speech and a
+   * re-ask prompts the page to run our own message. So the write is critical -
+   * if it cannot be recorded, the send does not happen. A text too long to hold
+   * exactly cannot be matched by equality, so it is not recorded and the
+   * snapshot path is left to do what it can; that is logged rather than silent.
+   */
+  private async notePendingSend(bridge: Bridge, text: string, threadId: string | null): Promise<void> {
+    const entry: PendingAttribution = { text, sentAt: now(), threadId }
+    if (entry.text.length > PENDING_ATTRIBUTION_TEXT_MAX) {
+      log(`not recording a pending attribution for "${bridge.state.name}": the text is too long to match exactly (${entry.text.length} chars)`)
+      return
+    }
+    bridge.state.pendingAttribution = [...bridge.state.pendingAttribution, entry].slice(-PENDING_ATTRIBUTION_MAX)
+    await this.persistBridgeState(bridge, true)
+  }
+
+  /** Drop the pending record one resolved send answered: the newest with this text. */
+  private dropPending(bridge: Bridge, sent: string): void {
+    const entries = bridge.state.pendingAttribution
+    const index = entries.map(entry => entry.text).lastIndexOf(sent)
+    if (index >= 0) bridge.state.pendingAttribution = [...entries.slice(0, index), ...entries.slice(index + 1)]
+  }
+
+  /**
+   * Adopt user nodes our own sends created but the page did not show us in time.
+   *
+   * Runs on every observation BEFORE anything is classified, so a late node is
+   * ours by the time the human-turn and page-answer paths look at it. A match is
+   * exact text within the window around the send's own timestamp, and a node
+   * already in `ourNodeIds` is never adopted again.
+   *
+   * Fail-closed direction: if a person retyped our exact words inside the
+   * window, their node is adopted as ours and their re-ask is skipped. That
+   * loses one human turn. The other direction asks the page to run our own
+   * primer as if a person had requested it, which is the bug this exists for.
+   */
+  private async resolvePendingAttribution(bridge: Bridge, conversation: Conversation): Promise<void> {
+    const entries = bridge.state.pendingAttribution
+    if (entries.length === 0) return
+    const ours = new Set(bridge.state.ourNodeIds)
+    const chain = chainOf(conversation)
+    const nowMs = Date.now()
+    const kept: PendingAttribution[] = []
+    let changed = false
+    for (const entry of entries) {
+      const sentMs = Date.parse(entry.sentAt)
+      if (!Number.isFinite(sentMs) || nowMs - sentMs > PENDING_ATTRIBUTION_TTL_MS) {
+        audit(this.hostState, {
+          op: 'attribution',
+          target: entry.threadId,
+          result: `expired: no user node matched within ${Math.round(PENDING_ATTRIBUTION_TTL_MS / 60_000)} min: "${one(entry.text, 60)}" [${bridge.state.name}]`,
+        })
+        changed = true
+        continue
+      }
+      const from = sentMs / 1000 - PENDING_WINDOW_BEFORE_MS / 1000
+      const to = sentMs / 1000 + PENDING_WINDOW_AFTER_MS / 1000
+      const match = chain.find(turn => turn.role === 'user'
+        && !ours.has(turn.id)
+        && turn.text.trim() === entry.text.trim()
+        && typeof turn.createTime === 'number'
+        && turn.createTime >= from && turn.createTime <= to)
+      if (!match) { kept.push(entry); continue }
+      ours.add(match.id)
+      bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== match.id), match.id].slice(-200)
+      audit(this.hostState, {
+        op: 'attribution',
+        target: match.id,
+        result: `resolved late: the send's own node, seen after the snapshot: "${one(entry.text, 60)}" [${bridge.state.name}]`,
+      })
+      changed = true
+    }
+    bridge.state.pendingAttribution = kept
+    if (!changed) return
+    await this.persistBridgeState(bridge)
+    await this.persistHostState()
   }
 
   /**
@@ -1344,6 +1444,9 @@ export class ChatGptHost {
       await this.advertise(bridge)
     }
     const conversation = read.conversation
+    // Before anything is classified: adopt the nodes our own sends created but
+    // the page had not shown us when we looked for them.
+    await this.resolvePendingAttribution(bridge, conversation)
     if (!bridge.state.cursor) {
       // Adopted or never observed: what is already there is history, not work.
       bridge.state.cursor = chainOf(conversation).at(-1)?.id ?? pathOf(conversation).at(-1) ?? null

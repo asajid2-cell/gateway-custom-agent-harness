@@ -144,6 +144,11 @@ block you are merely quoting stays a quotation - and no other op runs from an
 answer like that. To do anything other than say something, use the HUMAN TURN
 path above, which gives you a nonce.
 
+Write the block as a plain three-backtick fence whose first line is the word
+`gateway`, never as `CodeBlock` markup: the host reads the fence out of the
+raw text you send back, and a block written as a tool-call tag is not the same
+text.
+
 At most 20 relays an hour per thread. Past that the host refuses and records it.
 
 ## Getting context
