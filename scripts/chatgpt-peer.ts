@@ -374,6 +374,9 @@ export class ChatGptHost {
 
     await this.listen()
     await this.loadBridges()
+    // Before any transport exists or any observation runs: a thread has at most
+    // one owner, even when the files on disk disagree.
+    await this.enforceThreadOwnership()
     // A host that has never run before is today's single bridge: one peer with
     // a minted address and the name `chatgpt-web`. A host whose bridges were
     // all removed on purpose is NOT repopulated.
@@ -435,6 +438,31 @@ export class ChatGptHost {
   private async loadBridges(): Promise<void> {
     await mkdir(this.bridgeDirectory, { recursive: true })
     for (const { state } of await listBridgeStates(this.bridgeDirectory)) this.registerBridge(state)
+  }
+
+  /**
+   * One conversation, one live bridge - enforced against the files too.
+   *
+   * A file pair that claims the same thread predates this rule (or was written
+   * by hand). Keeping both would give one page turn two independent cursors
+   * and two uplink dedup sets. The first file (directory order) keeps the
+   * thread; the rest are detached, reported, and start a thread of their own.
+   */
+  private async enforceThreadOwnership(): Promise<void> {
+    const owners = new Map<string, Bridge>()
+    for (const bridge of this.bridges.values()) {
+      const threadId = bridge.state.threadId
+      if (!threadId) continue
+      const id = threadId.toLowerCase()
+      const owner = owners.get(id)
+      if (!owner) { owners.set(id, bridge); continue }
+      bridge.state.threadId = null
+      bridge.state.primedThreadId = null
+      await this.persistBridgeState(bridge)
+      audit(this.hostState, { op: 'thread', target: threadId, result: `detached bridge "${bridge.state.name}": thread already owned by "${owner.state.name}"` })
+      log(`detached bridge "${bridge.state.name}": thread ${shortId(threadId)} is already owned by "${owner.state.name}"`)
+    }
+    await this.persistHostState()
   }
 
   private async startBridgeTransport(bridge: Bridge): Promise<void> {
@@ -869,6 +897,10 @@ export class ChatGptHost {
         const found = threads.find(candidate => candidate.id.toLowerCase() === wanted.toLowerCase())
         if (!found && explicit) throw new Error(`no thread ${wanted} on the account`)
         chosen = found ?? { id: wanted, title: '' }
+        // A second live bridge on one conversation would observe it with its
+        // own cursor, node ids and dedup set. Refuse rather than split it.
+        const owner = this.liveThreadOwner(chosen.id)
+        if (owner) throw new Error(`thread ${chosen.id} is already bridged by "${owner.state.name}"; one live bridge per thread`)
         const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, chosen.title, `chatgpt-${randomUUID().slice(0, 8)}`)
         const created = await this.createBridge(newBridgeState({
           sessionId: randomUUID(),
@@ -933,6 +965,9 @@ export class ChatGptHost {
     if (action === 'use') {
       const threadId = String(body.threadId ?? '')
       if (!UUID.test(threadId)) throw new Error('use requires a thread id')
+      // Refused before the page moves: one conversation, one live bridge.
+      const owner = this.liveThreadOwner(threadId, bridge)
+      if (owner) throw new Error(`thread ${threadId} is already bridged by "${owner.state.name}"; one live bridge per thread`)
       const reply = await this.driver.call({ op: 'use', threadId }, TURN_TIMEOUT_MS)
       if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not open thread'))
       const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
@@ -1379,9 +1414,23 @@ export class ChatGptHost {
 
   /** The bridge bound to a thread id, if one is. Only live bridges count. */
   private bridgeForThread(threadId: string): Bridge | undefined {
+    return this.liveThreadOwner(threadId)
+  }
+
+  /**
+   * The one live bridge that owns a thread, if any.
+   *
+   * Two bridges on one conversation observe it with independent cursors,
+   * `ourNodeIds` and uplink dedup sets: one page turn can be relayed twice
+   * under two identities, and each bridge reads the other's host-authored
+   * turns as a person typing. So a thread has at most one owner, and every
+   * binding passes through here - adoption, `thread use`, and file load.
+   */
+  private liveThreadOwner(threadId: string, except?: Bridge): Bridge | undefined {
     const id = threadId.toLowerCase()
     for (const bridge of this.bridges.values()) {
-      if (!bridge.removed && bridge.state.threadId && bridge.state.threadId.toLowerCase() === id) return bridge
+      if (bridge === except || bridge.removed) continue
+      if (bridge.state.threadId && bridge.state.threadId.toLowerCase() === id) return bridge
     }
     return undefined
   }

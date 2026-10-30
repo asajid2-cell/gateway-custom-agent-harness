@@ -1118,6 +1118,85 @@ describe('adopt the open tab', () => {
   })
 })
 
+describe('one live bridge per thread', () => {
+  test('adopting a thread another live bridge already owns is refused, and allowed once that bridge is removed', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const first = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'first' })
+      expect(first.status).toBe(200)
+
+      const again = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'second' })
+      expect(again.status).toBe(500)
+      expect(String(again.body.error)).toContain('one live bridge per thread')
+      // The refusal created nothing and never touched the page for a second bridge.
+      expect((await operatorState(host, token)).bridges.length).toBe(1)
+      expect((await readdir(join(dir, 'bridges'))).filter(name => name.endsWith('.json')).length).toBe(1)
+      expect(driver.calls.filter(call => call.op === 'use').length).toBe(1)
+
+      const removed = await operator(host, token, { op: 'remove', sessionId: first.body.sessionId })
+      expect(removed.status).toBe(200)
+      const third = await operator(host, token, { op: 'adopt', threadId: THREAD_A, name: 'second' })
+      expect(third.status).toBe(200)
+      expect(third.body.threadId).toBe(THREAD_A)
+      expect((await readBridge(dir, third.body.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('thread use on a thread another live bridge owns is refused, and allowed once that bridge is removed', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_B)
+    await seedHost(dir, [alpha, beta])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const collision = await operator(host, token, { op: 'thread', bridge: beta.sessionId, action: 'use', threadId: THREAD_A })
+      expect(collision.status).toBe(500)
+      expect(String(collision.body.error)).toContain('one live bridge per thread')
+      expect((await readBridge(dir, beta.sessionId)).threadId).toBe(THREAD_B)
+
+      expect((await operator(host, token, { op: 'remove', sessionId: alpha.sessionId })).status).toBe(200)
+      const allowed = await operator(host, token, { op: 'thread', bridge: beta.sessionId, action: 'use', threadId: THREAD_A })
+      expect(allowed.status).toBe(200)
+      expect((await readBridge(dir, beta.sessionId)).threadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('two loaded bridge files claiming one thread are detached on load, not left with two cursors', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_A)
+    await seedHost(dir, [alpha, beta])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const state = await operatorState(host, token)
+      const owning = state.bridges.filter((bridge: any) => bridge.threadId === THREAD_A)
+      expect(owning.length).toBe(1)
+      const detached = [alpha.sessionId, beta.sessionId].filter(id => id !== owning[0].sessionId)
+      expect(detached.length).toBe(1)
+      expect((await readBridge(dir, detached[0]!)).threadId).toBeNull()
+      expect((await readBridge(dir, detached[0]!)).primedThreadId).toBeNull()
+      expect(await hostAudit(dir)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ op: 'thread', target: THREAD_A, result: expect.stringContaining('detached') }),
+      ]))
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 describe('thread uplink', () => {
   /** A bridged thread whose page answers a HUMAN TURN prompt with a real nonce. */
   async function uplinkHost(dir: string, driver: FakeDriver, prepare?: (bridge: BridgeState) => void): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
