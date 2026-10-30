@@ -134,10 +134,16 @@ describe('newPageAnswers', () => {
 })
 
 describe('attributeSend', () => {
-  test('the single user node that appeared across our send is ours', () => {
+  test('the single user node that appeared across our send is ours when it carries our text', () => {
     const before = conversation('a1', base)
     const after = conversation('pa', [...base, { id: 'p', parent: 'a1', role: 'user', t: 20, text: 'push' }, { id: 'pa', parent: 'p', role: 'assistant', t: 21, end: true, text: 'r' }])
     expect(attributeSend(nodeIdsOf(before), after, 'push')).toEqual({ ours: ['p'], human: [] })
+  })
+
+  test('a single unseen user node with different text is not ours: the page had not shown our send yet', () => {
+    const before = conversation('a1', base)
+    const after = conversation('ha', [...base, { id: 'h', parent: 'a1', role: 'user', t: 20, text: 'typed by a person' }, { id: 'ha', parent: 'h', role: 'assistant', t: 21, end: true, text: 'x' }])
+    expect(attributeSend(nodeIdsOf(before), after, 'push')).toEqual({ ours: [], human: [] })
   })
 
   test('when a human typed in the same window, only the node carrying exactly our text is ours', () => {

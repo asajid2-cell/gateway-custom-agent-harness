@@ -166,17 +166,26 @@ export function newPageAnswers(conversation: Conversation, state: { ours: Readon
 /**
  * Which new user nodes our send created.
  *
- * `before` is the node ids the thread had before we typed. Normally exactly
- * one user node appears and it is ours. If a human typed in the same window,
- * the node whose text is exactly what we sent is ours and the rest are human;
- * if none matches, the newest is taken as ours.
+ * `before` is the node ids the thread had before we typed. A node is ours only
+ * if its text is exactly what we sent; identity by text is checked for a single
+ * new node too, because a person can type while our own send is still missing
+ * from the page's read - calling their node ours would skip their question and
+ * hand the page our primer as if they had asked. An unmatched node is left for
+ * the pending-attribution path (which adopts by text within the send window).
+ *
+ * When a human typed in the same window, the node carrying exactly our text is
+ * ours and the rest are human; if none matches, the newest is taken as ours so
+ * a lost snapshot still ends up with one owned node.
  */
 export function attributeSend(before: ReadonlySet<string>, after: Conversation, sentText: string): { ours: string[]; human: string[] } {
   const fresh = Object.values(after.mapping)
     .filter(n => !before.has(n.id) && n.message?.author.role === 'user')
     .sort((a, b) => (a.message?.create_time ?? 0) - (b.message?.create_time ?? 0))
-  if (fresh.length <= 1) return { ours: fresh.map(n => n.id), human: [] }
+  if (fresh.length === 0) return { ours: [], human: [] }
   const matching = fresh.filter(n => textOf(n).trim() === sentText.trim())
+  if (fresh.length === 1) {
+    return matching.length === 1 ? { ours: [fresh[0]!.id], human: [] } : { ours: [], human: [] }
+  }
   const ours = matching.length > 0 ? [matching[matching.length - 1]!] : [fresh[fresh.length - 1]!]
   return { ours: ours.map(n => n.id), human: fresh.filter(n => !ours.includes(n)).map(n => n.id) }
 }
