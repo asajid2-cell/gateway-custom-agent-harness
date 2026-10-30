@@ -27,7 +27,12 @@ export type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => voi
 
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<string, (reply: DriverReply) => void>()
+  /**
+   * A waiter belongs to the child generation that accepted the request. If a
+   * forced kill or a reopen replaces the child before an old one exits, that
+   * old exit must settle only its own requests - never the new child's.
+   */
+  private readonly pending = new Map<string, { generation: number; finish: (reply: DriverReply) => void }>()
   /**
    * The acceptor for a request is held until that request's `accepted` line
    * arrives, so two sends in flight each hear about their own message. An id
@@ -39,6 +44,8 @@ export class DriverChild {
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
+  /** Bumped for every spawn; a line or exit from an older generation is stale. */
+  private generation = 0
 
   constructor(private readonly options: {
     script: string
@@ -65,28 +72,41 @@ export class DriverChild {
     // through an explicit reopen(), never as a side effect of a late call.
     if (this.closed) throw new Error('driver is closed')
     if (this.child && this.child.exitCode === null) return this.child
+    const generation = ++this.generation
     const env = { ...process.env, ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}) }
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    createInterface({ input: child.stdout }).on('line', line => this.handleLine(line))
+    createInterface({ input: child.stdout }).on('line', line => this.handleLine(line, generation))
     createInterface({ input: child.stderr }).on('line', line => {
       if (line.trim()) this.log(`driver: ${line.trim().slice(0, 400)}`)
     })
     child.on('exit', code => {
       const reason = `driver exited (code ${code ?? 'null'})`
       this.log(reason)
-      this.child = undefined
-      for (const settle of this.pending.values()) settle({ ok: false, error: reason })
-      this.pending.clear()
-      this.acceptors.clear()
+      // Only the current child may clear the current child. An old child that
+      // exits after reopen()/timeout recovery left this.child pointing at its
+      // replacement, and clearing it here would orphan that replacement.
+      if (this.child === child) this.child = undefined
+      // Settle this generation's waiters only; they carry the generation.
+      for (const [id, waiter] of [...this.pending]) {
+        if (waiter.generation !== generation) continue
+        waiter.finish({ ok: false, id, error: reason })
+        this.acceptors.delete(id)
+      }
     })
     child.stdin.on('error', () => {})
     this.child = child
     return child
   }
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, generation: number): void {
+    // A line from a child that has been replaced is stale: it can neither
+    // settle a newer request nor push an event on behalf of the current page.
+    if (generation !== this.generation) {
+      if (line.trim()) this.log(`driver: stale line from an older child: ${line.trim().slice(0, 120)}`)
+      return
+    }
     const trimmed = line.trim()
     if (!trimmed) return
     let message: Record<string, unknown>
@@ -121,15 +141,15 @@ export class DriverChild {
       this.log(`driver: reply without a request id: ${trimmed.slice(0, 120)}`)
       return
     }
-    const settle = this.pending.get(id)
-    if (!settle) {
+    const waiter = this.pending.get(id)
+    if (!waiter) {
       this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
       return
     }
     // `finish` owns the cleanup: it deletes the pending entry and the acceptor
     // together, so a request is settled exactly once from either path.
     this.acceptors.delete(id)
-    settle(message as DriverReply)
+    waiter.finish(message as DriverReply)
   }
 
   private dispatch(event: DriverEvent): void {
@@ -143,6 +163,7 @@ export class DriverChild {
     const settings = typeof options === 'number' ? { timeoutMs: options } : options
     const timeoutMs = settings.timeoutMs ?? this.options.timeoutMs ?? 600_000
     const child = this.ensure()
+    const generation = this.generation
     const id = `r${++this.sequence}`
     return await new Promise<DriverReply>(resolve => {
       let done = false
@@ -157,7 +178,7 @@ export class DriverChild {
       const timer = setTimeout(() => {
         finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
       }, timeoutMs)
-      this.pending.set(id, finish)
+      this.pending.set(id, { generation, finish })
       if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)
       child.stdin.write(`${JSON.stringify({ ...request, id })}\n`, error => {
         if (!error) return

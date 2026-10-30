@@ -707,6 +707,38 @@ rl.on('line', line => {
     } finally { await child.kill(); await cleanup() }
   })
 
+  // F5: an old child's exit must not fail the requests of the child that
+  // replaced it. kill() returns before the OS exit is delivered, so reopen()
+  // plus a new call can create a new child first; the old handler used to clear
+  // this.child and every pending waiter regardless of which child exited.
+  test('F5: an old child exiting does not fail the new child\'s requests', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'generations.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { setTimeout(() => process.exit(0), 100); return }
+  const delay = request.op === 'ping' ? 0 : 300
+  setTimeout(() => emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') }), delay)
+})
+setTimeout(() => process.exit(0), 3000)
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      expect((await child.call({ op: 'ping' })).ok).toBe(true)
+      const stopping = child.kill()
+      child.reopen()
+      const second = await child.call({ op: 'send', text: 'second' }, 2000)
+      await stopping
+      expect(second.ok).toBe(true)
+      expect(second.text).toBe('echo:second')
+    } finally { await child.kill(); await cleanup() }
+  })
+
   test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
     const { dir, cleanup } = await scratch()
     const script = join(dir, 'slow-driver.js')
