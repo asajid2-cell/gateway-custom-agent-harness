@@ -41,6 +41,43 @@ class FakeDriver {
   answerFor: ((request: Call) => string | undefined) | undefined
   private accepted: ((id: string) => void) | undefined
   private current: string | null = null
+  /** Serve the read-only thread ops from an in-memory tree shaped like /backend-api/conversation. */
+  observable = false
+  readonly deleted = new Set<string>()
+  private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
+  private clock = 1000
+
+  private treeOf(threadId: string): { current: string; mapping: Record<string, any> } {
+    let tree = this.trees.get(threadId)
+    if (!tree) {
+      const root = `root-${threadId}`
+      tree = { current: root, mapping: { [root]: { id: root, parent: null, children: [], message: null } } }
+      this.trees.set(threadId, tree)
+    }
+    return tree
+  }
+
+  private grow(threadId: string, role: 'user' | 'assistant', text: string): string {
+    const tree = this.treeOf(threadId)
+    const id = randomUUID()
+    tree.mapping[id] = { id, parent: tree.current, children: [], message: { id, author: { role }, create_time: this.clock++, end_turn: role === 'assistant' ? true : null, status: 'finished_successfully', content: { content_type: 'text', parts: [text] } } }
+    tree.mapping[tree.current].children.push(id)
+    tree.current = id
+    return id
+  }
+
+  /** The person types in the thread directly; the model answers. Returns the user node id. */
+  humanTypes(threadId: string, text: string, answer: string): string {
+    const id = this.grow(threadId, 'user', text)
+    this.grow(threadId, 'assistant', answer)
+    return id
+  }
+
+  userNodes(threadId: string): { id: string; text: string }[] {
+    return Object.values(this.treeOf(threadId).mapping)
+      .filter((node: any) => node.message?.author.role === 'user')
+      .map((node: any) => ({ id: node.id, text: String(node.message.content.parts[0]) }))
+  }
 
   onAccepted(handler: ((id: string) => void) | undefined): void { this.accepted = handler }
 
@@ -64,6 +101,8 @@ class FakeDriver {
       if (!threadId) return { ok: false, op, error: 'no thread is open' }
       this.current = threadId
       this.answer = this.answerFor?.(request) ?? this.answer
+      this.grow(threadId, 'user', String(request.text ?? ''))
+      this.grow(threadId, 'assistant', this.answer)
       this.accepted?.(String(request.id ?? ''))
       return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
     }
@@ -71,6 +110,17 @@ class FakeDriver {
       this.readCalls++
       if (this.readError) return { ok: false, op, error: this.readError }
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
+    }
+    if (op === 'conversation' && this.observable) {
+      const threadId = String(request.threadId ?? '')
+      if (this.deleted.has(threadId)) return { ok: false, op, status: 404, error: 'conversation not found' }
+      const tree = this.treeOf(threadId)
+      return { ok: true, op, conversation: { current_node: tree.current, mapping: structuredClone(tree.mapping) } }
+    }
+    if (op === 'conversations' && this.observable) {
+      const offset = Number(request.offset ?? 0)
+      const limit = Number(request.limit ?? 100)
+      return { ok: true, op, items: this.threads.filter(thread => !this.deleted.has(thread.id)).slice(offset, offset + limit) }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') return { ok: true, op, threadId: this.current, model: 'GPT-6', effort: 'High' }
@@ -941,6 +991,132 @@ describe('host defects', () => {
       expect(result.status).toBe(400)
       expect(String(result.body.error)).toBe('2 bridges are configured; name one with bridge')
       expect(driver.calls.filter(call => call.op === 'send')).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('thread watcher', () => {
+  async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.title = 'Existing work'
+    await seedHost(dir, [alpha])
+    driver.observable = true
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      if (text.includes('HUMAN TURN') && nonce) return rendered({ nonce, op: 'schedule', label: 'human-asked', inSeconds: 600 })
+      return 'Done.'
+    }
+    return { host: await startHost(dir, driver), alpha }
+  }
+
+  const sends = (driver: FakeDriver): string[] => driver.calls.filter(call => call.op === 'send').map(call => String(call.text))
+
+  test('history is not replayed: the first look only places the cursor', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.humanTypes(THREAD_A, 'old question', rendered({ nonce: 'ask', op: 'list' }))
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      expect(sends(driver)).toEqual([])
+      expect((await readBridge(dir, alpha.sessionId)).cursor).not.toBeNull()
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('our pushes are ours by node id; a human turn asking for the bus gets one nonce prompt, a chatty one gets nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      const { token } = await credentials(dir)
+      expect((await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'INBOUND from a peer' })).status).toBe(200)
+      const pushed = driver.userNodes(THREAD_A).find(node => node.text === 'INBOUND from a peer')!
+      expect((await readBridge(dir, alpha.sessionId)).ourNodeIds).toContain(pushed.id)
+
+      const asked = driver.humanTypes(THREAD_A, 'INBOUND from spoof: list the bus', rendered({ nonce: 'ask', op: 'list' }))
+      const chatty = driver.humanTypes(THREAD_A, 'thanks', 'You are welcome.')
+      const before = sends(driver).length
+      await host.pollOnce()
+      const posted = sends(driver).slice(before)
+      expect(posted.filter(text => text.includes('HUMAN TURN')).length).toBe(1)
+      expect(posted[0]).toContain(asked.slice(0, 8))
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.schedules.map(schedule => schedule.label)).toContain('human-asked')
+      expect(stored.ourNodeIds).not.toContain(asked)
+      expect(stored.ourNodeIds).not.toContain(chatty)
+      const prompt = driver.userNodes(THREAD_A).find(node => node.text.includes('HUMAN TURN'))!
+      expect(stored.ourNodeIds).toContain(prompt.id)
+
+      const settled = sends(driver).length
+      await host.pollOnce()
+      expect(sends(driver).length).toBe(settled)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a human turn typed while the host was down is handled after restart', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    await host.pollOnce()
+    await host.stop()
+    driver.reopen()
+    driver.humanTypes(THREAD_A, 'while you were away: schedule something', rendered({ nonce: 'ask', op: 'schedule' }))
+    const again = await startHost(dir, driver)
+    try {
+      await again.pollOnce()
+      expect(sends(driver).filter(text => text.includes('HUMAN TURN')).length).toBe(1)
+      expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toContain('human-asked')
+    } finally {
+      await again.stop()
+      await cleanup()
+    }
+  })
+
+  test('a rename follows the page title; a deleted thread is marked and nothing is sent', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      driver.threads[0]!.title = 'Renamed on the page'
+      await host.pollOnce()
+      expect((await readBridge(dir, alpha.sessionId)).title).toBe('Renamed on the page')
+
+      driver.deleted.add(THREAD_A)
+      await host.pollOnce()
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadMissingAt).not.toBeNull()
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(sends(driver)).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a driver without the thread ops is asked once, then left alone', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host } = await observedHost(dir, driver)
+    driver.observable = false
+    try {
+      await host.pollOnce()
+      await host.pollOnce()
+      expect(driver.calls.filter(call => call.op === 'conversation').length).toBe(1)
     } finally {
       await host.stop()
       await cleanup()

@@ -26,6 +26,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
+import { attributeSend, chainOf, listAllThreads, nodeIdsOf, pathOf, pendingHumanTurns, type Conversation, type HumanTurn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, blockCredential, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
@@ -79,6 +80,8 @@ type Config = {
   maxAttachmentBytes?: number
   /** File operations. Overridden in tests so a refusal can be proved before a read. */
   files?: { stat: typeof stat; readFile: typeof readFile }
+  /** Seconds between thread observations; 0 or absent disables the timer (tests call pollOnce). */
+  pollSeconds?: number
 }
 
 /** One bridged thread: its durable memory and its live transport. */
@@ -109,6 +112,7 @@ function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
     else if (arg === '--health-port') config.healthPort = Number(take(index++))
     else if (arg === '--idle-minutes') config.idleUnloadMinutes = Number(take(index++))
     else if (arg === '--number') config.number = Number(take(index++))
+    else if (arg === '--poll-seconds') config.pollSeconds = Number(take(index++))
   }
   return config
 }
@@ -124,6 +128,7 @@ export function resolveConfig(partial: Partial<Config>): Config {
     healthPort: Number.isFinite(partial.healthPort) ? Number(partial.healthPort) : Number(process.env.CHATGPT_WEB_HEALTH_PORT ?? 0),
     idleUnloadMinutes: Number.isFinite(partial.idleUnloadMinutes) ? Number(partial.idleUnloadMinutes) : Number(process.env.CHATGPT_WEB_IDLE_MINUTES ?? 0),
     number: Number.isFinite(partial.number) && Number(partial.number) > 0 ? Number(partial.number) : 1,
+    pollSeconds: Number.isFinite(partial.pollSeconds) ? Number(partial.pollSeconds) : Number(process.env.CHATGPT_WEB_POLL_SECONDS ?? 15),
   }
 }
 
@@ -184,6 +189,10 @@ export class ChatGptHost {
   private readonly pageLock = this.makeLock()
   private readonly primer: { text: string; sha: string }
   private stopping = false
+  /** Does the driver answer the read-only thread ops? Learned on first use; false stops asking. */
+  private observes: boolean | undefined
+  private polling = false
+  private pollTimer: NodeJS.Timeout | undefined
 
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
@@ -275,6 +284,11 @@ export class ChatGptHost {
     }
     // A Chrome left running from an earlier host is still disposable.
     this.scheduleIdleUnload()
+    const pollSeconds = this.config.pollSeconds ?? 0
+    if (pollSeconds > 0) {
+      this.pollTimer = setInterval(() => { void this.pollTick() }, pollSeconds * 1000)
+      this.pollTimer.unref?.()
+    }
     if (this.bridges.size === 0) log('registered no bridges (none adopted; use the operator page)')
     for (const bridge of this.bridges.values()) {
       log(`bridge "${bridge.state.name}" (${shortId(bridge.state.sessionId)}) on 127.0.0.1:${this.hostState.healthPort} thread ${bridge.state.threadId ? shortId(bridge.state.threadId) : '(none)'}`)
@@ -327,7 +341,8 @@ export class ChatGptHost {
 
   private purposeFor(bridge: Bridge): string {
     const title = bridge.state.title ? ` Bridged thread: "${one(bridge.state.title, 160)}".` : ''
-    return `${PURPOSE}${title}`.slice(0, 1000)
+    const missing = bridge.state.threadMissingAt ? ' The bound thread was deleted on the page; adopt another thread.' : ''
+    return `${PURPOSE}${title}${missing}`.slice(0, 1000)
   }
 
   private route(bridge: Bridge): { provider: string; number: number; baseUrl: string; model?: string; effort?: string } {
@@ -1097,6 +1112,7 @@ export class ChatGptHost {
   /** One page turn for one bridge: post the prompt and return the answer text. */
   private async pageTurn(bridge: Bridge, text: string): Promise<string> {
     const requested = bridge.state.threadId
+    const before = await this.snapshotBeforeSend(requested)
     const reply = await this.driver.call({
       op: 'send',
       text,
@@ -1119,11 +1135,191 @@ export class ChatGptHost {
       bridge.state.primedThreadId = null
       await this.persistBridgeState(bridge)
     }
-    const before = { model: bridge.state.model, effort: bridge.state.effort }
+    if (before) await this.recordOurs(bridge, before, text)
+    const page = { model: bridge.state.model, effort: bridge.state.effort }
     this.absorbPage(bridge, reply)
-    if (before.model !== bridge.state.model || before.effort !== bridge.state.effort) await this.advertise(bridge)
+    if (page.model !== bridge.state.model || page.effort !== bridge.state.effort) await this.advertise(bridge)
     this.health = { state: 'serving', at: now() }
     return typeof reply.text === 'string' ? reply.text : ''
+  }
+
+  // ------------------------------------------------------------- observation
+  //
+  // The page's own thread tree is the record of who said what. These read it
+  // by thread id through the driver (an in-page fetch of /backend-api), so the
+  // answer does not depend on which thread the tab happens to show.
+
+  /** One read of a thread: its tree, `missing` on a 404, or undefined when it cannot be read. */
+  private async readConversation(threadId: string): Promise<{ conversation: Conversation } | { missing: true } | undefined> {
+    if (this.observes === false) return undefined
+    const reply = await this.driver.call({ op: 'conversation', threadId }, 30_000)
+    if (reply.ok === true && reply.conversation && typeof reply.conversation === 'object') {
+      this.observes = true
+      return { conversation: reply.conversation as Conversation }
+    }
+    if (/unknown op/i.test(String(reply.error ?? ''))) {
+      this.observes = false
+      log('the page driver has no conversation op; thread observation is off')
+      return undefined
+    }
+    if (reply.status === 404) return { missing: true }
+    log(`could not read thread ${shortId(threadId)}: ${one(reply.error, 200)}`)
+    return undefined
+  }
+
+  /** The node ids before a send, so the send's own node can be told apart. A new chat starts empty. */
+  private async snapshotBeforeSend(threadId: string | null): Promise<Set<string> | undefined> {
+    if (this.observes === false) return undefined
+    if (!threadId) return new Set()
+    const read = await this.readConversation(threadId)
+    return read && 'conversation' in read ? nodeIdsOf(read.conversation) : undefined
+  }
+
+  private async recordOurs(bridge: Bridge, before: Set<string>, sent: string): Promise<void> {
+    const threadId = bridge.state.threadId
+    if (!threadId) return
+    const read = await this.readConversation(threadId)
+    if (!read || !('conversation' in read)) return
+    const { ours } = attributeSend(before, read.conversation, sent)
+    if (ours.length === 0) return
+    bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => !ours.includes(id)), ...ours].slice(-200)
+    // A thread seen for the first time through our own send starts after it.
+    if (!bridge.state.cursor) bridge.state.cursor = ours[ours.length - 1]!
+    await this.persistBridgeState(bridge)
+  }
+
+  /** The timer's entry: never launch Chrome just to look. */
+  private async pollTick(): Promise<void> {
+    if (this.stopping || this.polling || this.observes === false) return
+    if (!(await this.cdpAlive())) return
+    await this.pollOnce()
+  }
+
+  /**
+   * Look at every bound thread once: titles, deletion, and turns a person
+   * typed into the thread directly. Public so tests can drive it without a
+   * timer.
+   */
+  async pollOnce(): Promise<void> {
+    if (this.stopping || this.polling) return
+    this.polling = true
+    try {
+      for (const bridge of [...this.bridges.values()]) {
+        if (bridge.removed || bridge.stopping || !bridge.state.threadId) continue
+        await this.pageWork(() => this.observeBridge(bridge))
+        if (this.observes === false) return
+      }
+      if (this.observes) await this.pageWork(() => this.observeTitles())
+    } catch (error) {
+      log(`observation failed: ${(error as Error).message}`)
+    } finally {
+      this.polling = false
+    }
+  }
+
+  private async observeBridge(bridge: Bridge): Promise<void> {
+    if (bridge.removed || bridge.stopping) return
+    const threadId = bridge.state.threadId
+    if (!threadId) return
+    const read = await this.readConversation(threadId)
+    if (!read) return
+    if ('missing' in read) {
+      if (!bridge.state.threadMissingAt) {
+        bridge.state.threadMissingAt = now()
+        audit(this.hostState, { op: 'thread', target: threadId, result: `deleted on the page [${bridge.state.name}]` })
+        log(`thread ${shortId(threadId)} of "${bridge.state.name}" is gone from the page (404)`)
+        await this.persistBridgeState(bridge)
+        await this.persistHostState()
+        await this.advertise(bridge)
+      }
+      return
+    }
+    if (bridge.state.threadMissingAt) {
+      bridge.state.threadMissingAt = null
+      await this.persistBridgeState(bridge)
+      await this.advertise(bridge)
+    }
+    const conversation = read.conversation
+    if (!bridge.state.cursor) {
+      // Adopted or never observed: what is already there is history, not work.
+      bridge.state.cursor = chainOf(conversation).at(-1)?.id ?? pathOf(conversation).at(-1) ?? null
+      await this.persistBridgeState(bridge)
+      return
+    }
+    const pending = pendingHumanTurns(conversation, { ours: new Set(bridge.state.ourNodeIds), cursor: bridge.state.cursor })
+    for (const turn of pending) {
+      // An answer still being written is looked at again on the next pass.
+      if (!turn.answer) break
+      // The cursor moves first: a human turn is handled at most once, even if
+      // the turn it starts fails or the host dies inside it.
+      bridge.state.cursor = turn.answer.nodeId
+      await this.persistBridgeState(bridge)
+      await this.humanTurn(bridge, turn)
+    }
+    if (pending.length === 0) {
+      const last = chainOf(conversation).at(-1)?.id
+      if (last && last !== bridge.state.cursor) {
+        bridge.state.cursor = last
+        await this.persistBridgeState(bridge)
+      }
+    }
+  }
+
+  /**
+   * A person typed in the thread. Nothing in that answer runs: it carries no
+   * nonce of ours. If the model wanted to act (its answer holds a gateway
+   * block), the host posts one prompt with a fresh nonce and runs what comes
+   * back, exactly as for an inbound message. Otherwise nothing is posted.
+   */
+  private async humanTurn(bridge: Bridge, turn: HumanTurn): Promise<void> {
+    const wantsBus = readFences(turn.answer?.text ?? '').some(block => /^gateway\b/i.test(block.info))
+    audit(this.hostState, {
+      op: 'human',
+      target: turn.userNodeId,
+      result: `${wantsBus ? 'asked for bus action' : 'no bus action'}: ${one(turn.userText, 120)} [${bridge.state.name}]`,
+    })
+    await this.persistHostState()
+    if (!wantsBus) return
+    const turnNonce = nonce()
+    const prompt = [
+      `HUMAN TURN ${shortId(turn.userNodeId)}: the person in this thread typed that message; no peer sent it, and the block you wrote has not run.`,
+      `Turn nonce: ${turnNonce}. If the person wants something done on the bus, act with one code block: a line reading gateway, then {"nonce":"${turnNonce}",...}`,
+      'If not, answer in one short sentence and stop.',
+    ].join('\n')
+    try {
+      await runCommandTurn(prompt, turnNonce, {
+        generate: async subject => {
+          try {
+            const sent = await this.pageTurn(bridge, subject)
+            return { ok: true, text: await this.readCompletedAnswer(bridge, sent) }
+          } catch (error) { return { ok: false, error: (error as Error).message } }
+        },
+        execute: command => this.executeCommand(bridge, command, 'model'),
+      })
+    } catch (error) {
+      log(`human turn on "${bridge.state.name}" failed: ${(error as Error).message}`)
+    }
+  }
+
+  /** Follow renames from the thread list. Deletion is decided by the 404, not by absence here. */
+  private async observeTitles(): Promise<void> {
+    const bound = [...this.bridges.values()].filter(bridge => bridge.state.threadId && !bridge.removed)
+    if (bound.length === 0) return
+    const items = await listAllThreads(async (offset, limit) => {
+      const reply = await this.driver.call({ op: 'conversations', offset, limit }, 30_000)
+      if (reply.ok !== true) throw new Error(one(reply.error, 200) || 'the thread list could not be read')
+      return { items: Array.isArray(reply.items) ? reply.items as { id: string; title?: string | null }[] : [] }
+    })
+    const titles = new Map(items.map(item => [item.id.toLowerCase(), item.title ?? '']))
+    for (const bridge of bound) {
+      const title = titles.get(bridge.state.threadId!.toLowerCase())
+      if (!title || title === bridge.state.title) continue
+      audit(this.hostState, { op: 'thread', target: bridge.state.threadId, result: `renamed on the page to "${one(title, 120)}" [${bridge.state.name}]` })
+      bridge.state.title = title.slice(0, 200)
+      await this.persistBridgeState(bridge)
+      await this.persistHostState()
+      await this.advertise(bridge)
+    }
   }
 
   private classifyFailure(reason: string): void {
@@ -1827,6 +2023,7 @@ export class ChatGptHost {
     if (this.stopping) return
     this.stopping = true
     this.cancelIdleUnload()
+    if (this.pollTimer) clearInterval(this.pollTimer)
     for (const bridge of this.bridges.values()) {
       bridge.stopping = true
       for (const handle of bridge.schedules.values()) clearTimeout(handle)

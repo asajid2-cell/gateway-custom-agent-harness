@@ -118,6 +118,16 @@ export const bridgeStateSchema = z.object({
   effort: z.string().max(40).nullable(),
   createdAt: z.string(),
   title: z.string().max(200).optional(),
+  /**
+   * The page's node ids for the user messages this host posted. "Ours" is
+   * decided by id, never by what a message says, so a person typing
+   * "INBOUND from ..." is still a person.
+   */
+  ourNodeIds: z.array(z.string().max(64)).max(200).default([]),
+  /** The last node of the thread the host has handled; null until first observed. */
+  cursor: z.string().max(64).nullable().default(null),
+  /** When the page last answered 404 for the bound thread; cleared when it answers again. */
+  threadMissingAt: z.string().nullable().default(null),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -175,6 +185,9 @@ export function newBridgeState(options: {
     effort: options.effort ?? null,
     createdAt: options.createdAt ?? new Date().toISOString(),
     ...(options.title ? { title: options.title } : {}),
+    ourNodeIds: [],
+    cursor: null,
+    threadMissingAt: null,
   }
 }
 
@@ -196,6 +209,9 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     model: legacy.model,
     effort: legacy.effort,
     createdAt,
+    ourNodeIds: [],
+    cursor: null,
+    threadMissingAt: null,
   }
 }
 
