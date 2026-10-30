@@ -1128,6 +1128,57 @@ describe('host inbound reply attribution (R3-F11)', () => {
       await cleanup()
     }
   }, 20_000)
+
+  // R3-F11: two REAL inbound turns from two DISTINCT senders. Each sender must
+  // receive the answer to its own inbound, threaded to its own message id, and
+  // never the other sender's answer. A cached "last sender/target" (or a target
+  // swapped between the two) fails this; the old unit test could not, because
+  // both its target and its expectation came from the same mock return value.
+  test('two distinct senders each get the answer to their own inbound, never the other\'s', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    await seedPeerHost(dir, [alpha])
+    const driver = new PageDriver()
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      if (text.includes('question from ALICE')) return 'the answer for ALICE'
+      if (text.includes('question from BOB')) return 'the answer for BOB'
+      return 'an unrelated answer'
+    }
+    const host = await startPeerHost(dir, driver)
+    const alice = await busPeer(dir, 'alice')
+    const bob = await busPeer(dir, 'bob')
+    try {
+      const aId = ((await alice.send(alpha.sessionId, 'this is the question from ALICE', 'alice inbound', undefined, 'inquiry', true)) as { id?: string }).id ?? ''
+      const bId = ((await bob.send(alpha.sessionId, 'this is the question from BOB', 'bob inbound', undefined, 'inquiry', true)) as { id?: string }).id ?? ''
+      expect(aId).not.toBe('')
+      expect(bId).not.toBe('')
+
+      // Each sender's OWN inbox holds a reply threaded to its OWN inbound.
+      const aReply = await waitFor(() => alice.inbox().find(item => item.message.replyTo === aId)?.message as unknown as { text: string } | undefined)
+      const bReply = await waitFor(() => bob.inbox().find(item => item.message.replyTo === bId)?.message as unknown as { text: string } | undefined)
+      expect(aReply.text).toContain('the answer for ALICE')
+      expect(bReply.text).toContain('the answer for BOB')
+
+      // No cross-delivery: alice never hears bob's answer and vice versa, and
+      // neither sender's inbox holds a reply threaded to the other's inbound.
+      expect(alice.inbox().some(item => item.message.text.includes('the answer for BOB'))).toBe(false)
+      expect(bob.inbox().some(item => item.message.text.includes('the answer for ALICE'))).toBe(false)
+      expect(alice.inbox().some(item => item.message.replyTo === bId)).toBe(false)
+      expect(bob.inbox().some(item => item.message.replyTo === aId)).toBe(false)
+    } finally {
+      await alice.close().catch(() => {})
+      await bob.close().catch(() => {})
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
 })
 
 // ---------------------------------------------------------------------------
