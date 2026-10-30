@@ -107,7 +107,7 @@ const READ_TIMEOUT_MS = 45_000
  * of nothing.
  */
 class GeneratingTurn extends Error {
-  constructor(readonly threadId: string | null) {
+  constructor(readonly threadId: string | null, readonly driverFault = false) {
     super(`the page was still generating${threadId ? ` in thread ${threadId}` : ''} when the host stopped watching; the turn was not refused and is not a model failure`)
   }
 }
@@ -117,7 +117,7 @@ class GeneratingTurn extends Error {
  * running, or the read failed - and never a reason to hand back our own text.
  */
 class PageUnproven extends Error {
-  constructor(readonly pageState: 'not-read' | 'not-complete', message: string) {
+  constructor(readonly pageState: 'not-read' | 'not-complete', message: string, readonly driverFault = false) {
     super(message)
   }
 }
@@ -134,6 +134,8 @@ type CheapStatus = {
   ageMs: number | null
   at: string | null
   matchesThread: boolean | null
+  /** True when the DRIVER could not answer the status read (a timeout or a replacement). */
+  fault: boolean
 }
 
 /**
@@ -1297,14 +1299,15 @@ export class ChatGptHost {
       // The driver says the turn is still running. That is a state, not a
       // refusal: the answer exists on the page even though this call ended.
       if (reply.timedOut === true) {
-        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
       }
       // R-LIVE-5: the DRIVER failed this send, not the page. The page may hold
       // the text, so its state is unproven: leave the turn running and let the
       // observation pass reconcile it, never report a page refusal (or a model
-      // failure) neither the page nor the model produced.
+      // failure) neither the page nor the model produced. R-LIVE-8: it is also
+      // never a failure LINE to the sender - the turn stays owed.
       if (isDriverFaultReply(reply)) {
-        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
@@ -1338,10 +1341,10 @@ export class ChatGptHost {
       },
     })
     if (reply.ok !== true) {
-      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
       if (isDriverFaultReply(reply)) {
-        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
@@ -1396,7 +1399,7 @@ export class ChatGptHost {
     if (!threadId) throw new Error('the page posted nothing into a thread')
     let deadline = Date.now() + this.turnTimeout
     let progress = ''
-    let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null }
+    let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null, fault: false }
     // A proof read is licensed by a new page signal, and re-attempted on a
     // bounded clock regardless: a page that never pushes again must not hold
     // this turn - and every inbound queued behind it - until the timeout.
@@ -1413,9 +1416,15 @@ export class ChatGptHost {
     let deepFor: string | null | undefined
     let proofAt = Date.now()
     let domUnproven = false
+    // R-LIVE-8: when the driver failed (rather than the page saying anything),
+    // the deadline is not evidence that the page stopped. Remember when the
+    // driver last failed so the give-up path can tell "stalled page" from
+    // "nobody could ask the page".
+    let driverFaultAt = 0
     for (;;) {
       if (this.stopping || bridge.stopping) throw new GeneratingTurn(threadId)
       const cheap = await this.cheapStatus(threadId)
+      if (cheap.fault) driverFaultAt = Date.now()
       // R-LIVE-5: `unknown` is the driver saying NOTHING (a timeout, a
       // replacement), not the page saying anything. A failed read is "no
       // evidence yet": keep the page's last known word, so a driver hiccup
@@ -1501,11 +1510,19 @@ export class ChatGptHost {
       }
       if (Date.now() >= deadline) {
         // The clock only reaches here when the page's signal has not advanced
-        // across a real interval. Those two conclusions are different and are
+        // across a real interval. Those conclusions are different and are
         // reported differently: a page whose last word was `generating` when it
         // stopped moving is still generating (never a model failure), and a
         // page that stopped without a readable answer is unproven.
-        if (last.state === 'generating') throw new GeneratingTurn(threadId)
+        //
+        // R-LIVE-8: a DRIVER that failed during the wait explains the silence
+        // just as well. The page may be generating happily and finish later, so
+        // no deadline conclusion may be drawn about it: the turn stays owed.
+        const driverFailed = driverFaultAt !== 0 && Date.now() - driverFaultAt <= Math.max(this.waitPoll * 4, 5_000)
+        if (driverFailed) throw new GeneratingTurn(threadId, true)
+        // `unknown` is the page saying nothing - not the turn stopping. It is
+        // no evidence of failure, so it is never reported as one either.
+        if (last.state === 'generating' || last.state === 'unknown') throw new GeneratingTurn(threadId)
         throw new PageUnproven('not-complete', 'the page said the turn stopped but no finished answer could be read')
       }
       await new Promise(resolve => setTimeout(resolve, this.waitPoll))
@@ -1728,8 +1745,10 @@ export class ChatGptHost {
   private async cheapStatus(threadId: string): Promise<CheapStatus> {
     const reply = await this.driver.call({ op: 'status', threadId }, 20_000)
     if (reply.ok !== true) {
-      // A timeout or a driver error says nothing about the page.
-      return { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null }
+      // A timeout or a driver error says nothing about the page. `fault` keeps
+      // that distinction: a page that pushed nothing and a DRIVER that could not
+      // be asked are both `unknown`, but only the second is a driver fact.
+      return { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null, fault: isDriverFaultReply(reply) }
     }
     const state = reply.state === 'generating' || reply.state === 'idle' || reply.state === 'failed' ? reply.state : 'unknown'
     return {
@@ -1738,6 +1757,7 @@ export class ChatGptHost {
       ageMs: typeof reply.ageMs === 'number' ? reply.ageMs : null,
       at: typeof reply.at === 'string' ? reply.at : null,
       matchesThread: typeof reply.matchesThread === 'boolean' ? reply.matchesThread : null,
+      fault: false,
     }
   }
 
@@ -1824,7 +1844,7 @@ export class ChatGptHost {
     const stalledProofMs = proofRetryMs * 4
     let deepFor: string | null | undefined
     let proofAt = Date.now()
-    let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null }
+    let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null, fault: false }
     for (;;) {
       last = await this.cheapStatus(threadId)
       if (last.state === 'failed') return { state: 'failed', phase: last.phase, error: 'the page rendered a failure message' }
@@ -2018,15 +2038,39 @@ export class ChatGptHost {
     }
   }
 
-  /** The user node our posted text became, once the page shows it. */
-  private ownUserNodeOf(conversation: Conversation, text: string, sinceMs: number, ours: ReadonlySet<string>): string | null {
-    return chainOf(conversation)
+  /**
+   * The user node our posted text became, once the page shows it.
+   *
+   * `includeOwned` is the recovery path (R-LIVE-9): a recorded turn with no
+   * node id may name a node an earlier pass already adopted into `ourNodeIds`.
+   *
+   * `exclude` holds nodes another pending turn already claims. Two turns with
+   * the SAME text (the same question asked twice) each have their own node;
+   * without this both would resolve to the newest match and one sender would
+   * be handed the other's answer. `earliest` binds in post order - the oldest
+   * unclaimed node at or after this turn's own post - which is what assigns
+   * n1 to the first turn and n2 to the second.
+   */
+  private ownUserNodeOf(
+    conversation: Conversation,
+    text: string,
+    sinceMs: number,
+    ours: ReadonlySet<string>,
+    includeOwned = false,
+    exclude: ReadonlySet<string> = new Set(),
+    earliest = false,
+  ): string | null {
+    const eligible = chainOf(conversation)
       .filter(turn => turn.role === 'user'
-        && !ours.has(turn.id)
+        // `!ours` finds the send's node among NEW nodes. A recorded turn with no
+        // node id is a different question (R-LIVE-9): the node may already have
+        // been adopted this pass, and the text still names it as the send's own.
+        && (includeOwned || !ours.has(turn.id))
+        && !exclude.has(turn.id)
         && turn.text.trim() === text.trim()
         && typeof turn.createTime === 'number'
         && turn.createTime * 1000 >= sinceMs - PENDING_WINDOW_BEFORE_MS)
-      .at(-1)?.id ?? null
+    return (earliest ? eligible[0] : eligible.at(-1))?.id ?? null
   }
 
   /**
@@ -2039,12 +2083,32 @@ export class ChatGptHost {
   private async resumePendingTurns(bridge: Bridge, conversation: Conversation): Promise<void> {
     if (bridge.state.pendingTurns.length === 0) return
     const ours = new Set(bridge.state.ourNodeIds)
+    // Nodes another pending turn already holds. Accumulated across the loop so
+    // a turn that is DELIVERED (and so dropped from `pendingTurns`) still keeps
+    // its claim: otherwise two turns with identical text both take the first
+    // node and the second sender receives the first sender's answer.
+    const claimed = new Set(bridge.state.pendingTurns
+      .map(item => item.userNodeId)
+      .filter((id): id is string => typeof id === 'string'))
     for (const record of [...bridge.state.pendingTurns]) {
       // A deferred job was never typed: nothing to answer yet.
       if (record.postedAt === null) continue
       if (this.attachedTurns.has(record.messageId)) continue
+      // R-LIVE-9: the bus is authoritative for what has been answered. If a
+      // reply for this message is already in the transport history, the turn is
+      // settled - retire it. Otherwise the TTL branch below would tell the
+      // sender, hours later, that the question failed when it was answered.
+      const alreadySent = bridge.transport?.historyEntries()
+        .some(entry => entry.direction === 'sent' && entry.message.replyTo === record.messageId) ?? false
+      if (alreadySent) {
+        await this.retirePendingTurn(bridge, record.messageId)
+        continue
+      }
       const postedMs = Date.parse(record.postedAt)
-      const userNodeId = record.userNodeId ?? (Number.isFinite(postedMs) ? this.ownUserNodeOf(conversation, record.ourText, postedMs, ours) : null)
+      const userNodeId = record.userNodeId ?? (Number.isFinite(postedMs)
+        ? this.ownUserNodeOf(conversation, record.ourText, postedMs, ours, true, claimed, true)
+        : null)
+      if (userNodeId) claimed.add(userNodeId)
       if (userNodeId && userNodeId !== record.userNodeId) {
         bridge.state.pendingTurns = bridge.state.pendingTurns.map(item => item.messageId === record.messageId ? { ...item, userNodeId } : item)
         await this.persistBridgeState(bridge)
@@ -2331,6 +2395,11 @@ export class ChatGptHost {
       if (match) {
         ours.add(match.id)
         bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== match.id), match.id].slice(-200)
+        // R-LIVE-8: the send whose post-send read wedged left its pending turn
+        // with no node. The node just adopted IS that send, so name it here;
+        // the observation pass can then attribute and deliver its answer.
+        const target = bridge.state.pendingTurns.find(turn => turn.userNodeId === null && turn.ourText.trim() === entry.text.trim())
+        if (target) target.userNodeId = match.id
         audit(this.hostState, {
           op: 'attribution',
           target: match.id,
@@ -2998,6 +3067,11 @@ export class ChatGptHost {
     // still working on them, or it could not be read. They stay owed - the
     // observation pass settles them - but they must not spin this loop.
     const unproven = new Set<string>()
+    // Nodes already settled by this loop, so a delivered turn keeps its claim
+    // after it leaves `pendingTurns` (identical-text double-bind, R-LIVE-9).
+    const claimed = new Set(bridge.state.pendingTurns
+      .map(item => item.userNodeId)
+      .filter((id): id is string => typeof id === 'string'))
     for (;;) {
       const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId) && !unproven.has(item.toMessageId))
       if (!entry) return
@@ -3010,7 +3084,7 @@ export class ChatGptHost {
       // never produce evidence either, so it keeps the old behaviour.
       const job = bridge.state.pendingTurns.find(item => item.messageId === entry.toMessageId)
       if (job && job.postedAt !== null && this.observes !== false) {
-        const evidence = await this.settlePostedTurn(bridge, job)
+        const evidence = await this.settlePostedTurn(bridge, job, claimed)
         if (evidence === 'delivered') {
           bridge.handled.add(entry.toMessageId)
           continue
@@ -3047,7 +3121,7 @@ export class ChatGptHost {
    * landed and the caller may post. `unreadable` - a driver fault or a
    * throttled read says nothing about the turn, so it must not be re-posted.
    */
-  private async settlePostedTurn(bridge: Bridge, job: PendingTurn): Promise<'delivered' | 'present' | 'absent' | 'unreadable'> {
+  private async settlePostedTurn(bridge: Bridge, job: PendingTurn, claimed: Set<string>): Promise<'delivered' | 'present' | 'absent' | 'unreadable'> {
     const threadId = job.threadId ?? bridge.state.threadId
     if (!threadId) return 'unreadable'
     const read = await this.readConversation(threadId)
@@ -3058,9 +3132,12 @@ export class ChatGptHost {
     const conversation = read.conversation
     const ours = new Set(bridge.state.ourNodeIds)
     const postedMs = job.postedAt ? Date.parse(job.postedAt) : Number.NaN
+    // Same double-bind guard as the observation pass: identical text on two
+    // pending turns must not both settle on the same node.
     const userNodeId = (job.userNodeId && conversation.mapping[job.userNodeId] ? job.userNodeId : null)
-      ?? (Number.isFinite(postedMs) ? this.ownUserNodeOf(conversation, job.ourText, postedMs, ours) : null)
+      ?? (Number.isFinite(postedMs) ? this.ownUserNodeOf(conversation, job.ourText, postedMs, ours, false, claimed, true) : null)
     if (!userNodeId) return 'absent'
+    claimed.add(userNodeId)
     // The read proved the node; keep it so the observation pass need not match
     // the text again.
     if (userNodeId !== job.userNodeId) {
@@ -3221,6 +3298,15 @@ export class ChatGptHost {
           // the next host.
           return
         }
+        // R-LIVE-8: when the DRIVER failed, the page is unproven, not slow. No
+        // line is sent and the job stays owed for the observation pass, exactly
+        // as a driver-faulted send does; a failure line here told the sender
+        // its question failed while the page went on to answer it.
+        if (error.driverFault) {
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [no evidence: the driver failed, not the page; left for the observation pass]`, messageId: message.id })
+          await this.persistHostState()
+          return
+        }
         audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
         if (job) await this.deliverSolicitedFailure(bridge, job, line)
         else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not answer: ${line}`)
@@ -3233,11 +3319,19 @@ export class ChatGptHost {
         return
       }
       const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
+      // R-LIVE-8: a driver fault (including one that wrapped a page read) is no
+      // evidence about the page. Leave the turn owed; sending a failure line
+      // settled the debt as a definite negative the page never produced.
+      const driverFault = (error instanceof PageUnproven && error.driverFault) || isDriverFault(reason)
       log(`turn for ${message.id} failed: ${reason}`)
-      audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
+      audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: driverFault ? `no evidence (the driver failed, not the page): ${reason}` : `failed: ${reason}`, messageId: message.id })
       // A removed or stopping bridge is cancelled: it types nothing more into
       // the page and tells nobody about a turn it is no longer running.
       if (bridge.removed || bridge.stopping) return
+      if (driverFault) {
+        await this.persistHostState()
+        return
+      }
       if (job) await this.deliverSolicitedFailure(bridge, job, reason)
       else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
     } finally {
@@ -3303,6 +3397,11 @@ export class ChatGptHost {
     if (!threadId) throw new Error('the page posted nothing into a thread')
     const reply = await this.driver.call({ op: 'read' }, this.turnTimeout)
     if (reply.ok !== true) {
+      // R-LIVE-8: a driver fault is not the page failing to answer. It is no
+      // evidence, so the turn stays owed.
+      if (isDriverFaultReply(reply)) {
+        throw new PageUnproven('not-read', `the page read failed: ${one(reply.error, 160) || 'no reason given'}`, true)
+      }
       throw new PageUnproven('not-read', `the page read failed: ${one(reply.error, 160) || 'no reason given'}`)
     }
     const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
