@@ -95,6 +95,9 @@ class FakeDriver {
   emit(event: Record<string, unknown>): void { for (const listener of this.listeners) listener(event) }
 
   async call(request: Call, options?: number | { onAccepted?: (id: string) => void }): Promise<DriverReply> {
+    // `ping` is liveness, not page work: the host sends it at boot to bring the
+    // child (and its event channel) up, so it is not recorded as a page call.
+    if (String(request.op ?? '') === 'ping') return { ok: true, op: 'ping' }
     this.calls.push({ ...request })
     const onAccepted = typeof options === 'object' && options ? options.onAccepted : undefined
     const op = String(request.op ?? '')

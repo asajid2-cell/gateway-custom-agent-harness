@@ -87,6 +87,9 @@ class FakeDriver {
   conversationReads(): number { return this.calls.filter(call => call.op === 'conversation').length }
 
   async call(request: Call, _options?: number | { onAccepted?: (id: string) => void }): Promise<DriverReply> {
+    // `ping` is liveness, not page work: the host sends it at boot to bring the
+    // child (and its event channel) up, so it is not recorded as a page call.
+    if (String(request.op ?? '') === 'ping') return { ok: true, op: 'ping' }
     this.calls.push({ ...request })
     const op = String(request.op ?? '')
     if (op === 'threads') return { ok: true, op, threadId: this.current, threads: this.threads }

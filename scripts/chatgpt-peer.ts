@@ -381,6 +381,13 @@ export class ChatGptHost {
     // Events are the fast path; the reconcile timer and the title walk are the
     // slow safety nets. None of the three counts as page work for idle unload.
     this.detachEvents = this.driver.onEvent(event => this.onDriverEvent(event))
+    // The event channel lives in the driver child, and the child only exists
+    // once it is asked for something. Ask now, so a page we already hold starts
+    // pushing turns at boot instead of after the first timer fires. `ping`
+    // touches no page and starts no Chrome.
+    void this.driver.call({ op: 'ping' }, 15_000).then(reply => {
+      if (reply.ok !== true) log(`driver did not answer ping: ${one(reply.error, 160)}`)
+    })
     this.armPoll()
     this.armTitles()
     if (this.bridges.size === 0) log('registered no bridges (none adopted; POST /operator with op "adopt" or "newBridge")')

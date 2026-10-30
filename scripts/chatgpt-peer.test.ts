@@ -383,7 +383,9 @@ describe('route health', () => {
     const { dir, cleanup } = await scratch()
     const fake = {
       calls: 0,
-      call: async () => { fake.calls++; return { ok: true } },
+      // `ping` is liveness, not page work: the host sends it at boot to bring
+      // the child (and its event channel) up, so it is not counted here.
+      call: async (request: { op?: string }) => { if (request.op === 'ping') return { ok: true }; fake.calls++; return { ok: true } },
       onEvent: () => () => {},
       kill: async () => {},
       reopen: () => {},
