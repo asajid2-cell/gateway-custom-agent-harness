@@ -1270,7 +1270,12 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // when an older turn has the same words. Take the baseline before the send so
   // only a RISE counts. Normal pages pay nothing: the degraded path only runs
   // when the DOM exposed none of them.
-  const beforeTree = beforeUsers === 0 ? await countUserTextOnPage(page, text) : 0
+  //
+  // `null`, not `0`, when the DOM DID show user nodes: the check is reached on
+  // any failed acceptance, so a page that renames or soft-navigates its selector
+  // mid-turn would otherwise present a zero baseline for a conversation that has
+  // history, and any older node with our words would accept a swallowed send.
+  const beforeTree = beforeUsers === 0 ? await countUserTextOnPage(page, text) : null
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
   await composer.click()
   const typed = await composer.fill(text).then(() => true).catch(() => false)
