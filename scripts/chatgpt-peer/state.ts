@@ -152,11 +152,13 @@ export const DELIVERED_FILES_MAX = 200
  * `deliveredFiles` window so revisiting an evicted node still dedups and still
  * counts against the cumulative cap.
  *
- * The node list is bounded only to keep one state file finite; the bound is
- * orders of magnitude larger than the per-file window it replaces.
+ * The node list is NOT evicted by count (R7-F7). A count bound silently
+ * forgets the oldest delivery after enough newer nodes, and re-requesting that
+ * node then produces a second sibling file - the at-most-once promise cannot be
+ * a rolling window. Nothing prunes it: a delivered node can be requested for as
+ * long as the thread exists. The per-node index list stays capped because the
+ * per-request file cap is 5.
  */
-export const DELIVERED_NODES_MAX = 4096
-/** One node's delivered indexes. The per-node file cap is 5, so this is slack. */
 export const DELIVERED_NODE_INDEXES_MAX = 256
 
 export const deliveredNodeSchema = z.object({
@@ -199,7 +201,13 @@ export const inboundRunSchema = z.object({
   at: z.string().max(40),
 }).strict()
 
-export const INBOUND_RUNS_MAX = 200
+/**
+ * The per-inbound run marker is retained by TURN LIFETIME, not by count
+ * (R7-F8): a count bound evicted the marker of an inbound that was still owed
+ * after 200 newer inbounds, and a replay of it - whose command the page may
+ * have worded differently - then dispatched a second time. Pruning is by age
+ * and never touches an outstanding inbound; see `pruneInboundRuns`.
+ */
 
 /**
  * An inbound turn the host has posted but not yet answered (D5b).
@@ -299,7 +307,8 @@ export const bridgeStateSchema = z.object({
    * The durable per-node delivery ledger. It survives the `deliveredFiles`
    * window and is what dedup and the cumulative byte cap are decided from.
    */
-  deliveredNodes: z.array(deliveredNodeSchema).max(DELIVERED_NODES_MAX).default([]),
+  // R7-F7: no count bound - see DELIVERED_NODE_INDEXES_MAX's comment.
+  deliveredNodes: z.array(deliveredNodeSchema).default([]),
   /** Inbound turns posted but not yet answered; see `pendingTurnSchema`. */
   pendingTurns: z.array(pendingTurnSchema).max(PENDING_TURNS_MAX).default([]),
   /** Turn keys already answered, written BEFORE the reply goes out. */
@@ -315,7 +324,8 @@ export const bridgeStateSchema = z.object({
    * Inbounds that already executed a model command, newest last. Written before
    * the first side effect; a replay of that inbound after a restart runs none.
    */
-  inboundRuns: z.array(inboundRunSchema).max(INBOUND_RUNS_MAX).default([]),
+  // R7-F8: no count bound - retention is by turn lifetime (see above).
+  inboundRuns: z.array(inboundRunSchema).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -439,7 +449,9 @@ function foldDeliveredLedger(state: BridgeState): BridgeState {
     node.indexes.push(entry.index)
     node.bytes = node.bytes === null || entry.bytes === null ? null : node.bytes + entry.bytes
   }
-  state.deliveredNodes = [...ledger.values()].slice(-DELIVERED_NODES_MAX)
+  // R7-F7: the ledger is permanent - folding the rolling detail in must never
+  // evict the oldest node, or at-most-once becomes a window again.
+  state.deliveredNodes = [...ledger.values()]
   return state
 }
 
