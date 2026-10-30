@@ -1425,6 +1425,27 @@ describe('thread uplink', () => {
       await cleanup()
     }
   })
+
+  test('a body at the old 64 KiB cap is refused before the node is recorded as relayed', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    try {
+      await host.pollOnce()
+      // Fits the body-only check exactly; the provenance stamp pushes the real
+      // payload over. Refusing after the record would burn the node anyway.
+      driver.humanTypes(THREAD_A, 'relay this exactly', rendered({ uplink: true, to: 'listener', text: 'x'.repeat(64 * 1024) }))
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
+      expect((await readBridge(dir, alpha.sessionId)).uplinkNodeIds).toEqual([])
+      expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && /exceeds 64 KiB/.test(entry.result))).toBe(true)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
 })
 
 describe('transcript grants', () => {
