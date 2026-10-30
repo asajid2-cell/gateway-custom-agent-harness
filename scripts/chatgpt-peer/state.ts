@@ -116,6 +116,13 @@ export const bridgeStateSchema = z.object({
    * there would spend someone else's turns.
    */
   uplinkTimes: z.array(z.string().max(40)).max(50).default([]),
+  /**
+   * The page answer nodes this bridge has relayed or decided to relay, newest
+   * last. Written BEFORE the send, so a crash mid-relay loses one message
+   * rather than posting it twice; a node found here after a restart is never
+   * sent again.
+   */
+  uplinkNodeIds: z.array(z.string().max(64)).max(200).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -176,6 +183,7 @@ export function newBridgeState(options: {
     cursor: null,
     threadMissingAt: null,
     uplinkTimes: [],
+    uplinkNodeIds: [],
   }
 }
 
@@ -196,6 +204,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     cursor: null,
     threadMissingAt: null,
     uplinkTimes: [],
+    uplinkNodeIds: [],
   }
 }
 

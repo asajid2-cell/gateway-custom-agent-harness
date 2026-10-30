@@ -384,7 +384,7 @@ describe('route health', () => {
     const fake = {
       calls: 0,
       call: async () => { fake.calls++; return { ok: true } },
-      onAccepted: () => {},
+      onEvent: () => () => {},
       kill: async () => {},
       reopen: () => {},
     }
@@ -429,7 +429,7 @@ describe('attachment envelope (D6)', () => {
         state.calls++
         return { ok: true, op: request.op, threadId: '11111111-1111-4111-8111-111111111111', text: 'ok', model: 'm', effort: 'e' }
       },
-      onAccepted: () => {},
+      onEvent: () => () => {},
       kill: async () => {},
       reopen: () => {},
     }
@@ -557,9 +557,8 @@ rl.on('line', line => {
 `, 'utf8')
     const accepted: string[] = []
     const child = new DriverChild({ script, log: () => {} })
-    child.onAccepted(() => accepted.push('yes'))
     try {
-      const reply = await child.call({ op: 'send', text: 'hi' })
+      const reply = await child.call({ op: 'send', text: 'hi' }, { onAccepted: id => accepted.push(id) })
       expect(reply.ok).toBe(true)
       expect(reply.text).toBe('echo:hi')
       expect(accepted.length).toBe(1)
