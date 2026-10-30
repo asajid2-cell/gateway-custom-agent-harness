@@ -188,6 +188,23 @@ describe('command channel', () => {
     expect(extractCommands(source, 'abcd1234').commands).toEqual([])
   })
 
+  // F2: a prose answer that opens with an object is not a command. Only a
+  // strictly valid bare envelope - a JSON object naming a real op - is refused
+  // as command-shaped; a JSON example in an answer is prose.
+  test('F2: a JSON example in prose is an answer, not a stale command', () => {
+    const inline = '{"op": "example"} is the shape of a command.'
+    expect(proseFromTurn(inline)).toEqual({ prose: inline, commandShaped: false })
+    const wholeObject = '{"op":"example"}'
+    expect(proseFromTurn(wholeObject)).toEqual({ prose: wholeObject, commandShaped: false })
+    const sentence = '{"op": "list"} is what a command looks like'
+    expect(proseFromTurn(sentence)).toEqual({ prose: sentence, commandShaped: false })
+  })
+
+  test('F2: a bare envelope naming a real op is still command-shaped', () => {
+    expect(proseFromTurn('{"op":"list"}').commandShaped).toBe(true)
+    expect(proseFromTurn('{"nonce":"abcd1234","op":"list"}').commandShaped).toBe(true)
+  })
+
   test('a non-gateway code block stays in the answer as prose', () => {
     const { prose } = proseFromTurn('Like this:\n```js\nconst a = {}\n```')
     expect(prose).toContain('```js')

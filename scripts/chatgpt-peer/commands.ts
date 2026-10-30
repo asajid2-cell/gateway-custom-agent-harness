@@ -425,6 +425,23 @@ export function extractCommands(source: string, nonce: string, limit = MAX_COMMA
  * in an answer is prose. `commandShaped` is true when a gateway block was the
  * only thing in the turn, or when the whole turn is a bare JSON command object.
  */
+/**
+ * A whole-answer bare envelope: the exact JSON object the prompt calls a
+ * refused action, not prose that merely contains an `op` field.
+ *
+ * The prompt tells the model that a bare JSON command with no label line is
+ * refused, so that shape must stay distinguishable from an answer that quotes
+ * JSON - a `{` at the start is not enough. The object must parse and name one
+ * of this host's ops.
+ */
+function bareCommandEnvelope(visible: string): boolean {
+  if (!visible.startsWith('{')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(visible) }
+  catch { return false }
+  return isRecord(parsed) && typeof parsed.op === 'string' && (COMMAND_OPS as readonly string[]).includes(parsed.op)
+}
+
 export function proseFromTurn(source: string): { prose: string; commandShaped: boolean } {
   const { blocks, spans } = scanBlocks(source)
   let visible = ''
@@ -436,8 +453,7 @@ export function proseFromTurn(source: string): { prose: string; commandShaped: b
   }
   visible = (visible + source.slice(cursor)).trim()
   const action = blocks.some(block => /^gateway\b/i.test(block.info))
-  const jsonAction = visible.startsWith('{') && /\{\s*"op"\s*:/.test(visible)
-  return { prose: visible, commandShaped: (action && !visible) || jsonAction }
+  return { prose: visible, commandShaped: (action && !visible) || bareCommandEnvelope(visible) }
 }
 
 /**
