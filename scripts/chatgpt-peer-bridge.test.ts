@@ -8,6 +8,7 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
 import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
@@ -358,6 +359,33 @@ async function operator(host: ChatGptHost, token: string, body: Record<string, u
 async function operatorState(host: ChatGptHost, token: string): Promise<any> {
   const response = await fetch(`http://127.0.0.1:${host.port}/operator/state`, { headers: { authorization: `Bearer ${token}` } })
   return response.json()
+}
+
+/**
+ * A request whose Host header we choose. `fetch` will not let a caller lie
+ * about Host, but a rebinding browser can, so the check must be driven with a
+ * raw connection to the loopback port under a foreign Host name.
+ */
+function rawRequest(port: number, path: string, options: {
+  method?: string
+  host: string
+  authorization?: string
+  body?: string
+}): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = options.body ?? ''
+    const headers: Record<string, string> = { host: options.host }
+    if (options.authorization) headers.authorization = options.authorization
+    if (payload) { headers['content-type'] = 'application/json'; headers['content-length'] = String(Buffer.byteLength(payload)) }
+    const request = httpRequest({ host: '127.0.0.1', port, path, method: options.method ?? 'GET', headers }, response => {
+      let text = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => { text += chunk })
+      response.on('end', () => resolve({ status: response.statusCode ?? 0, body: text }))
+    })
+    request.on('error', reject)
+    request.end(payload)
+  })
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -867,7 +895,8 @@ describe('multi-bridge host', () => {
   test('there is no operator page and no cookie authority; the API is bearer-only', async () => {
     const { dir, cleanup } = await scratch()
     await seedHost(dir, [bridgeNamed('alpha', THREAD_A)])
-    const host = await startHost(dir, new FakeDriver())
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
     try {
       const { token } = await credentials(dir)
       const page = await fetch(`http://127.0.0.1:${host.port}/operator`)
@@ -885,6 +914,24 @@ describe('multi-bridge host', () => {
         const refused = await operator(host, token, { op })
         expect(refused.status).toBe(400)
       }
+      expect((await operatorState(host, token)).bridges.length).toBe(1)
+
+      // DNS rebinding: a hostile Host is refused even with a KNOWN VALID
+      // bearer, and the operator dispatcher is never reached.
+      const auth = ['Bearer', token].join(' ')
+      const threadsBefore = driver.calls.filter(call => call.op === 'threads').length
+      const hostileWrite = await rawRequest(host.port, '/operator', {
+        method: 'POST',
+        host: 'evil.example',
+        authorization: auth,
+        body: JSON.stringify({ op: 'threads' }),
+      })
+      expect(hostileWrite.status).toBe(421)
+      const hostileState = await rawRequest(host.port, '/operator/state', { host: 'evil.example', authorization: auth })
+      expect(hostileState.status).toBe(421)
+      // The dispatcher was not called: a 'threads' op would have reached the
+      // page driver, and the bridge count is untouched.
+      expect(driver.calls.filter(call => call.op === 'threads').length).toBe(threadsBefore)
       expect((await operatorState(host, token)).bridges.length).toBe(1)
     } finally {
       await host.stop()
