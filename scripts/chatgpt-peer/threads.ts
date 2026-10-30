@@ -164,11 +164,19 @@ export function isReasoningNode(node: ConversationNode | null | undefined): bool
   return typeof type === 'string' && REASONING_TYPE.test(type)
 }
 
-/** Fail-safe completion: only explicit finishing evidence counts. */
+/**
+ * Fail-safe completion: only explicit finishing evidence counts.
+ *
+ * An explicit `end_turn: false` outranks the status string (NEW-3). The page
+ * writes `status: 'finished_successfully'` on an assistant node whose
+ * `end_turn` is false while it is still writing the turn, so trusting the
+ * status alone settles a turn on a "working..." placeholder.
+ */
 export function nodeComplete(node: ConversationNode | null | undefined): boolean {
   // A thought/recap is never an answer, however finished it looks.
   if (isReasoningNode(node)) return false
   const message = node?.message
+  if (message?.end_turn === false) return false
   const status = typeof message?.status === 'string' ? message.status : null
   return status === 'finished_successfully' || status === 'complete' || message?.end_turn === true
 }
@@ -180,13 +188,18 @@ export function nodeComplete(node: ConversationNode | null | undefined): boolean
  * nodes with `end_turn` unset (thoughts, reasoning recaps) between the question
  * and the answer, so `user -> assistant(thoughts) -> assistant(finished)` is a
  * real shape. Walking only the direct children misses the answer and a known
- * user node then never resolves (R2-F9). So descend each branch until the first
- * non-reasoning assistant node - the answer for that branch - and stop at any
- * user node: a later question owns whatever follows it.
+ * user node then never resolves (R2-F9).
  *
- * The visible branch wins when it has an answer; otherwise the newest answer by
- * create_time is returned. Completion is the caller's question (`nodeComplete`),
- * never this one's.
+ * A nonterminal assistant node - an explicit `end_turn: false`, whatever its
+ * status string says - is a placeholder too, not the answer (NEW-3): the page
+ * writes `working...` as a normal assistant node with `status:
+ * 'finished_successfully'` and `end_turn: false` while it composes. So descend
+ * past every nonterminal assistant node as well, and stop at any user node: a
+ * later question owns whatever follows it.
+ *
+ * The visible branch wins when it has an answer; otherwise the newest terminal
+ * answer by create_time is returned. Completion is the caller's question
+ * (`nodeComplete`), never this one's.
  */
 export function answerAfter(conversation: Conversation, userNodeId: string): ConversationNode | null {
   if (!conversation.mapping[userNodeId]) return null
@@ -202,7 +215,9 @@ export function answerAfter(conversation: Conversation, userNodeId: string): Con
       const role = child.message?.author.role
       // A later user node starts a new turn: nothing past it is this answer.
       if (role === 'user') continue
-      if (role === 'assistant' && !isReasoningNode(child)) {
+      if (role === 'assistant' && !isReasoningNode(child) && nodeComplete(child)) {
+        // A finished answer is the answer for this branch; a regenerated
+        // sibling is a separate branch and owns nothing below this one.
         answers.push(child)
         continue
       }

@@ -111,6 +111,9 @@ class FakeDriver {
 
   openThread(threadId: string | null): void { this.current = threadId }
 
+  /** Set the page's clock, so a node can be placed before or after a bind. */
+  setClock(seconds: number): void { this.clock = seconds }
+
   onEvent(handler: (event: Record<string, unknown>) => void): () => void {
     this.listeners.add(handler)
     return () => { this.listeners.delete(handler) }
@@ -653,4 +656,123 @@ describe('N4 follow-up: the retry records the path it actually wrote', () => {
       await cleanup()
     }
   }, 30_000)
+})
+
+describe('R1-F10: the bind anchor survives a restart', () => {
+  test('a person typing between the bind and the first look is delivered by the restarted host', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', null)
+    await seedHost(dir, [alpha])
+    const driverA = new FakeDriver()
+    driverA.observable = true
+    const hostA = await startHost(dir, driverA)
+    try {
+      const { token } = await credentials(dir)
+      // `thread use` binds the bridge but nothing observes yet: pollSeconds is 0
+      // in these tests, so the anchor is the ONLY record of when the bind was.
+      const used = await operator(hostA, token, { op: 'thread', bridge: alpha.sessionId, action: 'use', threadId: THREAD_A })
+      expect(used.status).toBe(200)
+      const bound = await readBridge(dir, alpha.sessionId)
+      expect(bound.cursor).toBe(null)
+      expect(typeof bound.boundAt).toBe('string')
+    } finally {
+      await hostA.stop()
+    }
+    // A new process over the same state dir: no memory of the bind, only state.
+    const anchor = (await readBridge(dir, alpha.sessionId)).boundAt
+    const bindSec = Math.floor(Date.parse(anchor!) / 1000)
+    const driverB = new FakeDriver()
+    driverB.observable = true
+    // History: typed a long time before the bind.
+    driverB.setClock(bindSec - 300)
+    driverB.humanTypes(THREAD_A, 'an old question', rendered({ uplink: true, to: 'listener', text: 'OLD ERRAND' }))
+    // Work: typed after the bind but before the host ever looked.
+    driverB.setClock(bindSec + 30)
+    driverB.humanTypes(THREAD_A, 'a question typed after the bind', rendered({ uplink: true, to: 'listener', text: 'NEW ERRAND' }))
+    const listener = await busPeer(dir, 'listener')
+    const hostB = await startHost(dir, driverB)
+    try {
+      await hostB.pollOnce()
+      await waitFor(() => (listener.inbox().length >= 1 ? true : undefined), 10_000)
+      await new Promise(resolve => setTimeout(resolve, 200))
+      const texts = listener.inbox().map(item => String((item.message as unknown as { text: string }).text))
+      // Exactly the post-bind turn is owed; the pre-bind one is history.
+      expect(texts.length).toBe(1)
+      expect(texts[0]).toContain('NEW ERRAND')
+      expect(texts[0]).not.toContain('OLD ERRAND')
+    } finally {
+      await hostB.stop()
+      await listener.close()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+describe('R1-F9: a regenerated replay cannot double a side effect', () => {
+  test('a turn whose command is re-worded on replay executes nothing the second time', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const sender = await busPeer(dir, 'sender')
+    // The page answers the first INBOUND with one command and any later
+    // replay of the SAME inbound with differently-worded text: the same
+    // intent, a different per-command hash, so only the inbound's id can tell
+    // that this turn already ran (R1-F9).
+    const scripted = (commandText: string): ((request: Call) => string | undefined) => {
+      let minted: string | null = null
+      return request => {
+        const text = String(request.text ?? '')
+        const found = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+        if (found) minted = found
+        if (!text.startsWith('INBOUND from another live session') || !minted) return 'done'
+        return rendered({ nonce: minted, op: 'send', to: 'listener', text: commandText })
+      }
+    }
+    const driverA = new FakeDriver()
+    driverA.observable = true
+    driverA.answerFor = scripted('the side effect')
+    // The round after the command never settles: that is the turn we crash.
+    driverA.stallFor = request => {
+      const text = String(request.text ?? '')
+      return !text.startsWith('INBOUND from another live session') && text.includes('sent ')
+    }
+    const hostA = await startHost(dir, driverA)
+    try {
+      await sender.send(alpha.sessionId, 'do the side effect', 'do the side effect', undefined, 'inquiry', true)
+      await waitFor(() => (listener.inbox().length >= 1 ? true : undefined), 15_000)
+      expect(listener.inbox().length).toBe(1)
+      const first = String((listener.inbox()[0]!.message as unknown as { text: string }).text)
+
+      // Hard stop mid-turn. The process-local handled set dies; the state dir
+      // survives, and the per-inbound transcript is written before the effect.
+      await hostA.stop()
+      driverA.dead = true
+      await waitFor(async () => {
+        const state = await readBridge(dir, alpha.sessionId) as { inboundRuns?: unknown[] }
+        return Array.isArray(state.inboundRuns) && state.inboundRuns.length > 0 ? true : undefined
+      }, 20_000)
+      await new Promise(resolve => setTimeout(resolve, 200))
+      expect(sender.inbox().length).toBe(0)
+
+      const driverB = new FakeDriver()
+      driverB.observable = true
+      driverB.answerFor = scripted('the side effect, take two')
+      const hostB = await startHost(dir, driverB)
+      try {
+        await waitFor(() => (sender.inbox().length >= 1 ? true : undefined), 15_000)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        // The replay answered its sender, and executed nothing: one effect.
+        expect(listener.inbox().length).toBe(1)
+        expect(String((listener.inbox()[0]!.message as unknown as { text: string }).text)).toBe(first)
+      } finally {
+        await hostB.stop()
+      }
+    } finally {
+      await sender.close()
+      await listener.close()
+      await hostA.stop()
+      await cleanup()
+    }
+  }, 40_000)
 })
