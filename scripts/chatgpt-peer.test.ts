@@ -265,6 +265,18 @@ describe('CodeBlock markup', () => {
     expect(extractCommands(rendered('abcd1234', { op: 'list' }), 'abcd1234').commands).toEqual([{ op: 'list' }])
     expect(extractCommands('```gateway abcd1234\n{"op":"list"}\n```', 'abcd1234').commands).toEqual([{ op: 'list' }])
   })
+
+  // F1: a rendered label inside a non-gateway CodeBlock is example text, not a
+  // command. The label scan used to record it before the enclosing tag was seen,
+  // and the tag was then skipped for overlapping that label's span - so an
+  // answer that QUOTED a command inside a text block executed it when the
+  // example carried the current nonce.
+  test('F1: a gateway label quoted inside a non-gateway CodeBlock never executes', () => {
+    const source = '<CodeBlock language="text">\ngateway\n{"nonce":"abcd1234","op":"list"}\n</CodeBlock>'
+    expect(extractCommands(source, 'abcd1234')).toEqual({ commands: [], problems: [] })
+    expect(readFences(source).map(block => block.info)).toEqual(['text'])
+    expect(proseFromTurn(source).prose).toBe(source)
+  })
 })
 
 describe('turn loop', () => {
