@@ -27,7 +27,7 @@ import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { attributeSend, chainOf, listAllThreads, nodeIdsOf, pathOf, pendingHumanTurns, type Conversation, type HumanTurn } from './chatgpt-peer/threads.ts'
-import { attachmentRefusal, blockCredential, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
+import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, listBridgeStates, loadHostState, newBridgeState, newHostState,
   saveJson, type BridgeState, type HostState,
@@ -37,8 +37,6 @@ const execFileAsync = promisify(execFile)
 
 const NAME = 'chatgpt-web'
 const PROVIDER = 'chatgpt-web'
-/** The cookie the operator page carries its instance credential in. */
-const OPERATOR_COOKIE = 'chatgpt-operator'
 const PURPOSE = 'A signed-in ChatGPT web thread on the operator\'s account, addressed like any other live session.'
 // One page turn can legitimately outlast ten minutes: a large attachment is
 // uploaded first and only then does the model answer. Cutting the turn off
@@ -49,10 +47,6 @@ const TURN_TIMEOUT_MS = Number(process.env.CHATGPT_TURN_TIMEOUT_MS || 20 * 60_00
 /** Host-private files: where the instance identity is written. */
 const PRIVATE_HOME = process.env.CHATGPT_WEB_PRIVATE_HOME ?? join(homedir(), '.chatgpt-web')
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-/** The only form in which a join token is ever written down. */
-const sha256Hex = (value: string | Buffer): string => createHash('sha256').update(value).digest('hex')
-/** A bootstrap token is shown once and never stored: 24 random bytes. */
-const BOOTSTRAP_BYTES = 24
 
 /** Only the operator's local-file picker needs a guess; transcripts are text. */
 const MIME: Record<string, string> = {
@@ -289,7 +283,7 @@ export class ChatGptHost {
       this.pollTimer = setInterval(() => { void this.pollTick() }, pollSeconds * 1000)
       this.pollTimer.unref?.()
     }
-    if (this.bridges.size === 0) log('registered no bridges (none adopted; use the operator page)')
+    if (this.bridges.size === 0) log('registered no bridges (none adopted; POST /operator adopt or newBridge)')
     for (const bridge of this.bridges.values()) {
       log(`bridge "${bridge.state.name}" (${shortId(bridge.state.sessionId)}) on 127.0.0.1:${this.hostState.healthPort} thread ${bridge.state.threadId ? shortId(bridge.state.threadId) : '(none)'}`)
       void this.drain(bridge)
@@ -509,21 +503,14 @@ export class ChatGptHost {
 
     const url = new URL(request.url ?? '/', `http://${expected}`)
     if (request.method === 'GET' && url.pathname === '/gateway/route-health') return this.routeHealth(url, response)
-    if (request.method === 'GET' && (url.pathname === '/operator' || url.pathname === '/operator/')) return this.sendOperatorPage(response)
     if (request.method === 'GET' && url.pathname === '/operator/state') {
-      if (!this.authorizedBy(request)) return this.send(response, 401, { error: 'unauthorized' })
+      if (!this.authorized(request)) return this.send(response, 401, { error: 'unauthorized' })
       return this.send(response, 200, this.operatorState())
     }
     if (request.method === 'POST' && url.pathname === '/operator') {
-      const via = this.authorizedBy(request)
-      if (!via) return this.send(response, 401, { error: 'unauthorized' })
-      // A cookie is ambient authority, so a write carrying one must name this
-      // exact origin: another page on this machine is same-site, not same-origin,
-      // and must not drive the host. Bearer callers are explicit already.
-      const origin = request.headers.origin
-      if (via === 'cookie' && typeof origin === 'string' && origin !== `http://${expected}`) {
-        return this.send(response, 403, { error: 'cross-origin request refused' })
-      }
+      // Bearer only. There is no page and no cookie: nothing ambient that
+      // another page on this machine could ride.
+      if (!this.authorized(request)) return this.send(response, 401, { error: 'unauthorized' })
       return this.operator(request, response)
     }
     this.send(response, 404, { error: 'not found' })
@@ -535,52 +522,15 @@ export class ChatGptHost {
     response.end(text)
   }
 
-  /**
-   * Serve the page and hand the browser the instance credential as a cookie.
-   *
-   * Loopback is not an authentication boundary: any page in any browser on this
-   * machine can POST to this port. The real guards are the Host pin (DNS
-   * rebinding) and the Origin check on writes; the cookie only carries the
-   * credential so a human never copies it. SameSite=Strict keeps a foreign page
-   * from sending it and there are no CORS headers, so that page cannot read us.
-   *
-   * Session cookie (no Max-Age): every page load re-sets it, which also picks up
-   * the credential that is regenerated on every host start.
-   */
-  private sendOperatorPage(response: ServerResponse): void {
-    const html = this.operatorPageHtml()
-    response.writeHead(200, {
-      'content-type': 'text/html; charset=utf-8',
-      'content-length': Buffer.byteLength(html),
-      'cache-control': 'no-store',
-      'set-cookie': `${OPERATOR_COOKIE}=${this.operatorToken}; HttpOnly; SameSite=Strict; Path=/`,
-    })
-    response.end(html)
-  }
-
-  private authorizedBy(request: IncomingMessage): 'bearer' | 'cookie' | null {
+  private authorized(request: IncomingMessage): boolean {
     const header = request.headers.authorization
-    if (typeof header === 'string' && header.startsWith('Bearer ') && this.matchesToken(header.slice(7))) return 'bearer'
-    const cookie = this.operatorCookie(request)
-    if (cookie !== undefined && this.matchesToken(cookie)) return 'cookie'
-    return null
+    return typeof header === 'string' && header.startsWith('Bearer ') && this.matchesToken(header.slice(7))
   }
 
   private matchesToken(given: string): boolean {
     const offered = Buffer.from(given, 'utf8')
     const expected = Buffer.from(this.operatorToken, 'utf8')
     return offered.length === expected.length && timingSafeEqual(offered, expected)
-  }
-
-  private operatorCookie(request: IncomingMessage): string | undefined {
-    const header = request.headers.cookie
-    if (typeof header !== 'string') return undefined
-    for (const part of header.split(';')) {
-      const index = part.indexOf('=')
-      if (index < 0) continue
-      if (part.slice(0, index).trim() === OPERATOR_COOKIE) return part.slice(index + 1).trim()
-    }
-    return undefined
   }
 
   /**
@@ -715,22 +665,7 @@ export class ChatGptHost {
         await this.persistHostState()
         return this.send(response, 200, { ok: true, op, line })
       }
-      // The join path: a brand-new thread gets one paste-ready snippet. The
-      // token is revealed here and nowhere else, and only its sha is kept.
-      if (op === 'snippet') {
-        const text = await this.snippetFor(bridge)
-        audit(this.hostState, { op: 'snippet', target: bridge.state.name, result: 'minted a one-shot bootstrap token' })
-        await this.persistHostState()
-        return this.send(response, 200, { ok: true, op, line: 'paste the snippet into the thread', text })
-      }
-      // The operator's click is the trust path: it may run what the page
-      // already answered, without any turn of ours having posted it.
-      if (op === 'arm') {
-        const result = await this.armBridge(bridge)
-        await this.persistHostState()
-        return this.send(response, 200, { op, ...result })
-      }
-      // The two grants. Both are pushes the operator issues from the page.
+      // The two grants. Both are pushes the operator issues.
       if (op === 'attachTranscript') {
         const peer = String(body.peer ?? '')
         if (!peer) return this.send(response, 400, { ok: false, error: 'attachTranscript requires peer' })
@@ -881,173 +816,6 @@ export class ChatGptHost {
       return threads.length === 0 ? 'no threads on the account' : threads.map(thread => `${thread.id} "${one(thread.title, 80)}"`).join('; ').slice(0, 900)
     }
     throw new Error(`unknown thread action ${action || '(missing)'}`)
-  }
-
-  /**
-   * The paste-ready teaching snippet for one bridge.
-   *
-   * The token exists in this response and in the thread the human pastes it
-   * into. The file keeps only the sha, and calling this again mints a NEW
-   * token - the previous snippet stops matching the sha on disk immediately,
-   * whether or not it was ever used.
-   */
-  private async snippetFor(bridge: Bridge): Promise<string> {
-    const token = randomBytes(BOOTSTRAP_BYTES).toString('hex')
-    bridge.state.bootstrapSha256 = sha256Hex(token)
-    bridge.state.bootstrapBurnedAt = null
-    await this.persistBridgeState(bridge, true)
-    const name = bridge.state.name
-    return [
-      `# Join the local session bus as "${name}"`,
-      '',
-      `This thread is already bound to the peer "${name}", session id ${bridge.state.sessionId}.`,
-      'That peer is one participant in a bus of live agent sessions on ONE machine. Each',
-      'message it receives was sent by another session, not by the person whose account',
-      'this is.',
-      '',
-      'To send the first bus message, emit exactly ONE code block: a line reading',
-      '`gateway`, then ONE JSON object. The token goes INSIDE the object, as its',
-      'first field:',
-      '',
-      'gateway',
-      `{"nonce":"${token}","op":"send","to":"${name}","text":"...","summary":"..."}`,
-      '',
-      '- The label line is exactly `gateway` and nothing else. The page keeps only',
-      '  that word and drops everything else on the line, so the token must be in',
-      '  the body.',
-      '- Fill in `text` and `summary`. Do not change `nonce`.',
-      '- The token is ONE-SHOT: the host burns it the moment it runs the block, so a',
-      '  second block carrying it is refused.',
-      '- Every later turn carries its OWN fresh nonce in the message the host posts. Use',
-      '  only the nonce you were just given, in the same `"nonce"` field; this token is',
-      '  never reusable.',
-      '- `to` is a peer name or session id taken from `list`. Never invent one.',
-      '- Keep `summary` under 200 characters.',
-      '',
-      '## Operations',
-      '',
-      this.primerOps(),
-      '',
-      'Prose without a block is only prose: the host sends your answer back to whoever',
-      'messaged you.',
-    ].join('\n')
-  }
-
-  /** The operation list exactly as primer.md defines it - never a second table. */
-  private primerOps(): string {
-    const lines = this.primer.text.split(/\r?\n/)
-    const start = lines.findIndex(line => /^## Operations\s*$/.test(line))
-    if (start < 0) return COMMAND_OPS.map(op => `- {"op":"${op}"}`).join('\n')
-    const end = lines.findIndex((line, index) => index > start && /^## /.test(line))
-    return lines.slice(start + 1, end < 0 ? undefined : end).join('\n').trim()
-  }
-
-  /**
-   * Arm the newest finished answer on the bridge's own thread.
-   *
-   * The click is the trust path. The page holds an answer no turn of ours
-   * posted, and the operator decides it may act, so exactly two kinds of block
-   * are accepted here: one carrying this bridge's live bootstrap token, burned
-   * BEFORE anything runs, and - because the click itself is the authority - a
-   * bare `gateway` block, at most once per answer text.
-   */
-  private async armBridge(bridge: Bridge): Promise<{ ok: boolean; line: string; lines?: string[]; evidence?: string }> {
-    const state = bridge.state
-    const threadId = state.threadId
-    if (!threadId) {
-      return { ok: false, line: 'no thread yet: this bridge is not bound to a ChatGPT thread; adopt a thread or create a bridge first' }
-    }
-    return await this.pageWork(async () => {
-      // Take the tab this bridge posts to and prove the page landed on it. The
-      // same check operatorThread makes: arming the wrong tab would run an
-      // answer that belongs to another peer.
-      const used = await this.driver.call({ op: 'use', threadId }, TURN_TIMEOUT_MS)
-      if (used.ok !== true) return { ok: false, line: `could not open the bridge thread: ${one(used.error, 200) || 'the page refused'}` }
-      const landed = typeof used.threadId === 'string' ? used.threadId : ''
-      if (landed.toLowerCase() !== threadId.toLowerCase()) {
-        return { ok: false, line: `the page opened ${landed || 'another thread'} instead of the bridge thread ${threadId}` }
-      }
-      const read = await this.driver.call({ op: 'read' }, TURN_TIMEOUT_MS)
-      if (read.ok !== true) {
-        const reason = one(read.error, 240) || 'the page did not answer'
-        if (/still in progress/i.test(reason)) {
-          return { ok: false, line: 'the answer is still being written; wait for it to finish, then click "Arm last answer" again' }
-        }
-        if (/no assistant turn|no thread is open/i.test(reason)) {
-          return { ok: false, line: 'nothing to arm: the page holds no finished assistant answer' }
-        }
-        return { ok: false, line: `could not read the page: ${reason}` }
-      }
-      const evidence = typeof read.evidence === 'string' ? read.evidence : ''
-      if (evidence !== 'state-complete' && evidence !== 'stability') {
-        return { ok: false, line: `nothing to arm: the page could not confirm the answer finished (evidence: ${evidence || 'none'}); wait and click "Arm last answer" again` }
-      }
-      const answer = typeof read.text === 'string' ? read.text : ''
-      if (!answer.trim()) return { ok: false, line: 'nothing to arm: the newest assistant answer is empty' }
-
-      const tokenSha = state.bootstrapSha256
-      const burned = state.bootstrapBurnedAt !== null
-      type Armed = { line: number; value: unknown }
-      let bootstrapBlock: Armed | undefined
-      const bareBlocks: Armed[] = []
-      const refused: string[] = []
-      for (const block of readFences(answer)) {
-        if (!/^gateway\b/i.test(block.info)) continue
-        let parsed: unknown
-        try { parsed = JSON.parse(block.body) } catch (error) {
-          refused.push(`line ${block.line}: refused: invalid JSON (${(error as Error).message})`)
-          continue
-        }
-        const { credential, value } = blockCredential(parsed, block.info)
-        if (!credential) { bareBlocks.push({ line: block.line, value }); continue }
-        if (tokenSha !== null && sha256Hex(credential) === tokenSha) {
-          if (burned || bootstrapBlock) refused.push(`line ${block.line}: refused: the bootstrap token is one-shot; a second block carrying it is refused`)
-          else bootstrapBlock = { line: block.line, value }
-          continue
-        }
-        refused.push(`line ${block.line}: refused: the nonce matches neither this bridge's live bootstrap token nor a bare gateway fence`)
-      }
-      if (!bootstrapBlock && bareBlocks.length === 0) {
-        return { ok: false, line: refused[0] ?? 'nothing to arm: the newest assistant answer contains no gateway command block', lines: refused }
-      }
-
-      const answerSha = sha256Hex(answer)
-      if (!bootstrapBlock && state.lastArmedSha256 === answerSha) {
-        return { ok: false, line: 'already armed: this answer was armed before; arm a newer answer', lines: refused }
-      }
-      const chosen = bootstrapBlock ? [bootstrapBlock] : bareBlocks
-      if (bootstrapBlock) {
-        // Burn first and persist it, then run: a crash between the two must not
-        // leave a token that still works.
-        state.bootstrapBurnedAt = now()
-        await this.persistBridgeState(bridge, true)
-        if (bareBlocks.length > 0) refused.push(`not run: ${bareBlocks.length} bare gateway fence(s) were ignored because the bootstrap token was used`)
-      }
-
-      const lines: string[] = []
-      let ran = 0
-      for (const block of chosen) {
-        const command = parseCommand(block.value)
-        if (!command.ok) { lines.push(`line ${block.line}: refused: ${command.error}`); continue }
-        if (ran >= MAX_COMMANDS_PER_TURN) { lines.push(`line ${block.line}: refused: command budget (${MAX_COMMANDS_PER_TURN} per turn)`); continue }
-        ran++
-        try {
-          const result = await this.executeCommand(bridge, command.command, 'operator')
-          lines.push(result.line)
-        } catch (error) {
-          lines.push(`${command.command.op} failed: ${one((error as Error).message, 240)}`)
-        }
-      }
-      lines.push(...refused)
-      if (!bootstrapBlock) state.lastArmedSha256 = answerSha
-      await this.persistBridgeState(bridge)
-      return {
-        ok: ran > 0,
-        line: ran > 0 ? `armed ${ran} command${ran === 1 ? '' : 's'} from the answer` : (lines[0] ?? 'nothing to arm'),
-        lines,
-        evidence,
-      }
-    })
   }
 
   private readBody(request: IncomingMessage): Promise<string | undefined> {
@@ -1555,7 +1323,7 @@ export class ChatGptHost {
    *
    * A peer may attach a transcript only when it names its own session id. Any
    * other session id is a pull-by-proxy and is refused - the operator is the
-   * only other authority, and only from the page.
+   * only other authority, and only through the bearer API.
    */
   private async injectAttachment(bridge: Bridge, text: string, fromSessionId: string, messageId: string): Promise<void> {
     const match = /^[ \t]*attachment:[ \t]*session[ \t]+(\S+)[ \t]*$/im.exec(text)
@@ -2038,131 +1806,6 @@ export class ChatGptHost {
       await bridge.transport?.close().catch(error => log(`transport close failed: ${(error as Error).message}`))
     }
   }
-
-  // ---------------------------------------------------------- operator page
-
-  private operatorPageHtml(): string {
-    const tokenFile = join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.config.instanceId}.json`)
-    return `<!doctype html>
-<meta charset="utf-8">
-<title>${NAME} bridges</title>
-<style>
- body{font:14px system-ui,sans-serif;margin:24px;max-width:960px;line-height:1.45}
- h1{font-size:18px} h2{font-size:15px;margin-top:28px}
- table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left;vertical-align:top}
- code,pre{background:#f4f4f4;padding:2px 4px;border-radius:3px} pre{padding:8px;white-space:pre-wrap}
- button{margin-right:6px} input{width:220px;margin-right:6px}
- .note{color:#555;margin:6px 0}
- #health{background:#f4f4f4;padding:8px;border-radius:3px}
- #out{margin-top:16px}
-</style>
-<h1>${NAME}</h1>
-<p>This page is the local control surface for the ChatGPT bridge host on this machine. Conversations happen in the ChatGPT window next to it - this page never talks to ChatGPT itself. A <b>bridge</b> is one ChatGPT thread registered on the peer bus under a name, so other sessions can message it by that name. Nothing is written into a thread on its own: a bridge only acts when another session messages it, or when you click a button here.</p>
-<p id="health">Route state: checking...</p>
-<h2>Bridges</h2>
-<table><thead><tr><th>Name</th><th>ChatGPT thread</th><th>Model / effort</th><th>State</th><th>Pending</th><th>Actions</th></tr></thead><tbody id="bridges"></tbody></table>
-<p id="empty" class="note" hidden>No bridges yet - choose a ChatGPT thread under 'Adopt an existing thread', or start a fresh one with 'New bridge'.</p>
-<p class="note">Snippet - paste-ready instructions that hand a thread its one-shot token. Arm last answer - run the newest answer already on that thread because you clicked. Remove - unregister the bridge and leave the ChatGPT conversation alone.</p>
-<h2>Adopt an existing ChatGPT thread</h2>
-<p class="note">The thread becomes a bus peer under the name you give it, and the teaching primer is posted into that same conversation.</p>
-<p><button id="loadThreads">Load threads</button> <select id="threads"></select> <input id="adoptName" placeholder="name (optional)"> <button id="adopt">Adopt</button></p>
-<h2>Start a new ChatGPT thread</h2>
-<p class="note">Mints a peer and a fresh ChatGPT conversation.</p>
-<p><input id="newName" placeholder="name (optional)"> <button id="newBridge">New bridge</button></p>
-<div id="out"></div>
-<p class="note">Scripts can use the bearer token in <code>${tokenFile}</code>.</p>
-<script>
-const $ = id => document.getElementById(id)
-function show(text){ $('out').innerHTML = '<pre></pre>'; $('out').firstChild.textContent = text }
-function describe(body){
-  if(body && typeof body === 'object') return body.error || body.line || JSON.stringify(body)
-  return String(body)
-}
-async function fetchJson(url, init){
-  try{
-    const response = await fetch(url, init)
-    const text = await response.text()
-    let body = null
-    try{ body = text ? JSON.parse(text) : null }catch{ body = { error: text } }
-    return { ok: response.ok, status: response.status, body }
-  }catch(error){ return { ok: false, status: 0, body: { error: String((error && error.message) || error) } } }
-}
-function report(r){
-  if(r.status === 401){ show('Not authorized. Reload this page (the host sets an access cookie on load).'); return true }
-  if(r.status === 0){ show('network error: ' + describe(r.body)); return true }
-  if(!r.ok){ show(r.status + ' ' + describe(r.body)); return true }
-  return false
-}
-async function api(op, extra){
-  return fetchJson('/operator', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(Object.assign({op}, extra || {}))})
-}
-function threadLabel(b){
-  if(b.title) return b.title
-  if(b.threadId) return 'thread ' + String(b.threadId).slice(0, 8)
-  return 'no thread yet'
-}
-function renderHealth(state){
-  const el = $('health')
-  if(!state){ el.textContent = 'Route state: unknown - the host did not answer the state call.'; return }
-  const health = state.health || {}
-  const count = (state.bridges || []).length
-  const reason = health.reason ? ' (' + health.reason + ')' : ''
-  el.textContent = 'Route state: ' + (health.state || 'unknown') + reason + ' - ' + count + ' bridge' + (count === 1 ? '' : 's') + ' registered.'
-}
-function renderBridges(bridges){
-  const rows = $('bridges'); rows.textContent = ''
-  for(const b of bridges){
-    const tr = document.createElement('tr')
-    for(const value of [b.name, threadLabel(b), (b.model||'?') + (b.effort ? ' / ' + b.effort : ''), b.status || 'unknown', (b.owed||[]).length]){
-      const td = document.createElement('td'); td.textContent = String(value); tr.appendChild(td)
-    }
-    const td = document.createElement('td')
-    const snippet = document.createElement('button'); snippet.textContent = 'Snippet'
-    snippet.title = 'Paste-ready instructions that hand this thread its one-shot token.'
-    snippet.onclick = async () => { const r = await api('snippet', {bridge:b.sessionId}); if(report(r)) return; show(r.body.text || r.body.line || JSON.stringify(r.body)) }
-    const arm = document.createElement('button'); arm.textContent = 'Arm last answer'
-    arm.title = 'Run the newest answer already on this thread because you clicked.'
-    arm.onclick = async () => { const r = await api('arm', {bridge:b.sessionId}); if(report(r)) return; show(r.body.line || JSON.stringify(r.body)); refresh() }
-    const remove = document.createElement('button'); remove.textContent = 'Remove'
-    remove.title = 'Unregister the bridge; the ChatGPT conversation is left alone.'
-    remove.onclick = async () => {
-      if(!confirm('Remove bridge ' + b.name + '? This only unregisters it here; the ChatGPT conversation is left alone.')) return
-      const r = await api('remove', {sessionId:b.sessionId}); if(report(r)) return; show(r.body.line || JSON.stringify(r.body)); refresh()
-    }
-    td.appendChild(snippet); td.appendChild(arm); td.appendChild(remove); tr.appendChild(td); rows.appendChild(tr)
-  }
-  $('empty').hidden = bridges.length > 0
-}
-async function refresh(){
-  const r = await fetchJson('/operator/state')
-  if(report(r)){ renderHealth(null); return }
-  const state = r.body || {}
-  renderHealth(state)
-  renderBridges(state.bridges || [])
-}
-$('loadThreads').onclick = async () => {
-  const r = await api('threads'); if(report(r)) return
-  const select = $('threads'); select.textContent = ''
-  for(const t of r.body.threads || []){ const option = document.createElement('option'); option.value = t.id; option.textContent = t.title ? t.title + ' (' + t.id + ')' : t.id; select.appendChild(option) }
-  show('loaded ' + ((r.body.threads||[]).length) + ' thread(s)')
-}
-$('adopt').onclick = async () => {
-  const threadId = $('threads').value; if(!threadId) return show('choose a thread first')
-  const name = $('adoptName').value.trim()
-  const r = await api('adopt', name ? {threadId, name} : {threadId})
-  if(report(r)) return
-  show(r.body.line || JSON.stringify(r.body)); refresh()
-}
-$('newBridge').onclick = async () => {
-  const name = $('newName').value.trim()
-  const r = await api('newBridge', name ? {name} : {})
-  if(report(r)) return
-  show(r.body.line || JSON.stringify(r.body)); refresh()
-}
-refresh()
-</script>
-`
-  }
 }
 
 async function main(): Promise<void> {
@@ -2178,11 +1821,11 @@ async function main(): Promise<void> {
       '  --driver <file>     the page driver (chatgpt.mjs)',
       '  --profile <dir>     Chrome profile directory',
       '  --instance <id>     instance slug (default "default")',
-      '  --health-port <n>   loopback port for the operator page and route health (0 = ephemeral)',
+      '  --health-port <n>   loopback port for the operator API and route health (0 = ephemeral)',
       '  --idle-minutes <n>  unload Chrome after this long idle (0 = never)',
       '  --number <n>        route credential number this page answers as (default 1)',
       '',
-      'Bridges are adopted or created from the operator page at /operator.',
+      'Bridges are adopted or created with POST /operator (bearer token from the instance file).',
     ].join('\n') + '\n')
     return
   }
