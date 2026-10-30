@@ -39,6 +39,16 @@ if (SHIPPED_DRIVER_MISSING) {
   console.warn(`[C10 skipped] the shipped driver is not at ${SHIPPED_DRIVER}; set CHATGPT_WEB_DRIVER (or CHATGPT_WEB_HOME) to the real chatgpt.mjs`)
 }
 
+/**
+ * A byte-for-byte snapshot of the shipped driver (chatgpt.mjs @ d5-async,
+ * commit 6dec928), vendored so the quit-drain test always runs against the real
+ * `serve` protocol instead of being skipped on a machine without the deployed
+ * copy. C10v below drives THIS file as a real child; the R3-F8 mutation (revert
+ * `serve`'s drain) must fail it. C10 separately drives the deployed copy when
+ * one is present.
+ */
+const VENDORED_DRIVER = join(import.meta.dir, 'chatgpt-peer', 'fixtures', 'chatgpt-driver.mjs')
+
 type Call = Record<string, unknown>
 
 const rendered = (fields: Record<string, unknown>): string => 'gateway\n' + JSON.stringify(fields)
@@ -422,7 +432,128 @@ describe('uplink is relayed at most once', () => {
       await cleanup()
     }
   })
+
+  // R3-F10: C5 dies AFTER the bus took the message. The other half of the
+  // write-ahead window is death BETWEEN the durable record and the send. The
+  // record is already on disk, so a restart must not retry: the uplink is lost,
+  // never duplicated. There was no fault injection at this boundary at all.
+  test('C5b: a crash between the write-ahead record and the send loses one uplink, never posts it twice', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    let reborn: ChatGptHost | undefined
+    try {
+      await host.pollOnce()
+      const bridge = (host as unknown as {
+        bridges: Map<string, { transport: { send: (...args: unknown[]) => Promise<unknown> } }>
+      }).bridges.get(alpha.sessionId)!
+      let recordedAtCrash: string[] | null = null
+      bridge.transport.send = async () => {
+        // The process dies here: the write-ahead record exists, the bus was
+        // never asked to take the message. Snapshot the disk at that instant.
+        recordedAtCrash = (await readBridge(dir, alpha.sessionId)).uplinkNodeIds
+        throw new Error('injected process death between persist and send')
+      }
+
+      driver.humanTypes(THREAD_A, 'tell the other agent', rendered({ uplink: true, to: 'listener', text: 'lost at the persist boundary' }))
+      const answerId = driver.newestId(THREAD_A)
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'complete' })
+      await host.flushTriggers()
+      await host.pollOnce()
+
+      // The durable record existed before the send was attempted...
+      expect(recordedAtCrash).not.toBeNull()
+      expect(recordedAtCrash!).toContain(answerId)
+      // ...and the recipient never got it, because the send never completed.
+      const delivered = (): number => listener.transport.inbox().filter(record => record.message.text.includes('lost at the persist boundary')).length
+      expect(delivered()).toBe(0)
+
+      // Restart from disk. The pre-send record must suppress a retry: at most
+      // one delivery, and here exactly zero (a loss, not a duplicate).
+      await host.stop()
+      const stored = await readBridge(dir, alpha.sessionId)
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), { ...stored, cursor: driver.rootId(THREAD_A) })
+      reborn = await startHost(dir, driver)
+      await reborn.pollOnce()
+      expect(delivered()).toBe(0)
+      const audit = await hostAudit(dir)
+      expect(audit.some(entry => entry.op === 'uplink' && entry.result.includes('already relayed'))).toBe(true)
+    } finally {
+      await reborn?.stop()
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
 })
+
+/**
+ * Drive one real driver process through the quit drain.
+ *
+ * A loopback socket accepts and never replies. The driver's page-free deep
+ * status read reaches for CDP through it and is held for the read's own 1.5 s
+ * abort, so there is a genuine in-flight request when `quit` lands - with no
+ * Chrome, no CDP and no page anywhere. The frames are returned in arrival
+ * order; the caller asserts the drain ordering.
+ */
+async function drainThroughQuit(driverPath: string, dir: string): Promise<{ frames: Record<string, unknown>[]; code: number | null }> {
+  const sockets = new Set<Socket>()
+  const hole = createServer(socket => { sockets.add(socket) })
+  await new Promise<void>(resolve => hole.listen(0, '127.0.0.1', resolve))
+  const port = (hole.address() as { port: number }).port
+  const frames: Record<string, unknown>[] = []
+  const child = spawn(process.execPath, [driverPath, 'serve'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    // Isolate the driver's own log dir (~/.chatgpt-web) from the real one.
+    env: { ...process.env, HOME: dir, USERPROFILE: dir, CHATGPT_PROFILE: join(dir, 'chrome-profile'), CHATGPT_CDP_PORT: String(port) },
+  })
+  const exited = new Promise<number | null>(resolve => child.on('exit', code => resolve(code)))
+  createInterface({ input: child.stdout }).on('line', line => {
+    const trimmed = line.trim()
+    if (!trimmed) return
+    try { frames.push(JSON.parse(trimmed) as Record<string, unknown>) } catch { /* not a frame */ }
+  })
+  child.stderr.resume()
+  const waitFor = async (predicate: () => boolean, ms = 15_000): Promise<void> => {
+    const until = Date.now() + ms
+    while (Date.now() < until) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
+    throw new Error(`timed out waiting for the driver at ${driverPath}`)
+  }
+  try {
+    await waitFor(() => frames.some(frame => frame.event === 'ready'))
+    // A real page-free request: no page, no Chrome; it blocks only on the
+    // loopback socket above.
+    child.stdin.write(`${JSON.stringify({ op: 'status', threadId: THREAD_A, deep: true, id: 'in-flight' })}\n`)
+    // Let the driver read that request before the quit, so it is queued.
+    await new Promise(resolve => setTimeout(resolve, 150))
+    child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`)
+    const code = await exited
+    return { frames, code }
+  } finally {
+    try { child.kill() } catch { /* already gone */ }
+    for (const socket of sockets) socket.destroy()
+    hole.close()
+  }
+}
+
+/** The drain must be announced, the queued answer must go out, then the quit. */
+function expectDrained(frames: Record<string, unknown>[], code: number | null): void {
+  expect(code).toBe(0)
+  const index = (predicate: (frame: Record<string, unknown>) => boolean): number => frames.findIndex(predicate)
+  const draining = index(frame => frame.event === 'draining')
+  const answered = index(frame => frame.op === 'status' && frame.id === 'in-flight')
+  const quit = index(frame => frame.op === 'quit')
+  // The in-flight request was answered...
+  expect(answered).toBeGreaterThan(-1)
+  expect(frames[answered]!.cost).toBe('conversation')
+  // ...in the shipped order: the drain is announced, then the queued answer,
+  // and only then does the quit answer go out.
+  expect(draining).toBeGreaterThan(-1)
+  expect(frames[draining]!.queued).toBe(1)
+  expect(draining).toBeLessThan(answered)
+  expect(answered).toBeLessThan(quit)
+}
 
 describe('driver child protocol', () => {
   test('C8: two sends in flight each hear only about their own acceptance', async () => {
@@ -461,6 +592,9 @@ rl.on('line', line => {
       ])
       expect(a.ok).toBe(true)
       expect(b.ok).toBe(true)
+      // Each reply is the answer to its OWN request, not the other's.
+      expect(a.text).toBe('echo:first')
+      expect(b.text).toBe('echo:second')
       expect(first.length).toBe(1)
       expect(second.length).toBe(1)
       // Each callback heard about the id of ITS OWN request, even though the
@@ -561,60 +695,24 @@ rl.on('line', line => {
 
   test.skipIf(SHIPPED_DRIVER_MISSING)('C10: the shipped driver refuses new work, drains what is queued, then answers', async () => {
     const { dir, cleanup } = await scratch()
-    // A loopback socket that accepts and never replies. The driver's page-free
-    // deep status read reaches for CDP through it and is held for its own 1.5 s
-    // abort, so there is a genuine in-flight request when quit lands - with no
-    // Chrome, no CDP and no page anywhere.
-    const sockets = new Set<Socket>()
-    const hole = createServer(socket => { sockets.add(socket) })
-    await new Promise<void>(resolve => hole.listen(0, '127.0.0.1', resolve))
-    const port = (hole.address() as { port: number }).port
-    const profile = join(dir, 'chrome-profile')
-    const frames: Record<string, unknown>[] = []
-    const child = spawn(process.execPath, [SHIPPED_DRIVER, 'serve'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CHATGPT_PROFILE: profile, CHATGPT_CDP_PORT: String(port) },
-    })
-    const exited = new Promise<number | null>(resolve => child.on('exit', code => resolve(code)))
-    createInterface({ input: child.stdout }).on('line', line => {
-      const trimmed = line.trim()
-      if (!trimmed) return
-      try { frames.push(JSON.parse(trimmed) as Record<string, unknown>) } catch { /* not a frame */ }
-    })
-    child.stderr.resume()
-    const waitFor = async (predicate: () => boolean, ms = 15_000): Promise<void> => {
-      const until = Date.now() + ms
-      while (Date.now() < until) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 10)) }
-      throw new Error('timed out waiting for the driver')
-    }
     try {
-      await waitFor(() => frames.some(frame => frame.event === 'ready'))
-      // A real page-free request: no page, no Chrome; it blocks only on the
-      // loopback socket above.
-      child.stdin.write(`${JSON.stringify({ op: 'status', threadId: THREAD_A, deep: true, id: 'in-flight' })}\n`)
-      // Let the driver read that request before the quit, so it is queued.
-      await new Promise(resolve => setTimeout(resolve, 150))
-      child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`)
-      const code = await exited
-      expect(code).toBe(0)
-
-      const index = (predicate: (frame: Record<string, unknown>) => boolean): number => frames.findIndex(predicate)
-      const draining = index(frame => frame.event === 'draining')
-      const answered = index(frame => frame.op === 'status' && frame.id === 'in-flight')
-      const quit = index(frame => frame.op === 'quit')
-      // The in-flight request was answered...
-      expect(answered).toBeGreaterThan(-1)
-      expect(frames[answered]!.cost).toBe('conversation')
-      // ...in the shipped order: the drain is announced, then the queued answer,
-      // and only then does the quit answer go out.
-      expect(draining).toBeGreaterThan(-1)
-      expect(frames[draining]!.queued).toBe(1)
-      expect(draining).toBeLessThan(answered)
-      expect(answered).toBeLessThan(quit)
+      const { frames, code } = await drainThroughQuit(SHIPPED_DRIVER, dir)
+      expectDrained(frames, code)
     } finally {
-      try { child.kill() } catch { /* already gone */ }
-      for (const socket of sockets) socket.destroy()
-      hole.close()
+      await cleanup()
+    }
+  })
+
+  // R3-F8: C10 is skipped whenever the deployed driver is absent, so a revert
+  // of its quit-drain passed as a green. This runs the vendored copy of the
+  // shipped driver - the real `serve` protocol, as a real OS child - and so it
+  // can never be skipped. Revert `serve`'s drain in that file and it fails.
+  test('C10v: the vendored shipped driver refuses new work, drains what is queued, then answers', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { frames, code } = await drainThroughQuit(VENDORED_DRIVER, dir)
+      expectDrained(frames, code)
+    } finally {
       await cleanup()
     }
   })
