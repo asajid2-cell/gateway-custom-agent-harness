@@ -1706,6 +1706,7 @@ export class ChatGptHost {
   private async postPendingTurn(bridge: Bridge, record: PendingTurn, waitMs = 30_000, locked = false): Promise<boolean> {
     const deadline = Date.now() + waitMs
     for (;;) {
+      if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
       const threadId = bridge.state.threadId
       if (!threadId) {
         // No thread yet: nothing can be generating, so the primer (which mints
@@ -2695,6 +2696,7 @@ export class ChatGptHost {
     await transport.update({ status: 'running' }).catch(() => {})
     const kind: 'inquiry' | 'directive' = message.kind === 'directive' ? 'directive' : 'inquiry'
     let job: PendingTurn | null = null
+    const alive = (): void => { if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`) }
     try {
       const name = await this.nameOf(message.fromSessionId)
       const text = sanitizePeerText(message.text)
@@ -2734,6 +2736,7 @@ export class ChatGptHost {
         await this.ensurePrimerAndThread(bridge)
         await this.injectAttachment(bridge, text, message.fromSessionId, message.id)
       })
+      alive()
       const seeded = await this.postPendingTurn(bridge, job, 30_000)
       if (!seeded) {
         // Deferred, never refused: nothing was typed, and the next idle
@@ -2747,35 +2750,44 @@ export class ChatGptHost {
       // The seed WAS round 1's page turn. Waiting for its answer here (rather
       // than posting the same prompt again) is what keeps one inbound to one
       // page turn.
+      alive()
       acknowledge()
       let seededAnswer = true
       const outcome = await runCommandTurn(prompt, turnNonce, {
         generate: async subject => {
           try {
+            alive()
             if (seededAnswer) {
               seededAnswer = false
               const answer = await this.awaitAnswer(bridge, job!.userNodeId)
               return { ok: true, text: answer.text }
             }
+            alive()
             return { ok: true, text: await this.generateRound(bridge, job!, subject, acknowledge) }
           } catch (error) { return { ok: false, error: (error as Error).message } }
         },
-        execute: command => this.executeCommand(bridge, command, 'model', message.id),
+        execute: command => {
+          alive()
+          return this.executeCommand(bridge, command, 'model', message.id)
+        },
       })
       // The delivery decision is written BEFORE the reply leaves, so a crash
       // between here and the receipt loses one reply rather than sending two.
+      alive()
       await this.markAnswered(bridge, job)
+      alive()
       await this.settleReply(bridge, message, expects, outcome)
     } catch (error) {
       const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
       log(`turn for ${message.id} failed: ${reason}`)
       audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `failed: ${reason}`, messageId: message.id })
+      if (bridge.removed || bridge.stopping) return
       if (job) await this.deliverSolicitedFailure(bridge, job, reason)
       else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
     } finally {
       this.attachedTurns.delete(message.id)
       await bridge.transport?.update({ status: 'idle' }).catch(() => {})
-      this.refreshOwed(bridge)
+      if (!bridge.removed) this.refreshOwed(bridge)
       await this.persistBridgeState(bridge)
       await this.persistHostState()
       this.scheduleIdleUnload()
