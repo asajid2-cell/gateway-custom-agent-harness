@@ -1301,7 +1301,13 @@ export class ChatGptHost {
     const threadId = bridge.state.threadId
     if (!threadId) throw new Error('the page posted nothing into a thread')
     const deadline = Date.now() + timeoutMs
+    // A proof read is licensed by a new page signal, and re-attempted on a
+    // bounded clock regardless: a page that never pushes again must not hold
+    // this turn - and every inbound queued behind it - until the timeout.
+    const proofRetryMs = Math.min(Math.max(this.waitPoll * 25, 1_000), 15_000)
     let deepFor: string | null | undefined
+    let proofAt = 0
+    let domUnproven = false
     for (;;) {
       const cheap = await this.cheapStatus(threadId)
       if (cheap.state === 'failed') {
@@ -1311,12 +1317,29 @@ export class ChatGptHost {
         // One conversation read per page signal, not one per poll: the page's
         // own word that the turn stopped is what licenses the expensive read.
         const key = cheap.at ?? ''
-        if (deepFor !== key) {
+        const due = deepFor !== key || Date.now() - proofAt >= proofRetryMs
+        if (due) {
           deepFor = key
+          proofAt = Date.now()
           const read = await this.readConversation(threadId)
           if (read && 'conversation' in read) {
             const answer = userNodeId ? answerAfter(read.conversation, userNodeId) : latestAssistantOf(read.conversation)
             if (answer && nodeComplete(answer)) return { text: nodeTextOf(answer), nodeId: answer.id }
+          } else if (this.observes === false) {
+            // This driver has no conversation op, so the thread tree cannot
+            // prove anything here: the page's own DOM read is the only proof
+            // there is, and it is the one every turn used before the job shape.
+            // Without it the turn could never complete on such a driver, and
+            // the serial drain held every inbound queued behind it until the
+            // turn timeout - a page that pushes nothing starved the whole bus.
+            try {
+              return { text: await this.readCompletedAnswer(bridge), nodeId: userNodeId ?? '' }
+            } catch (error) {
+              if (!domUnproven) {
+                domUnproven = true
+                log(`turn proof on "${bridge.state.name}" has no conversation tree; using the page read (${one((error as Error).message, 160)})`)
+              }
+            }
           }
         }
       }
