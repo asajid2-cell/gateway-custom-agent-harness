@@ -202,8 +202,12 @@ export class DriverChild {
         resolve(reply)
       }
       const timer = setTimeout(() => {
+        // `reason:'timeout'` is part of the contract: a caller must be able to
+        // tell "no answer came" from "the page said no", and the two lead to
+        // opposite decisions (wait longer vs. stop). `recover` still gets the
+        // child's channel back for the requests behind this one.
         const wasAccepted = this.accepted.has(id)
-        finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        finish({ ok: false, id, reason: 'timeout', error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
         this.recover(generation, id, wasAccepted)
       }, timeoutMs)
       this.pending.set(id, { generation, finish })
