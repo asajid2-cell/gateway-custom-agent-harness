@@ -2067,14 +2067,23 @@ export class ChatGptHost {
   /** One solicited answer to the sender. Explicitly NOT untrusted page speech. */
   private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: { id: string }): Promise<void> {
     const key = this.turnKey(record)
-    if (bridge.state.answeredTurns.includes(key)) {
+    // The bus is authoritative for what has been answered, not the mark. A
+    // write-ahead mark says the answer was OBTAINED from the page
+    // (`markAnswered` runs before the reply leaves), so it is only a delivery
+    // once the transport history holds a 'sent' entry for this message
+    // (R-LIVE-7). With the mark but no sent entry the sender is still owed, so
+    // every caller - the observation pass and the startup recovery alike -
+    // delivers rather than retiring.
+    const alreadySent = bridge.transport?.historyEntries()
+      .some(entry => entry.direction === 'sent' && entry.message.replyTo === record.messageId) ?? false
+    if (bridge.state.answeredTurns.includes(key) && alreadySent) {
       await this.retirePendingTurn(bridge, record.messageId)
       return
     }
     // Write-ahead: the answer is marked and the job retired BEFORE it is sent,
     // so a crash from here to the receipt loses one answer rather than sending
     // the same one twice.
-    bridge.state.answeredTurns = [...bridge.state.answeredTurns, key].slice(-ANSWERED_TURNS_MAX)
+    bridge.state.answeredTurns = [...bridge.state.answeredTurns.filter(item => item !== key), key].slice(-ANSWERED_TURNS_MAX)
     bridge.state.pendingTurns = bridge.state.pendingTurns.filter(item => item.messageId !== record.messageId)
     await this.persistBridgeState(bridge, true)
     const node = await this.answerNodeById(bridge, answer.id)
@@ -2934,6 +2943,11 @@ export class ChatGptHost {
    * answer is settled, and one already answered is in the sent history. Without
    * this, a crash between acknowledge and reply leaves the sender waiting
    * forever, which the bus contract forbids.
+   *
+   * EVIDENCE FIRST (R-LIVE-6): a restart is not proof that the page never got
+   * the turn. The job record says whether it was posted, and the page itself
+   * says whether it is still there. Posting without looking re-typed a whole
+   * prompt whose turn had long finished.
    */
   private async recoverOwed(bridge: Bridge): Promise<void> {
     const transport = bridge.transport
@@ -2942,11 +2956,36 @@ export class ChatGptHost {
     // per bridge. Every remaining owed entry gets one error reply so its sender
     // is not left waiting, and is then marked handled so the loop terminates.
     let pages = 0
+    // Entries this pass could not settle from evidence: the page is (or may be)
+    // still working on them, or it could not be read. They stay owed - the
+    // observation pass settles them - but they must not spin this loop.
+    const unproven = new Set<string>()
     for (;;) {
-      const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId))
+      const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId) && !unproven.has(item.toMessageId))
       if (!entry) return
       const record = transport.inbox().find(item => item.message.id === entry.toMessageId)
       if (!record) { bridge.handled.add(entry.toMessageId); continue }
+      // What do we already know about this turn? A job record with a null
+      // `postedAt` was never typed, and no record at all means this host has no
+      // evidence the page saw anything - both are the post path, unchanged. A
+      // driver that cannot read conversations at all (no `conversation` op) can
+      // never produce evidence either, so it keeps the old behaviour.
+      const job = bridge.state.pendingTurns.find(item => item.messageId === entry.toMessageId)
+      if (job && job.postedAt !== null && this.observes !== false) {
+        const evidence = await this.settlePostedTurn(bridge, job)
+        if (evidence === 'delivered') {
+          bridge.handled.add(entry.toMessageId)
+          continue
+        }
+        if (evidence === 'present' || evidence === 'unreadable') {
+          unproven.add(entry.toMessageId)
+          log(`leaving ${shortId(entry.toMessageId)} owed: ${evidence === 'present'
+            ? 'our user node is on the page, so its turn is the page\'s to finish'
+            : 'the page could not be read, so a re-post would be blind'}`)
+          continue
+        }
+        // 'absent': the send provably never landed. Post it as before.
+      }
       if (pages >= 3) {
         bridge.handled.add(entry.toMessageId)
         log(`gave up on ${shortId(entry.toMessageId)} after 3 page turns at startup`)
@@ -2960,11 +2999,63 @@ export class ChatGptHost {
     }
   }
 
+  /**
+   * Settle one recorded-as-posted turn from the page before re-posting it.
+   *
+   * `delivered` - the page finished an answer of ours: it is sent to the
+   * sender and nothing is typed. `present` - our own user node is there but no
+   * completed answer yet: the page may still be generating, so the turn is left
+   * to the observation path. `absent` - no user node of ours, so the send never
+   * landed and the caller may post. `unreadable` - a driver fault or a
+   * throttled read says nothing about the turn, so it must not be re-posted.
+   */
+  private async settlePostedTurn(bridge: Bridge, job: PendingTurn): Promise<'delivered' | 'present' | 'absent' | 'unreadable'> {
+    const threadId = job.threadId ?? bridge.state.threadId
+    if (!threadId) return 'unreadable'
+    const read = await this.readConversation(threadId)
+    if (!read) return 'unreadable'
+    if ('rateLimited' in read) return 'unreadable'
+    // The thread is gone: nothing of ours survives in it, so the turn was lost.
+    if ('missing' in read) return 'absent'
+    const conversation = read.conversation
+    const ours = new Set(bridge.state.ourNodeIds)
+    const postedMs = job.postedAt ? Date.parse(job.postedAt) : Number.NaN
+    const userNodeId = (job.userNodeId && conversation.mapping[job.userNodeId] ? job.userNodeId : null)
+      ?? (Number.isFinite(postedMs) ? this.ownUserNodeOf(conversation, job.ourText, postedMs, ours) : null)
+    if (!userNodeId) return 'absent'
+    // The read proved the node; keep it so the observation pass need not match
+    // the text again.
+    if (userNodeId !== job.userNodeId) {
+      bridge.state.pendingTurns = bridge.state.pendingTurns.map(item => item.messageId === job.messageId ? { ...item, userNodeId } : item)
+      await this.persistBridgeState(bridge)
+      job.userNodeId = userNodeId
+    }
+    const answer = this.answerFor(conversation, userNodeId)
+    if (!answer) return 'present'
+    await this.deliverSolicited(bridge, job, answer)
+    return 'delivered'
+  }
+
   private async handleRecord(bridge: Bridge, record: { message: { id: string; fromSessionId: string; summary: string; text: string; kind?: string; expectReply?: boolean; replyTo?: string } }): Promise<void> {
     const transport = bridge.transport
     if (!transport) return
     const message = record.message
     bridge.handled.add(message.id)
+    // The bus is authoritative for what has been answered (R-LIVE-7). This
+    // guard is for the DRAIN path: a kill between a reply and its
+    // fire-and-forget acknowledgement leaves the inbox record `queued`, so the
+    // next process's drain reads it as new and would start a second page turn
+    // for a message the sender was already answered - the live 4,893-char
+    // prompt was typed twice exactly this way. `recoverOwed` never reaches it
+    // with such a message: a sent reply is already excluded from
+    // `outstandingReplies()`, so the two guards are layered, not redundant.
+    if (transport.historyEntries().some(entry => entry.direction === 'sent' && entry.message.replyTo === message.id)) {
+      void transport.acknowledge(message.id).catch(() => {})
+      log(`turn ${shortId(message.id)}: the bus already holds a reply; not re-running it`)
+      audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `already answered on the bus; not re-run [${bridge.state.name}]`, messageId: message.id })
+      await this.persistHostState()
+      return
+    }
     log(`turn ${shortId(message.id)} from ${shortId(message.fromSessionId)} on "${bridge.state.name}"`)
     const expects = message.replyTo === undefined && message.expectReply !== false
     // Record the inbound before the turn: a turn that emits no command and no
