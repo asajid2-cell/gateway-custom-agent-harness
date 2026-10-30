@@ -456,8 +456,7 @@ export class ChatGptHost {
       const id = threadId.toLowerCase()
       const owner = owners.get(id)
       if (!owner) { owners.set(id, bridge); continue }
-      bridge.state.threadId = null
-      bridge.state.primedThreadId = null
+      this.setThread(bridge, null)
       await this.persistBridgeState(bridge)
       audit(this.hostState, { op: 'thread', target: threadId, result: `detached bridge "${bridge.state.name}": thread already owned by "${owner.state.name}"` })
       log(`detached bridge "${bridge.state.name}": thread ${shortId(threadId)} is already owned by "${owner.state.name}"`)
@@ -957,8 +956,7 @@ export class ChatGptHost {
   private async operatorThread(bridge: Bridge, body: Record<string, unknown>): Promise<string> {
     const action = String(body.action ?? '')
     if (action === 'new') {
-      bridge.state.threadId = null
-      bridge.state.primedThreadId = null
+      this.setThread(bridge, null)
       await this.persistBridgeState(bridge)
       return 'next turn starts a new thread and re-posts the primer'
     }
@@ -972,11 +970,10 @@ export class ChatGptHost {
       if (reply.ok !== true) throw new Error(String(reply.error ?? 'could not open thread'))
       const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
       if (landed.toLowerCase() !== threadId.toLowerCase()) throw new Error(`the page opened ${landed || 'another thread'} instead of ${threadId}`)
-      bridge.state.threadId = threadId
       // This thread's history was not primed by this host, so the sha recorded
-      // for the previous thread says nothing about it. Clearing the mark makes
-      // the next turn post the primer into it before honouring a command.
-      bridge.state.primedThreadId = null
+      // for the previous thread says nothing about it, and none of the old
+      // thread's cursor, node ids or dedup set describe it either.
+      this.setThread(bridge, threadId)
       await this.persistBridgeState(bridge)
       return `using thread ${threadId}; the primer is re-posted on the next turn`
     }
@@ -1024,9 +1021,12 @@ export class ChatGptHost {
       landed: async threadId => {
         if (!UUID.test(threadId)) throw new Error('the page did not return a thread id for the primer')
         if (selected && threadId.toLowerCase() !== selected.toLowerCase()) throw new Error(threadGone(selected, threadId))
+        // A first send into a new chat IS a thread change; anything it could
+        // have carried belongs to the old conversation. A re-post into the
+        // SAME thread is not, and keeps its history and cursor.
+        if (state.threadId !== threadId) this.setThread(bridge, threadId)
         // Written down in memory before the attribution read: a new thread's
         // id is the address that read must target.
-        state.threadId = threadId
         state.primedThreadId = threadId
         state.primerSha256 = this.primer.sha
       },
@@ -1066,8 +1066,7 @@ export class ChatGptHost {
         }
         if (threadId !== requested) {
           // Only reachable when there was no thread to begin with: a new chat.
-          bridge.state.threadId = threadId
-          bridge.state.primedThreadId = null
+          this.setThread(bridge, threadId)
           await this.persistBridgeState(bridge)
         }
       },
@@ -1433,6 +1432,28 @@ export class ChatGptHost {
       if (bridge.state.threadId && bridge.state.threadId.toLowerCase() === id) return bridge
     }
     return undefined
+  }
+
+  /**
+   * Bind a bridge to a thread and drop everything scoped to the old one.
+   *
+   * The cursor, `ourNodeIds`, pending attributions and the uplink dedup set all
+   * name nodes of ONE conversation. Carried across a switch they make the next
+   * look start at another thread's cursor (skipping turns or replaying
+   * history), read another thread's nodes as ours, and refuse a fresh answer
+   * because an unrelated node id already looked relayed. `new`, `use` and a
+   * first send into a fresh chat all pass through here, so they cannot diverge.
+   */
+  private setThread(bridge: Bridge, threadId: string | null): void {
+    const state = bridge.state
+    state.threadId = threadId
+    state.primedThreadId = null
+    state.primerSha256 = null
+    state.cursor = null
+    state.ourNodeIds = []
+    state.pendingAttribution = []
+    state.uplinkNodeIds = []
+    state.threadMissingAt = null
   }
 
   /**
@@ -2040,8 +2061,7 @@ export class ChatGptHost {
           throw new Error(threadGone(requested, threadId))
         }
         if (threadId !== requested) {
-          bridge.state.threadId = threadId
-          bridge.state.primedThreadId = null
+          this.setThread(bridge, threadId)
           await this.persistBridgeState(bridge)
         }
       },

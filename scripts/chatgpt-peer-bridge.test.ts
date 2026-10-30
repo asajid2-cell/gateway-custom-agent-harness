@@ -1197,6 +1197,61 @@ describe('one live bridge per thread', () => {
   })
 })
 
+describe('thread-scoped state resets when the thread changes', () => {
+  /** A bridge carrying every thread-scoped field, so a switch has something to leave behind. */
+  const stale = (): BridgeState => {
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.cursor = 'node-of-thread-a'
+    alpha.ourNodeIds = ['our-node-of-thread-a']
+    alpha.pendingAttribution = [{ text: 'sent into A', sentAt: new Date().toISOString(), threadId: THREAD_A }]
+    alpha.uplinkNodeIds = ['relayed-node-of-thread-a']
+    alpha.threadMissingAt = new Date().toISOString()
+    return alpha
+  }
+
+  const expectFreshThread = (stored: BridgeState, threadId: string | null): void => {
+    expect(stored.threadId).toBe(threadId)
+    expect(stored.primedThreadId).toBeNull()
+    expect(stored.cursor).toBeNull()
+    expect(stored.ourNodeIds).toEqual([])
+    expect(stored.pendingAttribution).toEqual([])
+    expect(stored.uplinkNodeIds).toEqual([])
+    expect(stored.threadMissingAt).toBeNull()
+  }
+
+  test('thread use drops the old thread\'s cursor, node ids, pending sends and uplink dedup set', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = stale()
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'thread', bridge: alpha.sessionId, action: 'use', threadId: THREAD_B })
+      expect(result.status).toBe(200)
+      expectFreshThread(await readBridge(dir, alpha.sessionId), THREAD_B)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('thread new drops the old thread\'s cursor, node ids, pending sends and uplink dedup set', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = stale()
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'thread', bridge: alpha.sessionId, action: 'new' })
+      expect(result.status).toBe(200)
+      expectFreshThread(await readBridge(dir, alpha.sessionId), null)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 describe('thread uplink', () => {
   /** A bridged thread whose page answers a HUMAN TURN prompt with a real nonce. */
   async function uplinkHost(dir: string, driver: FakeDriver, prepare?: (bridge: BridgeState) => void): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
