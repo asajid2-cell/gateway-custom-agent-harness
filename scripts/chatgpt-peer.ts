@@ -2803,40 +2803,61 @@ export class ChatGptHost {
     const wanted = Array.isArray(block.files)
       ? block.files.filter(value => typeof value === 'number' && Number.isInteger(value) && value >= 0).slice(0, OUTBOX_MAX_FILES)
       : []
-    const collected = wanted.length > 0
-      ? await this.collectFiles(bridge, nodeId, wanted)
-      : { nodeId, files: [] as { index: number; path: string; bytes: number; sha256: string; name: string }[], refused: [] as string[] }
-    const filesBlock = collected.files.length > 0
-      ? `\n\nFILES (${collected.files.length}):\n${collected.files.map(file => filesLine(file.path, file.bytes, file.sha256)).join('\n')}`
-      : ''
-    const refusedBlock = collected.refused.length > 0 ? `\n\nFILES REFUSED: ${collected.refused.join('; ')}` : ''
-    // The cap applies to the WHOLE outbound message - text, stamp, file list and
-    // refusals - and it is checked before the node is written down, so an
-    // oversized delivery burns nothing.
-    const outbound = sanitizePeerText(`${stamp}\n\n${body}${filesBlock}${refusedBlock}`)
-    if (Buffer.byteLength(outbound, 'utf8') > MAX_MESSAGE_BYTES) {
-      // Clean up the files written to the outbox; without this a retry fails
-      // with 'exists' forever because the driver uses flag:'wx'.
-      await Promise.all(collected.files.map(file => rm(file.path, { force: true }).catch(() => {})))
-      return this.refuseUplink(bridge, nodeId, `text, provenance stamp and file list are ${Buffer.byteLength(outbound, 'utf8')} bytes; exceeds 64 KiB`)
-    }
-    // Written down BEFORE the send (at-most-once): a crash from here to the bus
-    // receipt loses this one uplink rather than posting it twice on restart.
-    bridge.state.uplinkNodeIds = [...bridge.state.uplinkNodeIds, nodeId].slice(-200)
-    // The same durable ledger the operator path uses: an uplink-delivered file
-    // counts against the node's cumulative cap and is deduped exactly like one
-    // requested through `files` (N3).
-    this.recordDelivered(bridge, nodeId, collected.files.map(file => ({ index: file.index, bytes: file.bytes })))
-    await this.persistBridgeState(bridge, true)
-    audit(this.hostState, { op: 'uplink', target: resolved.sessionId, result: `recorded before send; a crash here loses this uplink rather than posting it twice [${bridge.state.name}]` })
-    await this.persistHostState()
+    // Collection and reservation are ONE serial section per bridge, under the
+    // same delivery lock the operator path uses: a page-pushed file and an
+    // operator-requested file for the same (nodeId, index) must not both pass
+    // the dedup check before either records it.
+    //
+    // Lock order is fixed at pageLock -> deliveryLock: relayUplink already runs
+    // inside pageLock, and the operator path takes only the delivery lock and
+    // never reaches for pageLock, so no cycle can form.
+    //
+    // The bus send itself is deliberately OUTSIDE the lock: transport.send
+    // persists bus state and fires onInboxChanged, which can reach a delivery
+    // through the drain path, and holding a non-reentrant mutex across a
+    // callback that may re-enter it would wedge the bridge. It also avoids
+    // making an operator `files` read wait on somebody else's bus latency. What
+    // the lock protects - the dedup decision and the ledger write - is done
+    // before the send.
+    const outcome = await this.deliveryLockFor(bridge).run(async (): Promise<{ refusal: string } | { outbound: string; sessionId: string }> => {
+      const collected = wanted.length > 0
+        ? await this.collectFiles(bridge, nodeId, wanted)
+        : { nodeId, files: [] as { index: number; path: string; bytes: number; sha256: string; name: string }[], refused: [] as string[] }
+      const filesBlock = collected.files.length > 0
+        ? `\n\nFILES (${collected.files.length}):\n${collected.files.map(file => filesLine(file.path, file.bytes, file.sha256)).join('\n')}`
+        : ''
+      const refusedBlock = collected.refused.length > 0 ? `\n\nFILES REFUSED: ${collected.refused.join('; ')}` : ''
+      // The cap applies to the WHOLE outbound message - text, stamp, file list and
+      // refusals - and it is checked before the node is written down, so an
+      // oversized delivery burns nothing.
+      const outbound = sanitizePeerText(`${stamp}\n\n${body}${filesBlock}${refusedBlock}`)
+      if (Buffer.byteLength(outbound, 'utf8') > MAX_MESSAGE_BYTES) {
+        // Clean up the files written to the outbox; without this a retry fails
+        // with 'exists' forever because the driver uses flag:'wx'.
+        await Promise.all(collected.files.map(file => rm(file.path, { force: true }).catch(() => {})))
+        return { refusal: `text, provenance stamp and file list are ${Buffer.byteLength(outbound, 'utf8')} bytes; exceeds 64 KiB` }
+      }
+      // Written down BEFORE the send (at-most-once): a crash from here to the bus
+      // receipt loses this one uplink rather than posting it twice on restart.
+      bridge.state.uplinkNodeIds = [...bridge.state.uplinkNodeIds, nodeId].slice(-200)
+      // The same durable ledger the operator path uses: an uplink-delivered file
+      // counts against the node's cumulative cap and is deduped exactly like one
+      // requested through `files` (N3).
+      this.recordDelivered(bridge, nodeId, collected.files.map(file => ({ index: file.index, bytes: file.bytes })))
+      await this.persistBridgeState(bridge, true)
+      audit(this.hostState, { op: 'uplink', target: resolved.sessionId, result: `recorded before send; a crash here loses this uplink rather than posting it twice [${bridge.state.name}]` })
+      await this.persistHostState()
+      return { outbound, sessionId: resolved.sessionId }
+    })
+    if ('refusal' in outcome) return this.refuseUplink(bridge, nodeId, outcome.refusal)
+    const { outbound, sessionId } = outcome
     try {
-      const receipt = await transport.send(resolved.sessionId, outbound, summary, undefined, 'inquiry', false) as { id?: string; state?: string }
+      const receipt = await transport.send(sessionId, outbound, summary, undefined, 'inquiry', false) as { id?: string; state?: string }
       bridge.state.uplinkTimes = [...bridge.state.uplinkTimes, now()].slice(-50)
       await this.persistBridgeState(bridge)
-      audit(this.hostState, { op: 'uplink', target: resolved.sessionId, result: `sent ${receipt.id ?? '?'} to ${resolved.label}: ${receipt.state ?? 'queued'} [${bridge.state.name}]` })
+      audit(this.hostState, { op: 'uplink', target: sessionId, result: `sent ${receipt.id ?? '?'} to ${resolved.label}: ${receipt.state ?? 'queued'} [${bridge.state.name}]` })
     } catch (error) {
-      audit(this.hostState, { op: 'uplink', target: resolved.sessionId, result: `failed: ${one((error as Error).message, 200)} [${bridge.state.name}]` })
+      audit(this.hostState, { op: 'uplink', target: sessionId, result: `failed: ${one((error as Error).message, 200)} [${bridge.state.name}]` })
     }
     await this.persistHostState()
   }
