@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { attachmentRefusal, extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { audit, loadState, newState, peerStateSchema, saveState } from './chatgpt-peer/state.ts'
+import { audit, listBridgeStates, loadState, newBridgeState, newState, peerStateSchema, saveJson, saveState } from './chatgpt-peer/state.ts'
 import { DriverChild } from './chatgpt-peer/driver.ts'
 import { ChatGptHost } from './chatgpt-peer.ts'
 
@@ -468,6 +468,27 @@ describe('state', () => {
       await Promise.all([saveState(path, older), saveState(path, newer)])
       const loaded = await loadState(path, () => { throw new Error('should not be used') })
       expect(loaded.model).toBe('newer')
+    } finally { await cleanup() }
+  })
+
+  // F8: one unreadable or misnamed bridge file used to abort the whole list,
+  // so a single truncated file stopped every healthy bridge from registering.
+  test('F8: an invalid bridge file is quarantined and healthy bridges still load', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const alpha = newBridgeState({ sessionId: '11111111-1111-4111-8111-111111111111', name: 'alpha' })
+      const beta = newBridgeState({ sessionId: '22222222-2222-4222-8222-222222222222', name: 'beta' })
+      await saveJson(join(dir, `${alpha.sessionId}.json`), alpha)
+      await saveJson(join(dir, `${beta.sessionId}.json`), beta)
+      // A truncated write and a file named for a different session.
+      const truncated = join(dir, '33333333-3333-4333-8333-333333333333.json')
+      await writeFile(truncated, '{"sessionId": "trunc', 'utf8')
+      const misnamed = join(dir, '44444444-4444-4444-8444-444444444444.json')
+      await saveJson(misnamed, { ...alpha, sessionId: '55555555-5555-4555-8555-555555555555' })
+      const problems: string[] = []
+      const states = await listBridgeStates(dir, problem => problems.push(problem.path))
+      expect(states.map(entry => entry.state.name).sort()).toEqual(['alpha', 'beta'])
+      expect(problems.sort()).toEqual([misnamed, truncated].sort())
     } finally { await cleanup() }
   })
 
