@@ -127,9 +127,25 @@ export type HostState = z.infer<typeof hostStateSchema>
  * every read, and a node's index order never changes, so `(nodeId, index)` is
  * what makes a file at-most-once. It is written BEFORE the bus send.
  */
-export const deliveredFileSchema = z.object({ nodeId: z.string().max(64), index: z.number().int().min(0) }).strict()
+export const deliveredFileSchema = z.object({ nodeId: z.string().max(64), index: z.number().int().min(0), bytes: z.number().int().min(0).default(0) }).strict()
 
 export const DELIVERED_FILES_MAX = 200
+
+/**
+ * A durable receipt for one model command, written BEFORE the side effect.
+ *
+ * Keyed by `${messageId}:${sha256(commandWithoutNonce)}` so a replay on a
+ * fresh process-local handled set is a no-op: the key is already present and
+ * the dispatch is skipped.
+ */
+export const commandReceiptSchema = z.object({
+  key: z.string().max(200),
+  line: z.string().max(500),
+  replied: z.boolean().default(false),
+  repliedTo: z.string().max(80).optional(),
+}).strict()
+
+export const COMMAND_RECEIPTS_MAX = 200
 
 /**
  * An inbound turn the host has posted but not yet answered (D5b).
@@ -219,6 +235,13 @@ export const bridgeStateSchema = z.object({
   pendingTurns: z.array(pendingTurnSchema).max(PENDING_TURNS_MAX).default([]),
   /** Turn keys already answered, written BEFORE the reply goes out. */
   answeredTurns: z.array(z.string().max(80)).max(ANSWERED_TURNS_MAX).default([]),
+  /**
+   * Durable receipts for model commands, written BEFORE their side effects.
+   *
+   * A replay on a fresh process-local handled set finds the key here and skips
+   * the dispatch, making every model command at-most-once across host restarts.
+   */
+  commandReceipts: z.array(commandReceiptSchema).max(COMMAND_RECEIPTS_MAX).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -284,6 +307,7 @@ export function newBridgeState(options: {
     deliveredFiles: [],
     pendingTurns: [],
     answeredTurns: [],
+    commandReceipts: [],
   }
 }
 
@@ -309,6 +333,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     deliveredFiles: [],
     pendingTurns: [],
     answeredTurns: [],
+    commandReceipts: [],
   }
 }
 

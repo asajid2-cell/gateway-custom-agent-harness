@@ -27,13 +27,24 @@ export type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => voi
 
 /**
  * How long a graceful shutdown lets an in-progress page operation run before
- * the child is forced. The floor is the old short grace when nothing is in
- * flight; the ceiling stops a very long page-turn budget (the host's default is
- * 20 minutes) from holding a shutdown open indefinitely. terminate() is the
- * always-forced path.
+ * the child is forced. The drain honours the in-flight operation's own
+ * deadline, so a twenty-minute page turn is not cut short. When nothing is in
+ * flight the floor keeps a wedged child from holding a shutdown open
+ * indefinitely. terminate() is the always-forced path.
  */
 const MIN_DRAIN_MS = 10_000
-const MAX_DRAIN_MS = 5 * 60_000
+
+/**
+ * How long a graceful drain may run: the latest in-flight operation's own
+ * deadline, floored at MIN_DRAIN_MS when nothing is in flight. A fixed
+ * five-minute ceiling used to cut a twenty-minute page turn in half; the
+ * operation's deadline is already bounded, so it is the bound. A deadline
+ * that has already passed falls back to the floor rather than never firing.
+ */
+export function drainGraceMs(latestDeadline: number, nowMs: number = Date.now()): number {
+  if (!(latestDeadline > 0)) return MIN_DRAIN_MS
+  return Math.max(MIN_DRAIN_MS, latestDeadline - nowMs)
+}
 
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
@@ -260,7 +271,7 @@ export class DriverChild {
     this.closed = true
     if (!child || child.exitCode !== null) return
     const latest = [...this.deadlines.values()].reduce((max, at) => Math.max(max, at), 0)
-    const grace = Math.max(MIN_DRAIN_MS, Math.min(latest - Date.now(), MAX_DRAIN_MS))
+    const grace = drainGraceMs(latest, Date.now())
     await new Promise<void>(resolve => {
       const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } ; resolve() }, grace)
       child.once('exit', () => { clearTimeout(timer); resolve() })
