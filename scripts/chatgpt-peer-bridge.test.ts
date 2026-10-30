@@ -854,3 +854,96 @@ describe('multi-bridge host', () => {
     }
   })
 })
+
+describe('host defects', () => {
+  test('the page is never unloaded on idle by default, and a stored idle policy does not outlive the config', async () => {
+    const { resolveConfig } = await import('./chatgpt-peer.ts')
+    const saved = process.env.CHATGPT_WEB_IDLE_MINUTES
+    delete process.env.CHATGPT_WEB_IDLE_MINUTES
+    try { expect(resolveConfig({}).idleUnloadMinutes).toBe(0) }
+    finally { if (saved !== undefined) process.env.CHATGPT_WEB_IDLE_MINUTES = saved }
+
+    const { dir, cleanup } = await scratch()
+    await mkdir(join(dir, 'bridges'), { recursive: true })
+    await saveJson(join(dir, 'peer.json'), newHostState({ profile: profileDir(dir), healthPort: 0, idleUnloadMinutes: 20, instanceId: 'test' }))
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      expect(JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')).idleUnloadMinutes).toBe(0)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a scheduled wake extracts commands from the page read, never the send text', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.schedules = [{ label: 'wake', at: new Date(Date.now() - 1000).toISOString() }]
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.sendText = 'Noted.' // the post-time text carries no command
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      return text.includes('SCHEDULED WAKE') && nonce ? `On it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-wake-read', inSeconds: 600 })}` : 'Done.'
+    }
+    const host = await startHost(dir, driver)
+    try {
+      const stored = await waitFor(async () => {
+        const bridge = await readBridge(dir, alpha.sessionId)
+        return bridge.schedules.some(schedule => schedule.label === 'from-wake-read') ? bridge : undefined
+      })
+      expect(stored.schedules.map(schedule => schedule.label)).not.toContain('wake')
+      expect(driver.readCalls).toBeGreaterThanOrEqual(1)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an upload that lands on another thread fails instead of moving the bridge', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const file = join(dir, 'note.txt')
+      await Bun.write(file, 'hello')
+      driver.landOn = THREAD_B
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(result.status).toBe(500)
+      expect(String(result.body.error)).toBe(`the ChatGPT thread ${THREAD_A} is no longer reachable: the page landed on ${THREAD_B}; ${THREAD_RECOVERY}`)
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(stored.primedThreadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('with two bridges, an op that names no bridge is refused instead of acting on the first', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_B)
+    await seedHost(dir, [alpha, beta])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'prompt', text: 'hello' })
+      expect(result.status).toBe(400)
+      expect(String(result.body.error)).toBe('2 bridges are configured; name one with bridge')
+      expect(driver.calls.filter(call => call.op === 'send')).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})

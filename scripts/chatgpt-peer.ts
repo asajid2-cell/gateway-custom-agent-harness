@@ -113,7 +113,7 @@ function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
   return config
 }
 
-function resolveConfig(partial: Partial<Config>): Config {
+export function resolveConfig(partial: Partial<Config>): Config {
   const home = partial.home ?? join(homedir(), 'chatgpt-web')
   return {
     home,
@@ -122,7 +122,7 @@ function resolveConfig(partial: Partial<Config>): Config {
     profile: partial.profile ?? process.env.CHATGPT_WEB_PROFILE ?? join(PRIVATE_HOME, 'profile'),
     instanceId: partial.instanceId ?? process.env.CHATGPT_WEB_INSTANCE ?? 'default',
     healthPort: Number.isFinite(partial.healthPort) ? Number(partial.healthPort) : Number(process.env.CHATGPT_WEB_HEALTH_PORT ?? 0),
-    idleUnloadMinutes: Number.isFinite(partial.idleUnloadMinutes) ? Number(partial.idleUnloadMinutes) : Number(process.env.CHATGPT_WEB_IDLE_MINUTES ?? 20),
+    idleUnloadMinutes: Number.isFinite(partial.idleUnloadMinutes) ? Number(partial.idleUnloadMinutes) : Number(process.env.CHATGPT_WEB_IDLE_MINUTES ?? 0),
     number: Number.isFinite(partial.number) && Number(partial.number) > 0 ? Number(partial.number) : 1,
   }
 }
@@ -221,6 +221,10 @@ export class ChatGptHost {
       instanceId: this.config.instanceId,
     }))
     this.hostState = loaded.state
+    // The idle policy is the launch's, not the file's: a value stored by an
+    // older build (20 minutes) would otherwise keep closing a window the user
+    // is looking at, whatever --idle-minutes says now.
+    this.hostState.idleUnloadMinutes = this.config.idleUnloadMinutes
     // One host file is one instance. Launching it under a different slug would
     // put two hosts behind one session id, so it is refused rather than
     // rewritten; the fix is a different --state file, not a silent rename.
@@ -343,11 +347,19 @@ export class ChatGptHost {
     catch (error) { log(`could not re-advertise "${bridge.state.name}": ${(error as Error).message}`) }
   }
 
-  /** Resolve a bridge by session id or name; no selector means the first one. */
-  private bridgeFor(value: unknown): Bridge | undefined {
+  /**
+   * Resolve a bridge by session id or name, or say why not. No selector is
+   * accepted only when there is exactly one bridge: with two, "the first" is
+   * an accident of directory order and would act on the wrong thread.
+   */
+  private bridgeFor(value: unknown): Bridge | string {
     const key = typeof value === 'string' ? value.trim() : ''
-    if (!key) return this.bridges.values().next().value as Bridge | undefined
-    return this.bridges.get(key) ?? [...this.bridges.values()].find(bridge => bridge.state.name === key)
+    if (!key) {
+      if (this.bridges.size === 0) return 'no bridges are configured; adopt a thread or create one first'
+      if (this.bridges.size > 1) return `${this.bridges.size} bridges are configured; name one with bridge`
+      return this.bridges.values().next().value as Bridge
+    }
+    return this.bridges.get(key) ?? [...this.bridges.values()].find(bridge => bridge.state.name === key) ?? 'unknown bridge'
   }
 
   private nameTaken(name: string): boolean {
@@ -664,19 +676,14 @@ export class ChatGptHost {
       }
       if (op === 'remove') {
         const bridge = this.bridgeFor(body.sessionId ?? body.name ?? body.bridge)
-        if (!bridge) return this.send(response, 400, { ok: false, error: 'no such bridge' })
+        if (typeof bridge === 'string') return this.send(response, 400, { ok: false, error: bridge })
         const line = await this.removeBridge(bridge)
         return this.send(response, 200, { ok: true, op, line })
       }
 
       // --- everything below acts through one bridge --------------------------
       const bridge = this.bridgeFor(body.bridge)
-      if (!bridge) {
-        return this.send(response, 400, {
-          ok: false,
-          error: this.bridges.size === 0 ? 'no bridges are configured; adopt a thread or create one first' : 'unknown bridge',
-        })
-      }
+      if (typeof bridge === 'string') return this.send(response, 400, { ok: false, error: bridge })
       if (op === 'prompt') {
         const text = one(body.text, 64 * 1024)
         if (!text) return this.send(response, 400, { ok: false, error: 'prompt requires text' })
@@ -1463,9 +1470,12 @@ export class ChatGptHost {
       throw new Error(`the page rejected ${name}: ${reason}`)
     }
     const threadId = typeof reply.threadId === 'string' ? reply.threadId : ''
-    if (threadId && threadId !== bridge.state.threadId) {
-      // The page landed in a different thread from the primed one, so that
-      // thread has never seen the primer.
+    const requested = bridge.state.threadId
+    if (requested && threadId && threadId.toLowerCase() !== requested.toLowerCase()) {
+      // Same rule as pageTurn: an upload never moves the bridge.
+      throw new Error(threadGone(requested, threadId))
+    }
+    if (threadId && !requested) {
       bridge.state.threadId = threadId
       bridge.state.primedThreadId = null
       await this.persistBridgeState(bridge)
@@ -1693,8 +1703,10 @@ export class ChatGptHost {
         ].join('\n')
         await runCommandTurn(prompt, turnNonce, {
           generate: async subject => {
-            try { return { ok: true, text: await this.pageTurn(bridge, subject) } }
-            catch (error) { return { ok: false, error: (error as Error).message } }
+            try {
+              const sent = await this.pageTurn(bridge, subject)
+              return { ok: true, text: await this.readCompletedAnswer(bridge, sent) }
+            } catch (error) { return { ok: false, error: (error as Error).message } }
           },
           execute: command => this.executeCommand(bridge, command, 'model'),
         })
