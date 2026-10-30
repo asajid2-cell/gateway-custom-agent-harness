@@ -739,6 +739,45 @@ setTimeout(() => process.exit(0), 3000)
     } finally { await child.kill(); await cleanup() }
   })
 
+  // F6: a request timeout used to remove only the host-side waiter while the
+  // child stayed stuck on that operation, so every later call queued behind it
+  // and timed out too. Recovery replaces the child and records the
+  // accepted-but-unfinished work explicitly.
+  test('F6: a timed-out operation is abandoned and the child replaced', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'stuck.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+let chain = Promise.resolve()
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); setTimeout(() => process.exit(0), 50); return }
+  chain = chain.then(() => new Promise(resolve => {
+    if (request.op === 'stuck') { emit({ event: 'accepted', id: request.id }); return }
+    emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+    resolve()
+  }))
+})
+`, 'utf8')
+    const lines: string[] = []
+    const child = new DriverChild({ script, log: line => lines.push(line) })
+    try {
+      // Warm the child so spawn cost is not inside the stuck request's window.
+      expect((await child.call({ op: 'ping' })).ok).toBe(true)
+      const stuck = await child.call({ op: 'stuck' }, 150)
+      expect(stuck.ok).toBe(false)
+      expect(stuck.error).toMatch(/timed out/)
+      // The child was stuck on the first operation; a fresh one must answer.
+      const next = await child.call({ op: 'send', text: 'after' }, 2000)
+      expect(next.ok).toBe(true)
+      expect(next.text).toBe('echo:after')
+      expect(lines.join('\n')).toMatch(/accepted but unfinished: r\d+/)
+    } finally { await child.kill(); await cleanup() }
+  })
+
   test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
     const { dir, cleanup } = await scratch()
     const script = join(dir, 'slow-driver.js')

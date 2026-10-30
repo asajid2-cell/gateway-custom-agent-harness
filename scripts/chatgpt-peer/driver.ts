@@ -41,6 +41,12 @@ export class DriverChild {
    * whoever happens to be waiting now.
    */
   private readonly acceptors = new Map<string, (id: string) => void>()
+  /**
+   * Requests the page told us it took, by id and by the child generation that
+   * took them. Used to name the work a timeout recovery abandons; an id leaves
+   * this set when it is settled or its child exits.
+   */
+  private readonly accepted = new Map<string, number>()
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
@@ -94,6 +100,9 @@ export class DriverChild {
         waiter.finish({ ok: false, id, error: reason })
         this.acceptors.delete(id)
       }
+      for (const [id, acceptedGeneration] of [...this.accepted]) {
+        if (acceptedGeneration === generation) this.accepted.delete(id)
+      }
     })
     child.stdin.on('error', () => {})
     this.child = child
@@ -125,6 +134,9 @@ export class DriverChild {
     const event = typeof message.event === 'string' ? message.event : ''
     if (event) {
       if (event === 'accepted') {
+        // Remember acceptance even without a callback: it is what the timeout
+        // recovery has to account for as accepted-but-unfinished work.
+        if (id) this.accepted.set(id, generation)
         const accept = id ? this.acceptors.get(id) : undefined
         if (!accept) {
           this.log(`driver: accepted for ${id || 'no id'} has no live waiter; dropped`)
@@ -173,10 +185,13 @@ export class DriverChild {
         clearTimeout(timer)
         if (!this.pending.delete(id)) return
         this.acceptors.delete(id)
+        this.accepted.delete(id)
         resolve(reply)
       }
       const timer = setTimeout(() => {
+        const wasAccepted = this.accepted.has(id)
         finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        this.recover(generation, id, wasAccepted)
       }, timeoutMs)
       this.pending.set(id, { generation, finish })
       if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)
@@ -185,6 +200,34 @@ export class DriverChild {
         finish({ ok: false, id, error: `could not write to the driver: ${error.message}` })
       })
     })
+  }
+
+  /**
+   * Abandon the child a timed-out operation was monopolising.
+   *
+   * The host-side waiter alone was removed before, so the child kept working on
+   * an operation nobody would read and every later request queued behind it. A
+   * timeout now replaces that child: the abandoned work is named in the log
+   * (accepted-but-unfinished ids), the generation is left behind so its late
+   * lines and exit cannot touch the replacement, and any other waiter of the
+   * same generation is failed rather than left to time out behind the stuck op.
+   */
+  private recover(generation: number, timedOutId: string, wasAccepted: boolean): void {
+    if (generation !== this.generation) return
+    const child = this.child
+    const unfinished = [
+      ...(wasAccepted ? [timedOutId] : []),
+      ...[...this.accepted].filter(([id, at]) => at === generation && id !== timedOutId).map(([id]) => id),
+    ]
+    this.log(`driver: ${timedOutId} timed out; replacing the child (accepted but unfinished: ${unfinished.join(', ') || 'none'})`)
+    this.child = undefined
+    if (child && child.exitCode === null) { try { child.kill() } catch { /* already gone */ } }
+    const reason = `driver was replaced after ${timedOutId} timed out`
+    for (const [id, waiter] of [...this.pending]) {
+      if (waiter.generation !== generation) continue
+      waiter.finish({ ok: false, id, error: reason })
+    }
+    for (const [id, at] of [...this.accepted]) if (at === generation) this.accepted.delete(id)
   }
 
   /** Stop the child and, with it, the page. */
