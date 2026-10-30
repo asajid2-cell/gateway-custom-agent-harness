@@ -25,6 +25,16 @@ export type DriverReply = { ok: boolean; op?: string; id?: string; [key: string]
 export type DriverEvent = { event: string; [key: string]: unknown }
 export type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => void }
 
+/**
+ * How long a graceful shutdown lets an in-progress page operation run before
+ * the child is forced. The floor is the old short grace when nothing is in
+ * flight; the ceiling stops a very long page-turn budget (the host's default is
+ * 20 minutes) from holding a shutdown open indefinitely. terminate() is the
+ * always-forced path.
+ */
+const MIN_DRAIN_MS = 10_000
+const MAX_DRAIN_MS = 5 * 60_000
+
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
   /**
@@ -47,6 +57,8 @@ export class DriverChild {
    * this set when it is settled or its child exits.
    */
   private readonly accepted = new Map<string, number>()
+  /** When each in-flight request's own deadline falls, for a graceful drain. */
+  private readonly deadlines = new Map<string, number>()
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
@@ -186,6 +198,7 @@ export class DriverChild {
         if (!this.pending.delete(id)) return
         this.acceptors.delete(id)
         this.accepted.delete(id)
+        this.deadlines.delete(id)
         resolve(reply)
       }
       const timer = setTimeout(() => {
@@ -194,6 +207,7 @@ export class DriverChild {
         this.recover(generation, id, wasAccepted)
       }, timeoutMs)
       this.pending.set(id, { generation, finish })
+      this.deadlines.set(id, Date.now() + timeoutMs)
       if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)
       child.stdin.write(`${JSON.stringify({ ...request, id })}\n`, error => {
         if (!error) return
@@ -230,18 +244,36 @@ export class DriverChild {
     for (const [id, at] of [...this.accepted]) if (at === generation) this.accepted.delete(id)
   }
 
-  /** Stop the child and, with it, the page. */
+  /**
+   * Graceful shutdown: refuse new work, detach the child so a later reopen()
+   * starts a new generation, ask it to quit, and let an in-flight page
+   * operation reach its own bounded deadline before forcing it. A fixed 10 s
+   * forced kill used to cut a page turn short mid-operation.
+   */
   async kill(): Promise<void> {
     const child = this.child
     this.child = undefined
     this.closed = true
     if (!child || child.exitCode !== null) return
+    const latest = [...this.deadlines.values()].reduce((max, at) => Math.max(max, at), 0)
+    const grace = Math.max(MIN_DRAIN_MS, Math.min(latest - Date.now(), MAX_DRAIN_MS))
     await new Promise<void>(resolve => {
-      // The child refuses new requests and lets its queue drain before it
-      // quits, so the budget here is larger than a single page turn.
-      const timer = setTimeout(() => { child.kill(); resolve() }, 10_000)
+      const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } ; resolve() }, grace)
       child.once('exit', () => { clearTimeout(timer); resolve() })
-      try { child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`) } catch { child.kill() }
+      try { child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`) } catch { try { child.kill() } catch { /* already gone */ }; resolve() }
+    })
+    if (this.child === child) this.child = undefined
+  }
+
+  /** Forced shutdown: kill now, ignoring any operation's deadline. */
+  async terminate(): Promise<void> {
+    this.closed = true
+    const child = this.child
+    this.child = undefined
+    if (!child || child.exitCode !== null) return
+    await new Promise<void>(resolve => {
+      child.once('exit', () => resolve())
+      try { child.kill() } catch { resolve() }
     })
   }
 

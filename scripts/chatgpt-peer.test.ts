@@ -778,6 +778,73 @@ rl.on('line', line => {
     } finally { await child.kill(); await cleanup() }
   })
 
+  // F7: kill() forced the child after a fixed 10 s even when quit was queued
+  // behind a page operation whose own deadline was longer. Shutdown waits for
+  // that operation's bounded deadline; a separate terminate() is the forced
+  // path.
+  test('F7: kill waits for an in-progress operation instead of forcing at 10s', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'slowquit.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+let quitting = false
+let finished = false
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { quitting = true; if (finished) process.exit(0); return }
+  if (request.op === 'wait') {
+    setTimeout(() => {
+      emit({ ok: true, op: 'wait', id: request.id, text: 'done' })
+      finished = true
+      if (quitting) process.exit(0)
+    }, 11_000)
+    return
+  }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      const pending = child.call({ op: 'wait' }, 30_000)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      await child.kill()
+      const reply = await pending
+      expect(reply.ok).toBe(true)
+      expect(reply.text).toBe('done')
+    } finally { await child.kill(); await cleanup() }
+  }, 30_000)
+
+  test('F7: terminate is the forced path and does not wait for a deadline', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'ignorequit.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') return
+  if (request.op === 'wait') { setTimeout(() => process.exit(0), 30_000); return }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+setTimeout(() => process.exit(0), 8000)
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      const pending = child.call({ op: 'wait' }, 60_000)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      const started = Date.now()
+      await child.terminate()
+      // Forced shutdown does not sit on the 60 s request deadline.
+      expect(Date.now() - started).toBeLessThan(5000)
+      expect((await pending).ok).toBe(false)
+    } finally { await child.kill(); await cleanup() }
+  }, 30_000)
+
   test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
     const { dir, cleanup } = await scratch()
     const script = join(dir, 'slow-driver.js')
