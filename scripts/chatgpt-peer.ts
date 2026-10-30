@@ -2764,6 +2764,10 @@ export class ChatGptHost {
       alive()
       acknowledge()
       let seededAnswer = true
+      // The command's ordinal within the turn. Two identical commands differ by
+      // position, so the durable receipt key cannot collapse them; a restart
+      // replay re-runs the same sequence from zero and lands on the same keys.
+      let ordinal = 0
       const outcome = await runCommandTurn(prompt, turnNonce, {
         generate: async subject => {
           try {
@@ -2779,7 +2783,7 @@ export class ChatGptHost {
         },
         execute: command => {
           alive()
-          return this.executeCommand(bridge, command, 'model', message.id)
+          return this.executeCommand(bridge, command, 'model', message.id, ordinal++)
         },
       })
       // The delivery decision is written BEFORE the reply leaves, so a crash
@@ -3094,16 +3098,18 @@ export class ChatGptHost {
    * receipt is written BEFORE the side effect so a replay after a host restart
    * skips the dispatch and returns the recorded result (at-most-once).
    */
-  private async executeCommand(bridge: Bridge, command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
+  private async executeCommand(bridge: Bridge, command: Command, by: 'model' | 'operator', messageId?: string, ordinal = 0): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
     const target = (command as { to?: string }).to ?? null
 
     // Durable idempotency for model commands: compute a key that does NOT
     // include the per-turn nonce (a replay mints a new one) by dropping the
-    // nonce property before hashing.
+    // nonce property before hashing. The ordinal is the command's position in
+    // the turn, so two identical commands in one turn cannot share a key; a
+    // restart replay re-runs the same sequence from zero and reuses the keys.
     if (by === 'model' && messageId !== undefined) {
       const { nonce: _nonce, ...commandWithoutNonce } = command as Command & { nonce?: unknown }
       const json = JSON.stringify(commandWithoutNonce, Object.keys(commandWithoutNonce).sort())
-      const receiptKey = `${messageId}:${createHash('sha256').update(json).digest('hex').slice(0, 32)}`
+      const receiptKey = `${messageId}:${ordinal}:${createHash('sha256').update(json).digest('hex').slice(0, 32)}`
       const existing = bridge.state.commandReceipts.find(entry => entry.key === receiptKey)
       if (existing) {
         // Already ran before a host restart; return the recorded result without

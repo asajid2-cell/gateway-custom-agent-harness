@@ -572,6 +572,49 @@ describe('N4: a refused uplink leaves nothing blocking a retry', () => {
   }, 30_000)
 })
 
+describe('R1-F9 follow-up: the receipt key is positional within the turn', () => {
+  test('a receipt key carries the command ordinal, not just the command identity', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const sender = await busPeer(dir, 'sender')
+    const driver = new FakeDriver()
+    driver.observable = true
+    let minted: string | null = null
+    // Two distinct commands in one answer so both reach the dispatcher; the
+    // ordinal must still appear in each receipt key.
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const found = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      if (found) minted = found
+      if (!text.startsWith('INBOUND from another live session') || !minted) return 'done'
+      const first = rendered({ nonce: minted, op: 'send', to: 'listener', text: 'first' })
+      const second = rendered({ nonce: minted, op: 'send', to: 'listener', text: 'second' })
+      return `${first}\n${second}`
+    }
+    const host = await startHost(dir, driver)
+    try {
+      const inbound = await sender.send(alpha.sessionId, 'two sends', 'two sends', undefined, 'inquiry', true) as { id?: string }
+      await waitFor(() => (listener.inbox().length >= 2 ? true : undefined), 20_000)
+      const bridge = await readBridge(dir, alpha.sessionId) as unknown as { commandReceipts?: { key: string }[] }
+      const receipts = bridge.commandReceipts ?? []
+      expect(receipts.length).toBe(2)
+      // `<messageId>:<ordinal>:<hash>`: the ordinal is the positional component
+      // that keeps command 1 and command 2 apart.
+      const parts = receipts.map(entry => entry.key.split(':'))
+      expect(parts.every(part => part.length === 3)).toBe(true)
+      expect(parts.every(part => part[0] === inbound.id)).toBe(true)
+      expect(parts.map(part => part[1]).sort()).toEqual(['0', '1'])
+    } finally {
+      await sender.close()
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
 describe('N4 follow-up: the retry records the path it actually wrote', () => {
   test('after an exists retry whose reply names no path, the FILES line carries the sibling path', async () => {
     const { dir, cleanup } = await scratch()
