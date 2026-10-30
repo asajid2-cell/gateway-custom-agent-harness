@@ -24,7 +24,7 @@ import { promisify } from 'node:util'
 import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewaySessionTransport.js'
 import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
-import { DriverChild, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
+import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, pathOf, pendingHumanTurns, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
@@ -96,6 +96,8 @@ const OUTBOX_MAX_NODE_BYTES = 32 * 1024 * 1024
 const OUTBOX_MAX_FILES = 5
 /** How often `wait` and the answer loop look at the page. */
 const WAIT_POLL_MS = 2000
+/** How long one conversation read may take. */
+const READ_TIMEOUT_MS = 45_000
 
 /**
  * A page turn that outlived the driver's send budget while still running.
@@ -207,6 +209,8 @@ type Config = {
   turnTimeoutMs?: number
   /** How often a status/answer wait looks at the pushed signal. Tests shorten it. */
   waitPollMs?: number
+  /** How long one conversation read may take. Overridden in tests; never widened. */
+  readTimeoutMs?: number
 }
 
 /** One bridged thread: its durable memory and its live transport. */
@@ -441,6 +445,12 @@ export class ChatGptHost {
 
   /** How often a wait looks at the pushed page signal. */
   private get waitPoll(): number { return this.config.waitPollMs ?? WAIT_POLL_MS }
+
+  /**
+   * How long one conversation read may take. It is the only page read a page
+   * can rate-limit, so it has its own deadline, separate from the turn's.
+   */
+  private get readTimeout(): number { return this.config.readTimeoutMs ?? READ_TIMEOUT_MS }
 
   /** Where the per-bridge files live: one durable file per bus peer. */
   private get bridgeDirectory(): string { return join(this.config.home, 'bridges') }
@@ -1273,6 +1283,13 @@ export class ChatGptHost {
       if (reply.timedOut === true) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
       }
+      // R-LIVE-5: the DRIVER failed this send, not the page. The page may hold
+      // the text, so its state is unproven: leave the turn running and let the
+      // observation pass reconcile it, never report a page refusal (or a model
+      // failure) neither the page nor the model produced.
+      if (isDriverFaultReply(reply)) {
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+      }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
@@ -1306,6 +1323,10 @@ export class ChatGptHost {
     })
     if (reply.ok !== true) {
       if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+      // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
+      if (isDriverFaultReply(reply)) {
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
+      }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
@@ -1379,7 +1400,14 @@ export class ChatGptHost {
     for (;;) {
       if (this.stopping || bridge.stopping) throw new GeneratingTurn(threadId)
       const cheap = await this.cheapStatus(threadId)
-      last = cheap
+      // R-LIVE-5: `unknown` is the driver saying NOTHING (a timeout, a
+      // replacement), not the page saying anything. A failed read is "no
+      // evidence yet": keep the page's last known word, so a driver hiccup
+      // neither erases a live `generating` nor resets this turn's budget, and
+      // the turn ends on its own clock - reported as still generating, never as
+      // a model failure.
+      const known = cheap.state === 'unknown' && last.state !== 'unknown' ? last : cheap
+      last = known
       // R-LIVE-4: progress is the page's own signal MOVING, not the state name.
       // A page that keeps pushing a new signal is working, so the clock is
       // pushed forward. A page that says `generating` while its signal never
@@ -1387,12 +1415,12 @@ export class ChatGptHost {
       // wait, as "still generating", never as a model failure. (Extending on the
       // bare word `generating` would mean a stuck page holds the turn, and
       // every inbound queued behind it, forever.)
-      const mark = `${cheap.state}|${cheap.at ?? ''}|${cheap.phase ?? ''}`
+      const mark = `${known.state}|${known.at ?? ''}|${known.phase ?? ''}`
       if (mark !== progress) {
         progress = mark
         deadline = Date.now() + this.turnTimeout
       }
-      if (cheap.state === 'failed') {
+      if (known.state === 'failed') {
         throw new Error('the page reported a problem: the page rendered a failure message')
       }
       // One conversation read per page signal, not one per poll: the page's
@@ -1400,14 +1428,14 @@ export class ChatGptHost {
       // While the push names another phase, only the slow clock above licenses
       // one - a stale `in_progress` element left behind by an abandoned turn
       // must not pin a finished answer for the whole wait (N2).
-      const key = `${cheap.state}|${cheap.at ?? ""}|${cheap.phase ?? ""}`
-      const idleNow = cheap.state === "idle"
+      const key = mark
+      const idleNow = known.state === "idle"
       // Chronology (N1): an `idle` signal pushed BEFORE this turn was accepted
       // is the previous turn's word, not ours. It may not license the
       // signal-driven read - the last completed answer is still on the branch.
       // The slow clock remains a licence: identity below, not the signal, is
       // what decides which answer is ours.
-      const signalAt = cheap.at ? Date.parse(cheap.at) : Number.NaN
+      const signalAt = known.at ? Date.parse(known.at) : Number.NaN
       const postAccept = !Number.isFinite(hint.acceptedAt)
         || !Number.isFinite(signalAt)
         || signalAt >= (hint.acceptedAt as number) - PENDING_WINDOW_BEFORE_MS
@@ -2038,7 +2066,7 @@ export class ChatGptHost {
    */
   private async readConversation(threadId: string): Promise<{ conversation: Conversation } | { missing: true } | { rateLimited: true } | undefined> {
     if (this.observes === false) return undefined
-    const reply = await this.driver.call({ op: 'conversation', threadId }, 45_000)
+    const reply = await this.driver.call({ op: 'conversation', threadId }, this.readTimeout)
     if (reply.ok === true && reply.conversation && typeof reply.conversation === 'object') {
       this.observes = true
       return { conversation: reply.conversation as Conversation }
@@ -2059,6 +2087,14 @@ export class ChatGptHost {
         log(`thread ${shortId(threadId)}: the page rate-limited the observation read`)
       }
       return { rateLimited: true }
+    }
+    if (isDriverFaultReply(reply)) {
+      // R-LIVE-5: the driver, not the page, failed this read - its own deadline
+      // (`reason:'timeout'`) or a replacement. It is "no evidence yet" - the
+      // caller keeps waiting on its own budget - so it is neither counted as a
+      // page read error (which backs off the reconcile pass) nor logged as one.
+      log(`thread ${shortId(threadId)}: no evidence yet (the driver did not answer the read: ${one(reply.error, 120)})`)
+      return undefined
     }
     this.readErrors += 1
     log(`could not read thread ${shortId(threadId)}: ${one(reply.error, 200)}`)
