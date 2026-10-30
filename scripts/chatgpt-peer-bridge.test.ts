@@ -6,7 +6,7 @@
  * directory, so the proof is the set of registration files the host writes.
  */
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -81,6 +81,9 @@ class FakeDriver {
       .filter((node: any) => node.message?.author.role === 'user')
       .map((node: any) => ({ id: node.id, text: String(node.message.content.parts[0]) }))
   }
+
+  /** The newest node on the branch - what a cursor points at after a turn. */
+  newestId(threadId: string): string { return this.treeOf(threadId).current }
 
   onAccepted(handler: ((id: string) => void) | undefined): void { this.accepted = handler }
 
@@ -1202,6 +1205,86 @@ describe('thread uplink', () => {
       await host.pollOnce()
       expect(listener.transport.inbox().length).toBe(0)
       expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && entry.result.includes('cap reached'))).toBe(true)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('every send is attributed', () => {
+  /**
+   * A thread that already has history and a cursor, so the primer/attachment
+   * send lands AFTER it - which is the shape that exposed the defect. With no
+   * cursor the first poll would take a baseline and the bug would hide.
+   */
+  test('the primer\'s user node is ours: its uplink answer is not relayed, but a person\'s still is', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.humanTypes(THREAD_A, 'earlier question', 'earlier answer')
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.cursor = driver.newestId(THREAD_A)
+    // primedThreadId stays null, so the primer is re-posted into this thread.
+    await seedHost(dir, [alpha])
+    driver.answer = rendered({ uplink: true, to: 'listener', text: 'echo of the primer example' })
+    const host = await startHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    try {
+      const { token } = await credentials(dir)
+      // prompt re-posts the stale primer, then asks a turn. Both are ours.
+      const result = await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'hello' })
+      expect(result.status).toBe(200)
+
+      const primerNode = driver.userNodes(THREAD_A).find(node => node.text.includes('a peer on a local session bus'))
+      expect(primerNode).toBeDefined()
+      expect((await readBridge(dir, alpha.sessionId)).ourNodeIds).toContain(primerNode!.id)
+
+      // Nobody asked the page for this uplink: it is the answer to a primer.
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
+
+      // A person typing afterwards is still a person.
+      driver.humanTypes(THREAD_A, 'tell the other agent', rendered({ uplink: true, to: 'listener', text: 'a person said this' }))
+      await host.pollOnce()
+      const inbox = listener.transport.inbox()
+      expect(inbox.length).toBe(1)
+      expect((inbox[0]!.message as unknown as { text: string }).text).toContain('a person said this')
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an attachment turn\'s user node is ours: its uplink answer is not relayed', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.humanTypes(THREAD_A, 'earlier question', 'earlier answer')
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.cursor = driver.newestId(THREAD_A)
+    await seedHost(dir, [alpha])
+    // The document starts with a gateway block; a stranger's words must stay quoted.
+    driver.answer = rendered({ uplink: true, to: 'listener', text: 'echo from the document' })
+    const host = await startHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    const file = join(dir, 'notes.txt')
+    await writeFile(file, 'reference material')
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(result.status).toBe(200)
+
+      const attachNode = driver.userNodes(THREAD_A).find(node => node.text.startsWith('ATTACHED DOCUMENT'))
+      expect(attachNode).toBeDefined()
+      expect((await readBridge(dir, alpha.sessionId)).ourNodeIds).toContain(attachNode!.id)
+
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
     } finally {
       await listener.close()
       await host.stop()
