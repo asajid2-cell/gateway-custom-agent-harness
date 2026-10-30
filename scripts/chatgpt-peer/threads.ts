@@ -114,10 +114,32 @@ export function pendingHumanTurns(conversation: Conversation, state: { ours: Rea
 export type PageAnswer = { nodeId: string; text: string; userNodeId: string | null; userText: string | null }
 
 /**
+ * The nearest user node above `nodeId`, however many assistant nodes sit
+ * between it and the answer.
+ *
+ * A finished answer is not always parented directly by the question: the page
+ * inserts assistant nodes with `end_turn` unset (thoughts, reasoning recaps)
+ * on the chain, so `user -> assistant -> assistant(end_turn)` is a real shape.
+ * Looking only at the immediate parent misses the question and misreads an
+ * answer to the host's own send as the page speaking on its own.
+ */
+function governingUser(conversation: Conversation, nodeId: string): ConversationNode | undefined {
+  const seen = new Set<string>()
+  let id = conversation.mapping[nodeId]?.parent
+  while (id && conversation.mapping[id] && !seen.has(id)) {
+    seen.add(id)
+    const node = conversation.mapping[id]!
+    if (node.message?.author.role === 'user') return node
+    id = node.parent
+  }
+  return undefined
+}
+
+/**
  * Finished answers after the cursor that the page produced on its own.
  *
- * "Ours" is by node id: an answer whose parent user node is one the host
- * posted belongs to a turn the host started, and the turn loop already owns it.
+ * "Ours" is by node id: an answer governed by a user node the host posted
+ * belongs to a turn the host started, and the turn loop already owns it.
  * Everything else - an answer to something a person typed, or an answer with
  * no user turn in front of it - is the page speaking for itself, and that is
  * the only thing the uplink path may relay.
@@ -127,18 +149,16 @@ export function newPageAnswers(conversation: Conversation, state: { ours: Readon
   return turnsAfter(conversation, state.cursor)
     .filter(turn => turn.role === 'assistant' && !state.ours.has(turn.id))
     .filter(turn => {
-      const parent = conversation.mapping[turn.id]?.parent
-      return !parent || !state.ours.has(parent)
+      const user = governingUser(conversation, turn.id)
+      return !user || !state.ours.has(user.id)
     })
     .map(turn => {
-      const parent = conversation.mapping[turn.id]?.parent
-      const asked = parent ? conversation.mapping[parent] : undefined
-      const human = asked && asked.message?.author.role === 'user'
+      const user = governingUser(conversation, turn.id)
       return {
         nodeId: turn.id,
         text: turn.text,
-        userNodeId: human ? parent : null,
-        userText: human ? textOf(asked) : null,
+        userNodeId: user ? user.id : null,
+        userText: user ? textOf(user) : null,
       }
     })
 }

@@ -4,6 +4,7 @@ import {
   chainOf,
   diffThreadList,
   listAllThreads,
+  newPageAnswers,
   nodeIdsOf,
   pendingHumanTurns,
   type Conversation,
@@ -105,6 +106,30 @@ describe('pendingHumanTurns', () => {
   test('no cursor yet (freshly adopted thread): history is not replayed', () => {
     const c = conversation('pa1', pushed)
     expect(pendingHumanTurns(c, { ours: new Set(), cursor: null })).toEqual([])
+  })
+})
+
+describe('newPageAnswers', () => {
+  const pushed: Spec[] = [...base,
+    { id: 'p1', parent: 'a1', role: 'user', t: 20, text: 'INBOUND from x' },
+    { id: 'pa1', parent: 'p1', role: 'assistant', t: 21, end: true, text: 'reply' }]
+
+  test('an answer to our own send is not page speech even with a thoughts node between', () => {
+    const specs: Spec[] = [...pushed,
+      { id: 'm1', parent: 'pa1', role: 'user', t: 30, text: 'our push' },
+      { id: 'mth', parent: 'm1', role: 'assistant', t: 31, ctype: 'thoughts' },
+      { id: 'ans', parent: 'mth', role: 'assistant', t: 32, end: true, text: 'our answer' }]
+    expect(newPageAnswers(conversation('ans', specs), { ours: new Set(['u1', 'p1', 'm1']), cursor: 'pa1' })).toEqual([])
+  })
+
+  test('an answer to a person is page speech, named by the governing user node', () => {
+    const specs: Spec[] = [...pushed,
+      { id: 'h1', parent: 'pa1', role: 'user', t: 30, text: 'person question' },
+      { id: 'think', parent: 'h1', role: 'assistant', t: 31, ctype: 'thoughts' },
+      { id: 'ans', parent: 'think', role: 'assistant', t: 32, end: true, text: 'answer' }]
+    expect(newPageAnswers(conversation('ans', specs), { ours: new Set(['u1', 'p1']), cursor: 'pa1' })).toEqual([
+      { nodeId: 'ans', text: 'answer', userNodeId: 'h1', userText: 'person question' },
+    ])
   })
 })
 
