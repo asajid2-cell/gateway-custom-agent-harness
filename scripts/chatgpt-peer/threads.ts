@@ -174,19 +174,46 @@ export function nodeComplete(node: ConversationNode | null | undefined): boolean
 }
 
 /**
- * The assistant node a user node got as its answer: the child on the visible
- * branch when there is one, otherwise the newest child by create_time.
+ * The assistant node a user node got as its answer.
+ *
+ * The answer is not always an immediate child: the page inserts assistant
+ * nodes with `end_turn` unset (thoughts, reasoning recaps) between the question
+ * and the answer, so `user -> assistant(thoughts) -> assistant(finished)` is a
+ * real shape. Walking only the direct children misses the answer and a known
+ * user node then never resolves (R2-F9). So descend each branch until the first
+ * non-reasoning assistant node - the answer for that branch - and stop at any
+ * user node: a later question owns whatever follows it.
+ *
+ * The visible branch wins when it has an answer; otherwise the newest answer by
+ * create_time is returned. Completion is the caller's question (`nodeComplete`),
+ * never this one's.
  */
 export function answerAfter(conversation: Conversation, userNodeId: string): ConversationNode | null {
-  const user = conversation.mapping[userNodeId]
-  if (!user) return null
+  if (!conversation.mapping[userNodeId]) return null
   const path = new Set(pathOf(conversation))
-  const children = (user.children ?? []).map(id => conversation.mapping[id]).filter((n): n is ConversationNode => !!n)
-  const answers = children.filter(child => child.message?.author.role === 'assistant' && !isReasoningNode(child))
+  const answers: ConversationNode[] = []
+  const seen = new Set<string>([userNodeId])
+  const descend = (from: string): void => {
+    for (const childId of conversation.mapping[from]?.children ?? []) {
+      if (seen.has(childId)) continue
+      seen.add(childId)
+      const child = conversation.mapping[childId]
+      if (!child) continue
+      const role = child.message?.author.role
+      // A later user node starts a new turn: nothing past it is this answer.
+      if (role === 'user') continue
+      if (role === 'assistant' && !isReasoningNode(child)) {
+        answers.push(child)
+        continue
+      }
+      descend(childId)
+    }
+  }
+  descend(userNodeId)
   if (answers.length === 0) return null
-  const onPath = answers.find(child => path.has(child.id))
-  if (onPath) return onPath
-  return answers.slice().sort((a, b) => (a.message?.create_time ?? 0) - (b.message?.create_time ?? 0)).at(-1) ?? null
+  const onPath = answers.filter(answer => path.has(answer.id))
+  const pool = onPath.length > 0 ? onPath : answers
+  return pool.slice().sort((a, b) => (a.message?.create_time ?? 0) - (b.message?.create_time ?? 0)).at(-1) ?? null
 }
 
 /** Every node id from the root to `current_node`, root first. Stops on a cycle or a missing parent. */

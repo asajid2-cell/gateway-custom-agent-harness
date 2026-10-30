@@ -1032,7 +1032,7 @@ async function seedPeerHost(dir: string, bridges: BridgeState[]): Promise<void> 
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startPeerHost(dir: string, driver: PageDriver): Promise<ChatGptHost> {
+async function startPeerHost(dir: string, driver: PageDriver | ScriptedDriver, overrides: { turnTimeoutMs?: number } = {}): Promise<ChatGptHost> {
   const host = new ChatGptHost({
     home: dir,
     statePath: join(dir, 'peer.json'),
@@ -1045,7 +1045,7 @@ async function startPeerHost(dir: string, driver: PageDriver): Promise<ChatGptHo
     pollSeconds: 0,
     observeEvery: 0,
     titlesEvery: 0,
-    turnTimeoutMs: 5_000,
+    turnTimeoutMs: overrides.turnTimeoutMs ?? 5_000,
     waitPollMs: 20,
     directory: peerSessionsDir(dir),
     privateHome: peerPrivateHome(dir),
@@ -1120,6 +1120,271 @@ describe('host inbound reply attribution (R3-F11)', () => {
       expect(sender.inbox().some(item => item.message.replyTo === m2 && item.message.text.includes('explicit reply to the other message'))).toBe(true)
       // ...and the sender of THIS inbound still got the answer it was owed.
       expect(answer.text).toContain('the answer owed to the original sender')
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
+})
+
+// ---------------------------------------------------------------------------
+// Round 4: answer identity. A hand-built tree whose timing the test owns.
+// ---------------------------------------------------------------------------
+
+type Tree = { current: string; mapping: Record<string, any> }
+
+/**
+ * A page whose conversation the test writes by hand.
+ *
+ * The stock PageDriver settles every send instantly. These defects are about
+ * *when* the page shows what, so this one exposes the clock: `grow` appends at
+ * an explicit create_time, `failReads` throttles the conversation read, and
+ * `onStatus` lets a test advance the page between waits.
+ */
+class ScriptedDriver {
+  readonly calls: PageCall[] = []
+  private readonly tree: Tree
+  private clock: number
+  /** The first N conversation reads answer 429 (a throttled post-send read). */
+  failReads = 0
+  onSend: ((text: string, driver: ScriptedDriver) => void) | undefined
+  onStatus: ((driver: ScriptedDriver) => void) | undefined
+  state: { state: 'idle' | 'generating' | 'failed'; phase: string; at: string; ageMs: number } =
+    { state: 'idle', phase: 'complete', at: new Date().toISOString(), ageMs: 0 }
+
+  constructor(threadId: string) {
+    const root = `root-${threadId}`
+    this.tree = { current: root, mapping: { [root]: { id: root, parent: null, children: [], message: null } } }
+    this.clock = Math.floor(Date.now() / 1000)
+  }
+
+  grow(role: 'user' | 'assistant', text: string, options: { at?: number; end?: boolean; ctype?: string } = {}): string {
+    const id = randomUUID()
+    const at = options.at ?? this.clock++
+    this.tree.mapping[id] = {
+      id,
+      parent: this.tree.current,
+      children: [],
+      message: {
+        id,
+        author: { role },
+        create_time: at,
+        end_turn: options.end ?? role === 'assistant',
+        status: 'finished_successfully',
+        content: { content_type: options.ctype ?? 'text', parts: [text] },
+      },
+    }
+    this.tree.mapping[this.tree.current].children.push(id)
+    this.tree.current = id
+    return id
+  }
+
+  conversation(): { current_node: string; mapping: Record<string, any> } {
+    return { current_node: this.tree.current, mapping: structuredClone(this.tree.mapping) }
+  }
+
+  async call(request: PageCall): Promise<DriverReply> {
+    const op = String(request.op ?? '')
+    if (op === 'ping') return { ok: true, op }
+    this.calls.push({ ...request })
+    if (op === 'send') {
+      const threadId = typeof request.threadId === 'string' ? request.threadId : ''
+      if (!threadId) return { ok: false, op, error: 'no thread is open' }
+      this.onSend?.(String(request.text ?? ''), this)
+      return { ok: true, op, threadId, model: 'GPT-6', effort: 'High' }
+    }
+    if (op === 'status') {
+      this.onStatus?.(this)
+      return { ok: true, op, cost: 'push', threadId: String(request.threadId ?? ''), matchesThread: true, ...this.state }
+    }
+    if (op === 'conversation') {
+      if (this.failReads > 0) { this.failReads -= 1; return { ok: false, op, status: 429, error: 'too many requests' } }
+      return { ok: true, op, conversation: this.conversation() }
+    }
+    if (op === 'threads') return { ok: true, op, threads: [] }
+    if (op === 'use') return { ok: true, op, threadId: String(request.threadId ?? '') }
+    return { ok: false, op, error: `unknown op ${op}` }
+  }
+
+  onEvent(): () => void { return () => {} }
+  async kill(): Promise<void> {}
+  reopen(): void {}
+}
+
+/** A started host over a seeded bridge; returns the host and its bridge object. */
+async function seededHost(dir: string, driver: ScriptedDriver, seed: BridgeState, overrides: { turnTimeoutMs?: number } = {}): Promise<{ host: ChatGptHost; bridge: any }> {
+  const host = await startPeerHost(dir, driver, overrides)
+  const bridge = (host as any).bridges.get(seed.sessionId)
+  return { host, bridge }
+}
+
+describe('answer identity (N1)', () => {
+  test('a send whose post-send read was throttled never settles on the previous answer', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    const driver = new ScriptedDriver(INBOUND_THREAD)
+    const nowSec = Math.floor(Date.now() / 1000)
+    const priorUser = driver.grow('user', 'an earlier question', { at: nowSec - 300 })
+    const priorAnswer = driver.grow('assistant', 'PRIOR ANSWER', { at: nowSec - 299 })
+    alpha.cursor = priorAnswer
+    alpha.ourNodeIds = [priorUser]
+    await seedPeerHost(dir, [alpha])
+    // The page's last push is the previous turn's completion: it predates our
+    // send, so it must not license a proof read for the new turn.
+    driver.state = { state: 'idle', phase: 'complete', at: new Date((nowSec - 299) * 1000).toISOString(), ageMs: 600_000 }
+    driver.failReads = 1
+    let done = false
+    let statuses = 0
+    driver.onSend = text => { driver.grow('user', text, { at: Math.floor(Date.now() / 1000) }) }
+    driver.onStatus = d => {
+      statuses += 1
+      if (!done && statuses >= 6) {
+        done = true
+        d.grow('assistant', 'NEW ANSWER', { at: Math.floor(Date.now() / 1000) })
+        d.state = { state: 'idle', phase: 'complete', at: new Date().toISOString(), ageMs: 0 }
+      }
+    }
+    const { host } = await seededHost(dir, driver, alpha)
+    const sender = await busPeer(dir, 'sender-n1')
+    try {
+      const m1 = ((await sender.send(alpha.sessionId, 'the new question', 'new', undefined, 'inquiry', true)) as { id?: string }).id ?? ''
+      expect(m1).not.toBe('')
+      const answer = await waitFor(() => {
+        const record = sender.inbox().find(item => item.message.replyTo === m1)
+        return record ? record.message as unknown as { text: string } : undefined
+      })
+      expect(answer.text).toContain('NEW ANSWER')
+      expect(answer.text).not.toContain('PRIOR ANSWER')
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
+})
+
+describe('pending attribution (R1-F3, R1-F4)', () => {
+  test('a send older than the TTL still adopts its user node instead of expiring first', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    const driver = new ScriptedDriver(INBOUND_THREAD)
+    const sentAt = new Date(Date.now() - 11 * 60_000)
+    const userId = driver.grow('user', 'the late prompt', { at: Math.floor(sentAt.getTime() / 1000) })
+    const answerId = driver.grow('assistant', 'the late answer', { at: Math.floor(sentAt.getTime() / 1000) + 1 })
+    alpha.cursor = answerId
+    alpha.pendingAttribution = [{ text: 'the late prompt', sentAt: sentAt.toISOString(), threadId: INBOUND_THREAD }]
+    await seedPeerHost(dir, [alpha])
+    const { host, bridge } = await seededHost(dir, driver, alpha)
+    try {
+      await (host as any).resolvePendingAttribution(bridge, driver.conversation(), false)
+      expect(bridge.state.ourNodeIds).toContain(userId)
+      expect(bridge.state.pendingAttribution.length).toBe(0)
+    } finally {
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('a send too long to attribute is refused before the page is called', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    await seedPeerHost(dir, [alpha])
+    const driver = new ScriptedDriver(INBOUND_THREAD)
+    const { host, bridge } = await seededHost(dir, driver, alpha)
+    try {
+      const tooLong = 'x'.repeat(65_537) // PENDING_ATTRIBUTION_TEXT_MAX + 1
+      await expect((host as any).sendRecorded(bridge, tooLong, { threadId: INBOUND_THREAD })).rejects.toThrow(/could never be attributed/)
+      expect(driver.calls.some(call => call.op === 'send')).toBe(false)
+    } finally {
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
+})
+
+describe('first observation after a bind (R1-F10)', () => {
+  test('a person sending after the bind is processed, not swallowed as history', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    await seedPeerHost(dir, [alpha])
+    const driver = new ScriptedDriver(INBOUND_THREAD)
+    const nowSec = Math.floor(Date.now() / 1000)
+    // History that predates the bind.
+    driver.grow('user', 'an old question', { at: nowSec - 200 })
+    driver.grow('assistant', 'an old answer', { at: nowSec - 199 })
+    const { host, bridge } = await seededHost(dir, driver, alpha)
+    try {
+      // Bind now (the `use` path), then a person types before the first look.
+      ;(host as any).setThread(bridge, INBOUND_THREAD)
+      const humanQuestion = driver.grow('user', 'a question typed after the bind', { at: Math.floor(Date.now() / 1000) })
+      driver.grow('assistant', 'the answer to the person', { at: Math.floor(Date.now() / 1000) })
+      await (host as any).observeBridge(bridge)
+      const handled = (host as any).hostState.audit.filter((entry: { op: string; target: string | null }) => entry.op === 'human')
+      expect(handled.some((entry: { target: string | null }) => entry.target === humanQuestion)).toBe(true)
+    } finally {
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
+})
+
+describe('still generating is never a failure (R-LIVE-4)', () => {
+  test('a turn the page is still generating is left unsettled, not reported as a model failure', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    await seedPeerHost(dir, [alpha])
+    const driver = new ScriptedDriver(INBOUND_THREAD)
+    let sent = false
+    driver.onSend = (text, d) => {
+      d.grow('user', text, { at: Math.floor(Date.now() / 1000) })
+      sent = true
+    }
+    // Before the send the page is idle so the job may post; afterwards it
+    // reports generating forever, exactly as the live page did.
+    driver.onStatus = d => {
+      if (sent) d.state = { state: 'generating', phase: 'streaming', at: new Date().toISOString(), ageMs: 0 }
+    }
+    const { host } = await seededHost(dir, driver, alpha, { turnTimeoutMs: 300 })
+    const sender = await busPeer(dir, 'sender-live4')
+    try {
+      const m1 = ((await sender.send(alpha.sessionId, 'a long question', 'live4', undefined, 'inquiry', true)) as { id?: string }).id ?? ''
+      expect(m1).not.toBe('')
+      // Give the host far longer than its configured turn timeout and the
+      // pre-fix give-up: nothing may come back while the page is generating.
+      await new Promise(resolve => setTimeout(resolve, 1_400))
+      const replies = sender.inbox().filter(item => item.message.replyTo === m1)
+      expect(replies).toEqual([])
     } finally {
       await sender.close().catch(() => {})
       await host.stop()
