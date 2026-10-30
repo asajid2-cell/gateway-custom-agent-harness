@@ -386,6 +386,18 @@ async function acknowledged(dir: string, sessionId: string, messageId: string): 
   } catch { return false }
 }
 
+/** The message ids this session's transport has already answered. */
+async function sentReplyIds(dir: string, sessionId: string): Promise<string[]> {
+  try {
+    const raw = JSON.parse(await readFile(join(sessionsDir(dir), `${sessionId}.inbox`), 'utf8')) as {
+      history?: { direction: string; message: { replyTo?: string } }[]
+    }
+    return (raw.history ?? [])
+      .filter(entry => entry.direction === 'sent' && entry.message.replyTo)
+      .map(entry => entry.message.replyTo as string)
+  } catch { return [] }
+}
+
 async function credentials(dir: string): Promise<{ token: string }> {
   const body = JSON.parse(await readFile(join(privateHome(dir), 'instances', 'test.json'), 'utf8')) as { token: string }
   return { token: body.token }
@@ -480,7 +492,7 @@ describe('R7-1: settlePostedTurn is symmetric with resumePendingTurns', () => {
 })
 
 describe('R7-2: a crash after markAnswered but before the reply', () => {
-  test('the marked answer is delivered exactly once from the page and nothing is typed', async () => {
+  test('a mark with no pending turn and no sent reply is settled from the page, never re-typed', async () => {
     const { dir, cleanup } = await scratch()
     const { alpha } = await primedBridge()
     await seedHost(dir, [alpha])
@@ -500,26 +512,37 @@ describe('R7-2: a crash after markAnswered but before the reply', () => {
     try {
       const driverB = new FakeDriver()
       driverB.observable = true
+      // The page holds the answer the crashed host obtained and marked.
       driverB.seedUserTurn(THREAD_A, turn.userNodeId, turn.ourText, 'the answer obtained before the crash')
       const durable = await readBridge(dir, alpha.sessionId)
-      // The write-ahead mark is on disk; the transport history has NO sent
-      // reply for this message (the crash landed between the two).
+      // The reviewer's exact durable state: markAnswered writes the keys and
+      // DELETES the pending turn (chatgpt-peer.ts:3376-3379) before settleReply
+      // sends, so a crash in between leaves the mark, no turn and no sent reply.
+      // (Seeding "pending turn present" is a state this code cannot produce: it
+      // was why the earlier version passed for the wrong reason.)
       await writeBridge(dir, {
         ...durable,
         answeredTurns: [...durable.answeredTurns, `m:${messageId}`, `u:${turn.userNodeId}`],
-        pendingTurns: [turn],
+        pendingTurns: [],
       })
+      // Preconditions made explicit, so a later edit cannot silently recreate
+      // the unreachable shape or slip a sent reply in.
+      const seeded = await readBridge(dir, alpha.sessionId)
+      expect(seeded.pendingTurns.some(item => item.messageId === messageId)).toBe(false)
+      expect(await sentReplyIds(dir, alpha.sessionId)).not.toContain(messageId)
 
       const hostB = await startHost(dir, driverB)
       try {
         const replies = () => sender.inbox().filter(record => replyToOf(record) === messageId)
         await waitFor(() => (replies().length >= 1 ? true : undefined), 20_000)
         await new Promise(resolve => setTimeout(resolve, 400))
-        // Delivered once, from the page, with no second page turn.
         expect(replies().length).toBe(1)
-        expect(textOf(replies()[0]!)).toContain('the answer obtained before the crash')
+        // RED on d9836b6: with no job record, recoverOwed falls to handleRecord
+        // and types the prompt a second time for a question the page already
+        // answered. The sender is handed the re-typed turn's answer instead of
+        // the completed one on the page.
         expect(sendCount(driverB)).toBe(0)
-        expect((await readBridge(dir, alpha.sessionId)).pendingTurns.some(item => item.messageId === messageId)).toBe(false)
+        expect(textOf(replies()[0]!)).toContain('the answer obtained before the crash')
       } finally {
         await hostB.stop()
       }
@@ -530,7 +553,12 @@ describe('R7-2: a crash after markAnswered but before the reply', () => {
   }, 60_000)
 })
 
-describe('R7-3: a crash after the reply but before the turn was retired', () => {
+// Regression guard; unreachable on the base by construction, green there by
+// accident. markAnswered deletes the pending turn, so the "sent reply present
+// and pending turn still durable" shape this seeds is not a state d9836b6 can
+// actually reach on its own; the crash windows that look like it are R7-2's.
+// It exists so the retire path stays honest once #45 lands the host fixes.
+describe('R7-3: a crash after the reply but before the turn was retired [regression guard]', () => {
   test('an already-sent turn is retired on restart with no second send and no second line', async () => {
     const { dir, cleanup } = await scratch()
     const { alpha } = await primedBridge()
