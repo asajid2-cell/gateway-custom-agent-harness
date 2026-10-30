@@ -380,6 +380,22 @@ describe('turn loop', () => {
     expect(outcome.budgetSpent).toBe(false)
   })
 
+  // F3: a response that explains something and quotes a refused (stale-nonce)
+  // block is an answer, not a command-only turn. Retrying it burned the budget
+  // and ended as a canned error instead of delivering the prose.
+  test('F3: prose beside a refused block is delivered instead of retried', async () => {
+    let calls = 0
+    const text = 'Here is the syntax:\n```gateway deadbeef\n{"op":"list"}\n```\nUse your own nonce.'
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => { calls++; return { ok: true, text } },
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(calls).toBe(1)
+    expect(outcome.budgetSpent).toBe(false)
+    expect(outcome.executed).toEqual([])
+    expect(outcome.finalText).toBe(text)
+  })
+
   test('a turn that only emits refused blocks spends the budget', async () => {
     let calls = 0
     const outcome = await runCommandTurn('go', nonce, {

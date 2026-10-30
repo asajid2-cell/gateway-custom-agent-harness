@@ -7,7 +7,7 @@
  * host, not this module, decides what to do about a missing reply.
  */
 import {
-  extractCommands, formatResultLines, MAX_COMMANDS_PER_TURN, MAX_MODEL_ROUNDS, type Command,
+  extractCommands, formatResultLines, MAX_COMMANDS_PER_TURN, MAX_MODEL_ROUNDS, proseFromTurn, type Command,
 } from './commands.ts'
 
 export type GenerateResult = { ok: boolean; text?: string; error?: string }
@@ -69,8 +69,11 @@ export async function runCommandTurn(initialPrompt: string, nonce: string, deps:
     // A turn that produced neither a command nor a refusal is prose: the model
     // is answering, so the loop is done. A turn whose every block was refused
     // is not prose - the refusal goes back and the model gets a retry inside
-    // the same budget instead of the sender getting a canned error.
-    const refusedOnly = extraction.commands.length === 0 && extraction.problems.length > 0
+    // the same budget instead of the sender getting a canned error. Substantive
+    // prose beside a refused block is an answer, though: the model explained
+    // something and quoted an example, and retrying it would only spend the
+    // budget and lose the explanation.
+    const refusedOnly = extraction.commands.length === 0 && extraction.problems.length > 0 && proseFromTurn(finalText).prose.length === 0
     if (extraction.commands.length === 0 && !refusedOnly) {
       budgetSpent = false
       break
