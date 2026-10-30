@@ -93,6 +93,12 @@ function turnsAfter(conversation: Conversation, cursor: string): Turn[] {
  * has handled. A cursor that is no longer on the current branch (a human
  * edited an earlier message) is replaced by its create_time. No cursor means
  * the thread was just adopted: history is not replayed.
+ *
+ * A turn is only live - answered `null` - when nothing follows it on the
+ * branch. If a later turn exists and this one has no finished answer, the page
+ * moved on without ever finishing it (the person stopped it, or it failed);
+ * reporting `null` would make the host wait on an answer that will never come
+ * and never reach the later turns, so an abandoned turn is left to be skipped.
  */
 export function pendingHumanTurns(conversation: Conversation, state: { ours: ReadonlySet<string>; cursor: string | null }): HumanTurn[] {
   if (!state.cursor) return []
@@ -101,11 +107,12 @@ export function pendingHumanTurns(conversation: Conversation, state: { ours: Rea
   after.forEach((turn, i) => {
     if (turn.role !== 'user' || state.ours.has(turn.id)) return
     const next = after[i + 1]
-    result.push({
-      userNodeId: turn.id,
-      userText: turn.text,
-      answer: next && next.role === 'assistant' ? { nodeId: next.id, text: next.text } : null,
-    })
+    if (next && next.role === 'assistant') {
+      result.push({ userNodeId: turn.id, userText: turn.text, answer: { nodeId: next.id, text: next.text } })
+      return
+    }
+    if (next) return
+    result.push({ userNodeId: turn.id, userText: turn.text, answer: null })
   })
   return result
 }

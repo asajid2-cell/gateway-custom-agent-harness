@@ -96,6 +96,17 @@ describe('pendingHumanTurns', () => {
     expect(pendingHumanTurns(c, { ours: new Set(['u1', 'p1']), cursor: 'ha' })).toEqual([])
   })
 
+  test('a question whose answer was stopped does not block the questions after it', () => {
+    const specs: Spec[] = [...pushed,
+      { id: 'h1', parent: 'pa1', role: 'user', t: 30, text: 'q1' },
+      { id: 'h1a', parent: 'h1', role: 'assistant', t: 31, text: 'partial, never finished' },
+      { id: 'h2', parent: 'h1a', role: 'user', t: 40, text: 'q2' },
+      { id: 'h2a', parent: 'h2', role: 'assistant', t: 41, end: true, text: 'a2' }]
+    expect(pendingHumanTurns(conversation('h2a', specs), { ours: new Set(['u1', 'p1']), cursor: 'pa1' })).toEqual([
+      { userNodeId: 'h2', userText: 'q2', answer: { nodeId: 'h2a', text: 'a2' } },
+    ])
+  })
+
   test('a cursor that left the chain (human edited an earlier turn) falls back to its create_time', () => {
     const specs: Spec[] = [...pushed,
       { id: 'e', parent: 'a1', role: 'user', t: 40, text: 'edited branch' }, { id: 'ea', parent: 'e', role: 'assistant', t: 41, end: true, text: 'z' }]
