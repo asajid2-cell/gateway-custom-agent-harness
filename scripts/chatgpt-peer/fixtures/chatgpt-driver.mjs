@@ -128,8 +128,19 @@ function loadPlaywright() {
  * Chrome in Program Files never tried the 32-bit or per-user install - and the
  * failure surfaced as a spawn error instead of "not installed". Probe in order
  * and check the file exists.
+ *
+ * `CHATGPT_CHROME` pins the executable when the host sets it. It is a launch
+ * decision and nothing else: it is not identity, so it is never written into
+ * the launch marker or the install record, and the owner proof after a spawn
+ * still decides whether the browser that answered is ours.
  */
 async function chromePath() {
+  const override = String(process.env.CHATGPT_CHROME ?? '').trim()
+  if (override) {
+    const info = await fs.stat(override).catch(() => null)
+    if (!info?.isFile()) throw new Error(`CHATGPT_CHROME is set to ${override}, which is not a file`)
+    return override
+  }
   const candidates = [
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
@@ -358,7 +369,20 @@ async function ownedDebugger() {
   return { pid: verdict.pid, served, how: verdict.how }
 }
 
-/** Connect over CDP, but only after ownership is proven. The only CDP door. */
+/**
+ * Connect over CDP, but only after ownership is proven. The only CDP door.
+ *
+ * Decision (round 5): there is no private or authenticated debugging endpoint
+ * to ask for, so profile-proof ownership is the ceiling. CDP's HTTP endpoint
+ * has no auth primitive at all - anything that can reach the port is the
+ * browser. Loopback binding is the only exposure control Chrome offers and it
+ * is already in force (the default is 127.0.0.1, and Chrome requires a
+ * dedicated --user-data-dir before it opens the port at all). The alternative,
+ * `--remote-debugging-pipe`, is not usable here: Playwright's connectOverCDP
+ * speaks the HTTP/WebSocket endpoint and cannot be handed a pair of inherited
+ * pipe handles. So the defence is what this function does - prove the listener
+ * is the browser this install launched, and refuse everything else.
+ */
 async function connectOwned(ms = 0) {
   const owned = await ownedDebugger()
   if (!owned) throw new Error(`chrome is not running on port ${PORT}`)
@@ -392,10 +416,33 @@ function launchVerdict({ served, owner, profile, port }) {
   return { ok: true, retry: false, pid: Number(owner.pid) || null }
 }
 
+/** How long a launched browser has to prove itself before the window is spent. */
+const LAUNCH_PROOF_ATTEMPTS = 6
+const LAUNCH_PROOF_WINDOW_MS = 3_000
+
+/**
+ * The failure for a launch window that ran out before the port's owner could
+ * be proven.
+ *
+ * Deliberately NOT the refusal wording. A refusal says the port belongs to a
+ * browser that is not this install's; this says none of this install's has
+ * answered yet, and names the last owner it saw so the two are told apart from
+ * the log alone without reading the code.
+ */
+function exhaustedLaunchWhy({ port, served, owner, waitedMs }) {
+  const seen = served?.guid ? `answered as browser ${served.guid}` : 'answered without a browser GUID'
+  const who = owner?.pid ? `pid ${owner.pid}` : 'an owner that could not be read'
+  const waited = (Math.round(Number(waitedMs || 0) / 100) / 10).toFixed(1)
+  return `port ${port} ${seen}, but ${who} could not be proven to be this install's browser within ${waited} s; no browser of this install has answered yet, so nothing was adopted`
+}
+
 async function ensureChrome({ visible = true } = {}) {
   const owned = await ownedDebugger()
   if (owned) return { spawned: false, pid: owned.pid }
   const exe = await chromePath()
+  if (String(process.env.CHATGPT_CHROME ?? '').trim()) {
+    await log(`spawning ${exe} by CHATGPT_CHROME override (a launch decision, not recorded as identity)`)
+  }
   await fs.mkdir(PROFILE, { recursive: true })
   const args = [
     `--remote-debugging-port=${PORT}`,
@@ -427,7 +474,9 @@ async function ensureChrome({ visible = true } = {}) {
   child.unref()
   await fs.writeFile(PID_FILE, String(child.pid)).catch(() => {})
   await log(`spawned chrome pid=${child.pid} headful=${visible}`)
-  let unverified = 0
+  let attempts = 0
+  let proofStartedAt = 0
+  let last = { served: null, owner: null }
   for (let i = 0; i < 60; i++) {
     if (await cdpUp()) {
       // Record what the browser SERVES now, not the pid this process spawned:
@@ -435,7 +484,10 @@ async function ensureChrome({ visible = true } = {}) {
       // A GUID is only recorded once the port's owner is proven to be this
       // install - anything else that binds the port in this window is refused.
       const served = await browserIdentity()
-      const owner = served ? await portOwner() : null
+      // Read the owner even when nothing served a GUID: if this window runs out,
+      // the failure has to name who was holding the port, or "no browser yet"
+      // reads exactly like "wrong browser".
+      const owner = await portOwner()
       const verdict = launchVerdict({ served, owner, profile: PROFILE, port: PORT })
       if (verdict.ok) {
         await writeLaunchMarker(verdict.pid ?? child.pid, served)
@@ -443,12 +495,15 @@ async function ensureChrome({ visible = true } = {}) {
         return { spawned: true, pid: child.pid }
       }
       if (!verdict.retry) throw new Error(verdict.why)
-      // The port answers but the owner cannot be named yet. Bound the retries:
-      // a listener that never becomes provable is not this driver's, and
-      // adopting it would be the guess this check exists to prevent.
-      unverified += 1
-      if (unverified >= 6) {
-        throw new Error(`port ${PORT} answers (browser ${served?.guid ?? 'unknown'}) but the process that owns it could not be proven to be this install's; refusing to adopt it`)
+      // The port answers but the owner cannot be named yet. Bound the window by
+      // attempts AND wall clock: a listener that never becomes provable is not
+      // this driver's, and adopting it would be the guess this check prevents.
+      last = { served, owner }
+      attempts += 1
+      if (!proofStartedAt) proofStartedAt = Date.now()
+      const waited = Date.now() - proofStartedAt
+      if (attempts >= LAUNCH_PROOF_ATTEMPTS || waited >= LAUNCH_PROOF_WINDOW_MS) {
+        throw new Error(exhaustedLaunchWhy({ port: PORT, served: last.served, owner: last.owner, waitedMs: waited }))
       }
     }
     await new Promise(resolve => setTimeout(resolve, 500))
@@ -2389,6 +2444,7 @@ export {
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
   treeHasSentText, degradedSendVerdict, launchVerdict, ownerCarriesProfile, portOwner,
+  exhaustedLaunchWhy,
 }
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href

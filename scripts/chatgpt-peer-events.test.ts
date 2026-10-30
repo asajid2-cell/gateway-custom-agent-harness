@@ -41,7 +41,7 @@ if (SHIPPED_DRIVER_MISSING) {
 
 /**
  * A byte-for-byte snapshot of the shipped driver (chatgpt.mjs @ d5-async,
- * commit 6dec928), vendored so the quit-drain test always runs against the real
+ * commit 50e85ba), vendored so the quit-drain test always runs against the real
  * `serve` protocol instead of being skipped on a machine without the deployed
  * copy. C10v below drives THIS file as a real child; the R3-F8 mutation (revert
  * `serve`'s drain) must fail it. C10 separately drives the deployed copy when
