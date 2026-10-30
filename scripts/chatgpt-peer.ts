@@ -1360,9 +1360,18 @@ export class ChatGptHost {
     // A proof read is licensed by a new page signal, and re-attempted on a
     // bounded clock regardless: a page that never pushes again must not hold
     // this turn - and every inbound queued behind it - until the timeout.
+    //
+    // The clock is also what covers a push that keeps saying `generating` after
+    // the answer is on the page: one abandoned turn leaves its own
+    // `in_progress` element behind forever, and while the pushed phase names
+    // that element the page's word never becomes idle. A turn that is really
+    // finished must not be held for the whole timeout because of it, so the
+    // proof runs on a slower clock even while the push says streaming. Slower,
+    // because a page that is genuinely streaming pays this read every time.
     const proofRetryMs = Math.min(Math.max(this.waitPoll * 25, 1_000), 15_000)
+    const stalledProofMs = proofRetryMs * 4
     let deepFor: string | null | undefined
-    let proofAt = 0
+    let proofAt = Date.now()
     let domUnproven = false
     for (;;) {
       if (this.stopping || bridge.stopping) throw new GeneratingTurn(threadId)
@@ -1383,59 +1392,62 @@ export class ChatGptHost {
       if (cheap.state === 'failed') {
         throw new Error('the page reported a problem: the page rendered a failure message')
       }
-      if (cheap.state === 'idle') {
-        // One conversation read per page signal, not one per poll: the page's
-        // own word that the turn stopped is what licenses the expensive read.
-        const key = cheap.at ?? ''
-        const due = deepFor !== key || Date.now() - proofAt >= proofRetryMs
-        // Chronology (N1): an `idle` signal pushed BEFORE this turn was accepted
-        // is the previous turn's word, not ours. It may not license a proof
-        // read - the last completed answer is still on the branch, and taking
-        // it would settle this turn with somebody else's answer. A driver that
-        // supplies no clock leaves identity below as the guard.
-        const signalAt = cheap.at ? Date.parse(cheap.at) : Number.NaN
-        const postAccept = !Number.isFinite(hint.acceptedAt)
-          || !Number.isFinite(signalAt)
-          || signalAt >= (hint.acceptedAt as number) - PENDING_WINDOW_BEFORE_MS
-        if (due && postAccept) {
-          deepFor = key
-          proofAt = Date.now()
-          const read = await this.readConversation(threadId)
-          if (read && 'conversation' in read) {
-            // An answer belongs to a USER NODE, never to "the newest assistant
-            // node". When the send's own node could not be recorded (a 429 on
-            // the post-send read), identify it from the text we sent within the
-            // post-accept window; with no identifiable node there is no answer
-            // to accept, so the turn keeps waiting (N1). There is deliberately
-            // no uncorrelated latest-assistant fallback here.
-            const resolved = this.answerUserOf(read.conversation, userNodeId, hint)
-            if (resolved) {
-              if (resolved !== userNodeId) {
-                // Adopt it now: an owned user node is never read back as a
-                // person typing while this turn is still in flight.
-                bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== resolved), resolved].slice(-200)
-                if (hint.sentText) this.dropPending(bridge, hint.sentText)
-                await this.persistBridgeState(bridge)
-              }
-              const answer = answerAfter(read.conversation, resolved)
-              if (answer && nodeComplete(answer) && askerOf(read.conversation, answer.id) === resolved) {
-                return { text: nodeTextOf(answer), nodeId: answer.id }
-              }
+      // One conversation read per page signal, not one per poll: the page's
+      // own word that the turn stopped is what licenses the expensive read.
+      // While the push names another phase, only the slow clock above licenses
+      // one - a stale `in_progress` element left behind by an abandoned turn
+      // must not pin a finished answer for the whole wait (N2).
+      const key = `${cheap.state}|${cheap.at ?? ""}|${cheap.phase ?? ""}`
+      const idleNow = cheap.state === "idle"
+      // Chronology (N1): an `idle` signal pushed BEFORE this turn was accepted
+      // is the previous turn's word, not ours. It may not license the
+      // signal-driven read - the last completed answer is still on the branch.
+      // The slow clock remains a licence: identity below, not the signal, is
+      // what decides which answer is ours.
+      const signalAt = cheap.at ? Date.parse(cheap.at) : Number.NaN
+      const postAccept = !Number.isFinite(hint.acceptedAt)
+        || !Number.isFinite(signalAt)
+        || signalAt >= (hint.acceptedAt as number) - PENDING_WINDOW_BEFORE_MS
+      const dueIdle = idleNow && deepFor !== key && postAccept
+      const dueClock = Date.now() - proofAt >= (idleNow ? proofRetryMs : stalledProofMs)
+      if (dueIdle || dueClock) {
+        deepFor = key
+        proofAt = Date.now()
+        const read = await this.readConversation(threadId)
+        if (read && "conversation" in read) {
+          // An answer belongs to a USER NODE, never to "the newest assistant
+          // node". When the send's own node could not be recorded (a 429 on
+          // the post-send read), identify it from the text we sent within the
+          // post-accept window; with no identifiable node there is no answer
+          // to accept, so the turn keeps waiting (N1). There is deliberately
+          // no uncorrelated latest-assistant fallback here.
+          const resolved = this.answerUserOf(read.conversation, userNodeId, hint)
+          if (resolved) {
+            if (resolved !== userNodeId) {
+              // Adopt it now: an owned user node is never read back as a
+              // person typing while this turn is still in flight.
+              bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== resolved), resolved].slice(-200)
+              if (hint.sentText) this.dropPending(bridge, hint.sentText)
+              await this.persistBridgeState(bridge)
             }
-          } else if (this.observes === false) {
-            // This driver has no conversation op, so the thread tree cannot
-            // prove anything here: the page's own DOM read is the only proof
-            // there is, and it is the one every turn used before the job shape.
-            // Without it the turn could never complete on such a driver, and
-            // the serial drain held every inbound queued behind it until the
-            // turn timeout - a page that pushes nothing starved the whole bus.
-            try {
-              return { text: await this.readCompletedAnswer(bridge), nodeId: userNodeId ?? '' }
-            } catch (error) {
-              if (!domUnproven) {
-                domUnproven = true
-                log(`turn proof on "${bridge.state.name}" has no conversation tree; using the page read (${one((error as Error).message, 160)})`)
-              }
+            const answer = answerAfter(read.conversation, resolved)
+            if (answer && nodeComplete(answer) && askerOf(read.conversation, answer.id) === resolved) {
+              return { text: nodeTextOf(answer), nodeId: answer.id }
+            }
+          }
+        } else if (this.observes === false) {
+          // This driver has no conversation op, so the thread tree cannot
+          // prove anything here: the page's own DOM read is the only proof
+          // there is, and it is the one every turn used before the job shape.
+          // Without it the turn could never complete on such a driver, and
+          // the serial drain held every inbound queued behind it until the
+          // turn timeout - a page that pushes nothing starved the whole bus.
+          try {
+            return { text: await this.readCompletedAnswer(bridge), nodeId: userNodeId ?? "" }
+          } catch (error) {
+            if (!domUnproven) {
+              domUnproven = true
+              log(`turn proof on "${bridge.state.name}" has no conversation tree; using the page read (${one((error as Error).message, 160)})`)
             }
           }
         }
@@ -1699,15 +1711,27 @@ export class ChatGptHost {
     const threadId = bridge.state.threadId
     if (!threadId) return { state: 'idle', phase: null, files: [] }
     const deadline = Date.now() + timeoutMs
+    // The same two clocks as the turn's own wait: a new page signal licenses
+    // the conversation read, and a slower clock licenses one anyway, so a push
+    // stuck on a stale `in_progress` cannot make this wait report `generating`
+    // for an answer that is already on the page.
+    const proofRetryMs = Math.min(Math.max(this.waitPoll * 25, 1_000), 15_000)
+    const stalledProofMs = proofRetryMs * 4
     let deepFor: string | null | undefined
+    let proofAt = Date.now()
     let last: CheapStatus = { state: 'unknown', phase: null, ageMs: null, at: null, matchesThread: null }
     for (;;) {
       last = await this.cheapStatus(threadId)
       if (last.state === 'failed') return { state: 'failed', phase: last.phase, error: 'the page rendered a failure message' }
-      if (last.state === 'idle') {
+      {
+        // One read per page signal while the page says it stopped; the slow
+        // clock is the only licence while the push names another phase.
         const key = last.at ?? ''
-        if (deepFor !== key) {
+        const idleNow = last.state === 'idle'
+        const due = (idleNow && deepFor !== key) || Date.now() - proofAt >= (idleNow ? proofRetryMs : stalledProofMs)
+        if (due) {
           deepFor = key
+          proofAt = Date.now()
           const read = await this.readConversation(threadId)
           if (read && 'conversation' in read) {
             const answer = latestAssistantOf(read.conversation)

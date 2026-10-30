@@ -117,6 +117,11 @@ class FakeDriver {
     return id
   }
 
+  /** The turn the page accepted earlier finally finishes: only the answer appears. */
+  finishTurn(threadId: string, answer: string): string {
+    return this.grow(threadId, 'assistant', answer)
+  }
+
   /**
    * A finished answer node on the branch, carrying the files the page says.
    *
@@ -789,6 +794,47 @@ describe('multi-bridge host', () => {
       await cleanup()
     }
   })
+
+  test('a stale in_progress that pins the push at streaming does not hold a finished answer', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver, { turnTimeoutMs: 15_000 })
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir),
+      sessionId: randomUUID(),
+      name: 'sender',
+      cwd: dir,
+      purpose: 'test sender',
+      policy: 'accept',
+    })
+    try {
+      await sender.start()
+      driver.observable = true
+      // The page takes the text and its push says streaming - and stays there,
+      // which is what one abandoned turn's own in_progress element makes it
+      // (N2: six nodes complete, one in_progress, for a turn that is over).
+      driver.stallFor = request => /INBOUND/.test(String(request.text ?? ''))
+      await sender.send(alpha.sessionId, 'please answer', 'please answer', undefined, 'inquiry', true)
+      await waitFor(async () => (driver.calls.some(call => call.op === 'send' && /INBOUND/.test(String(call.text ?? ''))) ? true : undefined))
+      // The answer lands on the page, but the page's own word never becomes idle.
+      driver.finishTurn(THREAD_A, 'the finished answer')
+      const reply = await waitFor(async () => {
+        const record = sender.inbox().find(item => typeof (item.message as unknown as { replyTo?: string }).replyTo === 'string')
+        return record ? record : undefined
+      }, 12_000).catch(() => null)
+      expect(reply).not.toBeNull()
+      expect(String((reply!.message as unknown as { text: string }).text)).toContain('the finished answer')
+      // The thread tree proved it; the push was never asked for a new word.
+      expect(driver.conversationReads).toBeGreaterThanOrEqual(1)
+      expect(driver.signal.phase).toBe('streaming')
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
 
   test('a primer sha change re-posts into the SAME thread instead of abandoning it', async () => {
     const { dir, cleanup } = await scratch()
