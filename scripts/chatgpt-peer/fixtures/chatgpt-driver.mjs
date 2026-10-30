@@ -243,10 +243,50 @@ async function writeInstallRecord(pid, served = null) {
  * table. Quoted, forward-slash and trailing-separator spellings are the same
  * profile (Windows paths ignore case).
  */
+function commandLineTokens(line) {
+  const tokens = []
+  let current = ''
+  let quoted = false
+  let started = false
+  for (const character of String(line ?? '')) {
+    if (character === '"') {
+      quoted = !quoted
+      started = true
+      continue
+    }
+    if (!quoted && /\s/.test(character)) {
+      if (started) {
+        tokens.push(current)
+        current = ''
+        started = false
+      }
+      continue
+    }
+    current += character
+    started = true
+  }
+  if (started) tokens.push(current)
+  return tokens
+}
+
 function ownerCarriesProfile(owner, profile) {
+  if (typeof owner?.commandLine !== 'string') return false
   const tidy = value => String(value).replace(/"/g, '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
-  const line = typeof owner?.commandLine === 'string' ? tidy(owner.commandLine) : ''
-  return line.includes(`--user-data-dir=${tidy(profile)}`)
+  const want = tidy(profile)
+  if (!want) return false
+  // Compare the flag's VALUE, not a substring of the whole line: a profile that
+  // merely starts with ours (`...\profile-other` against `...\profile`) is a
+  // different install, and a substring test adopts it.
+  const tokens = commandLineTokens(owner.commandLine)
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index].toLowerCase()
+    if (token === '--user-data-dir') {
+      if (tidy(tokens[index + 1]) === want) return true
+      continue
+    }
+    if (token.startsWith('--user-data-dir=') && tidy(tokens[index].slice('--user-data-dir='.length)) === want) return true
+  }
+  return false
 }
 
 /**
@@ -787,44 +827,68 @@ async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30
  * prefix, because the page reflows and trims the text it stored.
  */
 function treeHasSentText(body, text) {
+  return countUserTextInTree(body, text) > 0
+}
+
+/**
+ * How many user nodes in the thread tree carry what we sent.
+ *
+ * A count rather than a yes/no, because the send has to be NEW: an earlier turn
+ * with the same words is identity too, and would make a swallowed send look
+ * accepted. Comparing the count before and after is what tells the two apart.
+ */
+function countUserTextInTree(body, text) {
   const needle = String(text ?? '').trim().replace(/\s+/g, ' ').slice(0, 40)
-  if (!needle) return false
+  if (!needle) return 0
   const mapping = body && typeof body === 'object' && body.mapping && typeof body.mapping === 'object' ? body.mapping : {}
+  let count = 0
   for (const node of Object.values(mapping)) {
     if (node?.message?.author?.role !== 'user') continue
     const parts = Array.isArray(node.message.content?.parts) ? node.message.content.parts : []
     const said = parts.filter(part => typeof part === 'string').join('\n').replace(/\s+/g, ' ')
-    if (said.includes(needle)) return true
+    if (said.includes(needle)) count += 1
   }
-  return false
+  return count
 }
 
 /**
  * The acceptance decision for a page that exposes no user nodes at all.
  *
- * Pure: the count and the tree answer are arguments. The evidence must be
- * IDENTITY - our text on a user turn - and never undifferentiated growth: an
- * earlier turn can append a reasoning or assistant node while this send is
- * swallowed, so a risen message count proves only that the page rendered
- * something, not that it rendered ours. A cleared composer is likewise never
- * acceptance on its own, since a rerender after a swallowed click clears it
- * with nothing posted. With no user node in the DOM, the thread tree is the
- * only place that can carry that identity; a page that cannot show it has not
- * accepted the send.
+ * Pure: the counts are arguments. The evidence must be IDENTITY of THIS send -
+ * our text on a user turn that was not already there - and never
+ * undifferentiated growth: an earlier turn can append a reasoning or assistant
+ * node while this send is swallowed, so a risen message count proves only that
+ * the page rendered something, not that it rendered ours. An older turn with
+ * the same words is identity too, which is why the tree is read before the send
+ * and the count must RISE. A cleared composer is likewise never acceptance, and
+ * a page with no baseline has not shown that anything new arrived.
  */
-function degradedSendVerdict({ userNodes, tree }) {
+function degradedSendVerdict({ userNodes, treeCount, baselineCount }) {
+  // A page that shows user nodes is decided by the DOM path, never here.
   if (Number(userNodes) > 0) return false
-  return tree === true
+  // With no baseline there is no way to tell our turn from an older one.
+  if (baselineCount === null || baselineCount === undefined) return false
+  return Number(treeCount) > Number(baselineCount)
+}
+
+/** How many user nodes in this page's thread tree carry the text, or null when unread. */
+async function countUserTextOnPage(page, text) {
+  const threadId = threadOf(page.url())
+  if (!threadId) return 0
+  const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
+  if (!read?.ok) return null
+  return countUserTextInTree(read.body, text)
 }
 
 /**
  * The degraded acceptance check, run only after `waitForAcceptance` failed.
  *
  * Reads the thread tree - the text-identity evidence that survives a DOM
- * rename - until it holds what we sent. The normal page never reaches this, so
- * it never costs a conversation read.
+ * rename - until it holds MORE user nodes with our text than the pre-send
+ * baseline did. An unreadable baseline is a refusal: without it, an older turn
+ * with the same words would look exactly like this send landing.
  */
-async function confirmDegradedSend(page, text) {
+async function confirmDegradedSend(page, text, baselineCount) {
   const userNodes = await page.locator(USER_MESSAGE).count().catch(() => 0)
   if (userNodes > 0) return false
   const deadline = Date.now() + 15_000
@@ -832,7 +896,7 @@ async function confirmDegradedSend(page, text) {
     const threadId = threadOf(page.url())
     if (threadId) {
       const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
-      if (read?.ok && degradedSendVerdict({ userNodes, tree: treeHasSentText(read.body, text) })) return true
+      if (read?.ok && degradedSendVerdict({ userNodes, treeCount: countUserTextInTree(read.body, text), baselineCount })) return true
     }
     await new Promise(resolve => setTimeout(resolve, 500))
   }
@@ -1201,6 +1265,17 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   const beforeCount = await page.locator(ASSISTANT).count()
   // The acceptance proof is a NEW user node, so its count is taken here too.
   const beforeUsers = await page.locator(USER_MESSAGE).count()
+  // Where the DOM shows no user node at all, the acceptance proof falls back to
+  // the thread tree - and "our text is in the tree" is not a proof of THIS send
+  // when an older turn has the same words. Take the baseline before the send so
+  // only a RISE counts. Normal pages pay nothing: the degraded path only runs
+  // when the DOM exposed none of them.
+  //
+  // `null`, not `0`, when the DOM DID show user nodes: the check is reached on
+  // any failed acceptance, so a page that renames or soft-navigates its selector
+  // mid-turn would otherwise present a zero baseline for a conversation that has
+  // history, and any older node with our words would accept a swallowed send.
+  const beforeTree = beforeUsers === 0 ? await countUserTextOnPage(page, text) : null
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
   await composer.click()
   const typed = await composer.fill(text).then(() => true).catch(() => false)
@@ -1227,7 +1302,7 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // selector - our text on a user turn in the thread tree - and never from a
     // cleared composer or an unspecific rise in the message count: either is
     // what a swallowed click looks like.
-    accepted = await confirmDegradedSend(page, text)
+    accepted = await confirmDegradedSend(page, text, beforeTree)
     if (accepted) await log('acceptance: no user-node delta on this page; confirmed by our text in the thread tree')
   }
   if (!accepted) {
@@ -2443,7 +2518,8 @@ export {
   // a live page (origin check, base64 validation, install probe, acceptance,
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
-  treeHasSentText, degradedSendVerdict, launchVerdict, ownerCarriesProfile, portOwner,
+  treeHasSentText, countUserTextInTree, degradedSendVerdict, launchVerdict, ownerCarriesProfile,
+  commandLineTokens, portOwner,
   exhaustedLaunchWhy,
 }
 
