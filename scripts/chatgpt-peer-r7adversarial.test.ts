@@ -516,6 +516,15 @@ describe('R7-2: a crash after markAnswered but before the reply', () => {
     // window under test is not a race with the host's own completion.
     driverA.stallFor = () => true
     const hostA = await startHost(dir, driverA, { turnTimeoutMs: 60_000 })
+    const internals = hostA as unknown as {
+      bridges: Map<string, {
+        state: { pendingTurns: { messageId: string }[] }
+        transport?: { acknowledge(id: string): Promise<void> }
+      }>
+      attachedTurns: Set<string>
+      freshTurns: Set<string>
+      markAnswered: (bridge: unknown, job: unknown) => Promise<void>
+    }
     let messageId = ''
     let userNodeId = ''
     try {
@@ -527,30 +536,49 @@ describe('R7-2: a crash after markAnswered but before the reply', () => {
         return found && found.postedAt !== null && found.userNodeId !== null ? found : undefined
       }, 15_000)
       userNodeId = turn.userNodeId as string
-      // The ack keeps the record out of the drain path; recoverOwed is the path
-      // under test.
-      await waitFor(async () => (await acknowledged(dir, alpha.sessionId, messageId) ? true : undefined), 10_000)
+      const bridge = internals.bridges.get(alpha.sessionId)!
+      // The ack keeps the record out of the drain path on restart; recoverOwed
+      // is the path under test. The host acks fire-and-forget and swallows a
+      // failed acknowledgement (`void ...acknowledge(id).catch(() => {})`), so
+      // waiting for it to appear is load-sensitive: a dropped write leaves it
+      // queued forever and the test pays the full timeout. Drive the same
+      // idempotent call ourselves and assert it - the ack is bus bookkeeping,
+      // not the behaviour under test, and `acknowledge` no-ops once delivered.
+      await bridge.transport!.acknowledge(messageId)
+      expect(await acknowledged(dir, alpha.sessionId, messageId)).toBe(true)
       // Build the crash state the way the code builds it. markAnswered is the
       // host's own write-ahead step between "the answer was obtained" and
       // "settleReply sends"; TypeScript `private` is compile-time only, so the
       // real method runs against the real bridge and persists through the real
       // persistBridgeState.
-      const internals = hostA as unknown as {
-        bridges: Map<string, { state: { pendingTurns: { messageId: string }[] } }>
-        markAnswered: (bridge: unknown, job: unknown) => Promise<void>
-      }
-      const bridge = internals.bridges.get(alpha.sessionId)!
       const job = bridge.state.pendingTurns.find(item => item.messageId === messageId)
       await internals.markAnswered(bridge, job)
     } finally {
       await hostA.stop()
       driverA.dead = true
-      // Let the interrupted turn's finally write once before the restart reads.
-      await new Promise(resolve => setTimeout(resolve, 300))
+      // A killed process writes nothing more. stop() returns while the
+      // interrupted turn is still unwinding, and its finally would persist this
+      // bridge a second time - after the restart may have loaded, or even
+      // rewritten, the same file. That late write is the load-sensitive flake:
+      // mark `removed` (the one switch the host honours for not writing a
+      // bridge) and wait for the turn to leave its sets, so host B starts on a
+      // file that can no longer change under it.
+      const bridge = internals.bridges.get(alpha.sessionId)
+      if (bridge) (bridge as { removed?: boolean }).removed = true
+      await waitFor(() => (internals.attachedTurns.size === 0 && internals.freshTurns.size === 0 ? true : undefined), 10_000)
+      await new Promise(resolve => setImmediate(resolve))
     }
     try {
-      // Precondition: host A never sent, so this is the crash window itself and
-      // not a host that settled the turn before it was stopped.
+      // Named, immediate preconditions: the shape the fix leaves at this
+      // boundary. A broken precondition used to surface as a 20 s reply
+      // timeout; it now fails here with the value that is wrong.
+      const durable = await readBridge(dir, alpha.sessionId)
+      const kept = durable.pendingTurns.find(item => item.messageId === messageId)
+      expect(kept).toBeTruthy()
+      expect(kept!.postedAt).not.toBe(null)
+      expect(kept!.userNodeId).toBe(userNodeId)
+      // Host A never sent, so this is the crash window itself and not a host
+      // that settled the turn before it was stopped.
       expect(await sentReplyIds(dir, alpha.sessionId)).not.toContain(messageId)
       expect(sendCount(driverA)).toBe(1)
       // Same page state at restart: the completed answer under the job's node.
