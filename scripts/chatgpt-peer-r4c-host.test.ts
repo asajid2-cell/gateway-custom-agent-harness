@@ -190,10 +190,14 @@ describe('R-LIVE-5: a driver fault is not the page\'s word', () => {
       // the turn's failure reason.
       expect(entry.result).toMatch(/still generating/)
       expect(entry.result).not.toMatch(/driver was replaced/)
-      const answered = await waitFor(() => (sender.inbox().length > 0 ? sender.inbox() : undefined), 5_000)
-      const text = JSON.stringify(answered)
-      expect(text).not.toMatch(/model turn failed/)
-      expect(text).not.toMatch(/driver was replaced/)
+      // R-LIVE-8: the driver failed, so the page is unproven. No line is sent
+      // (a line here would settle the debt as a definite negative the page
+      // never produced) and the turn stays owed for the observation pass.
+      await new Promise(resolve => setTimeout(resolve, 200))
+      expect(JSON.stringify(sender.inbox())).not.toMatch(/model turn failed|driver was replaced/)
+      expect(sender.inbox().length).toBe(0)
+      const owed = JSON.parse(await readFile(join(dir, 'bridges', `${alpha.sessionId}.json`), 'utf8')) as BridgeState
+      expect(owed.pendingTurns.some(turn => turn.postedAt !== null)).toBe(true)
     } finally {
       await sender.close()
       await host.stop()
