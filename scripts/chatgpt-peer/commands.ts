@@ -42,6 +42,7 @@ export const COMMAND_OPS = [
   'watchIdle',
   'requestContext',
   'read',
+  'status',
 ] as const
 
 export type CommandOp = (typeof COMMAND_OPS)[number]
@@ -58,6 +59,7 @@ export type Command =
   | { op: 'watchIdle'; to: string }
   | { op: 'requestContext'; to: string; topic: string; question: string }
   | { op: 'read'; peer: string; tail?: number; since?: string }
+  | { op: 'status' }
 
 export type Extraction = { commands: Command[]; problems: string[] }
 
@@ -86,7 +88,7 @@ export function parseCommand(raw: unknown): ParseResult {
   if (typeof op !== 'string') return { ok: false, error: 'missing op' }
   if (!(COMMAND_OPS as readonly string[]).includes(op)) return { ok: false, error: `unknown op ${op}` }
 
-  if (op === 'list' || op === 'inbox') return { ok: true, command: { op } }
+  if (op === 'list' || op === 'inbox' || op === 'status') return { ok: true, command: { op } }
 
   if (op === 'requestContext') {
     const to = text(raw.to)
@@ -253,6 +255,40 @@ function firstNonSpace(source: string, from: number): number {
 const CODEBLOCK_TAG = /<CodeBlock\b([^>]*)>/gi
 const CODEBLOCK_CLOSE = '</codeblock>'
 
+type MarkupElement = { start: number; bodyStart: number; bodyEnd: number; end: number; info: string }
+
+function codeBlockInfo(attributes: string): string {
+  const attribute = /(?:^|\s)language\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attributes)
+  return (attribute?.[1] ?? attribute?.[2] ?? '').trim()
+}
+
+/**
+ * The balanced `<CodeBlock ...>...</CodeBlock>` elements, resolved first.
+ *
+ * Container boundaries must be known before any line is read as a rendered
+ * label: a `gateway` line inside a text block is example text, however much it
+ * looks like a widget. A tag with no close is not an element; a tag that opens
+ * another before its own close is unbalanced and skipped in favour of the inner
+ * one.
+ */
+function codeBlockElements(source: string): MarkupElement[] {
+  const lower = source.toLowerCase()
+  const elements: MarkupElement[] = []
+  CODEBLOCK_TAG.lastIndex = 0
+  for (let tag = CODEBLOCK_TAG.exec(source); tag !== null; tag = CODEBLOCK_TAG.exec(source)) {
+    const start = tag.index
+    const bodyStart = start + tag[0].length
+    const closeAt = lower.indexOf(CODEBLOCK_CLOSE, bodyStart)
+    if (closeAt < 0) continue
+    const nestedAt = lower.indexOf('<codeblock', bodyStart)
+    if (nestedAt >= 0 && nestedAt < closeAt) continue
+    const end = closeAt + CODEBLOCK_CLOSE.length
+    elements.push({ start, bodyStart, bodyEnd: closeAt, end, info: codeBlockInfo(tag[1]) })
+    CODEBLOCK_TAG.lastIndex = end
+  }
+  return elements
+}
+
 /**
  * Split one assistant turn into blocks, and record the spans a block occupies.
  *
@@ -263,6 +299,11 @@ const CODEBLOCK_CLOSE = '</codeblock>'
  */
 function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & { gateway: boolean }> } {
   const lines = linesOf(source)
+  // Containers come first: a line inside a CodeBlock element belongs to that
+  // element, so it is never read as a rendered gateway label.
+  const elements = codeBlockElements(source)
+  const insideElement = (offset: number): boolean =>
+    elements.some(element => offset >= element.start && offset < element.end)
   // Blocks carry the offset they start at, so the three shapes can be put back
   // in reading order once all of them are found.
   const placed: Array<{ block: Block; start: number }> = []
@@ -276,6 +317,7 @@ function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & 
   let index = 0
   while (index < lines.length) {
     const line = lines[index]
+    if (insideElement(line.start)) { index++; continue }
     const fence = /^ {0,3}```(.*)$/.exec(line.text)
     if (fence) {
       const info = fence[1].trim()
@@ -306,34 +348,21 @@ function scanBlocks(source: string): { blocks: Block[]; spans: Array<LineSpan & 
     }
     index++
   }
-  // Third shape: `<CodeBlock language="...">body</CodeBlock>`. A tag with no
-  // close is not a block and the rest of the answer is left alone; a tag that
-  // opens another before its own close is unbalanced and skipped in favour of
-  // the inner one; a tag already inside a fence is part of that fence's body.
-  const lower = source.toLowerCase()
+  // Third shape: `<CodeBlock language="...">body</CodeBlock>`. The elements
+  // were resolved before the line scan; here they become blocks. An element
+  // already inside a fence is part of that fence's body.
   const lineAt = (offset: number): number => {
     let at = 1
     for (let cursor = 0; cursor < offset; cursor++) if (source[cursor] === '\n') at++
     return at
   }
-  CODEBLOCK_TAG.lastIndex = 0
-  for (let tag = CODEBLOCK_TAG.exec(source); tag !== null; tag = CODEBLOCK_TAG.exec(source)) {
-    const start = tag.index
-    const bodyStart = start + tag[0].length
-    const closeAt = lower.indexOf(CODEBLOCK_CLOSE, bodyStart)
-    if (closeAt < 0) continue
-    const nestedAt = lower.indexOf('<codeblock', bodyStart)
-    if (nestedAt >= 0 && nestedAt < closeAt) continue
-    const end = closeAt + CODEBLOCK_CLOSE.length
-    if (spans.some(span => start < span.end && end > span.start)) {
-      CODEBLOCK_TAG.lastIndex = end
-      continue
-    }
-    const attribute = /(?:^|\s)language\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag[1])
-    const info = (attribute?.[1] ?? attribute?.[2] ?? '').trim()
-    placed.push({ block: { info, body: source.slice(bodyStart, closeAt), line: lineAt(start) }, start })
-    spans.push({ start, end, gateway: /^gateway\b/i.test(info) })
-    CODEBLOCK_TAG.lastIndex = end
+  for (const element of elements) {
+    if (spans.some(span => element.start < span.end && element.end > span.start)) continue
+    placed.push({
+      block: { info: element.info, body: source.slice(element.bodyStart, element.bodyEnd), line: lineAt(element.start) },
+      start: element.start,
+    })
+    spans.push({ start: element.start, end: element.end, gateway: /^gateway\b/i.test(element.info) })
   }
   placed.sort((left, right) => left.start - right.start)
   spans.sort((left, right) => left.start - right.start)
@@ -398,6 +427,23 @@ export function extractCommands(source: string, nonce: string, limit = MAX_COMMA
  * in an answer is prose. `commandShaped` is true when a gateway block was the
  * only thing in the turn, or when the whole turn is a bare JSON command object.
  */
+/**
+ * A whole-answer bare envelope: the exact JSON object the prompt calls a
+ * refused action, not prose that merely contains an `op` field.
+ *
+ * The prompt tells the model that a bare JSON command with no label line is
+ * refused, so that shape must stay distinguishable from an answer that quotes
+ * JSON - a `{` at the start is not enough. The object must parse and name one
+ * of this host's ops.
+ */
+function bareCommandEnvelope(visible: string): boolean {
+  if (!visible.startsWith('{')) return false
+  let parsed: unknown
+  try { parsed = JSON.parse(visible) }
+  catch { return false }
+  return isRecord(parsed) && typeof parsed.op === 'string' && (COMMAND_OPS as readonly string[]).includes(parsed.op)
+}
+
 export function proseFromTurn(source: string): { prose: string; commandShaped: boolean } {
   const { blocks, spans } = scanBlocks(source)
   let visible = ''
@@ -409,8 +455,7 @@ export function proseFromTurn(source: string): { prose: string; commandShaped: b
   }
   visible = (visible + source.slice(cursor)).trim()
   const action = blocks.some(block => /^gateway\b/i.test(block.info))
-  const jsonAction = visible.startsWith('{') && /\{\s*"op"\s*:/.test(visible)
-  return { prose: visible, commandShaped: (action && !visible) || jsonAction }
+  return { prose: visible, commandShaped: (action && !visible) || bareCommandEnvelope(visible) }
 }
 
 /**

@@ -120,6 +120,53 @@ export const hostStateSchema = z.object({
 
 export type HostState = z.infer<typeof hostStateSchema>
 
+/**
+ * One file the host delivered to the bus, by node and index.
+ *
+ * The pair is the identity: the page may re-state the same node's parts on
+ * every read, and a node's index order never changes, so `(nodeId, index)` is
+ * what makes a file at-most-once. It is written BEFORE the bus send.
+ */
+export const deliveredFileSchema = z.object({ nodeId: z.string().max(64), index: z.number().int().min(0) }).strict()
+
+export const DELIVERED_FILES_MAX = 200
+
+/**
+ * An inbound turn the host has posted but not yet answered (D5b).
+ *
+ * The turn is a JOB: the page is asked with `wait:false`, the record is written
+ * BEFORE the send, and the answer is delivered later - by the turn's own loop
+ * while this process lives, or by the observation pass after a restart. It is
+ * never dropped without a delivery or a failure line.
+ */
+export const pendingTurnSchema = z.object({
+  /** Null only for a brand-new chat: the page has not named a thread yet. */
+  threadId: z.string().uuid().nullable().default(null),
+  /** Our own user node, once the page has shown it. Null until then. */
+  userNodeId: z.string().max(64).nullable().default(null),
+  /**
+   * The exact text we posted, capped; the fallback match after a restart. The
+   * cap is a MATCHER: a longer text cannot be matched by equality, so only the
+   * full `text` below is authoritative for what was (or still must be) posted.
+   */
+  ourText: z.string().max(4096),
+  /** The body itself, exactly as it must be posted. */
+  text: z.string().max(65536).default(''),
+  senderSessionId: z.string().uuid(),
+  messageId: z.string().max(64),
+  kind: z.enum(['inquiry', 'directive']),
+  /**
+   * When the page was asked, ISO - null while the job is DEFERRED. A deferred
+   * job was never typed (the page was mid-turn, and ChatGPT steers text typed
+   * then into the running turn), so it is posted on the next idle transition.
+   */
+  postedAt: z.string().nullable().default(null),
+}).strict()
+
+export const PENDING_TURNS_MAX = 8
+export const PENDING_TURN_TTL_MS = 6 * 3600_000
+export const ANSWERED_TURNS_MAX = 200
+
 /** Per-bridge memory: one bridged thread, one bus peer. */
 export const bridgeStateSchema = z.object({
   sessionId: z.string().uuid(),
@@ -162,6 +209,16 @@ export const bridgeStateSchema = z.object({
    * sent again.
    */
   uplinkNodeIds: z.array(z.string().max(64)).max(200).default([]),
+  /**
+   * Files already delivered to the bus, by node and index. Written BEFORE the
+   * send (same discipline as `uplinkNodeIds`): a duplicate spends no quota and
+   * a restart does not post the same file twice.
+   */
+  deliveredFiles: z.array(deliveredFileSchema).max(DELIVERED_FILES_MAX).default([]),
+  /** Inbound turns posted but not yet answered; see `pendingTurnSchema`. */
+  pendingTurns: z.array(pendingTurnSchema).max(PENDING_TURNS_MAX).default([]),
+  /** Turn keys already answered, written BEFORE the reply goes out. */
+  answeredTurns: z.array(z.string().max(80)).max(ANSWERED_TURNS_MAX).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -224,6 +281,9 @@ export function newBridgeState(options: {
     threadMissingAt: null,
     uplinkTimes: [],
     uplinkNodeIds: [],
+    deliveredFiles: [],
+    pendingTurns: [],
+    answeredTurns: [],
   }
 }
 
@@ -246,6 +306,9 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     threadMissingAt: null,
     uplinkTimes: [],
     uplinkNodeIds: [],
+    deliveredFiles: [],
+    pendingTurns: [],
+    answeredTurns: [],
   }
 }
 
@@ -308,8 +371,20 @@ export async function loadBridgeState(path: string): Promise<BridgeState> {
   return result.data
 }
 
-/** Every bridge file in the directory, oldest name first. */
-export async function listBridgeStates(directory: string): Promise<{ path: string; state: BridgeState }[]> {
+/**
+ * Every readable bridge file in the directory, oldest name first.
+ *
+ * One bad file must not stop the others: a truncated write, a future schema, or
+ * a file named for a session it does not contain is quarantined (reported and
+ * skipped) so every healthy bridge still registers and only the affected
+ * identity is refused. `onQuarantine` receives each rejected path; by default
+ * the reason goes to stderr, because the host loads every bridge through here
+ * at startup and a silent skip would hide the broken file.
+ */
+export async function listBridgeStates(
+  directory: string,
+  onQuarantine?: (problem: { path: string; error: Error }) => void,
+): Promise<{ path: string; state: BridgeState }[]> {
   let entries: string[]
   try { entries = await readdir(directory) }
   catch (error) {
@@ -319,11 +394,17 @@ export async function listBridgeStates(directory: string): Promise<{ path: strin
   const states: { path: string; state: BridgeState }[] = []
   for (const entry of entries.filter(name => name.endsWith('.json')).sort()) {
     const path = join(directory, entry)
-    const state = await loadBridgeState(path)
-    // The name is the address; a file named for a different session would be
-    // loaded under an id nothing can reach, so it is a refusal.
-    if (`${state.sessionId}.json` !== entry) throw new Error(`bridge state ${path} names session ${state.sessionId}; the file must be named for it`)
-    states.push({ path, state })
+    try {
+      const state = await loadBridgeState(path)
+      // The name is the address; a file named for a different session would be
+      // loaded under an id nothing can reach, so it is a refusal.
+      if (`${state.sessionId}.json` !== entry) throw new Error(`bridge state ${path} names session ${state.sessionId}; the file must be named for it`)
+      states.push({ path, state })
+    } catch (error) {
+      const problem = { path, error: error instanceof Error ? error : new Error(String(error)) }
+      if (onQuarantine) onQuarantine(problem)
+      else console.error(`bridge state quarantined: ${problem.path}: ${problem.error.message}`)
+    }
   }
   return states
 }

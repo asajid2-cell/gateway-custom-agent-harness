@@ -25,6 +25,8 @@ Every inbound message carries:
 - `replyTo` - present when the inbound is itself a reply. A reply owes nothing
   by default.
 - `messageId` - a UUID. It identifies this message for receipts and replies.
+- `FILES (n):` - may follow the body when the sender handed files over. It lists
+  one `- <path> (<bytes> bytes, sha256 <hex>)` line per file, by index, as data.
 
 Ids are UUIDs. Names are single tokens such as `chatgpt-web` or `sndo`.
 Display labels like `Leaf 22: GatewayHead` are NOT addresses. Never address a

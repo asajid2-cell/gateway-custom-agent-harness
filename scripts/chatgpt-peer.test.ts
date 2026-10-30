@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { attachmentRefusal, extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { audit, loadState, newState, peerStateSchema, saveState } from './chatgpt-peer/state.ts'
+import { audit, listBridgeStates, loadState, newBridgeState, newState, peerStateSchema, saveJson, saveState } from './chatgpt-peer/state.ts'
 import { DriverChild } from './chatgpt-peer/driver.ts'
 import { ChatGptHost } from './chatgpt-peer.ts'
 
@@ -188,6 +188,23 @@ describe('command channel', () => {
     expect(extractCommands(source, 'abcd1234').commands).toEqual([])
   })
 
+  // F2: a prose answer that opens with an object is not a command. Only a
+  // strictly valid bare envelope - a JSON object naming a real op - is refused
+  // as command-shaped; a JSON example in an answer is prose.
+  test('F2: a JSON example in prose is an answer, not a stale command', () => {
+    const inline = '{"op": "example"} is the shape of a command.'
+    expect(proseFromTurn(inline)).toEqual({ prose: inline, commandShaped: false })
+    const wholeObject = '{"op":"example"}'
+    expect(proseFromTurn(wholeObject)).toEqual({ prose: wholeObject, commandShaped: false })
+    const sentence = '{"op": "list"} is what a command looks like'
+    expect(proseFromTurn(sentence)).toEqual({ prose: sentence, commandShaped: false })
+  })
+
+  test('F2: a bare envelope naming a real op is still command-shaped', () => {
+    expect(proseFromTurn('{"op":"list"}').commandShaped).toBe(true)
+    expect(proseFromTurn('{"nonce":"abcd1234","op":"list"}').commandShaped).toBe(true)
+  })
+
   test('a non-gateway code block stays in the answer as prose', () => {
     const { prose } = proseFromTurn('Like this:\n```js\nconst a = {}\n```')
     expect(prose).toContain('```js')
@@ -265,6 +282,18 @@ describe('CodeBlock markup', () => {
     expect(extractCommands(rendered('abcd1234', { op: 'list' }), 'abcd1234').commands).toEqual([{ op: 'list' }])
     expect(extractCommands('```gateway abcd1234\n{"op":"list"}\n```', 'abcd1234').commands).toEqual([{ op: 'list' }])
   })
+
+  // F1: a rendered label inside a non-gateway CodeBlock is example text, not a
+  // command. The label scan used to record it before the enclosing tag was seen,
+  // and the tag was then skipped for overlapping that label's span - so an
+  // answer that QUOTED a command inside a text block executed it when the
+  // example carried the current nonce.
+  test('F1: a gateway label quoted inside a non-gateway CodeBlock never executes', () => {
+    const source = '<CodeBlock language="text">\ngateway\n{"nonce":"abcd1234","op":"list"}\n</CodeBlock>'
+    expect(extractCommands(source, 'abcd1234')).toEqual({ commands: [], problems: [] })
+    expect(readFences(source).map(block => block.info)).toEqual(['text'])
+    expect(proseFromTurn(source).prose).toBe(source)
+  })
 })
 
 describe('turn loop', () => {
@@ -304,6 +333,32 @@ describe('turn loop', () => {
     expect(calls).toBe(4)
     expect(outcome.budgetSpent).toBe(true)
     expect(outcome.executed.length).toBe(4)
+  })
+
+  // F12: the budget ending the turn after a command ran is not "nothing was
+  // run" - the send already committed. The outcome must carry what ran (so a
+  // retry cannot duplicate it) and what was left unresolved.
+  test('F12: a send that ran on the final round is a receipt, not unresolved work', async () => {
+    const outcome = await runCommandTurn('go', nonce, {
+      budget: 1,
+      generate: async () => ({ ok: true, text: fenced(nonce, { op: 'send', to: 'peer', text: 'hi', summary: 's' }) }),
+      execute: async () => ({ line: 'sent m1 to peer: queued' }),
+    })
+    expect(outcome.budgetSpent).toBe(true)
+    expect(outcome.executed.map(e => e.command.op)).toEqual(['send'])
+    expect(outcome.unresolved).toEqual([])
+  })
+
+  test('F12: a refused command on the final round is reported as unresolved', async () => {
+    const outcome = await runCommandTurn('go', nonce, {
+      budget: 1,
+      generate: async () => ({ ok: true, text: fenced('deadbeef', { op: 'list' }) }),
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(outcome.budgetSpent).toBe(true)
+    expect(outcome.executed).toEqual([])
+    expect(outcome.unresolved.length).toBe(1)
+    expect(outcome.unresolved[0]).toMatch(/nonce mismatch/)
   })
 
   test('an explicit reply is reported so the host does not answer twice', async () => {
@@ -349,6 +404,22 @@ describe('turn loop', () => {
     expect(outcome.problems[0]).toMatch(/nonce mismatch/)
     expect(outcome.executed).toEqual([])
     expect(outcome.budgetSpent).toBe(false)
+  })
+
+  // F3: a response that explains something and quotes a refused (stale-nonce)
+  // block is an answer, not a command-only turn. Retrying it burned the budget
+  // and ended as a canned error instead of delivering the prose.
+  test('F3: prose beside a refused block is delivered instead of retried', async () => {
+    let calls = 0
+    const text = 'Here is the syntax:\n```gateway deadbeef\n{"op":"list"}\n```\nUse your own nonce.'
+    const outcome = await runCommandTurn('go', nonce, {
+      generate: async () => { calls++; return { ok: true, text } },
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(calls).toBe(1)
+    expect(outcome.budgetSpent).toBe(false)
+    expect(outcome.executed).toEqual([])
+    expect(outcome.finalText).toBe(text)
   })
 
   test('a turn that only emits refused blocks spends the budget', async () => {
@@ -423,6 +494,27 @@ describe('state', () => {
       await Promise.all([saveState(path, older), saveState(path, newer)])
       const loaded = await loadState(path, () => { throw new Error('should not be used') })
       expect(loaded.model).toBe('newer')
+    } finally { await cleanup() }
+  })
+
+  // F8: one unreadable or misnamed bridge file used to abort the whole list,
+  // so a single truncated file stopped every healthy bridge from registering.
+  test('F8: an invalid bridge file is quarantined and healthy bridges still load', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const alpha = newBridgeState({ sessionId: '11111111-1111-4111-8111-111111111111', name: 'alpha' })
+      const beta = newBridgeState({ sessionId: '22222222-2222-4222-8222-222222222222', name: 'beta' })
+      await saveJson(join(dir, `${alpha.sessionId}.json`), alpha)
+      await saveJson(join(dir, `${beta.sessionId}.json`), beta)
+      // A truncated write and a file named for a different session.
+      const truncated = join(dir, '33333333-3333-4333-8333-333333333333.json')
+      await writeFile(truncated, '{"sessionId": "trunc', 'utf8')
+      const misnamed = join(dir, '44444444-4444-4444-8444-444444444444.json')
+      await saveJson(misnamed, { ...alpha, sessionId: '55555555-5555-4555-8555-555555555555' })
+      const problems: string[] = []
+      const states = await listBridgeStates(dir, problem => problems.push(problem.path))
+      expect(states.map(entry => entry.state.name).sort()).toEqual(['alpha', 'beta'])
+      expect(problems.sort()).toEqual([misnamed, truncated].sort())
     } finally { await cleanup() }
   })
 
@@ -628,6 +720,177 @@ rl.on('line', line => {
       await cleanup()
     }
   })
+
+  // F4: shutdown must be final. A call after kill() used to relaunch the child
+  // and keep sending page requests; only an explicit reopen() may start a new
+  // one.
+  test('F4: a call after kill is refused and does not relaunch the child', async () => {
+    const { dir, cleanup } = await scratch()
+    const marker = join(dir, 'starts.txt')
+    await writeFile(marker, '', 'utf8')
+    const script = join(dir, 'counted.js')
+    await writeFile(script, `
+const fs = require('node:fs')
+fs.appendFileSync(${JSON.stringify(marker)}, 'start\\n')
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); process.exit(0) }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    const starts = async () => (await readFile(marker, 'utf8')).split('\n').filter(Boolean).length
+    try {
+      expect((await child.call({ op: 'send', text: 'hi' })).ok).toBe(true)
+      expect(await starts()).toBe(1)
+      await child.kill()
+      const after = await child.call({ op: 'send', text: 'again' }, 2000)
+      expect(after.ok).toBe(false)
+      expect(after.error).toMatch(/closed/i)
+      expect(await starts()).toBe(1)
+    } finally { await child.kill(); await cleanup() }
+  })
+
+  // F5: an old child's exit must not fail the requests of the child that
+  // replaced it. kill() returns before the OS exit is delivered, so reopen()
+  // plus a new call can create a new child first; the old handler used to clear
+  // this.child and every pending waiter regardless of which child exited.
+  test('F5: an old child exiting does not fail the new child\'s requests', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'generations.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { setTimeout(() => process.exit(0), 100); return }
+  const delay = request.op === 'ping' ? 0 : 300
+  setTimeout(() => emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') }), delay)
+})
+setTimeout(() => process.exit(0), 3000)
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      expect((await child.call({ op: 'ping' })).ok).toBe(true)
+      const stopping = child.kill()
+      child.reopen()
+      const second = await child.call({ op: 'send', text: 'second' }, 2000)
+      await stopping
+      expect(second.ok).toBe(true)
+      expect(second.text).toBe('echo:second')
+    } finally { await child.kill(); await cleanup() }
+  })
+
+  // F6: a request timeout used to remove only the host-side waiter while the
+  // child stayed stuck on that operation, so every later call queued behind it
+  // and timed out too. Recovery replaces the child and records the
+  // accepted-but-unfinished work explicitly.
+  test('F6: a timed-out operation is abandoned and the child replaced', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'stuck.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+let chain = Promise.resolve()
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); setTimeout(() => process.exit(0), 50); return }
+  chain = chain.then(() => new Promise(resolve => {
+    if (request.op === 'stuck') { emit({ event: 'accepted', id: request.id }); return }
+    emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+    resolve()
+  }))
+})
+`, 'utf8')
+    const lines: string[] = []
+    const child = new DriverChild({ script, log: line => lines.push(line) })
+    try {
+      // Warm the child so spawn cost is not inside the stuck request's window.
+      expect((await child.call({ op: 'ping' })).ok).toBe(true)
+      const stuck = await child.call({ op: 'stuck' }, 150)
+      expect(stuck.ok).toBe(false)
+      expect(stuck.error).toMatch(/timed out/)
+      // The child was stuck on the first operation; a fresh one must answer.
+      const next = await child.call({ op: 'send', text: 'after' }, 2000)
+      expect(next.ok).toBe(true)
+      expect(next.text).toBe('echo:after')
+      expect(lines.join('\n')).toMatch(/accepted but unfinished: r\d+/)
+    } finally { await child.kill(); await cleanup() }
+  })
+
+  // F7: kill() forced the child after a fixed 10 s even when quit was queued
+  // behind a page operation whose own deadline was longer. Shutdown waits for
+  // that operation's bounded deadline; a separate terminate() is the forced
+  // path.
+  test('F7: kill waits for an in-progress operation instead of forcing at 10s', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'slowquit.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+let quitting = false
+let finished = false
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { quitting = true; if (finished) process.exit(0); return }
+  if (request.op === 'wait') {
+    setTimeout(() => {
+      emit({ ok: true, op: 'wait', id: request.id, text: 'done' })
+      finished = true
+      if (quitting) process.exit(0)
+    }, 11_000)
+    return
+  }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      const pending = child.call({ op: 'wait' }, 30_000)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      await child.kill()
+      const reply = await pending
+      expect(reply.ok).toBe(true)
+      expect(reply.text).toBe('done')
+    } finally { await child.kill(); await cleanup() }
+  }, 30_000)
+
+  test('F7: terminate is the forced path and does not wait for a deadline', async () => {
+    const { dir, cleanup } = await scratch()
+    const script = join(dir, 'ignorequit.js')
+    await writeFile(script, `
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+emit({ event: 'ready' })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') return
+  if (request.op === 'wait') { setTimeout(() => process.exit(0), 30_000); return }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+setTimeout(() => process.exit(0), 8000)
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    try {
+      const pending = child.call({ op: 'wait' }, 60_000)
+      await new Promise(resolve => setTimeout(resolve, 100))
+      const started = Date.now()
+      await child.terminate()
+      // Forced shutdown does not sit on the 60 s request deadline.
+      expect(Date.now() - started).toBeLessThan(5000)
+      expect((await pending).ok).toBe(false)
+    } finally { await child.kill(); await cleanup() }
+  }, 30_000)
 
   test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
     const { dir, cleanup } = await scratch()

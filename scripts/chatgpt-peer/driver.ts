@@ -25,9 +25,24 @@ export type DriverReply = { ok: boolean; op?: string; id?: string; [key: string]
 export type DriverEvent = { event: string; [key: string]: unknown }
 export type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => void }
 
+/**
+ * How long a graceful shutdown lets an in-progress page operation run before
+ * the child is forced. The floor is the old short grace when nothing is in
+ * flight; the ceiling stops a very long page-turn budget (the host's default is
+ * 20 minutes) from holding a shutdown open indefinitely. terminate() is the
+ * always-forced path.
+ */
+const MIN_DRAIN_MS = 10_000
+const MAX_DRAIN_MS = 5 * 60_000
+
 export class DriverChild {
   private child?: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<string, (reply: DriverReply) => void>()
+  /**
+   * A waiter belongs to the child generation that accepted the request. If a
+   * forced kill or a reopen replaces the child before an old one exits, that
+   * old exit must settle only its own requests - never the new child's.
+   */
+  private readonly pending = new Map<string, { generation: number; finish: (reply: DriverReply) => void }>()
   /**
    * The acceptor for a request is held until that request's `accepted` line
    * arrives, so two sends in flight each hear about their own message. An id
@@ -36,9 +51,19 @@ export class DriverChild {
    * whoever happens to be waiting now.
    */
   private readonly acceptors = new Map<string, (id: string) => void>()
+  /**
+   * Requests the page told us it took, by id and by the child generation that
+   * took them. Used to name the work a timeout recovery abandons; an id leaves
+   * this set when it is settled or its child exits.
+   */
+  private readonly accepted = new Map<string, number>()
+  /** When each in-flight request's own deadline falls, for a graceful drain. */
+  private readonly deadlines = new Map<string, number>()
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
+  /** Bumped for every spawn; a line or exit from an older generation is stale. */
+  private generation = 0
 
   constructor(private readonly options: {
     script: string
@@ -61,29 +86,48 @@ export class DriverChild {
   }
 
   private ensure(): ChildProcessWithoutNullStreams {
-    if (this.child && this.child.exitCode === null && !this.closed) return this.child
+    // After kill() the driver is closed for good: a new child is reachable only
+    // through an explicit reopen(), never as a side effect of a late call.
+    if (this.closed) throw new Error('driver is closed')
+    if (this.child && this.child.exitCode === null) return this.child
+    const generation = ++this.generation
     const env = { ...process.env, ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}) }
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
-    createInterface({ input: child.stdout }).on('line', line => this.handleLine(line))
+    createInterface({ input: child.stdout }).on('line', line => this.handleLine(line, generation))
     createInterface({ input: child.stderr }).on('line', line => {
       if (line.trim()) this.log(`driver: ${line.trim().slice(0, 400)}`)
     })
     child.on('exit', code => {
       const reason = `driver exited (code ${code ?? 'null'})`
       this.log(reason)
-      this.child = undefined
-      for (const settle of this.pending.values()) settle({ ok: false, error: reason })
-      this.pending.clear()
-      this.acceptors.clear()
+      // Only the current child may clear the current child. An old child that
+      // exits after reopen()/timeout recovery left this.child pointing at its
+      // replacement, and clearing it here would orphan that replacement.
+      if (this.child === child) this.child = undefined
+      // Settle this generation's waiters only; they carry the generation.
+      for (const [id, waiter] of [...this.pending]) {
+        if (waiter.generation !== generation) continue
+        waiter.finish({ ok: false, id, error: reason })
+        this.acceptors.delete(id)
+      }
+      for (const [id, acceptedGeneration] of [...this.accepted]) {
+        if (acceptedGeneration === generation) this.accepted.delete(id)
+      }
     })
     child.stdin.on('error', () => {})
     this.child = child
     return child
   }
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, generation: number): void {
+    // A line from a child that has been replaced is stale: it can neither
+    // settle a newer request nor push an event on behalf of the current page.
+    if (generation !== this.generation) {
+      if (line.trim()) this.log(`driver: stale line from an older child: ${line.trim().slice(0, 120)}`)
+      return
+    }
     const trimmed = line.trim()
     if (!trimmed) return
     let message: Record<string, unknown>
@@ -102,6 +146,9 @@ export class DriverChild {
     const event = typeof message.event === 'string' ? message.event : ''
     if (event) {
       if (event === 'accepted') {
+        // Remember acceptance even without a callback: it is what the timeout
+        // recovery has to account for as accepted-but-unfinished work.
+        if (id) this.accepted.set(id, generation)
         const accept = id ? this.acceptors.get(id) : undefined
         if (!accept) {
           this.log(`driver: accepted for ${id || 'no id'} has no live waiter; dropped`)
@@ -118,15 +165,15 @@ export class DriverChild {
       this.log(`driver: reply without a request id: ${trimmed.slice(0, 120)}`)
       return
     }
-    const settle = this.pending.get(id)
-    if (!settle) {
+    const waiter = this.pending.get(id)
+    if (!waiter) {
       this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
       return
     }
     // `finish` owns the cleanup: it deletes the pending entry and the acceptor
     // together, so a request is settled exactly once from either path.
     this.acceptors.delete(id)
-    settle(message as DriverReply)
+    waiter.finish(message as DriverReply)
   }
 
   private dispatch(event: DriverEvent): void {
@@ -136,9 +183,11 @@ export class DriverChild {
   }
 
   async call(request: Record<string, unknown>, options: number | CallOptions = this.options.timeoutMs ?? 600_000): Promise<DriverReply> {
+    if (this.closed) return { ok: false, error: 'driver is closed' }
     const settings = typeof options === 'number' ? { timeoutMs: options } : options
     const timeoutMs = settings.timeoutMs ?? this.options.timeoutMs ?? 600_000
     const child = this.ensure()
+    const generation = this.generation
     const id = `r${++this.sequence}`
     return await new Promise<DriverReply>(resolve => {
       let done = false
@@ -148,12 +197,21 @@ export class DriverChild {
         clearTimeout(timer)
         if (!this.pending.delete(id)) return
         this.acceptors.delete(id)
+        this.accepted.delete(id)
+        this.deadlines.delete(id)
         resolve(reply)
       }
       const timer = setTimeout(() => {
-        finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        // `reason:'timeout'` is part of the contract: a caller must be able to
+        // tell "no answer came" from "the page said no", and the two lead to
+        // opposite decisions (wait longer vs. stop). `recover` still gets the
+        // child's channel back for the requests behind this one.
+        const wasAccepted = this.accepted.has(id)
+        finish({ ok: false, id, reason: 'timeout', error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        this.recover(generation, id, wasAccepted)
       }, timeoutMs)
-      this.pending.set(id, finish)
+      this.pending.set(id, { generation, finish })
+      this.deadlines.set(id, Date.now() + timeoutMs)
       if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)
       child.stdin.write(`${JSON.stringify({ ...request, id })}\n`, error => {
         if (!error) return
@@ -162,18 +220,64 @@ export class DriverChild {
     })
   }
 
-  /** Stop the child and, with it, the page. */
+  /**
+   * Abandon the child a timed-out operation was monopolising.
+   *
+   * The host-side waiter alone was removed before, so the child kept working on
+   * an operation nobody would read and every later request queued behind it. A
+   * timeout now replaces that child: the abandoned work is named in the log
+   * (accepted-but-unfinished ids), the generation is left behind so its late
+   * lines and exit cannot touch the replacement, and any other waiter of the
+   * same generation is failed rather than left to time out behind the stuck op.
+   */
+  private recover(generation: number, timedOutId: string, wasAccepted: boolean): void {
+    if (generation !== this.generation) return
+    const child = this.child
+    const unfinished = [
+      ...(wasAccepted ? [timedOutId] : []),
+      ...[...this.accepted].filter(([id, at]) => at === generation && id !== timedOutId).map(([id]) => id),
+    ]
+    this.log(`driver: ${timedOutId} timed out; replacing the child (accepted but unfinished: ${unfinished.join(', ') || 'none'})`)
+    this.child = undefined
+    if (child && child.exitCode === null) { try { child.kill() } catch { /* already gone */ } }
+    const reason = `driver was replaced after ${timedOutId} timed out`
+    for (const [id, waiter] of [...this.pending]) {
+      if (waiter.generation !== generation) continue
+      waiter.finish({ ok: false, id, error: reason })
+    }
+    for (const [id, at] of [...this.accepted]) if (at === generation) this.accepted.delete(id)
+  }
+
+  /**
+   * Graceful shutdown: refuse new work, detach the child so a later reopen()
+   * starts a new generation, ask it to quit, and let an in-flight page
+   * operation reach its own bounded deadline before forcing it. A fixed 10 s
+   * forced kill used to cut a page turn short mid-operation.
+   */
   async kill(): Promise<void> {
     const child = this.child
     this.child = undefined
     this.closed = true
     if (!child || child.exitCode !== null) return
+    const latest = [...this.deadlines.values()].reduce((max, at) => Math.max(max, at), 0)
+    const grace = Math.max(MIN_DRAIN_MS, Math.min(latest - Date.now(), MAX_DRAIN_MS))
     await new Promise<void>(resolve => {
-      // The child refuses new requests and lets its queue drain before it
-      // quits, so the budget here is larger than a single page turn.
-      const timer = setTimeout(() => { child.kill(); resolve() }, 10_000)
+      const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } ; resolve() }, grace)
       child.once('exit', () => { clearTimeout(timer); resolve() })
-      try { child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`) } catch { child.kill() }
+      try { child.stdin.write(`${JSON.stringify({ op: 'quit' })}\n`) } catch { try { child.kill() } catch { /* already gone */ }; resolve() }
+    })
+    if (this.child === child) this.child = undefined
+  }
+
+  /** Forced shutdown: kill now, ignoring any operation's deadline. */
+  async terminate(): Promise<void> {
+    this.closed = true
+    const child = this.child
+    this.child = undefined
+    if (!child || child.exitCode !== null) return
+    await new Promise<void>(resolve => {
+      child.once('exit', () => resolve())
+      try { child.kill() } catch { resolve() }
     })
   }
 
