@@ -41,6 +41,46 @@ class FakeDriver {
   answerFor: ((request: Call) => string | undefined) | undefined
   private accepted: ((id: string) => void) | undefined
   private current: string | null = null
+  /** Serve the read-only thread ops from an in-memory tree shaped like /backend-api/conversation. */
+  observable = false
+  readonly deleted = new Set<string>()
+  private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
+  private clock = 1000
+
+  private treeOf(threadId: string): { current: string; mapping: Record<string, any> } {
+    let tree = this.trees.get(threadId)
+    if (!tree) {
+      const root = `root-${threadId}`
+      tree = { current: root, mapping: { [root]: { id: root, parent: null, children: [], message: null } } }
+      this.trees.set(threadId, tree)
+    }
+    return tree
+  }
+
+  private grow(threadId: string, role: 'user' | 'assistant', text: string): string {
+    const tree = this.treeOf(threadId)
+    const id = randomUUID()
+    tree.mapping[id] = { id, parent: tree.current, children: [], message: { id, author: { role }, create_time: this.clock++, end_turn: role === 'assistant' ? true : null, status: 'finished_successfully', content: { content_type: 'text', parts: [text] } } }
+    tree.mapping[tree.current].children.push(id)
+    tree.current = id
+    return id
+  }
+
+  /** The person types in the thread directly; the model answers. Returns the user node id. */
+  humanTypes(threadId: string, text: string, answer: string): string {
+    const id = this.grow(threadId, 'user', text)
+    this.grow(threadId, 'assistant', answer)
+    return id
+  }
+
+  /** The tab is showing this thread (as a person would have opened it). */
+  openThread(threadId: string | null): void { this.current = threadId }
+
+  userNodes(threadId: string): { id: string; text: string }[] {
+    return Object.values(this.treeOf(threadId).mapping)
+      .filter((node: any) => node.message?.author.role === 'user')
+      .map((node: any) => ({ id: node.id, text: String(node.message.content.parts[0]) }))
+  }
 
   onAccepted(handler: ((id: string) => void) | undefined): void { this.accepted = handler }
 
@@ -64,6 +104,8 @@ class FakeDriver {
       if (!threadId) return { ok: false, op, error: 'no thread is open' }
       this.current = threadId
       this.answer = this.answerFor?.(request) ?? this.answer
+      this.grow(threadId, 'user', String(request.text ?? ''))
+      this.grow(threadId, 'assistant', this.answer)
       this.accepted?.(String(request.id ?? ''))
       return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
     }
@@ -71,6 +113,17 @@ class FakeDriver {
       this.readCalls++
       if (this.readError) return { ok: false, op, error: this.readError }
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
+    }
+    if (op === 'conversation' && this.observable) {
+      const threadId = String(request.threadId ?? '')
+      if (this.deleted.has(threadId)) return { ok: false, op, status: 404, error: 'conversation not found' }
+      const tree = this.treeOf(threadId)
+      return { ok: true, op, conversation: { current_node: tree.current, mapping: structuredClone(tree.mapping) } }
+    }
+    if (op === 'conversations' && this.observable) {
+      const offset = Number(request.offset ?? 0)
+      const limit = Number(request.limit ?? 100)
+      return { ok: true, op, items: this.threads.filter(thread => !this.deleted.has(thread.id)).slice(offset, offset + limit) }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') return { ok: true, op, threadId: this.current, model: 'GPT-6', effort: 'High' }
@@ -86,7 +139,10 @@ async function scratch(): Promise<{ dir: string; cleanup: () => Promise<void> }>
   return { dir, cleanup: () => rm(dir, { recursive: true, force: true }) }
 }
 
-const sessionsDir = (dir: string): string => join(dir, 'sessions')
+// The config home is the scratch directory itself, so the bus directory is the
+// one resolveGatewayPeer looks in: a name has to resolve back to a session for
+// an uplink to be deliverable at all.
+const sessionsDir = (dir: string): string => join(dir, 'gateway-sessions')
 const privateHome = (dir: string): string => join(dir, 'private')
 const profileDir = (dir: string): string => join(dir, 'profile')
 
@@ -99,8 +155,8 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver): Promise<ChatGptHost> {
-  process.env.CLAUDE_CONFIG_DIR = join(dir, 'claude')
+async function startHost(dir: string, driver: FakeDriver, options: { idleUnloadMinutes?: number } = {}): Promise<ChatGptHost> {
+  process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
     statePath: join(dir, 'peer.json'),
@@ -108,8 +164,9 @@ async function startHost(dir: string, driver: FakeDriver): Promise<ChatGptHost> 
     profile: profileDir(dir),
     instanceId: 'test',
     healthPort: 0,
-    idleUnloadMinutes: 0,
+    idleUnloadMinutes: options.idleUnloadMinutes ?? 0,
     number: 1,
+    pollSeconds: 0,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -170,6 +227,21 @@ const THREAD_RECOVERY = 'adopt another thread with the thread use action, or sta
 
 async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
   return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
+}
+
+/** The rolling audit the host wrote: what it did, in its own words. */
+async function hostAudit(dir: string): Promise<{ op: string; target: string | null; result: string }[]> {
+  const state = JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')) as { audit: { op: string; target: string | null; result: string }[] }
+  return state.audit
+}
+
+/** A second real bus peer in the scratch directory: what an uplink is delivered to. */
+async function listenerPeer(dir: string, name = 'listener'): Promise<{ transport: GatewaySessionTransport; close: () => Promise<void> }> {
+  const transport = new GatewaySessionTransport({
+    directory: sessionsDir(dir), sessionId: randomUUID(), name, cwd: process.cwd(), purpose: 'test recipient', policy: 'accept',
+  })
+  await transport.start()
+  return { transport, close: () => transport.close() }
 }
 
 describe('multi-bridge host', () => {
@@ -393,16 +465,19 @@ describe('multi-bridge host', () => {
 
   // ------------------------------------------------------------- increment 2
 
-  test('a bridge file written before the join token existed still loads', async () => {
+  test('a bridge file from the operator-page build still loads; its join-token fields are dropped', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = bridgeNamed('alpha', THREAD_A)
-    // Exactly the increment-1 shape: no bootstrap fields at all.
+    // The 9dd33dc shape: join token, burn time and arm memory, no observation fields.
     await seedHost(dir, [{
       sessionId: alpha.sessionId,
       name: 'alpha',
       threadId: THREAD_A,
       primedThreadId: THREAD_A,
       primerSha256: 'a'.repeat(64),
+      bootstrapSha256: 'b'.repeat(64),
+      bootstrapBurnedAt: null,
+      lastArmedSha256: 'c'.repeat(64),
       owed: [],
       schedules: [],
       model: 'GPT-6',
@@ -416,169 +491,12 @@ describe('multi-bridge host', () => {
       const state = await operatorState(host, token)
       expect(state.bridges.length).toBe(1)
       expect(state.bridges[0].sessionId).toBe(alpha.sessionId)
-      // The old file is readable, and the next write normalises it: the three
-      // token fields exist as null rather than being rejected as unknown.
-      const snippet = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      expect(snippet.status).toBe(200)
-      const normalized = await readBridge(dir, alpha.sessionId)
-      expect(normalized.bootstrapBurnedAt).toBeNull()
-      expect(normalized.lastArmedSha256).toBeNull()
-      expect(normalized.bootstrapSha256).toMatch(/^[0-9a-f]{64}$/)
-    } finally {
       await host.stop()
-      await cleanup()
-    }
-  })
-
-  test('snippet reveals a one-shot token once and stores only its sha', async () => {
-    const { dir, cleanup } = await scratch()
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [alpha])
-    const host = await startHost(dir, new FakeDriver())
-    try {
-      const { token } = await credentials(dir)
-      const first = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      expect(first.status).toBe(200)
-      const text = String(first.body.text)
-      const minted = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(text)?.[1]
-      expect(minted).toBeDefined()
-      expect(text).toContain('bound to the peer "alpha"')
-      expect(text).toContain(alpha.sessionId)
-      expect(text).toContain('"op":"send","to":"alpha"')
-      // The token is in the body: the page destroys everything on the label line.
-      expect(text).toContain(`{"nonce":"${minted}","op":"send"`)
-      // The op table is the primer's own, not a second invention.
-      expect(text).toContain('{"op":"list"}')
-      expect(text).toContain('{"op":"read","peer"')
-      expect(text).toContain('ONE-SHOT')
-
-      const stored = await readBridge(dir, alpha.sessionId)
-      expect(stored.bootstrapSha256).toBe(sha256(minted!))
-      expect(stored.bootstrapBurnedAt).toBeNull()
-      // The sha is the only form on disk, and it is never echoed to the page.
-      expect(text).not.toContain(stored.bootstrapSha256!)
-
-      const second = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      const mintedAgain = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(String(second.body.text))?.[1]
-      expect(mintedAgain).toBeDefined()
-      expect(mintedAgain).not.toBe(minted)
-      const replaced = await readBridge(dir, alpha.sessionId)
-      expect(replaced.bootstrapSha256).toBe(sha256(mintedAgain!))
-      expect(replaced.bootstrapBurnedAt).toBeNull()
-    } finally {
-      await host.stop()
-      await cleanup()
-    }
-  })
-
-  test('arm burns the bootstrap token before it runs the command', async () => {
-    const { dir, cleanup } = await scratch()
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [alpha])
-    const driver = new FakeDriver()
-    const host = await startHost(dir, driver)
-    try {
-      const { token } = await credentials(dir)
-      const snippet = await operator(host, token, { op: 'snippet', bridge: alpha.sessionId })
-      const minted = /^gateway\n\{"nonce":"([0-9a-f]{48})"/m.exec(String(snippet.body.text))![1]
-      driver.answer = [
-        'Arming.',
-        '',
-        rendered({ nonce: minted, op: 'schedule', label: 'armed-once', inSeconds: 600 }),
-      ].join('\n')
-
-      const armed = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(armed.status).toBe(200)
-      expect(armed.body.ok).toBe(true)
-      expect(armed.body.evidence).toBe('state-complete')
-      // The tab was taken deliberately and the page read once.
-      expect(driver.calls.some(call => call.op === 'use' && call.threadId === THREAD_A)).toBe(true)
-      expect(driver.readCalls).toBe(1)
-
-      const after = await readBridge(dir, alpha.sessionId)
-      expect(after.bootstrapBurnedAt).not.toBeNull()
-      expect(after.schedules.map(schedule => schedule.label)).toContain('armed-once')
-
-      // The same answer cannot be armed twice through a dead token.
-      const again = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(again.body.ok).toBe(false)
-      expect(again.body.line).toContain('one-shot')
-    } finally {
-      await host.stop()
-      await cleanup()
-    }
-  })
-
-  test('a bare gateway fence is armed once per answer text', async () => {
-    const { dir, cleanup } = await scratch()
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [alpha])
-    const driver = new FakeDriver()
-    const host = await startHost(dir, driver)
-    try {
-      const { token } = await credentials(dir)
-      driver.evidence = 'stability'
-      driver.answer = rendered({ op: 'schedule', label: 'bare-one', inSeconds: 600 })
-
-      const first = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(first.body.ok).toBe(true)
-      expect(first.body.evidence).toBe('stability')
-      const stored = await readBridge(dir, alpha.sessionId)
-      expect(stored.lastArmedSha256).toBe(sha256(driver.answer))
-      expect(stored.schedules.map(schedule => schedule.label)).toContain('bare-one')
-
-      const second = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(second.body.ok).toBe(false)
-      expect(second.body.line).toContain('already armed')
-
-      // A newer answer is a new trust decision, so the same click works again.
-      driver.answer = rendered({ op: 'schedule', label: 'bare-two', inSeconds: 600 })
-      const third = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(third.body.ok).toBe(true)
-      expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toContain('bare-two')
-    } finally {
-      await host.stop()
-      await cleanup()
-    }
-  })
-
-  test('arm refuses with the literal line for every condition', async () => {
-    const { dir, cleanup } = await scratch()
-    const unbound = bridgeNamed('unbound', null)
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [unbound, alpha])
-    const driver = new FakeDriver()
-    const host = await startHost(dir, driver)
-    try {
-      const { token } = await credentials(dir)
-
-      const noThread = await operator(host, token, { op: 'arm', bridge: unbound.sessionId })
-      expect(noThread.body.ok).toBe(false)
-      expect(noThread.body.line).toBe('no thread yet: this bridge is not bound to a ChatGPT thread; adopt a thread or create a bridge first')
-
-      driver.answer = 'Just prose, no fence anywhere.'
-      const noFence = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(noFence.body.ok).toBe(false)
-      expect(noFence.body.line).toBe('nothing to arm: the newest assistant answer contains no gateway command block')
-
-      driver.readError = 'the newest assistant turn is still in progress'
-      const writing = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(writing.body.line).toBe('the answer is still being written; wait for it to finish, then click "Arm last answer" again')
-
-      driver.readError = 'no assistant turn is on the page'
-      const empty = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(empty.body.line).toBe('nothing to arm: the page holds no finished assistant answer')
-
-      driver.readError = 'no thread is open'
-      const closed = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(closed.body.line).toBe('nothing to arm: the page holds no finished assistant answer')
-
-      // A page that cannot prove the turn finished is not armable either.
-      driver.readError = null
-      driver.evidence = 'provisional'
-      driver.answer = rendered({ op: 'list' })
-      const unproven = await operator(host, token, { op: 'arm', bridge: alpha.sessionId })
-      expect(unproven.body.line).toContain('could not confirm the answer finished')
+      const rewritten = await readBridge(dir, alpha.sessionId) as Record<string, unknown>
+      expect('bootstrapSha256' in rewritten).toBe(false)
+      expect('lastArmedSha256' in rewritten).toBe(false)
+      expect(rewritten.ourNodeIds).toEqual([])
+      expect(rewritten.cursor).toBeNull()
     } finally {
       await host.stop()
       await cleanup()
@@ -769,86 +687,523 @@ describe('multi-bridge host', () => {
     }
   })
 
-  test('the operator page sets the credential cookie; no hand-typed token remains', async () => {
+  test('there is no operator page and no cookie authority; the API is bearer-only', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [bridgeNamed('alpha', THREAD_A)])
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      const { token } = await credentials(dir)
+      const page = await fetch(`http://127.0.0.1:${host.port}/operator`)
+      expect(page.status).toBe(404)
+      expect(page.headers.get('set-cookie')).toBeNull()
+      const cookieOnly = await fetch(`http://127.0.0.1:${host.port}/operator/state`, { headers: { cookie: `chatgpt-operator=${token}` } })
+      expect(cookieOnly.status).toBe(401)
+      const cookieWrite = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+        method: 'POST',
+        headers: { cookie: `chatgpt-operator=${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ op: 'threads' }),
+      })
+      expect(cookieWrite.status).toBe(401)
+      for (const op of ['snippet', 'arm']) {
+        const refused = await operator(host, token, { op })
+        expect(refused.status).toBe(400)
+      }
+      expect((await operatorState(host, token)).bridges.length).toBe(1)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('host defects', () => {
+  test('the page is never unloaded on idle by default, and a stored idle policy does not outlive the config', async () => {
+    const { resolveConfig } = await import('./chatgpt-peer.ts')
+    const saved = process.env.CHATGPT_WEB_IDLE_MINUTES
+    delete process.env.CHATGPT_WEB_IDLE_MINUTES
+    try { expect(resolveConfig({}).idleUnloadMinutes).toBe(0) }
+    finally { if (saved !== undefined) process.env.CHATGPT_WEB_IDLE_MINUTES = saved }
+
+    const { dir, cleanup } = await scratch()
+    await mkdir(join(dir, 'bridges'), { recursive: true })
+    await saveJson(join(dir, 'peer.json'), newHostState({ profile: profileDir(dir), healthPort: 0, idleUnloadMinutes: 20, instanceId: 'test' }))
+    const host = await startHost(dir, new FakeDriver())
+    try {
+      expect(JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')).idleUnloadMinutes).toBe(0)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a scheduled wake extracts commands from the page read, never the send text', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.schedules = [{ label: 'wake', at: new Date(Date.now() - 1000).toISOString() }]
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.sendText = 'Noted.' // the post-time text carries no command
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      return text.includes('SCHEDULED WAKE') && nonce ? `On it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-wake-read', inSeconds: 600 })}` : 'Done.'
+    }
+    const host = await startHost(dir, driver)
+    try {
+      const stored = await waitFor(async () => {
+        const bridge = await readBridge(dir, alpha.sessionId)
+        return bridge.schedules.some(schedule => schedule.label === 'from-wake-read') ? bridge : undefined
+      })
+      expect(stored.schedules.map(schedule => schedule.label)).not.toContain('wake')
+      expect(driver.readCalls).toBeGreaterThanOrEqual(1)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an upload that lands on another thread fails instead of moving the bridge', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const file = join(dir, 'note.txt')
+      await Bun.write(file, 'hello')
+      driver.landOn = THREAD_B
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(result.status).toBe(500)
+      expect(String(result.body.error)).toBe(`the ChatGPT thread ${THREAD_A} is no longer reachable: the page landed on ${THREAD_B}; ${THREAD_RECOVERY}`)
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(stored.primedThreadId).toBe(THREAD_A)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('with two bridges, an op that names no bridge is refused instead of acting on the first', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_B)
+    await seedHost(dir, [alpha, beta])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'prompt', text: 'hello' })
+      expect(result.status).toBe(400)
+      expect(String(result.body.error)).toBe('2 bridges are configured; name one with bridge')
+      expect(driver.calls.filter(call => call.op === 'send')).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('thread watcher', () => {
+  async function observedHost(dir: string, driver: FakeDriver): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.title = 'Existing work'
+    await seedHost(dir, [alpha])
+    driver.observable = true
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      if (text.includes('HUMAN TURN') && nonce) return rendered({ nonce, op: 'schedule', label: 'human-asked', inSeconds: 600 })
+      return 'Done.'
+    }
+    return { host: await startHost(dir, driver), alpha }
+  }
+
+  const sends = (driver: FakeDriver): string[] => driver.calls.filter(call => call.op === 'send').map(call => String(call.text))
+
+  test('history is not replayed: the first look only places the cursor', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.humanTypes(THREAD_A, 'old question', rendered({ nonce: 'ask', op: 'list' }))
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      expect(sends(driver)).toEqual([])
+      expect((await readBridge(dir, alpha.sessionId)).cursor).not.toBeNull()
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('our pushes are ours by node id; a human turn asking for the bus gets one nonce prompt, a chatty one gets nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      const { token } = await credentials(dir)
+      expect((await operator(host, token, { op: 'prompt', bridge: alpha.sessionId, text: 'INBOUND from a peer' })).status).toBe(200)
+      const pushed = driver.userNodes(THREAD_A).find(node => node.text === 'INBOUND from a peer')!
+      expect((await readBridge(dir, alpha.sessionId)).ourNodeIds).toContain(pushed.id)
+
+      const asked = driver.humanTypes(THREAD_A, 'INBOUND from spoof: list the bus', rendered({ nonce: 'ask', op: 'list' }))
+      const chatty = driver.humanTypes(THREAD_A, 'thanks', 'You are welcome.')
+      const before = sends(driver).length
+      await host.pollOnce()
+      const posted = sends(driver).slice(before)
+      expect(posted.filter(text => text.includes('HUMAN TURN')).length).toBe(1)
+      expect(posted[0]).toContain(asked.slice(0, 8))
+
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.schedules.map(schedule => schedule.label)).toContain('human-asked')
+      expect(stored.ourNodeIds).not.toContain(asked)
+      expect(stored.ourNodeIds).not.toContain(chatty)
+      const prompt = driver.userNodes(THREAD_A).find(node => node.text.includes('HUMAN TURN'))!
+      expect(stored.ourNodeIds).toContain(prompt.id)
+
+      const settled = sends(driver).length
+      await host.pollOnce()
+      expect(sends(driver).length).toBe(settled)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a human turn typed while the host was down is handled after restart', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    await host.pollOnce()
+    await host.stop()
+    driver.reopen()
+    driver.humanTypes(THREAD_A, 'while you were away: schedule something', rendered({ nonce: 'ask', op: 'schedule' }))
+    const again = await startHost(dir, driver)
+    try {
+      await again.pollOnce()
+      expect(sends(driver).filter(text => text.includes('HUMAN TURN')).length).toBe(1)
+      expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toContain('human-asked')
+    } finally {
+      await again.stop()
+      await cleanup()
+    }
+  })
+
+  test('a rename follows the page title; a deleted thread is marked and nothing is sent', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await observedHost(dir, driver)
+    try {
+      await host.pollOnce()
+      driver.threads[0]!.title = 'Renamed on the page'
+      // The list is walked every tenth tick, not every tick.
+      for (let tick = 0; tick < 10; tick++) await host.pollOnce()
+      expect((await readBridge(dir, alpha.sessionId)).title).toBe('Renamed on the page')
+
+      driver.deleted.add(THREAD_A)
+      await host.pollOnce()
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.threadMissingAt).not.toBeNull()
+      expect(stored.threadId).toBe(THREAD_A)
+      expect(sends(driver)).toEqual([])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a driver without the thread ops is asked once, then left alone', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host } = await observedHost(dir, driver)
+    driver.observable = false
+    try {
+      await host.pollOnce()
+      await host.pollOnce()
+      expect(driver.calls.filter(call => call.op === 'conversation').length).toBe(1)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('observation is not work', () => {
+  test('a poll every few milliseconds does not keep the page alive: the idle unload still fires', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    // unloadChrome only asks the driver to close a page it believes is up, so
+    // something has to answer CDP's version probe.
+    const savedPort = process.env.CHATGPT_CDP_PORT
+    const cdp = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('{}') })
+    process.env.CHATGPT_CDP_PORT = String(cdp.port)
+    // 0.0012 minutes is 72 ms: short enough to fire inside the loop below.
+    const host = await startHost(dir, driver, { idleUnloadMinutes: 0.0012 })
+    try {
+      const deadline = Date.now() + 5000
+      while (Date.now() < deadline && !driver.calls.some(call => call.op === 'unload')) {
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(driver.calls.some(call => call.op === 'unload')).toBe(true)
+    } finally {
+      await host.stop()
+      cdp.stop(true)
+      if (savedPort === undefined) delete process.env.CHATGPT_CDP_PORT
+      else process.env.CHATGPT_CDP_PORT = savedPort
+      await cleanup()
+    }
+  })
+})
+
+describe('poll budget', () => {
+  test('the default is a minute, and the title walk is a tenth of the reads', async () => {
+    const { resolveConfig } = await import('./chatgpt-peer.ts')
+    const saved = process.env.CHATGPT_WEB_POLL_SECONDS
+    delete process.env.CHATGPT_WEB_POLL_SECONDS
+    try { expect(resolveConfig({}).pollSeconds).toBe(60) }
+    finally { if (saved !== undefined) process.env.CHATGPT_WEB_POLL_SECONDS = saved }
+  })
+
+  test('a failed pass doubles the delay to a five-minute cap, and one clean pass resets it', async () => {
+    const { pollDelayMs } = await import('./chatgpt-peer.ts')
+    expect(pollDelayMs(60_000, 0)).toBe(60_000)
+    expect(pollDelayMs(60_000, 1)).toBe(120_000)
+    expect(pollDelayMs(60_000, 2)).toBe(240_000)
+    expect(pollDelayMs(60_000, 3)).toBe(300_000)
+    expect(pollDelayMs(60_000, 40)).toBe(300_000)
+    expect(pollDelayMs(60_000, 0)).toBe(60_000)
+    expect(pollDelayMs(0, 3)).toBe(0)
+  })
+})
+
+describe('unowned threads', () => {
+  const tickToTitleWalk = async (host: ChatGptHost): Promise<void> => {
+    for (let tick = 0; tick < 10; tick++) await host.pollOnce()
+  }
+
+  test('a thread no bridge owns is noted when it appears and when it vanishes; a bound one is not', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.observable = true
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.title = 'Existing work'
+    await seedHost(dir, [alpha])
+    const host = await startHost(dir, driver)
+    const stranger = '33333333-3333-4333-8333-333333333333'
+    try {
+      // The first walk is the baseline: THREAD_B and THREAD_A are not "new".
+      await host.pollOnce()
+      expect((await hostAudit(dir)).filter(entry => entry.result.includes('unowned')).length).toBe(0)
+
+      driver.threads.push({ id: stranger, title: 'Somebody else' })
+      await tickToTitleWalk(host)
+      const appeared = (await hostAudit(dir)).filter(entry => entry.result.includes('unowned thread appeared'))
+      expect(appeared.length).toBe(1)
+      expect(appeared[0]!.target).toBe(stranger)
+      expect(appeared[0]!.result).toContain('Somebody else')
+
+      // The bound thread being renamed is a bridge fact, not an unowned one.
+      driver.threads[0]!.title = 'Renamed on the page'
+      driver.deleted.add(stranger)
+      await tickToTitleWalk(host)
+      const audit = await hostAudit(dir)
+      expect(audit.filter(entry => entry.result.includes('unowned thread vanished')).map(entry => entry.target)).toEqual([stranger])
+      expect((await readBridge(dir, alpha.sessionId)).title).toBe('Renamed on the page')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('adopt the open tab', () => {
+  test('with no threadId, adopt binds the thread the tab is already showing and returns its title', async () => {
     const { dir, cleanup } = await scratch()
     await seedHost(dir, [])
-    const host = await startHost(dir, new FakeDriver())
+    const driver = new FakeDriver()
+    driver.openThread(THREAD_B)
+    const host = await startHost(dir, driver)
     try {
       const { token } = await credentials(dir)
-      const response = await fetch(`http://127.0.0.1:${host.port}/operator`)
-      expect(response.status).toBe(200)
-      const cookie = response.headers.get('set-cookie') ?? ''
-      expect(cookie).toContain(`chatgpt-operator=${token}`)
-      expect(cookie).toContain('HttpOnly')
-      expect(cookie).toContain('SameSite=Strict')
-      expect(cookie).toContain('Path=/')
-      const html = await response.text()
-      expect(html).not.toContain('Use token')
-      expect(html).not.toContain('localStorage')
-      expect(html).toContain('Scripts can use the bearer token in')
+      const result = await operator(host, token, { op: 'adopt' })
+      expect(result.status).toBe(200)
+      expect(result.body.threadId).toBe(THREAD_B)
+      expect(result.body.title).toBe('Other work')
+      expect(result.body.sessionId).toMatch(/^[0-9a-f-]{36}$/i)
+      expect(result.body.line).toContain(result.body.sessionId)
+      expect(driver.calls.some(call => call.op === 'use' && call.threadId === THREAD_B)).toBe(true)
+      const stored = JSON.parse(await readFile(join(dir, 'bridges', `${result.body.sessionId}.json`), 'utf8')) as BridgeState
+      expect(stored.threadId).toBe(THREAD_B)
+      expect(stored.title).toBe('Other work')
     } finally {
       await host.stop()
       await cleanup()
     }
   })
 
-  test('the state call accepts the cookie alone, with no Authorization header', async () => {
+  test('with no threadId and no thread open, adopt refuses in one sentence and creates no bridge', async () => {
     const { dir, cleanup } = await scratch()
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [alpha])
-    const host = await startHost(dir, new FakeDriver())
+    await seedHost(dir, [])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
     try {
       const { token } = await credentials(dir)
-      const response = await fetch(`http://127.0.0.1:${host.port}/operator/state`, {
-        headers: { cookie: `chatgpt-operator=${token}` },
-      })
-      expect(response.status).toBe(200)
-      const state = await response.json() as any
-      expect(state.bridges.map((bridge: any) => bridge.sessionId)).toEqual([alpha.sessionId])
+      const result = await operator(host, token, { op: 'adopt' })
+      expect(result.status).toBe(500)
+      expect(String(result.body.error)).toBe('the ChatGPT tab is not showing a conversation; open one, or pass a threadId')
+      expect((await operatorState(host, token)).bridges).toEqual([])
+      expect((await readdir(join(dir, 'bridges'))).filter(name => name.endsWith('.json'))).toEqual([])
     } finally {
       await host.stop()
       await cleanup()
     }
   })
+})
 
-  test('a cookie write from a foreign origin is refused and changes nothing', async () => {
-    const { dir, cleanup } = await scratch()
+describe('thread uplink', () => {
+  /** A bridged thread whose page answers a HUMAN TURN prompt with a real nonce. */
+  async function uplinkHost(dir: string, driver: FakeDriver, prepare?: (bridge: BridgeState) => void): Promise<{ host: ChatGptHost; alpha: BridgeState }> {
     const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    alpha.title = 'Existing work'
+    prepare?.(alpha)
     await seedHost(dir, [alpha])
-    const host = await startHost(dir, new FakeDriver())
+    driver.observable = true
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const turnNonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      if (text.startsWith('HUMAN TURN') && turnNonce) return rendered({ nonce: turnNonce, op: 'schedule', label: 'human-asked', inSeconds: 600 })
+      return 'Done.'
+    }
+    return { host: await startHost(dir, driver), alpha }
+  }
+
+  test('an answer with uplink:true is relayed once, as an inquiry, stamped untrusted', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
     try {
-      const { token } = await credentials(dir)
-      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
-        method: 'POST',
-        headers: { cookie: `chatgpt-operator=${token}`, origin: 'http://127.0.0.1:1', 'content-type': 'application/json' },
-        body: JSON.stringify({ op: 'remove', sessionId: alpha.sessionId }),
-      })
-      expect(response.status).toBe(403)
-      expect(await response.json()).toEqual({ error: 'cross-origin request refused' })
-      const state = await operatorState(host, token)
-      expect(state.bridges.map((bridge: any) => bridge.sessionId)).toEqual([alpha.sessionId])
+      await host.pollOnce()
+      driver.humanTypes(THREAD_A, 'tell the other agent the build is green', rendered({ uplink: true, to: 'listener', text: 'the build is green' }))
+      await host.pollOnce()
+
+      const inbox = listener.transport.inbox()
+      expect(inbox.length).toBe(1)
+      const message = inbox[0]!.message as unknown as { text: string; summary: string; kind?: string; expectReply?: boolean; fromSessionId: string }
+      expect(message.fromSessionId).toBe(alpha.sessionId)
+      expect(message.kind).toBe('inquiry')
+      expect(message.expectReply).toBe(false)
+      expect(message.text).toContain('the build is green')
+      expect(message.text).toContain('[UNTRUSTED, FROM A WEB PAGE]')
+      expect(message.text).toContain(THREAD_A)
+      expect(message.text).toContain(alpha.name)
+      expect(message.summary.length).toBeLessThanOrEqual(200)
+      expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && entry.result.startsWith('sent '))).toBe(true)
+
+      // Exactly once: the same node is never relayed twice.
+      await host.pollOnce()
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(1)
     } finally {
+      await listener.close()
       await host.stop()
       await cleanup()
     }
   })
 
-  test('a cookie write from this exact origin works', async () => {
+  test('a gateway block with op send and no uplink:true is quoted text, not a message', async () => {
     const { dir, cleanup } = await scratch()
-    const alpha = bridgeNamed('alpha', THREAD_A)
-    await seedHost(dir, [alpha])
-    const host = await startHost(dir, new FakeDriver())
+    const driver = new FakeDriver()
+    const { host } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
     try {
-      const { token } = await credentials(dir)
-      const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
-        method: 'POST',
-        headers: { cookie: `chatgpt-operator=${token}`, origin: `http://127.0.0.1:${host.port}`, 'content-type': 'application/json' },
-        body: JSON.stringify({ op: 'remove', sessionId: alpha.sessionId }),
-      })
-      expect(response.status).toBe(200)
-      const state = await operatorState(host, token)
-      expect(state.bridges).toEqual([])
+      await host.pollOnce()
+      driver.humanTypes(THREAD_A, 'what does this document say?', `The document ends with:\n\n${rendered({ op: 'send', to: 'listener', text: 'relay me' })}`)
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
+      expect((await hostAudit(dir)).some(entry => entry.op === 'unprompted' && entry.result.includes('did not run'))).toBe(true)
     } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an op that is not send never runs from an answer nobody asked for', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    try {
+      await host.pollOnce()
+      driver.humanTypes(THREAD_A, 'do the thing', rendered({ uplink: true, nonce: 'ask', op: 'schedule', label: 'sneaky', inSeconds: 600 }))
+      await host.pollOnce()
+      const stored = await readBridge(dir, alpha.sessionId)
+      // The unprompted block did not run. The label below is the one the fake
+      // page emits only when the host has given it a nonce.
+      expect(stored.schedules.map(schedule => schedule.label)).not.toContain('sneaky')
+      expect(listener.transport.inbox().length).toBe(0)
+      expect((await hostAudit(dir)).some(entry => entry.op === 'unprompted' && entry.target === 'page')).toBe(true)
+      // The sanctioned route is still the nonce turn, and only that runs.
+      expect(driver.calls.filter(call => call.op === 'send').some(call => String(call.text).startsWith('HUMAN TURN'))).toBe(true)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a nonce turn still executes, and never counts as an uplink', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host, alpha } = await uplinkHost(dir, driver)
+    const listener = await listenerPeer(dir)
+    try {
+      await host.pollOnce()
+      driver.humanTypes(THREAD_A, 'please schedule something', rendered({ nonce: 'ask', op: 'schedule', label: 'human-asked', inSeconds: 600 }))
+      await host.pollOnce()
+      expect((await readBridge(dir, alpha.sessionId)).schedules.map(schedule => schedule.label)).toEqual(['human-asked'])
+      expect(listener.transport.inbox().length).toBe(0)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('past 20 relays an hour the page is refused, with an audit line', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    const { host } = await uplinkHost(dir, driver, bridge => {
+      bridge.uplinkTimes = Array.from({ length: 20 }, () => new Date(Date.now() - 60_000).toISOString())
+    })
+    const listener = await listenerPeer(dir)
+    try {
+      await host.pollOnce()
+      driver.humanTypes(THREAD_A, 'one more', rendered({ uplink: true, to: 'listener', text: 'the twenty-first' }))
+      await host.pollOnce()
+      expect(listener.transport.inbox().length).toBe(0)
+      expect((await hostAudit(dir)).some(entry => entry.op === 'uplink' && entry.result.includes('cap reached'))).toBe(true)
+    } finally {
+      await listener.close()
       await host.stop()
       await cleanup()
     }

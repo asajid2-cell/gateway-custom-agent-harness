@@ -94,33 +94,33 @@ export const bridgeStateSchema = z.object({
   threadId: z.string().uuid().nullable(),
   primedThreadId: z.string().uuid().nullable(),
   primerSha256: z.string().max(64).nullable(),
-  /**
-   * The one-shot bootstrap token, kept only as its sha256.
-   *
-   * The token itself exists in exactly two places: the paste text the operator
-   * asked for, and the thread the human pasted it into. This file can prove a
-   * fence carries the right token, never reconstruct it, and a file that leaks
-   * cannot hand out a join.
-   */
-  bootstrapSha256: z.string().max(64).nullable().default(null),
-  /** Set the moment a bootstrap fence is accepted, before anything runs. */
-  bootstrapBurnedAt: z.string().nullable().default(null),
-  /**
-   * The sha256 of the last answer armed without a token.
-   *
-   * A bare `gateway` fence is accepted only because the operator clicked, so
-   * the click must not become a way to re-run the same answer over and over.
-   */
-  lastArmedSha256: z.string().max(64).nullable().default(null),
   owed: z.array(owedEntrySchema).max(50),
   schedules: z.array(scheduleSchema).max(8),
   model: z.string().max(100).nullable(),
   effort: z.string().max(40).nullable(),
   createdAt: z.string(),
   title: z.string().max(200).optional(),
+  /**
+   * The page's node ids for the user messages this host posted. "Ours" is
+   * decided by id, never by what a message says, so a person typing
+   * "INBOUND from ..." is still a person.
+   */
+  ourNodeIds: z.array(z.string().max(64)).max(200).default([]),
+  /** The last node of the thread the host has handled; null until first observed. */
+  cursor: z.string().max(64).nullable().default(null),
+  /** When the page last answered 404 for the bound thread; cleared when it answers again. */
+  threadMissingAt: z.string().nullable().default(null),
+  /**
+   * When this bridge last relayed an uplink, newest last. The host refuses past
+   * 20 an hour: the page is a signed-in account talking to the bus, and a loop
+   * there would spend someone else's turns.
+   */
+  uplinkTimes: z.array(z.string().max(40)).max(50).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
+
+const RETIRED_BRIDGE_KEYS = ['bootstrapSha256', 'bootstrapBurnedAt', 'lastArmedSha256'] as const
 
 export function newState(options: { profile: string; healthPort: number; idleUnloadMinutes: number; instanceId?: string }): PeerState {
   return {
@@ -166,15 +166,16 @@ export function newBridgeState(options: {
     threadId: options.threadId ?? null,
     primedThreadId: null,
     primerSha256: null,
-    bootstrapSha256: null,
-    bootstrapBurnedAt: null,
-    lastArmedSha256: null,
     owed: [],
     schedules: [],
     model: options.model ?? null,
     effort: options.effort ?? null,
     createdAt: options.createdAt ?? new Date().toISOString(),
     ...(options.title ? { title: options.title } : {}),
+    ourNodeIds: [],
+    cursor: null,
+    threadMissingAt: null,
+    uplinkTimes: [],
   }
 }
 
@@ -186,16 +187,15 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     threadId: legacy.threadId,
     primedThreadId: legacy.primedThreadId,
     primerSha256: legacy.primerSha256,
-    // A legacy single-bridge host never had a join token, so the migrated
-    // bridge starts without one: the operator mints one with `snippet`.
-    bootstrapSha256: null,
-    bootstrapBurnedAt: null,
-    lastArmedSha256: null,
     owed: legacy.owed,
     schedules: legacy.schedules,
     model: legacy.model,
     effort: legacy.effort,
     createdAt,
+    ourNodeIds: [],
+    cursor: null,
+    threadMissingAt: null,
+    uplinkTimes: [],
   }
 }
 
@@ -247,6 +247,9 @@ export async function loadBridgeState(path: string): Promise<BridgeState> {
   let parsed: unknown
   try { parsed = JSON.parse(raw) }
   catch (error) { throw new Error(`bridge state is invalid JSON at ${path}: ${(error as Error).message}`) }
+  // The operator page's join token and arm memory (builds up to 9dd33dc).
+  // They meant nothing without the page; a file that still carries them loads.
+  if (parsed && typeof parsed === 'object') for (const key of RETIRED_BRIDGE_KEYS) delete (parsed as Record<string, unknown>)[key]
   const result = bridgeStateSchema.safeParse(parsed)
   if (!result.success) {
     const [first] = result.error.issues
