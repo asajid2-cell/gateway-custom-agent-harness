@@ -26,7 +26,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, pathOf, pendingHumanTurns, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer } from './chatgpt-peer/threads.ts'
+import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, COMMAND_RECEIPTS_MAX, DELIVERED_FILES_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
@@ -1390,12 +1390,14 @@ export class ChatGptHost {
     hint: { acceptedAt?: number; sentText?: string },
   ): string | null {
     if (known) return conversation.mapping[known] ? known : null
-    const sent = hint.sentText?.trim()
+    const sent = hint.sentText ?? ''
     const since = hint.acceptedAt
-    if (!sent || !Number.isFinite(since)) return null
+    // R8-H1b: the shared matcher, never raw equality - the page re-wraps a long
+    // paste, and the record may hold only a 4,096-char prefix of it.
+    if (!normalizePromptText(sent) || !Number.isFinite(since)) return null
     const match = chainOf(conversation)
       .filter(turn => turn.role === 'user'
-        && turn.text.trim() === sent
+        && promptMatches(sent, turn.text)
         && typeof turn.createTime === 'number'
         && turn.createTime * 1000 >= (since as number) - PENDING_WINDOW_BEFORE_MS)
       .at(-1)
@@ -2027,14 +2029,26 @@ export class ChatGptHost {
     record.postedAt = now()
     record.userNodeId = null
     record.threadId = bridge.state.threadId
+    // R8-A: the positional anchor is the cursor at the moment of the post, not
+    // whatever the cursor becomes later. The live stuck turn had no such anchor
+    // and the cursor advanced to its first assistant successor, so a node with
+    // no create_time was then before the anchor for every later pass.
+    record.anchorNodeId = bridge.state.cursor ?? null
     await this.notePendingTurn(bridge, record)
     let posted: { threadId: string | null; userNodeId: string | null } | undefined
+    // R8-H3: acceptance is the SEND's own fact, tracked here - not this
+    // function's return value. `pageTurnAsync` can throw AFTER the driver took
+    // the text: the post-send snapshot's read or persist (`recordOurs`) is the
+    // live case, and `posted` is only assigned once the call returns. Testing
+    // `posted` alone therefore cleared `postedAt` on a turn the page had
+    // already accepted, and the restart typed the same prompt a second time.
+    let accepted = false
     try {
       // R1-F8: the bridge can be removed while the status read above is in
       // flight. The send is the irreversible step, so refuse it here too.
       const post = () => {
         if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
-        return this.pageTurnAsync(bridge, record.text)
+        return this.pageTurnAsync(bridge, record.text, () => { accepted = true })
       }
       if (locked) {
         // Real work, so the idle countdown restarts even though the lock is
@@ -2050,13 +2064,17 @@ export class ChatGptHost {
       await this.notePendingTurn(bridge, record)
       return true
     } catch (error) {
-      // NEW-2: `posted` set means the page already took the text and a LATER
-      // step threw. Clearing `postedAt` then would say "never posted" and the
-      // recovery path would type the prompt a second time, so the record keeps
-      // the node it became. Only a send that did not land may be cleared.
-      if (posted) {
-        record.threadId = posted.threadId ?? record.threadId
-        record.userNodeId = posted.userNodeId ?? record.userNodeId
+      // NEW-2 / R8-H3: `posted` OR `accepted` means the page already took the
+      // text and a LATER step threw. Clearing `postedAt` then would say "never
+      // posted" and the recovery path would type the prompt a second time, so
+      // the record keeps the node it became. Only a send that did not land may
+      // be cleared. (`accepted` covers the throw inside `pageTurnAsync` after
+      // the driver returned ok, where `posted` is still undefined.)
+      if (posted || accepted) {
+        if (posted) {
+          record.threadId = posted.threadId ?? record.threadId
+          record.userNodeId = posted.userNodeId ?? record.userNodeId
+        }
         await this.notePendingTurn(bridge, record).catch(() => {})
       } else if (error instanceof GeneratingTurn || error instanceof PageUnproven) {
         // R7-F3: the send was INITIATED - the driver may have typed the prompt
@@ -2101,18 +2119,62 @@ export class ChatGptHost {
     includeOwned = false,
     exclude: ReadonlySet<string> = new Set(),
     earliest = false,
+    afterId: string | null = null,
   ): string | null {
-    const eligible = chainOf(conversation)
-      .filter(turn => turn.role === 'user'
+    const chain = chainOf(conversation)
+    // R8 addendum: a node with NO create_time is invisible to every time-based
+    // matcher while `pendingHumanTurns` still sees it by position. The last
+    // node the bridge had handled when it posted is the positional anchor
+    // (the cursor); only a node after it can be this send's own. With no
+    // cursor there is no position to trust, so such a node is not accepted.
+    const anchor = afterId ? chain.findIndex(turn => turn.id === afterId) : -1
+    const eligible = chain
+      .filter((turn, index) => turn.role === 'user'
         // `!ours` finds the send's node among NEW nodes. A recorded turn with no
         // node id is a different question (R-LIVE-9): the node may already have
         // been adopted this pass, and the text still names it as the send's own.
         && (includeOwned || !ours.has(turn.id))
         && !exclude.has(turn.id)
-        && turn.text.trim() === text.trim()
-        && typeof turn.createTime === 'number'
-        && turn.createTime * 1000 >= sinceMs - PENDING_WINDOW_BEFORE_MS)
+        // R8-H1b: ONE normalizer for every text match. The record may hold a
+        // 4,096-char matcher while the page holds the whole body, and the page
+        // re-wraps whitespace; raw equality missed the send's own node in both
+        // cases and its answer was then read as a person's turn.
+        && promptMatches(text, turn.text)
+        && (typeof turn.createTime === 'number'
+          // A numeric create_time is always checked against the window: the
+          // page's own clock is the strongest evidence there is.
+          ? turn.createTime * 1000 >= sinceMs - PENDING_WINDOW_BEFORE_MS
+          // The positional fallback: not ours already, and after the anchor.
+          : !ours.has(turn.id) && anchor >= 0 && index > anchor))
     return (earliest ? eligible[0] : eligible.at(-1))?.id ?? null
+  }
+
+  /**
+   * R8-B: the whole-chain text retry, for when the anchored match fails.
+   *
+   * The anchored matcher is a TIME and POSITION argument, and neither is the
+   * only evidence: the live record had no stored anchor, its cursor had already
+   * moved past the node, and a `create_time: null` defeated the time branch -
+   * yet the node carried all 9,644 chars we sent. A full-body text match is the
+   * strongest identity there is, so the newest unowned, unclaimed user node
+   * carrying the sent text is this turn's node.
+   *
+   * Deliberately narrower than `ownUserNodeOf`: nodes already in `ourNodeIds`
+   * and nodes another pending turn holds are skipped, and the newest match
+   * wins - the fail-closed direction is unchanged (a person who retypes our
+   * exact words becomes the send's node, never the other way round).
+   */
+  private textMatchAnywhere(
+    conversation: Conversation,
+    text: string,
+    ours: ReadonlySet<string>,
+    exclude: ReadonlySet<string>,
+  ): string | null {
+    const matches = chainOf(conversation).filter(turn => turn.role === 'user'
+      && !ours.has(turn.id)
+      && !exclude.has(turn.id)
+      && promptMatches(text, turn.text))
+    return matches.at(-1)?.id ?? null
   }
 
   /**
@@ -2150,10 +2212,29 @@ export class ChatGptHost {
         continue
       }
       const postedMs = Date.parse(record.postedAt)
+      // R8-H1a: identity is the text that was actually sent, not the 4,096-char
+      // matcher slot. The live turn held a 9,642-char prompt in `text` and only
+      // its first 4,096 chars in `ourText`, and the page node carried the whole
+      // body, so the record never found its own node.
+      const matchText = record.text || record.ourText
+      // R8-A: the record's own anchor when it has one, so a cursor that advanced
+      // after the post cannot move the boundary out from under the record.
+      const anchorNodeId = record.anchorNodeId ?? bridge.state.cursor
       const userNodeId = record.userNodeId ?? (Number.isFinite(postedMs)
-        ? this.ownUserNodeOf(conversation, record.ourText, postedMs, ours, true, claimed, true)
+        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
+          // R8-B: the anchored match is time and position; the text is identity.
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
         : null)
       if (userNodeId) claimed.add(userNodeId)
+      // R8-H1c: the claimed node is OURS before anything is classified. It is
+      // the send's own node, and leaving it out of `ourNodeIds` is exactly how
+      // `pendingHumanTurns` read the live send back as a person typing and the
+      // answer was run as a human turn instead of delivered.
+      if (userNodeId && !ours.has(userNodeId)) {
+        ours.add(userNodeId)
+        bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== userNodeId), userNodeId].slice(-200)
+        await this.persistBridgeState(bridge)
+      }
       if (userNodeId && userNodeId !== record.userNodeId) {
         bridge.state.pendingTurns = bridge.state.pendingTurns.map(item => item.messageId === record.messageId ? { ...item, userNodeId } : item)
         await this.persistBridgeState(bridge)
@@ -2162,6 +2243,11 @@ export class ChatGptHost {
       const answer = userNodeId ? this.answerFor(conversation, userNodeId) : null
       if (answer) {
         await this.deliverSolicited(bridge, record, answer)
+        // R8-C: ownership was persisted above, and that alone stops the next
+        // pass re-handling this delivery - `pendingHumanTurns` skips `ours`, and
+        // `newPageAnswers` excludes a governing user node in `ourNodeIds`. The
+        // cursor is deliberately left where it is: moving it cannot be shown to
+        // be safe for a person's node typed after our send, and is not needed.
         continue
       }
       if (Number.isFinite(postedMs) && Date.now() - postedMs > PENDING_TURN_TTL_MS) {
@@ -2190,8 +2276,16 @@ export class ChatGptHost {
     }
   }
 
-  /** One solicited answer to the sender. Explicitly NOT untrusted page speech. */
-  private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: { id: string }): Promise<void> {
+  /**
+   * One solicited answer to the sender. Explicitly NOT untrusted page speech.
+   *
+   * R8-H2: the answer NODE is carried in from the caller that read it. This
+   * used to re-read the node by id, and a failed second read produced `raw = ''`
+   * and a false terminal line ("a command block only; nothing was sent") for an
+   * answer the page had already finished. With no node in hand the caller must
+   * leave the turn owed and send nothing.
+   */
+  private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: ConversationNode): Promise<void> {
     const key = this.turnKey(record)
     // The bus is authoritative for what has been answered, not the mark. A
     // write-ahead mark says the answer was OBTAINED from the page
@@ -2213,8 +2307,7 @@ export class ChatGptHost {
     try {
       bridge.state.answeredTurns = [...bridge.state.answeredTurns.filter(item => item !== key), key].slice(-ANSWERED_TURNS_MAX)
       await this.persistBridgeState(bridge, true)
-      const node = await this.answerNodeById(bridge, answer.id)
-      const raw = node ? nodeTextOf(node) : ''
+      const raw = nodeTextOf(answer)
       const { prose, commandShaped } = proseFromTurn(raw)
       const visible = prose || (commandShaped ? '' : raw)
       const shaped = await this.shapeAnswer(bridge, visible, answer.id)
@@ -2265,14 +2358,6 @@ export class ChatGptHost {
       this.settling.delete(record.messageId)
     }
     await this.persistHostState()
-  }
-
-  private async answerNodeById(bridge: Bridge, nodeId: string): Promise<ConversationNode | null> {
-    const threadId = bridge.state.threadId
-    if (!threadId) return null
-    const read = await this.readConversation(threadId)
-    if (!read || !('conversation' in read)) return null
-    return read.conversation.mapping[nodeId] ?? null
   }
 
   // ------------------------------------------------------------- observation
@@ -2396,6 +2481,12 @@ export class ChatGptHost {
     bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => !ours.includes(id)), ...ours].slice(-200)
     // A thread seen for the first time through our own send starts after it.
     if (!bridge.state.cursor) bridge.state.cursor = ours[ours.length - 1]!
+    // R8-H3: a persist that throws here must not leave the pending record and
+    // the attribution entry disagreeing. It cannot: the node is already ours in
+    // memory, and if the write is lost the dropped entry is still on disk, so
+    // the next `resolvePendingAttribution` adopts the same node and names the
+    // same pending turn (idempotent). `postRecordedTurn` keeps `postedAt` on
+    // the strength of `accepted`, so the send is never re-typed either.
     this.dropPending(bridge, sent)
     await this.persistBridgeState(bridge)
     return ours
@@ -2462,7 +2553,8 @@ export class ChatGptHost {
       // so it later read back as a person typing (R1-F3).
       const match = chain.find(turn => turn.role === 'user'
         && !ours.has(turn.id)
-        && turn.text.trim() === entry.text.trim()
+        // R8-H1b: the shared normalizer, never raw equality.
+        && promptMatches(entry.text, turn.text)
         && typeof turn.createTime === 'number'
         && turn.createTime >= from && turn.createTime <= to)
       if (match) {
@@ -2471,7 +2563,9 @@ export class ChatGptHost {
         // R-LIVE-8: the send whose post-send read wedged left its pending turn
         // with no node. The node just adopted IS that send, so name it here;
         // the observation pass can then attribute and deliver its answer.
-        const target = bridge.state.pendingTurns.find(turn => turn.userNodeId === null && turn.ourText.trim() === entry.text.trim())
+        // R8-H1a: the record's whole body is what the page holds; `ourText` is
+        // only its 4,096-char matcher slot.
+        const target = bridge.state.pendingTurns.find(turn => turn.userNodeId === null && promptMatches(entry.text, turn.text || turn.ourText))
         if (target) target.userNodeId = match.id
         audit(this.hostState, {
           op: 'attribution',
@@ -2834,6 +2928,13 @@ export class ChatGptHost {
     for (const turn of pending) {
       // An answer still being written is looked at again on the next pass.
       if (!turn.answer) break
+      // R8-H1c: ownership beats classification. A user node carrying a pending
+      // turn's own text is that turn's send, never a person's question - even
+      // when the time-based matcher could not name it (no create_time, a
+      // re-wrapped or truncated body). It is adopted here, and the cursor is
+      // NOT moved past it, so the answer stays owed to its sender instead of
+      // being run as a human turn (and the sender's answer being lost).
+      if (await this.holdForPendingTurn(bridge, turn)) break
       // The cursor moves first: a turn is handled at most once, even if the
       // turn it starts fails or the host dies inside it.
       bridge.state.cursor = turn.answer.nodeId
@@ -2842,7 +2943,8 @@ export class ChatGptHost {
     }
     // Answers nobody asked us for: the page speaking on its own. These are
     // looked at from wherever the person's turns left the cursor.
-    for (const answer of newPageAnswers(conversation, { ours, cursor: bridge.state.cursor })) {
+    const owed = new Set(bridge.state.ourNodeIds)
+    for (const answer of newPageAnswers(conversation, { ours: owed, cursor: bridge.state.cursor })) {
       bridge.state.cursor = answer.nodeId
       await this.persistBridgeState(bridge)
       await this.pageAnswer(bridge, answer)
@@ -2865,6 +2967,50 @@ export class ChatGptHost {
    * other gateway block), the host posts one prompt with a fresh nonce and runs
    * only what comes back bearing it, exactly as for an inbound message.
    */
+  /**
+   * R8-H1c: a user node that carries a pending send's own text is never a
+   * human turn.
+   *
+   * The classification runs AFTER adoption, but adoption can miss: a node with
+   * no `create_time` is invisible to every time-based matcher while
+   * `pendingHumanTurns` still sees it by position (the live asymmetry). Reading
+   * it as a person advanced the cursor past its answer and ran the turn as a
+   * human question, so the answer the sender was owed was lost. Holds it
+   * instead: the node is adopted, the record names it, and the cursor stays
+   * before it - the observation path delivers on the next pass.
+   *
+   * The fail-closed direction is deliberately the same as attribution's: a
+   * person who retyped our exact prompt becomes the pending turn's node, and
+   * their question goes unanswered. The other direction hands the page our own
+   * prompt as a human request and loses the sender's answer.
+   */
+  private async holdForPendingTurn(bridge: Bridge, turn: HumanTurn): Promise<boolean> {
+    // Only a turn that was actually typed has a node on the page.
+    const owner = bridge.state.pendingTurns.find(record => record.postedAt !== null
+      && promptMatches(record.text || record.ourText, turn.userText))
+    if (!owner) return false
+    const ours = new Set(bridge.state.ourNodeIds)
+    let changed = false
+    if (!ours.has(turn.userNodeId)) {
+      bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== turn.userNodeId), turn.userNodeId].slice(-200)
+      changed = true
+    }
+    if (owner.userNodeId !== turn.userNodeId) {
+      bridge.state.pendingTurns = bridge.state.pendingTurns.map(item => item.messageId === owner.messageId ? { ...item, userNodeId: turn.userNodeId } : item)
+      owner.userNodeId = turn.userNodeId
+      changed = true
+    }
+    if (changed) await this.persistBridgeState(bridge)
+    audit(this.hostState, {
+      op: 'turn',
+      target: owner.messageId,
+      result: `held for pending turn: user node ${shortId(turn.userNodeId)} carries this send's text, so it is not a human turn and the cursor stays before it [${bridge.state.name}]`,
+      messageId: owner.messageId,
+    })
+    await this.persistHostState()
+    return true
+  }
+
   private async personTurn(bridge: Bridge, turn: HumanTurn): Promise<void> {
     const blocks = gatewayObjects(turn.answer?.text ?? '')
     const uplinks = blocks.filter(isUplink)
@@ -3191,10 +3337,12 @@ export class ChatGptHost {
    *
    * `delivered` - the page finished an answer of ours: it is sent to the
    * sender and nothing is typed. `present` - our own user node is there but no
-   * completed answer yet: the page may still be generating, so the turn is left
-   * to the observation path. `absent` - no user node of ours, so the send never
-   * landed and the caller may post. `unreadable` - a driver fault or a
-   * throttled read says nothing about the turn, so it must not be re-posted.
+   * completed answer yet (or a user node in the window could not be named, R8
+   * H1d): the page may still be generating, so the turn is left to the
+   * observation path. `absent` - the page shows no user node in the window at
+   * all, so the send never landed and the caller may post. `unreadable` - a
+   * driver fault or a throttled read says nothing about the turn, so it must
+   * not be re-posted.
    */
   private async settlePostedTurn(bridge: Bridge, job: PendingTurn, claimed: Set<string>): Promise<'delivered' | 'present' | 'absent' | 'unreadable'> {
     const threadId = job.threadId ?? bridge.state.threadId
@@ -3213,10 +3361,29 @@ export class ChatGptHost {
     // asks - the send's node may already have been adopted into `ourNodeIds`
     // by an earlier pass. Without `includeOwned` such a turn was judged absent
     // and the prompt was typed a second time.
+    // R8-H1a: the same identity the observation pass uses - the whole sent
+    // text, falling back to the matcher slot only when the body is empty.
+    const matchText = job.text || job.ourText
+    // R8-A: the record's post-time anchor, never the live cursor, when it has
+    // one. R8-B: the anchored match is time and position; when both fail, the
+    // whole-chain text identity still names the node (the live record has no
+    // anchor and its cursor had already moved past the send node).
+    const anchorNodeId = job.anchorNodeId ?? bridge.state.cursor
     const userNodeId = (job.userNodeId && conversation.mapping[job.userNodeId] ? job.userNodeId : null)
-      ?? (Number.isFinite(postedMs) ? this.ownUserNodeOf(conversation, job.ourText, postedMs, ours, true, claimed, true) : null)
-    if (!userNodeId) return 'absent'
+      ?? (Number.isFinite(postedMs)
+        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
+        : null)
+    // R8-H1d: "no node matched" is not "the send never landed".
+    if (!userNodeId) return await this.absenceOf(bridge, conversation, job, matchText, ours, postedMs)
     claimed.add(userNodeId)
+    // R8-H1c: owned before anything is classified, so a later observation pass
+    // can never read this send's node as a person typing.
+    if (!ours.has(userNodeId)) {
+      ours.add(userNodeId)
+      bridge.state.ourNodeIds = [...bridge.state.ourNodeIds.filter(id => id !== userNodeId), userNodeId].slice(-200)
+      await this.persistBridgeState(bridge)
+    }
     // The read proved the node; keep it so the observation pass need not match
     // the text again.
     if (userNodeId !== job.userNodeId) {
@@ -3227,7 +3394,67 @@ export class ChatGptHost {
     const answer = this.answerFor(conversation, userNodeId)
     if (!answer) return 'present'
     await this.deliverSolicited(bridge, job, answer)
+    // R8-C: the node was added to `ourNodeIds` above; that is the barrier that
+    // keeps the next pass from re-handling it. The cursor is not moved.
     return 'delivered'
+  }
+
+  /**
+   * R8-H1d: what "no node matched" actually proves.
+   *
+   * `absent` is a claim that the send never landed, and it licenses typing the
+   * prompt a second time. It is only honest when the page shows NO user node in
+   * the window at or after the post. A user node that is there but did not
+   * match is our prompt under a shape the matcher did not recognise (the live
+   * H1: the page held a 9,642-char body while the record carried a 4,096-char
+   * prefix with different whitespace), so the turn is `present` - left to the
+   * page and to the observation pass - and one audit line names why the nearest
+   * candidate was rejected.
+   */
+  private async absenceOf(
+    bridge: Bridge,
+    conversation: Conversation,
+    job: PendingTurn,
+    text: string,
+    ours: ReadonlySet<string>,
+    postedMs: number,
+  ): Promise<'present' | 'absent'> {
+    // An unparseable post time (never produced by this host) proves nothing
+    // either way; keep the old direction rather than invent a window.
+    if (!Number.isFinite(postedMs)) return 'absent'
+    const users = chainOf(conversation).filter(turn => turn.role === 'user' && !ours.has(turn.id))
+    if (users.length === 0) return 'absent'
+    const inWindow = users.filter(turn => typeof turn.createTime === 'number'
+      && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)
+    // A node with no create_time is not "in the create_time window"; it is a
+    // positional candidate (R8 addendum), and its presence still means the page
+    // holds a user node this host could not name. Same predicate as
+    // `ownUserNodeOf`: a number is dated, ANYTHING else is undated.
+    const undated = users.filter(turn => typeof turn.createTime !== 'number')
+    if (inWindow.length === 0 && undated.length === 0) {
+      // Every user node on the branch predates the post: the send never landed.
+      this.auditNoMatch(bridge, job, users.at(-1)!, text, 'outside window')
+      await this.persistHostState()
+      return 'absent'
+    }
+    const nearest = (inWindow.length > 0 ? inWindow : undated).at(-1)!
+    this.auditNoMatch(bridge, job, nearest, text, typeof nearest.createTime === 'number' ? 'text mismatch' : 'missing create_time')
+    await this.persistHostState()
+    return 'present'
+  }
+
+  /** One line carrying why `turn` was not accepted as the job's own node. */
+  private auditNoMatch(bridge: Bridge, job: PendingTurn, turn: Turn, text: string, reason: string): void {
+    const sent = normalizePromptText(text)
+    const seen = normalizePromptText(turn.text)
+    let diverge = 0
+    while (diverge < sent.length && diverge < seen.length && sent[diverge] === seen[diverge]) diverge++
+    audit(this.hostState, {
+      op: 'turn',
+      target: job.messageId,
+      result: `settle: the nearest user node ${shortId(turn.id)} was not accepted (${reason}); sent ${sent.length} chars, node ${seen.length} chars, first divergence at ${diverge} [${bridge.state.name}]`,
+      messageId: job.messageId,
+    })
   }
 
   private async handleRecord(bridge: Bridge, record: { message: { id: string; fromSessionId: string; summary: string; text: string; kind?: string; expectReply?: boolean; replyTo?: string } }): Promise<void> {

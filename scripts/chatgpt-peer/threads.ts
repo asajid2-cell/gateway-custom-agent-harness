@@ -47,6 +47,42 @@ export function nodeTextOf(node: ConversationNode | null | undefined): string {
   return node ? textOf(node) : ''
 }
 
+/**
+ * The one normalizer every "is this node the text we sent" question uses (R8).
+ *
+ * Whitespace is not content: the page re-wraps a long paste, so the same prompt
+ * comes back with different runs of spaces and newlines. Collapsing every run to
+ * one space and trimming makes that vanish. It is the ONLY normalisation a
+ * matcher may apply - a match that needed a different one would be a match on
+ * something other than the text.
+ */
+export function normalizePromptText(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+/** The shortest side a prefix match may rest on: a truncated paste, never a guess. */
+export const PROMPT_PREFIX_MIN = 512
+
+/**
+ * Does a node's text carry the prompt we sent?
+ *
+ * Equal after normalisation, or one side is a strict prefix of the other and
+ * the shorter side is at least `PROMPT_PREFIX_MIN` chars - a long prompt is
+ * recorded as a 4,096-char matcher while the page holds the whole body (the
+ * live R8 case was a 4,096-char record against a 9,642-char send). A
+ * mid-string substring is never a match: that would name a node that merely
+ * quotes us.
+ */
+export function promptMatches(sent: string, seen: string): boolean {
+  const a = normalizePromptText(sent)
+  const b = normalizePromptText(seen)
+  if (!a || !b) return false
+  if (a === b) return true
+  const shorter = a.length <= b.length ? a : b
+  if (shorter.length < PROMPT_PREFIX_MIN) return false
+  return (shorter === a ? b : a).startsWith(shorter)
+}
+
 // ------------------------------------------------------------------- files
 //
 // A file's identity is the id in `metadata.attachments[].id` (observed live as
@@ -417,7 +453,9 @@ export function attributeSend(before: ReadonlySet<string>, after: Conversation, 
     .filter(n => !before.has(n.id) && n.message?.author.role === 'user')
     .sort((a, b) => (a.message?.create_time ?? 0) - (b.message?.create_time ?? 0))
   if (fresh.length === 0) return { ours: [], human: [] }
-  const matching = fresh.filter(n => textOf(n).trim() === sentText.trim())
+  // R8: the same normalizer every other text matcher uses (whitespace runs,
+  // and a long send whose page-held body may be the whole prompt).
+  const matching = fresh.filter(n => promptMatches(sentText, textOf(n)))
   if (fresh.length === 1) {
     return matching.length === 1 ? { ours: [fresh[0]!.id], human: [] } : { ours: [], human: [] }
   }
