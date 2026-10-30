@@ -29,7 +29,7 @@ import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, pathOf, pendingHumanTurns, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
-  ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, DELIVERED_FILES_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
+  ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, COMMAND_RECEIPTS_MAX, DELIVERED_FILES_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
   PENDING_ATTRIBUTION_MAX, PENDING_ATTRIBUTION_TEXT_MAX, PENDING_TURNS_MAX, PENDING_TURN_TTL_MS, pendingTurnSchema, saveJson,
   type BridgeState, type HostState, type PendingAttribution,
 } from './chatgpt-peer/state.ts'
@@ -3060,9 +3060,57 @@ export class ChatGptHost {
    * `undefined` means the op is not one this host knows; every known op either
    * returns a line or throws, so a refusal always reaches the model as a
    * sentence it can act on.
+   *
+   * For model-dispatched commands where `messageId` is defined, a durable
+   * receipt is written BEFORE the side effect so a replay after a host restart
+   * skips the dispatch and returns the recorded result (at-most-once).
    */
   private async executeCommand(bridge: Bridge, command: Command, by: 'model' | 'operator', messageId?: string): Promise<{ line: string; replied: boolean; repliedTo?: string }> {
     const target = (command as { to?: string }).to ?? null
+
+    // Durable idempotency for model commands: compute a key that does NOT
+    // include the per-turn nonce (a replay mints a new one) by dropping the
+    // nonce property before hashing.
+    if (by === 'model' && messageId !== undefined) {
+      const { nonce: _nonce, ...commandWithoutNonce } = command as Command & { nonce?: unknown }
+      const json = JSON.stringify(commandWithoutNonce, Object.keys(commandWithoutNonce).sort())
+      const receiptKey = `${messageId}:${createHash('sha256').update(json).digest('hex').slice(0, 32)}`
+      const existing = bridge.state.commandReceipts.find(entry => entry.key === receiptKey)
+      if (existing) {
+        // Already ran before a host restart; return the recorded result without
+        // dispatching again.
+        audit(this.hostState, { op: command.op, target, result: `already ran before a host restart, not repeated: ${one(existing.line, 240)}`, messageId })
+        await this.persistHostState()
+        return { line: existing.line, replied: existing.replied, ...(existing.repliedTo ? { repliedTo: existing.repliedTo } : {}) }
+      }
+      // Write-ahead receipt with a placeholder line; persist before the side
+      // effect so a crash between here and the dispatch is idempotent.
+      const isReply = command.op === 'reply'
+      const repliedTo = isReply ? (command as { toMessageId?: string }).toMessageId : undefined
+      const placeholder = { key: receiptKey, line: 'recorded before the side effect', replied: isReply, ...(repliedTo ? { repliedTo } : {}) }
+      bridge.state.commandReceipts = [...bridge.state.commandReceipts, placeholder].slice(-COMMAND_RECEIPTS_MAX)
+      await this.persistBridgeState(bridge, true)
+      let result: { line: string; replied: boolean; repliedTo?: string }
+      try {
+        result = await this.dispatch(bridge, command)
+        audit(this.hostState, { op: command.op, target, result: one(result.line, 300), messageId })
+      } catch (error) {
+        const line = `${command.op} failed: ${one((error as Error).message, 240)}`
+        audit(this.hostState, { op: command.op, target, result: one(line, 300), messageId })
+        result = { line, replied: false }
+      }
+      // Update the receipt with the real result and persist.
+      const idx = bridge.state.commandReceipts.findIndex(entry => entry.key === receiptKey)
+      if (idx !== -1) {
+        bridge.state.commandReceipts[idx] = { key: receiptKey, line: result.line.slice(0, 500), replied: result.replied, ...(result.repliedTo ? { repliedTo: result.repliedTo } : {}) }
+      }
+      await this.persistBridgeState(bridge)
+      await this.persistHostState()
+      return result
+    }
+
+    // Operator-dispatched commands (or model commands with no messageId): no
+    // receipt, same behaviour as before.
     try {
       const result = await this.dispatch(bridge, command)
       audit(this.hostState, { op: command.op, target, result: one(result.line, 300), messageId: messageId ?? null })

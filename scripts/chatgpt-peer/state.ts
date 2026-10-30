@@ -235,6 +235,13 @@ export const bridgeStateSchema = z.object({
   pendingTurns: z.array(pendingTurnSchema).max(PENDING_TURNS_MAX).default([]),
   /** Turn keys already answered, written BEFORE the reply goes out. */
   answeredTurns: z.array(z.string().max(80)).max(ANSWERED_TURNS_MAX).default([]),
+  /**
+   * Durable receipts for model commands, written BEFORE their side effects.
+   *
+   * A replay on a fresh process-local handled set finds the key here and skips
+   * the dispatch, making every model command at-most-once across host restarts.
+   */
+  commandReceipts: z.array(commandReceiptSchema).max(COMMAND_RECEIPTS_MAX).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -300,6 +307,7 @@ export function newBridgeState(options: {
     deliveredFiles: [],
     pendingTurns: [],
     answeredTurns: [],
+    commandReceipts: [],
   }
 }
 
@@ -325,6 +333,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     deliveredFiles: [],
     pendingTurns: [],
     answeredTurns: [],
+    commandReceipts: [],
   }
 }
 

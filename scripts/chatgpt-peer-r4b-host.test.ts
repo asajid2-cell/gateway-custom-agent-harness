@@ -417,9 +417,10 @@ describe('R1-F9: a restart does not repeat a side effect', () => {
       // dies, the transport closes. The state dir is what survives.
       await hostA.stop()
       driverA.dead = true
-      // The turn ends with a reply attempt on a closed transport: that audit
-      // line is the host's own word that it is finished writing state.
-      await waitFor(async () => ((await hostAudit(dir)).some(entry => entry.op === 'reply') ? true : undefined), 20_000)
+      // The turn ends failed: that audit line is written before the
+      // cancellation guard and persisted by the finally, so it is the host's
+      // own word that it is finished writing state.
+      await waitFor(async () => ((await hostAudit(dir)).some(entry => entry.op === 'turn' && entry.result.startsWith('failed')) ? true : undefined), 20_000)
       await new Promise(resolve => setTimeout(resolve, 200))
       // Nothing was answered: the sender is still owed a reply on the bus.
       expect(sender.inbox().length).toBe(0)
