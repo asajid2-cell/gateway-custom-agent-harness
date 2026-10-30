@@ -7,12 +7,14 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import { attachmentRefusal, extractCommands, MAX_COMMANDS_PER_TURN, parseCommand, proseFromTurn, readFences, sanitizePeerText } from './chatgpt-peer/commands.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { audit, listBridgeStates, loadState, newBridgeState, newState, peerStateSchema, saveJson, saveState } from './chatgpt-peer/state.ts'
-import { DriverChild } from './chatgpt-peer/driver.ts'
+import { audit, listBridgeStates, loadState, newBridgeState, newHostState, newState, peerStateSchema, saveJson, saveState, type BridgeState } from './chatgpt-peer/state.ts'
+import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { ChatGptHost } from './chatgpt-peer.ts'
 
 /** Markdown, which a raw driver read can still return. */
@@ -368,18 +370,6 @@ describe('turn loop', () => {
     })
     expect(outcome.repliedExplicitly).toBe(true)
     expect(outcome.repliedTargets).toEqual(['m1'])
-  })
-
-  // A reply to somebody else's older message is not an answer to this inbound.
-  // A single boolean made it look like one, and the real answer was dropped.
-  test('a reply to another message does not count as answering this one', async () => {
-    const inbound = 'this-inbound'
-    const outcome = await runCommandTurn('go', nonce, {
-      generate: async () => ({ ok: true, text: fenced(nonce, { op: 'reply', toMessageId: 'someone-else', text: 'here' }) }),
-      execute: async () => ({ line: 'replied', replied: true, repliedTo: 'someone-else' }),
-    })
-    expect(outcome.repliedTargets).toEqual(['someone-else'])
-    expect(outcome.repliedTargets.includes(inbound)).toBe(false)
   })
 
   test('a failed model turn is reported, not thrown', async () => {
@@ -935,4 +925,207 @@ rl.on('line', line => {
       await cleanup()
     }
   })
+})
+
+// ---------------------------------------------------------------------------
+// The host's inbound turn, end to end on a fake page and a real bus.
+// ---------------------------------------------------------------------------
+
+const INBOUND_THREAD = '11111111-1111-4111-8111-111111111111'
+
+type PageCall = Record<string, unknown>
+
+/**
+ * The page driver in memory: the frozen line-JSON ops an inbound turn uses.
+ *
+ * The host posts an inbound as a real user turn and then reads the answer back
+ * out of the thread, so the fake keeps a conversation tree shaped like
+ * /backend-api/conversation; `answerFor` decides what each posted prompt
+ * settles on.
+ */
+class PageDriver {
+  readonly calls: PageCall[] = []
+  answerFor: ((request: PageCall) => string) | undefined
+  private readonly listeners = new Set<(event: Record<string, unknown>) => void>()
+  private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
+  private clock = Math.floor(Date.now() / 1000)
+
+  private treeOf(threadId: string): { current: string; mapping: Record<string, any> } {
+    let tree = this.trees.get(threadId)
+    if (!tree) {
+      const root = `root-${threadId}`
+      tree = { current: root, mapping: { [root]: { id: root, parent: null, children: [], message: null } } }
+      this.trees.set(threadId, tree)
+    }
+    return tree
+  }
+
+  private grow(threadId: string, role: 'user' | 'assistant', text: string): void {
+    const tree = this.treeOf(threadId)
+    const id = randomUUID()
+    tree.mapping[id] = {
+      id,
+      parent: tree.current,
+      children: [],
+      message: {
+        id,
+        author: { role },
+        create_time: this.clock++,
+        end_turn: role === 'assistant' ? true : null,
+        status: 'finished_successfully',
+        content: { content_type: 'text', parts: [text] },
+      },
+    }
+    tree.mapping[tree.current].children.push(id)
+    tree.current = id
+  }
+
+  onEvent(handler: (event: Record<string, unknown>) => void): () => void {
+    this.listeners.add(handler)
+    return () => { this.listeners.delete(handler) }
+  }
+
+  async call(request: PageCall): Promise<DriverReply> {
+    const op = String(request.op ?? '')
+    // Liveness, not page work: the host pings at boot to bring the child up.
+    if (op === 'ping') return { ok: true, op }
+    this.calls.push({ ...request })
+    if (op === 'send') {
+      const threadId = typeof request.threadId === 'string' ? request.threadId : ''
+      if (!threadId) return { ok: false, op, error: 'no thread is open' }
+      const answer = this.answerFor?.(request) ?? 'ok'
+      this.grow(threadId, 'user', String(request.text ?? ''))
+      this.grow(threadId, 'assistant', answer)
+      return { ok: true, op, threadId, text: answer, model: 'GPT-6', effort: 'High' }
+    }
+    if (op === 'status') {
+      const threadId = String(request.threadId ?? '')
+      // The fake settles every posted turn before `send` returns.
+      return { ok: true, op, cost: 'push', threadId, state: 'idle', phase: 'complete', ageMs: 0, at: new Date().toISOString(), matchesThread: true }
+    }
+    if (op === 'conversation') {
+      const threadId = String(request.threadId ?? '')
+      const tree = this.treeOf(threadId)
+      return { ok: true, op, conversation: { current_node: tree.current, mapping: structuredClone(tree.mapping) } }
+    }
+    return { ok: false, op, error: `unknown op ${op}` }
+  }
+
+  async kill(): Promise<void> {}
+  reopen(): void {}
+}
+
+const peerSessionsDir = (dir: string): string => join(dir, 'gateway-sessions')
+const peerPrivateHome = (dir: string): string => join(dir, 'private')
+const peerProfileDir = (dir: string): string => join(dir, 'profile')
+
+/** The primer the host on disk would load; the bridge below is already primed. */
+const primerShaOf = async (): Promise<string> =>
+  createHash('sha256').update(await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8'), 'utf8').digest('hex')
+
+/** A host that already has its state file, so start() does not mint a default. */
+async function seedPeerHost(dir: string, bridges: BridgeState[]): Promise<void> {
+  await mkdir(join(dir, 'bridges'), { recursive: true })
+  await saveJson(join(dir, 'peer.json'), newHostState({
+    profile: peerProfileDir(dir), healthPort: 0, idleUnloadMinutes: 0, instanceId: 'test',
+  }))
+  for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
+}
+
+async function startPeerHost(dir: string, driver: PageDriver): Promise<ChatGptHost> {
+  const host = new ChatGptHost({
+    home: dir,
+    statePath: join(dir, 'peer.json'),
+    driverPath: join(dir, 'unused.mjs'),
+    profile: peerProfileDir(dir),
+    instanceId: 'test',
+    healthPort: 0,
+    idleUnloadMinutes: 0,
+    number: 1,
+    pollSeconds: 0,
+    observeEvery: 0,
+    titlesEvery: 0,
+    turnTimeoutMs: 5_000,
+    waitPollMs: 20,
+    directory: peerSessionsDir(dir),
+    privateHome: peerPrivateHome(dir),
+  }, driver as unknown as DriverChild)
+  await host.start()
+  return host
+}
+
+/** A second real bus peer in the scratch directory: the sender of the inbounds. */
+async function busPeer(dir: string, name: string): Promise<GatewaySessionTransport> {
+  const transport = new GatewaySessionTransport({
+    directory: peerSessionsDir(dir), sessionId: randomUUID(), name, cwd: dir, purpose: 'test sender', policy: 'accept',
+  })
+  await transport.start()
+  return transport
+}
+
+async function waitFor<T>(probe: () => T | undefined, timeoutMs = 8_000): Promise<T> {
+  const started = Date.now()
+  for (;;) {
+    const value = probe()
+    if (value !== undefined) return value
+    if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for the host')
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+}
+
+describe('host inbound reply attribution (R3-F11)', () => {
+  // The turn loop's own `repliedTargets` unit test could not prove the host's
+  // settlement decision: it compared a literal against a literal the mock had
+  // just produced. What matters is what the sender actually receives, so this
+  // drives one real inbound through the host's record path while the page
+  // explicitly replies to a DIFFERENT message, and reads the bus.
+  test('an explicit reply to another message does not suppress the answer owed to this one', async () => {
+    const { dir, cleanup } = await scratch()
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = dir
+    const alpha = newBridgeState({ sessionId: randomUUID(), name: 'alpha', threadId: INBOUND_THREAD })
+    alpha.primedThreadId = INBOUND_THREAD
+    alpha.primerSha256 = await primerShaOf()
+    await seedPeerHost(dir, [alpha])
+    const driver = new PageDriver()
+    let m1 = ''
+    let m2 = ''
+    driver.answerFor = request => {
+      const text = String(request.text ?? '')
+      const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
+      // The turn answers the inbound under test by explicitly replying to the
+      // OTHER message it can see in this bridge's inbox.
+      if (m1 && m2 && text.includes(`messageId: ${m1}`) && nonce) {
+        return rendered(nonce, { op: 'reply', toMessageId: m2, text: 'explicit reply to the other message' })
+      }
+      return 'the answer owed to the original sender'
+    }
+    const host = await startPeerHost(dir, driver)
+    const sender = await busPeer(dir, 'sender')
+    try {
+      // The other message first, so it is queued in this bridge's inbox before
+      // the turn under test runs and the page can address it.
+      m2 = ((await sender.send(alpha.sessionId, 'an earlier question about something else', 'other', undefined, 'inquiry', false)) as { id?: string }).id ?? ''
+      expect(m2).not.toBe('')
+      await waitFor(() => driver.calls.some(call => String(call.text ?? '').includes(`messageId: ${m2}`)) ? true : undefined)
+
+      m1 = ((await sender.send(alpha.sessionId, 'the question this answer is owed to', 'the inbound', undefined, 'inquiry', true)) as { id?: string }).id ?? ''
+      expect(m1).not.toBe('')
+      const answer = await waitFor(() => {
+        const record = sender.inbox().find(item => item.message.replyTo === m1)
+        return record ? record.message as unknown as { text: string } : undefined
+      })
+      // The page really did reply to the other message - otherwise the rest of
+      // this test would pass for the wrong reason.
+      expect(sender.inbox().some(item => item.message.replyTo === m2 && item.message.text.includes('explicit reply to the other message'))).toBe(true)
+      // ...and the sender of THIS inbound still got the answer it was owed.
+      expect(answer.text).toContain('the answer owed to the original sender')
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      await cleanup()
+    }
+  }, 20_000)
 })
