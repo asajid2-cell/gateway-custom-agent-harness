@@ -16,11 +16,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import { ChatGptHost } from './chatgpt-peer.ts'
-import type { DriverChild, DriverReply } from './chatgpt-peer/driver.ts'
+import { DriverChild, type DriverReply } from './chatgpt-peer/driver.ts'
 import { newBridgeState, newHostState, saveJson, type BridgeState } from './chatgpt-peer/state.ts'
 
 const THREAD_A = '11111111-1111-4111-8111-111111111111'
 const REPLACED = 'driver was replaced after r27 timed out'
+const CHILD = join(import.meta.dir, 'chatgpt-peer-r4c-fake-child.mjs')
 
 type Call = Record<string, unknown>
 
@@ -101,7 +102,12 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, turnTimeoutMs: number): Promise<ChatGptHost> {
+async function startHost(
+  dir: string,
+  driver: FakeDriver | DriverChild,
+  turnTimeoutMs: number,
+  extra: { readTimeoutMs?: number } = {},
+): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -116,11 +122,20 @@ async function startHost(dir: string, driver: FakeDriver, turnTimeoutMs: number)
     titlesEvery: 0,
     turnTimeoutMs,
     waitPollMs: 20,
+    ...extra,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
   await host.start()
   return host
+}
+
+/** The host logs to stderr; the assertions are about what it says and does not. */
+function captureLog(): { text: () => string; restore: () => void } {
+  const lines: string[] = []
+  const original = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: unknown) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
+  return { text: () => lines.join(''), restore: () => { process.stderr.write = original } }
 }
 
 async function waitFor<T>(probe: () => Promise<T | undefined> | T | undefined, timeoutMs = 10_000): Promise<T> {
@@ -180,6 +195,70 @@ describe('R-LIVE-5: a driver fault is not the page\'s word', () => {
       expect(text).not.toMatch(/model turn failed/)
       expect(text).not.toMatch(/driver was replaced/)
     } finally {
+      await sender.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+
+  // R-LIVE-5 residual: the live r27 was a plain timeout ("driver timed out after
+  // 45s"), not a replacement. It is a driver fact all the same - a healthy,
+  // talking child whose read missed its own deadline - so it must be classified
+  // by the reply's `reason`, not by the wording of `error`.
+  test('a conversation read that times out mid-turn is no evidence and does not replace the child', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const childLog: string[] = []
+    const driver = new DriverChild({ script: CHILD, log: line => childLog.push(line), wedgeMs: 5_000 })
+    const log = captureLog()
+    const host = await startHost(dir, driver, 1_500, { readTimeoutMs: 200 })
+    const sender = await busPeer(dir, 'sender')
+    try {
+      const pidBefore = (await driver.call({ op: 'pid' })).pid
+      expect(typeof pidBefore).toBe('number')
+      await sender.send(alpha.sessionId, 'do the thing', 'do the thing', undefined, 'inquiry', true)
+      const entry = await waitFor(async () => {
+        const audit = await hostAudit(dir)
+        return audit.find(item => item.op === 'turn' && /generating|failed/.test(item.result))
+      }, 10_000)
+      // (a) is structural: the reply's `reason` classifies before readErrors is
+      // touched (asserted directly in chatgpt-peer-r4c-live.test.ts).
+      // (b) the log says "no evidence yet", never a page read error.
+      const text = log.text()
+      expect(text).toMatch(/no evidence yet/)
+      expect(text).not.toMatch(/could not read thread/)
+      // (c) the turn keeps its own budget and ends as still generating.
+      expect(entry.result).toMatch(/still generating/)
+      expect(entry.result).not.toMatch(/driver was replaced/)
+      // (d) the child was never replaced: same pid, no replacement in its log.
+      expect((await driver.call({ op: 'pid' })).pid).toBe(pidBefore)
+      expect(childLog.join('\n')).not.toMatch(/replacing the child/)
+    } finally {
+      log.restore()
+      await sender.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('control: a page-side read failure is still counted as one', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new DriverChild({ script: CHILD, log: () => {}, wedgeMs: 5_000 })
+    // The driver answers and the PAGE fails the read: not a driver fault.
+    await driver.call({ op: 'mode', conversation: 'error' })
+    const log = captureLog()
+    const host = await startHost(dir, driver, 1_500, { readTimeoutMs: 200 })
+    const sender = await busPeer(dir, 'sender')
+    try {
+      await sender.send(alpha.sessionId, 'do the thing', 'do the thing', undefined, 'inquiry', true)
+      await waitFor(() => (/could not read thread/.test(log.text()) ? true : undefined), 10_000)
+      expect(log.text()).toMatch(/could not read thread/)
+      expect(log.text()).not.toMatch(/no evidence yet/)
+    } finally {
+      log.restore()
       await sender.close()
       await host.stop()
       await cleanup()

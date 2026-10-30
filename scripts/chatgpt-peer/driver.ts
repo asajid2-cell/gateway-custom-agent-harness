@@ -65,7 +65,18 @@ export const DEFAULT_WEDGE_MS = 120_000
  * failure.
  */
 export function isDriverFault(text: string): boolean {
-  return /driver (was replaced|is closed|exited)|could not write to the driver/i.test(text)
+  return /driver (was replaced|is closed|exited|timed out)|could not write to the driver/i.test(text)
+}
+
+/**
+ * The same judgement on a whole reply, which is the form `call()` returns.
+ *
+ * The driver states `reason: 'timeout'` structurally for its own deadline, so a
+ * timeout is classified by shape and not by the wording of `error`; the text
+ * check still covers a replacement, a closed driver, or a wrapped error string.
+ */
+export function isDriverFaultReply(reply: { ok?: unknown; reason?: unknown; error?: unknown; [key: string]: unknown }): boolean {
+  return reply.reason === 'timeout' || isDriverFault(String(reply.error ?? ''))
 }
 
 export class DriverChild {

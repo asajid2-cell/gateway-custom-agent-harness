@@ -1,4 +1,4 @@
-// Real child for the R-LIVE-5 lane: the driver under a page that keeps
+// Real child for the R-LIVE-5 lanes: the driver under a page that keeps
 // generating while one read misses its own deadline.
 //
 // Ops run on independent timers, not a FIFO chain: a page turn that is still
@@ -10,6 +10,14 @@ const readline = require('node:readline')
 const emit = value => process.stdout.write(JSON.stringify(value) + '\n')
 const rl = readline.createInterface({ input: process.stdin })
 
+// The page's one pushed signal. Its timestamp never moves by itself: a signal
+// that changed on every poll would read as progress and extend every wait.
+const SIGNAL_AT = new Date().toISOString()
+let statusCalls = 0
+// 'delay' answers a conversation read after `delayMs`; 'error' is a genuine
+// page-side failure (the driver answered, the page did not).
+let conversationMode = 'delay'
+
 emit({ event: 'ready' })
 
 rl.on('line', line => {
@@ -18,17 +26,39 @@ rl.on('line', line => {
   const id = request.id
   const delay = Number.isFinite(request.delayMs) ? Number(request.delayMs) : 0
   if (request.op === 'quit') { setTimeout(() => process.exit(0), 20); return }
-  if (request.op === 'ping' || request.op === 'pid') {
+  if (request.op === 'pid' || request.op === 'ping') {
     emit({ ok: true, op: request.op, id, pid: process.pid })
+    return
+  }
+  if (request.op === 'mode') {
+    if (typeof request.conversation === 'string') conversationMode = request.conversation
+    emit({ ok: true, op: 'mode', id })
+    return
+  }
+  if (request.op === 'status') {
+    // The first question is the post gate (the page is idle, so the job is
+    // typed); every later one is the turn's own wait, and the page generates.
+    statusCalls += 1
+    const state = statusCalls === 1 ? 'idle' : 'generating'
+    emit({
+      ok: true, op: 'status', id, cost: 'push', threadId: String(request.threadId ?? ''),
+      pushedThreadId: String(request.threadId ?? ''), matchesThread: true,
+      state, phase: state === 'generating' ? 'streaming' : 'complete',
+      ageMs: 0, at: SIGNAL_AT,
+    })
     return
   }
   if (request.op === 'send') {
     // Accepted at once, answered when the page finishes generating.
     emit({ event: 'accepted', id })
-    setTimeout(() => emit({ ok: true, op: 'send', id, text: 'answered:' + String(request.text ?? '') }), delay || 1200)
+    setTimeout(() => emit({ ok: true, op: 'send', id, text: 'answered:' + String(request.text ?? ''), threadId: String(request.threadId ?? '') }), delay || 1200)
     return
   }
   if (request.op === 'conversation') {
+    if (conversationMode === 'error') {
+      emit({ ok: false, op: 'conversation', id, status: 500, error: 'conversation fetch failed' })
+      return
+    }
     setTimeout(() => emit({ ok: true, op: 'conversation', id, conversation: { mapping: {} } }), delay || 800)
     return
   }

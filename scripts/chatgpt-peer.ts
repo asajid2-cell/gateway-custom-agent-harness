@@ -24,7 +24,7 @@ import { promisify } from 'node:util'
 import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewaySessionTransport.js'
 import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
-import { DriverChild, isDriverFault, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
+import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, pathOf, pendingHumanTurns, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
@@ -96,6 +96,8 @@ const OUTBOX_MAX_NODE_BYTES = 32 * 1024 * 1024
 const OUTBOX_MAX_FILES = 5
 /** How often `wait` and the answer loop look at the page. */
 const WAIT_POLL_MS = 2000
+/** How long one conversation read may take. */
+const READ_TIMEOUT_MS = 45_000
 
 /**
  * A page turn that outlived the driver's send budget while still running.
@@ -207,6 +209,8 @@ type Config = {
   turnTimeoutMs?: number
   /** How often a status/answer wait looks at the pushed signal. Tests shorten it. */
   waitPollMs?: number
+  /** How long one conversation read may take. Overridden in tests; never widened. */
+  readTimeoutMs?: number
 }
 
 /** One bridged thread: its durable memory and its live transport. */
@@ -439,6 +443,12 @@ export class ChatGptHost {
 
   /** How often a wait looks at the pushed page signal. */
   private get waitPoll(): number { return this.config.waitPollMs ?? WAIT_POLL_MS }
+
+  /**
+   * How long one conversation read may take. It is the only page read a page
+   * can rate-limit, so it has its own deadline, separate from the turn's.
+   */
+  private get readTimeout(): number { return this.config.readTimeoutMs ?? READ_TIMEOUT_MS }
 
   /** Where the per-bridge files live: one durable file per bus peer. */
   private get bridgeDirectory(): string { return join(this.config.home, 'bridges') }
@@ -1274,7 +1284,7 @@ export class ChatGptHost {
       // the text, so its state is unproven: leave the turn running and let the
       // observation pass reconcile it, never report a page refusal (or a model
       // failure) neither the page nor the model produced.
-      if (isDriverFault(String(reply.error ?? ''))) {
+      if (isDriverFaultReply(reply)) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
@@ -1311,7 +1321,7 @@ export class ChatGptHost {
     if (reply.ok !== true) {
       if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
-      if (isDriverFault(String(reply.error ?? ''))) {
+      if (isDriverFaultReply(reply)) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId)
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
@@ -2053,7 +2063,7 @@ export class ChatGptHost {
    */
   private async readConversation(threadId: string): Promise<{ conversation: Conversation } | { missing: true } | { rateLimited: true } | undefined> {
     if (this.observes === false) return undefined
-    const reply = await this.driver.call({ op: 'conversation', threadId }, 45_000)
+    const reply = await this.driver.call({ op: 'conversation', threadId }, this.readTimeout)
     if (reply.ok === true && reply.conversation && typeof reply.conversation === 'object') {
       this.observes = true
       return { conversation: reply.conversation as Conversation }
@@ -2075,10 +2085,11 @@ export class ChatGptHost {
       }
       return { rateLimited: true }
     }
-    if (isDriverFault(String(reply.error ?? ''))) {
-      // R-LIVE-5: the driver, not the page, failed this read. It is "no
-      // evidence yet" - the caller keeps waiting on its own budget - so it is
-      // neither counted as a page read error nor logged as one.
+    if (isDriverFaultReply(reply)) {
+      // R-LIVE-5: the driver, not the page, failed this read - its own deadline
+      // (`reason:'timeout'`) or a replacement. It is "no evidence yet" - the
+      // caller keeps waiting on its own budget - so it is neither counted as a
+      // page read error (which backs off the reconcile pass) nor logged as one.
       log(`thread ${shortId(threadId)}: no evidence yet (the driver did not answer the read: ${one(reply.error, 120)})`)
       return undefined
     }

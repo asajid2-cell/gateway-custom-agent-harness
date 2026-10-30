@@ -12,7 +12,7 @@
  */
 import { describe, expect, test } from 'bun:test'
 import { join } from 'node:path'
-import { DriverChild } from './chatgpt-peer/driver.ts'
+import { DriverChild, isDriverFault, isDriverFaultReply } from './chatgpt-peer/driver.ts'
 
 const CHILD = join(import.meta.dir, 'chatgpt-peer-r4c-fake-child.mjs')
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
@@ -24,6 +24,23 @@ const pidOf = async (child: DriverChild): Promise<number> => {
   expect(typeof pid).toBe('number')
   return pid as number
 }
+
+describe('R-LIVE-5 residual: a plain timeout is a driver fault by shape', () => {
+  test('the reply reason classifies a timeout, and a page-side error does not', () => {
+    // The live r27 was exactly this: the driver's own deadline, not a page word.
+    expect(isDriverFaultReply({ ok: false, reason: 'timeout', error: 'driver timed out after 45s' })).toBe(true)
+    expect(isDriverFaultReply({ ok: false, reason: 'timeout', error: 'no error text' })).toBe(true)
+    expect(isDriverFaultReply({ ok: false, error: 'driver was replaced after r27 timed out' })).toBe(true)
+    expect(isDriverFaultReply({ ok: false, error: 'driver is closed' })).toBe(true)
+    expect(isDriverFaultReply({ ok: false, error: 'could not write to the driver: EPIPE' })).toBe(true)
+    // A wrapped timeout string still classifies without the reply shape.
+    expect(isDriverFault('driver timed out after 45s')).toBe(true)
+    // The page failed: the driver answered, so this is a read error, not a
+    // driver fault, and it must keep backing the reconcile pass off.
+    expect(isDriverFaultReply({ ok: false, status: 500, error: 'conversation fetch failed' })).toBe(false)
+    expect(isDriverFaultReply({ ok: false, status: 429, error: 'too many requests' })).toBe(false)
+  })
+})
 
 describe('R-LIVE-5: the replacement decision needs evidence', () => {
   test('a read that times out beside accepted page work leaves the child alive and the turn completes', async () => {
