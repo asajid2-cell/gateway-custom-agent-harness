@@ -674,6 +674,39 @@ rl.on('line', line => {
     }
   })
 
+  // F4: shutdown must be final. A call after kill() used to relaunch the child
+  // and keep sending page requests; only an explicit reopen() may start a new
+  // one.
+  test('F4: a call after kill is refused and does not relaunch the child', async () => {
+    const { dir, cleanup } = await scratch()
+    const marker = join(dir, 'starts.txt')
+    await writeFile(marker, '', 'utf8')
+    const script = join(dir, 'counted.js')
+    await writeFile(script, `
+const fs = require('node:fs')
+fs.appendFileSync(${JSON.stringify(marker)}, 'start\\n')
+const readline = require('node:readline')
+const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', line => {
+  const request = JSON.parse(line)
+  if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); process.exit(0) }
+  emit({ ok: true, op: request.op, id: request.id, text: 'echo:' + (request.text || '') })
+})
+`, 'utf8')
+    const child = new DriverChild({ script, log: () => {} })
+    const starts = async () => (await readFile(marker, 'utf8')).split('\n').filter(Boolean).length
+    try {
+      expect((await child.call({ op: 'send', text: 'hi' })).ok).toBe(true)
+      expect(await starts()).toBe(1)
+      await child.kill()
+      const after = await child.call({ op: 'send', text: 'again' }, 2000)
+      expect(after.ok).toBe(false)
+      expect(after.error).toMatch(/closed/i)
+      expect(await starts()).toBe(1)
+    } finally { await child.kill(); await cleanup() }
+  })
+
   test('drops the late answer to a timed-out request instead of giving it to the next caller', async () => {
     const { dir, cleanup } = await scratch()
     const script = join(dir, 'slow-driver.js')

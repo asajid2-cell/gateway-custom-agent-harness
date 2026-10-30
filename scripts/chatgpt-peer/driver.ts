@@ -61,7 +61,10 @@ export class DriverChild {
   }
 
   private ensure(): ChildProcessWithoutNullStreams {
-    if (this.child && this.child.exitCode === null && !this.closed) return this.child
+    // After kill() the driver is closed for good: a new child is reachable only
+    // through an explicit reopen(), never as a side effect of a late call.
+    if (this.closed) throw new Error('driver is closed')
+    if (this.child && this.child.exitCode === null) return this.child
     const env = { ...process.env, ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}) }
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     child.stdout.setEncoding('utf8')
@@ -136,6 +139,7 @@ export class DriverChild {
   }
 
   async call(request: Record<string, unknown>, options: number | CallOptions = this.options.timeoutMs ?? 600_000): Promise<DriverReply> {
+    if (this.closed) return { ok: false, error: 'driver is closed' }
     const settings = typeof options === 'number' ? { timeoutMs: options } : options
     const timeoutMs = settings.timeoutMs ?? this.options.timeoutMs ?? 600_000
     const child = this.ensure()
