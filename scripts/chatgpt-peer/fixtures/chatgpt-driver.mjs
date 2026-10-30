@@ -819,84 +819,107 @@ async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30
   return false
 }
 
-/**
- * Does the thread tree hold a user node carrying what we sent?
- *
- * The acceptance proof that survives a DOM rename: it reads the page's own
- * backend conversation rather than an attribute. The needle is a collapsed
- * prefix, because the page reflows and trims the text it stored.
- */
-function treeHasSentText(body, text) {
-  return countUserTextInTree(body, text) > 0
+/** Collapse runs of whitespace and trim - the only normalization the page's own text is compared under. */
+function normalizedTurnText(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim()
 }
 
 /**
- * How many user nodes in the thread tree carry what we sent.
+ * Read the user nodes out of a thread tree: identity -> that node's FULL
+ * normalized text.
  *
- * A count rather than a yes/no, because the send has to be NEW: an earlier turn
- * with the same words is identity too, and would make a swallowed send look
- * accepted. Comparing the count before and after is what tells the two apart.
+ * Identity, not text, is what makes a node "already there": an id that was
+ * present before the send can never satisfy it afterwards, even if the server
+ * recycled that id for a different turn. A node is keyed by its message id when
+ * it has one and by its mapping key otherwise. An unreadable body is null, and
+ * a node with no usable identity is dropped so it can never look NEW.
  */
-function countUserTextInTree(body, text) {
-  const needle = String(text ?? '').trim().replace(/\s+/g, ' ').slice(0, 40)
-  if (!needle) return 0
-  const mapping = body && typeof body === 'object' && body.mapping && typeof body.mapping === 'object' ? body.mapping : {}
-  let count = 0
-  for (const node of Object.values(mapping)) {
+function userTreeNodes(body) {
+  const mapping = body && typeof body === 'object' && body.mapping && typeof body.mapping === 'object' ? body.mapping : null
+  if (!mapping) return null
+  const nodes = new Map()
+  for (const [key, node] of Object.entries(mapping)) {
     if (node?.message?.author?.role !== 'user') continue
+    const id = node.message.id ?? node.id
+    const identity = typeof id === 'string' && id ? `m:${id}` : typeof key === 'string' && key ? `n:${key}` : null
+    if (!identity) continue
     const parts = Array.isArray(node.message.content?.parts) ? node.message.content.parts : []
-    const said = parts.filter(part => typeof part === 'string').join('\n').replace(/\s+/g, ' ')
-    if (said.includes(needle)) count += 1
+    nodes.set(identity, normalizedTurnText(parts.filter(part => typeof part === 'string').join('\n')))
   }
-  return count
+  return nodes
+}
+
+/** The full normalized texts of the user nodes present now but absent at baseline, or null when either side is unusable. */
+function newUserNodes(baseline, after) {
+  if (!(baseline instanceof Map) || !(after instanceof Map)) return null
+  const fresh = []
+  for (const [identity, said] of after) {
+    if (!baseline.has(identity)) fresh.push(said)
+  }
+  return fresh
 }
 
 /**
  * The acceptance decision for a page that exposes no user nodes at all.
  *
- * Pure: the counts are arguments. The evidence must be IDENTITY of THIS send -
- * our text on a user turn that was not already there - and never
- * undifferentiated growth: an earlier turn can append a reasoning or assistant
- * node while this send is swallowed, so a risen message count proves only that
- * the page rendered something, not that it rendered ours. An older turn with
- * the same words is identity too, which is why the tree is read before the send
- * and the count must RISE. A cleared composer is likewise never acceptance, and
- * a page with no baseline has not shown that anything new arrived.
+ * Pure: the evidence is arguments. Acceptance must be THIS send and nothing
+ * else - exactly ONE new user node, carrying the FULL normalized text we sent.
+ * A shared prefix is not identity: the host's bus prompts share a long
+ * boilerplate opening, so a swallowed click plus any turn that merely starts
+ * like ours would otherwise pass. Two new nodes are ambiguous and refused, a
+ * node already present at the baseline can never accept, a page with no
+ * baseline has shown nothing, and a page that DOES show user nodes is decided
+ * by the DOM path. A cleared composer or a visible stop button is not
+ * acceptance here either.
  */
-function degradedSendVerdict({ userNodes, treeCount, baselineCount }) {
+function degradedSendVerdict({ userNodes, newNodes, sentText }) {
   // A page that shows user nodes is decided by the DOM path, never here.
   if (Number(userNodes) > 0) return false
-  // With no baseline there is no way to tell our turn from an older one.
-  if (baselineCount === null || baselineCount === undefined) return false
-  return Number(treeCount) > Number(baselineCount)
+  // No baseline (or an unreadable one) means nothing can be called new.
+  if (!Array.isArray(newNodes)) return false
+  // Exactly one new turn, or the evidence is ambiguous.
+  if (newNodes.length !== 1) return false
+  const want = normalizedTurnText(sentText)
+  if (!want) return false
+  return normalizedTurnText(newNodes[0]) === want
 }
 
-/** How many user nodes in this page's thread tree carry the text, or null when unread. */
-async function countUserTextOnPage(page, text) {
+/**
+ * Snapshot this page's user nodes from its thread tree, or null when unread.
+ *
+ * Taken BEFORE the send: the identities already there are what a later read is
+ * compared against. A page still on the new-chat route has no thread and so no
+ * history - an empty set, not an unreadable one.
+ */
+async function readUserTreeOnPage(page) {
   const threadId = threadOf(page.url())
-  if (!threadId) return 0
+  if (!threadId) return new Map()
   const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
   if (!read?.ok) return null
-  return countUserTextInTree(read.body, text)
+  return userTreeNodes(read.body)
 }
 
 /**
  * The degraded acceptance check, run only after `waitForAcceptance` failed.
  *
- * Reads the thread tree - the text-identity evidence that survives a DOM
- * rename - until it holds MORE user nodes with our text than the pre-send
- * baseline did. An unreadable baseline is a refusal: without it, an older turn
- * with the same words would look exactly like this send landing.
+ * Reads the thread tree - the evidence that survives a DOM rename - until it
+ * holds exactly one user node absent from the pre-send snapshot whose full text
+ * is the text we sent. An unreadable baseline is a refusal: without the set of
+ * nodes that were already there, a new node cannot be told from an old one.
  */
-async function confirmDegradedSend(page, text, baselineCount) {
+async function confirmDegradedSend(page, text, baseline) {
   const userNodes = await page.locator(USER_MESSAGE).count().catch(() => 0)
   if (userNodes > 0) return false
+  if (!(baseline instanceof Map)) return false
   const deadline = Date.now() + 15_000
   while (Date.now() < deadline) {
     const threadId = threadOf(page.url())
     if (threadId) {
       const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
-      if (read?.ok && degradedSendVerdict({ userNodes, treeCount: countUserTextInTree(read.body, text), baselineCount })) return true
+      if (read?.ok) {
+        const newNodes = newUserNodes(baseline, userTreeNodes(read.body))
+        if (degradedSendVerdict({ userNodes, newNodes, sentText: text })) return true
+      }
     }
     await new Promise(resolve => setTimeout(resolve, 500))
   }
@@ -1267,15 +1290,17 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   const beforeUsers = await page.locator(USER_MESSAGE).count()
   // Where the DOM shows no user node at all, the acceptance proof falls back to
   // the thread tree - and "our text is in the tree" is not a proof of THIS send
-  // when an older turn has the same words. Take the baseline before the send so
-  // only a RISE counts. Normal pages pay nothing: the degraded path only runs
-  // when the DOM exposed none of them.
+  // when an older turn has the same words. Snapshot the user nodes (identity
+  // and full text) before the send, so only a node that is genuinely NEW can
+  // count. Normal pages pay nothing: the degraded path only runs when the DOM
+  // exposed none of them.
   //
-  // `null`, not `0`, when the DOM DID show user nodes: the check is reached on
-  // any failed acceptance, so a page that renames or soft-navigates its selector
-  // mid-turn would otherwise present a zero baseline for a conversation that has
-  // history, and any older node with our words would accept a swallowed send.
-  const beforeTree = beforeUsers === 0 ? await countUserTextOnPage(page, text) : null
+  // `null`, not an empty set, when the DOM DID show user nodes: the check is
+  // reached on any failed acceptance, so a page that renames or soft-navigates
+  // its selector mid-turn would otherwise present a no-history baseline for a
+  // conversation that has history, and any older node with our words would
+  // accept a swallowed send.
+  const beforeTree = beforeUsers === 0 ? await readUserTreeOnPage(page) : null
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
   await composer.click()
   const typed = await composer.fill(text).then(() => true).catch(() => false)
@@ -1303,7 +1328,7 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // cleared composer or an unspecific rise in the message count: either is
     // what a swallowed click looks like.
     accepted = await confirmDegradedSend(page, text, beforeTree)
-    if (accepted) await log('acceptance: no user-node delta on this page; confirmed by our text in the thread tree')
+    if (accepted) await log('acceptance: no user-node delta on this page; confirmed by exactly one new user turn carrying the sent text')
   }
   if (!accepted) {
     // `not-posted`, never `timedOut`: a turn that was never posted cannot be
@@ -2518,7 +2543,7 @@ export {
   // a live page (origin check, base64 validation, install probe, acceptance,
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
-  treeHasSentText, countUserTextInTree, degradedSendVerdict, launchVerdict, ownerCarriesProfile,
+  normalizedTurnText, userTreeNodes, newUserNodes, degradedSendVerdict, launchVerdict, ownerCarriesProfile,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
 }
