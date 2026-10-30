@@ -1451,7 +1451,7 @@ export class ChatGptHost {
       }
       nodeBytes += bytes
       nodeCount += 1
-      files.push({ index, path: String(reply.path ?? target), bytes, sha256: String(reply.sha256 ?? ''), name: file.name || suffix })
+      files.push({ index, path: String(reply.path ?? outPath), bytes, sha256: String(reply.sha256 ?? ''), name: file.name || suffix })
     }
     return { nodeId: node.id, files, refused }
   }

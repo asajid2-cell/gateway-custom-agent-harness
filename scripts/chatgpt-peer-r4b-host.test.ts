@@ -45,6 +45,10 @@ class FakeDriver {
   busyUntil = 0
   readonly sentAtMs: number[] = []
   fileBytes: number | null = null
+  /** Answer the next file op with EEXIST, as a stale target on disk would. */
+  fileExistsOnce = false
+  /** Succeed without naming the file in the reply, so the caller must know its own path. */
+  omitFilePath = false
   stallFor: ((request: Call) => boolean) | undefined
   readonly fileCalls: { fileId?: string; sandboxPath?: string; outPath?: string }[] = []
   conversationReads = 0
@@ -194,12 +198,13 @@ class FakeDriver {
     if (op === 'file') {
       this.fileCalls.push({ fileId: request.fileId as string | undefined, sandboxPath: request.sandboxPath as string | undefined, outPath: request.outPath as string | undefined })
       if (!request.fileId && !(request.threadId && request.messageId && request.sandboxPath)) return { ok: false, op, reason: 'bad-id' }
+      if (this.fileExistsOnce) { this.fileExistsOnce = false; return { ok: false, op, reason: 'exists' } }
       const outPath = String(request.outPath ?? '')
       const body = `bytes of ${String(request.fileId ?? request.sandboxPath)}`
       try { await writeFile(outPath, body, { flag: 'wx' }) }
       catch (error) { return { ok: false, op, reason: (error as NodeJS.ErrnoException).code === 'EEXIST' ? 'exists' : 'io' } }
       const bytes = this.fileBytes ?? Buffer.byteLength(body)
-      return { ok: true, op, path: outPath, bytes, sha256: sha256(body), name: basenameOf(outPath) }
+      return { ok: true, op, bytes, sha256: sha256(body), name: basenameOf(outPath), ...(this.omitFilePath ? {} : { path: outPath }) }
     }
     return { ok: false, op, error: `unknown op ${op}` }
   }
@@ -559,6 +564,42 @@ describe('N4: a refused uplink leaves nothing blocking a retry', () => {
       expect(await listFiles(outbox)).toEqual([])
       // A second look must not read a leftover as "exists" and lose the file.
       expect(audit.some(entry => entry.op === 'file' && /exists/.test(entry.result))).toBe(false)
+    } finally {
+      await listener.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+describe('N4 follow-up: the retry records the path it actually wrote', () => {
+  test('after an exists retry whose reply names no path, the FILES line carries the sibling path', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const listener = await busPeer(dir, 'listener')
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.fileExistsOnce = true
+    driver.omitFilePath = true
+    const host = await startHost(dir, driver)
+    try {
+      await host.pollOnce()
+      const files = [{ id: `file_${'a'.repeat(32)}`, name: 'artifact.txt', mime: 'text/plain', size: 10 }]
+      driver.humanTypes(THREAD_A, 'relay this', rendered({ uplink: true, to: 'listener', text: 'a small note', files: [0] }), files)
+      await host.pollOnce()
+      await host.pollOnce()
+
+      await waitFor(() => (listener.inbox().length >= 1 ? true : undefined), 15_000)
+      // The first attempt hit the stale target; the retry wrote the sibling.
+      expect(driver.fileCalls.length).toBe(2)
+      const first = String(driver.fileCalls[0].outPath)
+      const sibling = String(driver.fileCalls[1].outPath)
+      expect(sibling).not.toBe(first)
+      const message = listener.inbox()[0].message as unknown as { text: string }
+      // The delivered file is at the sibling; the FILES block must name it, not
+      // the stale target it never wrote.
+      expect(message.text).toContain(sibling)
     } finally {
       await listener.close()
       await host.stop()
