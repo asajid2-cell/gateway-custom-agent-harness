@@ -422,10 +422,14 @@ describe('R1-F9: a restart does not repeat a side effect', () => {
       // dies, the transport closes. The state dir is what survives.
       await hostA.stop()
       driverA.dead = true
-      // The turn ends failed: that audit line is written before the
-      // cancellation guard and persisted by the finally, so it is the host's
-      // own word that it is finished writing state.
-      await waitFor(async () => ((await hostAudit(dir)).some(entry => entry.op === 'turn' && entry.result.startsWith('failed')) ? true : undefined), 20_000)
+      // A stop suppresses the turn's audit line - the honest outcome is "still
+      // generating when the host stopped watching", not a model failure - so
+      // the state file is the barrier: wait for the receipt of the command the
+      // host already ran before the crash.
+      await waitFor(async () => {
+        const state = await readBridge(dir, alpha.sessionId) as { commandReceipts?: { line?: string }[] } | undefined
+        return state?.commandReceipts?.some(entry => typeof entry.line === 'string' && entry.line !== 'recorded before the side effect') ? true : undefined
+      }, 20_000)
       await new Promise(resolve => setTimeout(resolve, 200))
       // Nothing was answered: the sender is still owed a reply on the bus.
       expect(sender.inbox().length).toBe(0)
