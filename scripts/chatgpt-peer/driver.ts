@@ -151,7 +151,10 @@ export class DriverChild {
         resolve(reply)
       }
       const timer = setTimeout(() => {
-        finish({ ok: false, id, error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
+        // `reason:'timeout'` is part of the contract: a caller must be able to
+        // tell "no answer came" from "the page said no", and the two lead to
+        // opposite decisions (wait longer vs. stop).
+        finish({ ok: false, id, reason: 'timeout', error: `driver timed out after ${Math.round(timeoutMs / 1000)}s` })
       }, timeoutMs)
       this.pending.set(id, finish)
       if (settings.onAccepted) this.acceptors.set(id, settings.onAccepted)

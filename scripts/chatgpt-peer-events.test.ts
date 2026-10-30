@@ -192,9 +192,9 @@ describe('page events trigger observation', () => {
     try {
       await host.pollOnce()
       const before = driver.conversationReads()
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'streaming' })
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'streaming' })
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'complete' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'streaming' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'streaming' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'complete' })
       await host.flushTriggers()
       expect(driver.conversationReads() - before).toBe(1)
     } finally {
@@ -233,7 +233,7 @@ describe('page events trigger observation', () => {
     try {
       await host.pollOnce()
       const before = driver.conversationReads()
-      driver.emit({ event: 'turn', threadId: THREAD_B, phase: 'complete' })
+      driver.emit({ event: 'signal', threadId: THREAD_B, phase: 'complete' })
       driver.emit({ event: 'navigated', threadId: THREAD_B })
       await host.flushTriggers()
       expect(driver.conversationReads()).toBe(before)
@@ -249,7 +249,7 @@ describe('page events trigger observation', () => {
     await seedHost(dir, [])
     const host = await startHost(dir, driver)
     try {
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'complete' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'complete' })
       driver.emit({ event: 'page-ready' })
       await host.flushTriggers()
       // No bridge to look at: page-ready may walk the thread list, but it must
@@ -269,7 +269,7 @@ describe('page events trigger observation', () => {
     try {
       await host.pollOnce()
       const before = driver.conversationReads()
-      for (let index = 0; index < 50; index++) driver.emit({ event: 'turn', threadId: THREAD_A, phase: index % 2 ? 'streaming' : 'complete' })
+      for (let index = 0; index < 50; index++) driver.emit({ event: 'signal', threadId: THREAD_A, phase: index % 2 ? 'streaming' : 'complete' })
       await host.flushTriggers()
       expect(driver.conversationReads() - before).toBe(1)
     } finally {
@@ -331,8 +331,8 @@ describe('uplink is relayed at most once', () => {
     try {
       await host.pollOnce()
       driver.humanTypes(THREAD_A, 'tell the other agent', rendered({ uplink: true, to: 'listener', text: 'the build is green' }))
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'complete' })
-      driver.emit({ event: 'turn', threadId: THREAD_A, phase: 'complete' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'complete' })
+      driver.emit({ event: 'signal', threadId: THREAD_A, phase: 'complete' })
       await host.flushTriggers()
       await host.pollOnce()
       const inbox = listener.transport.inbox().map(record => record.message.text)

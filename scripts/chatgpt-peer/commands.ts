@@ -42,6 +42,7 @@ export const COMMAND_OPS = [
   'watchIdle',
   'requestContext',
   'read',
+  'status',
 ] as const
 
 export type CommandOp = (typeof COMMAND_OPS)[number]
@@ -58,6 +59,7 @@ export type Command =
   | { op: 'watchIdle'; to: string }
   | { op: 'requestContext'; to: string; topic: string; question: string }
   | { op: 'read'; peer: string; tail?: number; since?: string }
+  | { op: 'status' }
 
 export type Extraction = { commands: Command[]; problems: string[] }
 
@@ -86,7 +88,7 @@ export function parseCommand(raw: unknown): ParseResult {
   if (typeof op !== 'string') return { ok: false, error: 'missing op' }
   if (!(COMMAND_OPS as readonly string[]).includes(op)) return { ok: false, error: `unknown op ${op}` }
 
-  if (op === 'list' || op === 'inbox') return { ok: true, command: { op } }
+  if (op === 'list' || op === 'inbox' || op === 'status') return { ok: true, command: { op } }
 
   if (op === 'requestContext') {
     const to = text(raw.to)
