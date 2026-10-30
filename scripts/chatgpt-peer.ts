@@ -1948,6 +1948,10 @@ export class ChatGptHost {
         return await this.postRecordedTurn(bridge, record, locked)
       }
       const gate = await this.cheapStatus(threadId)
+      // R1-F8: the bridge can be removed while that status read is in flight.
+      // Re-check before the post so a continuation never types into a bridge
+      // that is no longer in the registry.
+      if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
       // Only a RUNNING turn blocks a post: typing then would steer the text
       // into it. `idle` and `unknown` both mean "no turn seen running"; the
       // driver refuses a mid-turn send on its own word anyway, which is the
@@ -1972,9 +1976,14 @@ export class ChatGptHost {
     record.userNodeId = null
     record.threadId = bridge.state.threadId
     await this.notePendingTurn(bridge, record)
+    let posted: { threadId: string | null; userNodeId: string | null } | undefined
     try {
-      const post = () => this.pageTurnAsync(bridge, record.text)
-      let posted: { threadId: string | null; userNodeId: string | null }
+      // R1-F8: the bridge can be removed while the status read above is in
+      // flight. The send is the irreversible step, so refuse it here too.
+      const post = () => {
+        if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
+        return this.pageTurnAsync(bridge, record.text)
+      }
       if (locked) {
         // Real work, so the idle countdown restarts even though the lock is
         // already held by the observation pass.
@@ -1989,11 +1998,19 @@ export class ChatGptHost {
       await this.notePendingTurn(bridge, record)
       return true
     } catch (error) {
-      // Busy/not-posted is not a failed turn: nothing was typed, so the record
-      // stays deferred and the next idle transition posts it.
-      record.postedAt = null
-      record.userNodeId = null
-      await this.notePendingTurn(bridge, record)
+      // NEW-2: `posted` set means the page already took the text and a LATER
+      // step threw. Clearing `postedAt` then would say "never posted" and the
+      // recovery path would type the prompt a second time, so the record keeps
+      // the node it became. Only a send that did not land may be cleared.
+      if (posted) {
+        record.threadId = posted.threadId ?? record.threadId
+        record.userNodeId = posted.userNodeId ?? record.userNodeId
+        await this.notePendingTurn(bridge, record).catch(() => {})
+      } else {
+        record.postedAt = null
+        record.userNodeId = null
+        await this.notePendingTurn(bridge, record)
+      }
       const reason = one((error as Error).message, 160)
       if (!/mid-turn|not-posted|never left the composer/i.test(reason)) throw error
       log(`"${bridge.state.name}": ${shortId(record.messageId)} was not posted (${reason}); it stays queued`)

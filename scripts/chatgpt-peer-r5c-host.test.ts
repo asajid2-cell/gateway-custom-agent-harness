@@ -605,3 +605,86 @@ describe('R-LIVE-7: the bus decides what is owed, and a mark is not a delivery',
     }
   }, 40_000)
 })
+
+type LiveBridge = { state: BridgeState; removed: boolean; stopping: boolean }
+
+const liveBridge = (host: ChatGptHost, sessionId: string): LiveBridge =>
+  (host as unknown as { bridges: Map<string, LiveBridge> }).bridges.get(sessionId)!
+
+const pendingJob = (kind: 'inquiry' | 'directive' = 'inquiry') => ({
+  threadId: THREAD_A,
+  userNodeId: null as string | null,
+  ourText: 'unit ping',
+  text: 'unit ping',
+  senderSessionId: randomUUID(),
+  messageId: randomUUID(),
+  kind,
+  postedAt: null as string | null,
+})
+
+describe('R1-F8: a removed bridge is not posted to after the status read', () => {
+  test('a post whose bridge is removed while the status read is in flight types nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver)
+    const live = liveBridge(host, alpha.sessionId)
+    try {
+      const job = pendingJob()
+      // The page is idle, so the gate would let the post through. The removal
+      // lands DURING the read: only a re-check after it can stop the send.
+      const realCheap = host.cheapStatus.bind(host)
+      host.cheapStatus = async (threadId: string) => {
+        live.removed = true
+        live.stopping = true
+        return realCheap(threadId)
+      }
+      await expect((host as unknown as { postPendingTurn: (b: LiveBridge, j: unknown, ms?: number) => Promise<boolean> }).postPendingTurn(live, job, 1_000)).rejects.toThrow(/removed/)
+      expect(sendCount(driver)).toBe(0)
+    } finally {
+      live.removed = false
+      live.stopping = false
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+})
+
+describe('NEW-2: a later failure does not erase a send the page already took', () => {
+  test('a transient error after the page took the text leaves the turn recorded as posted', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver)
+    const live = liveBridge(host, alpha.sessionId)
+    try {
+      const job = pendingJob()
+      const realNote = host.notePendingTurn.bind(host)
+      let thrown = false
+      // The write-ahead record (postedAt set, no node yet) must succeed; the
+      // post-send record (both set) is the step that throws. That is exactly a
+      // transient failure AFTER the page accepted the text.
+      host.notePendingTurn = async (bridge: never, record: never) => {
+        const entry = record as { postedAt: string | null; userNodeId: string | null }
+        if (!thrown && entry.postedAt !== null && entry.userNodeId !== null) {
+          thrown = true
+          throw new Error('the bridge file could not be written')
+        }
+        return realNote(bridge, record)
+      }
+      await expect((host as unknown as { postRecordedTurn: (b: LiveBridge, j: unknown) => Promise<boolean> }).postRecordedTurn(live, job)).rejects.toThrow(/could not be written/)
+      expect(driver.sentAtMs.length).toBe(1)
+      const persisted = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(turn => turn.messageId === job.messageId)!
+      // THE defect: the blanket catch said "never posted", so recovery re-types.
+      expect(persisted.postedAt).not.toBe(null)
+      expect(typeof persisted.userNodeId).toBe('string')
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+})
