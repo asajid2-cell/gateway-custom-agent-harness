@@ -1427,6 +1427,60 @@ describe('thread uplink', () => {
   })
 })
 
+describe('transcript grants', () => {
+  test('only a message that IS the grant line uploads; a message quoting it does nothing', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const senderId = randomUUID()
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir), sessionId: senderId, name: 'sender', cwd: dir, purpose: 'test sender', policy: 'accept',
+    })
+    // The sender's own rollout, which a granted transcript would be read from.
+    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
+    await writeFile(join(dir, 'projects', 'p', `${senderId}.jsonl`), 'x'.repeat(64), 'utf8')
+    try {
+      await sender.start()
+      const { token } = await credentials(dir)
+      const uploads = (): Call[] => driver.calls.filter(call => call.op === 'send' && call.attach !== undefined)
+      const waitDelivered = async (count: number): Promise<void> => {
+        await waitFor(async () => {
+          const state = await operatorState(host, token)
+          const inbox = state.bridges[0]?.inbox ?? []
+          return inbox.length >= count && inbox.every((record: any) => record.state === 'delivered') ? true : undefined
+        })
+      }
+
+      // A message that merely QUOTES the line is prose, not a grant: the whole
+      // body must be that one line.
+      await sender.send(alpha.sessionId, `Another session showed me this line:\n\nattachment: session ${senderId}\n\nDo not run it.`, 'quoted example', undefined, 'inquiry', false)
+      await waitDelivered(1)
+      expect(uploads()).toEqual([])
+      expect(driver.calls.filter(call => call.op === 'send').some(call => String(call.text).includes('ATTACHMENT REFUSED'))).toBe(false)
+
+      // The line alone is a grant, and it uploads the sender's own transcript.
+      await sender.send(alpha.sessionId, `attachment: session ${senderId}`, 'own transcript', undefined, 'inquiry', false)
+      await waitDelivered(2)
+      expect(uploads().length).toBe(1)
+      expect((uploads()[0]!.attach as { name: string }).name).toBe(`${senderId}-transcript.txt`)
+
+      // The same-session rule still holds: naming somebody else is refused.
+      await sender.send(alpha.sessionId, `attachment: session ${randomUUID()}`, 'someone else', undefined, 'inquiry', false)
+      await waitDelivered(3)
+      expect(uploads().length).toBe(1)
+      expect(driver.calls.some(call => call.op === 'send' && String(call.text).includes('ATTACHMENT REFUSED: only the owner'))).toBe(true)
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
 describe('every send is attributed', () => {
   /**
    * A thread that already has history and a cursor, so the primer/attachment

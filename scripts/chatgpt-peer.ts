@@ -1965,7 +1965,10 @@ export class ChatGptHost {
    * only other authority, and only through the bearer API.
    */
   private async injectAttachment(bridge: Bridge, text: string, fromSessionId: string, messageId: string): Promise<void> {
-    const match = /^[ \t]*attachment:[ \t]*session[ \t]+(\S+)[ \t]*$/im.exec(text)
+    // A grant is an explicit act: the WHOLE message, trimmed, must be that one
+    // line. Matching one line anywhere in the body let a message that merely
+    // quoted the line upload the sender's entire transcript.
+    const match = /^[ \t]*attachment:[ \t]*session[ \t]+(\S+)[ \t]*$/i.exec(text.trim())
     if (!match) return
     const requested = match[1]!
     if (!UUID.test(requested)) {
