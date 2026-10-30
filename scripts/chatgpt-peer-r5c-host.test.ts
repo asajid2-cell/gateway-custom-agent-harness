@@ -635,8 +635,9 @@ describe('R1-F8: a removed bridge is not posted to after the status read', () =>
       const job = pendingJob()
       // The page is idle, so the gate would let the post through. The removal
       // lands DURING the read: only a re-check after it can stop the send.
-      const realCheap = host.cheapStatus.bind(host)
-      host.cheapStatus = async (threadId: string) => {
+      const patched = host as unknown as { cheapStatus: (threadId: string) => Promise<unknown> }
+      const realCheap = patched.cheapStatus.bind(host)
+      patched.cheapStatus = async (threadId: string) => {
         live.removed = true
         live.stopping = true
         return realCheap(threadId)
@@ -663,12 +664,15 @@ describe('NEW-2: a later failure does not erase a send the page already took', (
     const live = liveBridge(host, alpha.sessionId)
     try {
       const job = pendingJob()
-      const realNote = host.notePendingTurn.bind(host)
+      const patched = host as unknown as {
+        notePendingTurn: (bridge: unknown, record: unknown) => Promise<void>
+      }
+      const realNote = patched.notePendingTurn.bind(host)
       let thrown = false
       // The write-ahead record (postedAt set, no node yet) must succeed; the
       // post-send record (both set) is the step that throws. That is exactly a
       // transient failure AFTER the page accepted the text.
-      host.notePendingTurn = async (bridge: never, record: never) => {
+      patched.notePendingTurn = async (bridge: unknown, record: unknown) => {
         const entry = record as { postedAt: string | null; userNodeId: string | null }
         if (!thrown && entry.postedAt !== null && entry.userNodeId !== null) {
           thrown = true
