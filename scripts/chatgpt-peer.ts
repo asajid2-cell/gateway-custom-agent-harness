@@ -2884,12 +2884,28 @@ export class ChatGptHost {
     ].join('\n')
   }
 
-  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[] }): Promise<void> {
+  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[]; executed: { line: string }[] }): Promise<void> {
     // A reply to some other message is not an answer to this one.
     if (outcome.repliedTargets.includes(message.id)) return
     if (!expects) return
     if (outcome.failed) return this.replyError(bridge, message, `the page could not answer: ${one(outcome.problems.at(-1) ?? 'no answer', 180)}`)
-    if (outcome.budgetSpent) return this.replyError(bridge, message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
+    if (outcome.budgetSpent) {
+      // If commands ran on the final round, the side effects already happened.
+      // Telling the sender "budget spent" invites a retry that would duplicate
+      // them. Report what ran instead; the word "budget" must not appear.
+      if (outcome.executed.length > 0) {
+        const text = `the last round's commands ran: ${outcome.executed.map(entry => entry.line).join('; ')}`
+        const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
+        try {
+          await bridge.transport?.send(message.fromSessionId, text, summary, message.id, 'inquiry', false)
+          audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: 'receipt of final-round commands sent', messageId: message.id })
+        } catch (error) {
+          audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
+        }
+        return
+      }
+      return this.replyError(bridge, message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
+    }
     // A fence is an action, not an answer. If the only thing the page produced
     // was a command block that was refused (a stale or invented nonce), the
     // peer gets an error - never the fence text as if it were prose. This also
