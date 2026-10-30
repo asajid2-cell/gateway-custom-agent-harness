@@ -1427,7 +1427,15 @@ export class ChatGptHost {
       const address = file.kind === 'attachment'
         ? { fileId: file.fileId }
         : { threadId, messageId: node.id, sandboxPath: file.sandboxPath }
-      const reply = await this.driver.call({ op: 'file', ...address, outPath: target, maxBytes: OUTBOX_MAX_FILE_BYTES }, 180_000)
+      let outPath = target
+      let reply = await this.driver.call({ op: 'file', ...address, outPath, maxBytes: OUTBOX_MAX_FILE_BYTES }, 180_000)
+      // A previous attempt may have left the deterministic target behind (e.g. an
+      // over-limit uplink that was cleaned up but whose file op already landed).
+      // Retry once at a unique sibling path so the file is not permanently lost.
+      if (reply.ok !== true && reply.reason === 'exists') {
+        outPath = `${target}.${Date.now().toString(36)}${randomUUID().slice(0, 4)}`
+        reply = await this.driver.call({ op: 'file', ...address, outPath, maxBytes: OUTBOX_MAX_FILE_BYTES }, 180_000)
+      }
       if (reply.ok !== true) {
         const why = one(reply.reason ?? reply.detail ?? reply.error, 120) || 'the page refused'
         refused.push(`index ${index} refused: ${why}`)
@@ -1436,7 +1444,7 @@ export class ChatGptHost {
       }
       const bytes = Number(reply.bytes) || 0
       if (bytes > OUTBOX_MAX_FILE_BYTES || nodeBytes + bytes > OUTBOX_MAX_NODE_BYTES) {
-        await rm(target, { force: true }).catch(() => {})
+        await rm(String(reply.path ?? outPath), { force: true }).catch(() => {})
         refused.push(`index ${index} refused: ${bytes} bytes exceeds the delivery cap`)
         audit(this.hostState, { op: 'file', target: shortId(node.id), result: `index ${index} refused: ${bytes} bytes over cap [${bridge.state.name}]` })
         continue
@@ -2532,6 +2540,9 @@ export class ChatGptHost {
     // oversized delivery burns nothing.
     const outbound = sanitizePeerText(`${stamp}\n\n${body}${filesBlock}${refusedBlock}`)
     if (Buffer.byteLength(outbound, 'utf8') > MAX_MESSAGE_BYTES) {
+      // Clean up the files written to the outbox; without this a retry fails
+      // with 'exists' forever because the driver uses flag:'wx'.
+      await Promise.all(collected.files.map(file => rm(file.path, { force: true }).catch(() => {})))
       return this.refuseUplink(bridge, nodeId, `text, provenance stamp and file list are ${Buffer.byteLength(outbound, 'utf8')} bytes; exceeds 64 KiB`)
     }
     // Written down BEFORE the send (at-most-once): a crash from here to the bus
