@@ -335,6 +335,32 @@ describe('turn loop', () => {
     expect(outcome.executed.length).toBe(4)
   })
 
+  // F12: the budget ending the turn after a command ran is not "nothing was
+  // run" - the send already committed. The outcome must carry what ran (so a
+  // retry cannot duplicate it) and what was left unresolved.
+  test('F12: a send that ran on the final round is a receipt, not unresolved work', async () => {
+    const outcome = await runCommandTurn('go', nonce, {
+      budget: 1,
+      generate: async () => ({ ok: true, text: fenced(nonce, { op: 'send', to: 'peer', text: 'hi', summary: 's' }) }),
+      execute: async () => ({ line: 'sent m1 to peer: queued' }),
+    })
+    expect(outcome.budgetSpent).toBe(true)
+    expect(outcome.executed.map(e => e.command.op)).toEqual(['send'])
+    expect(outcome.unresolved).toEqual([])
+  })
+
+  test('F12: a refused command on the final round is reported as unresolved', async () => {
+    const outcome = await runCommandTurn('go', nonce, {
+      budget: 1,
+      generate: async () => ({ ok: true, text: fenced('deadbeef', { op: 'list' }) }),
+      execute: async () => ({ line: 'should not run' }),
+    })
+    expect(outcome.budgetSpent).toBe(true)
+    expect(outcome.executed).toEqual([])
+    expect(outcome.unresolved.length).toBe(1)
+    expect(outcome.unresolved[0]).toMatch(/nonce mismatch/)
+  })
+
   test('an explicit reply is reported so the host does not answer twice', async () => {
     const outcome = await runCommandTurn('go', nonce, {
       generate: async () => ({ ok: true, text: fenced(nonce, { op: 'reply', toMessageId: 'm1', text: 'here' }) }),
