@@ -148,6 +148,24 @@ export const commandReceiptSchema = z.object({
 export const COMMAND_RECEIPTS_MAX = 200
 
 /**
+ * One inbound's execution transcript, written BEFORE its first side effect.
+ *
+ * A per-command receipt is keyed on the command's own text, and a page that
+ * regenerates a turn can word the same command differently - a new key, a
+ * second dispatch, a doubled side effect (R1-F9). The run marker is keyed on
+ * the INBOUND alone, so once a turn from that inbound has executed anything,
+ * a replay of the inbound executes nothing.
+ */
+export const inboundRunSchema = z.object({
+  messageId: z.string().max(80),
+  /** The result lines of the commands this turn already ran, oldest first. */
+  results: z.array(z.string().max(500)).max(20).default([]),
+  at: z.string().max(40),
+}).strict()
+
+export const INBOUND_RUNS_MAX = 200
+
+/**
  * An inbound turn the host has posted but not yet answered (D5b).
  *
  * The turn is a JOB: the page is asked with `wait:false`, the record is written
@@ -210,6 +228,16 @@ export const bridgeStateSchema = z.object({
   pendingAttribution: z.array(pendingAttributionSchema).max(PENDING_ATTRIBUTION_MAX).default([]),
   /** The last node of the thread the host has handled; null until first observed. */
   cursor: z.string().max(64).nullable().default(null),
+  /**
+   * When this bridge was bound to its current thread, until the first
+   * observation commits a cursor.
+   *
+   * The first observation must tell history from what a person typed AFTER the
+   * bind. Kept in bridge state, not in memory, so a restart between the bind
+   * and that first read cannot swallow the person's turn as history (R1-F10).
+   * Cleared as soon as the initial cursor is committed.
+   */
+  boundAt: z.string().max(40).nullable().default(null),
   /** When the page last answered 404 for the bound thread; cleared when it answers again. */
   threadMissingAt: z.string().nullable().default(null),
   /**
@@ -242,6 +270,11 @@ export const bridgeStateSchema = z.object({
    * the dispatch, making every model command at-most-once across host restarts.
    */
   commandReceipts: z.array(commandReceiptSchema).max(COMMAND_RECEIPTS_MAX).default([]),
+  /**
+   * Inbounds that already executed a model command, newest last. Written before
+   * the first side effect; a replay of that inbound after a restart runs none.
+   */
+  inboundRuns: z.array(inboundRunSchema).max(INBOUND_RUNS_MAX).default([]),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -301,6 +334,7 @@ export function newBridgeState(options: {
     ourNodeIds: [],
     pendingAttribution: [],
     cursor: null,
+    boundAt: null,
     threadMissingAt: null,
     uplinkTimes: [],
     uplinkNodeIds: [],
@@ -308,6 +342,7 @@ export function newBridgeState(options: {
     pendingTurns: [],
     answeredTurns: [],
     commandReceipts: [],
+    inboundRuns: [],
   }
 }
 
@@ -327,6 +362,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     ourNodeIds: [],
     pendingAttribution: [],
     cursor: null,
+    boundAt: null,
     threadMissingAt: null,
     uplinkTimes: [],
     uplinkNodeIds: [],
@@ -334,6 +370,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     pendingTurns: [],
     answeredTurns: [],
     commandReceipts: [],
+    inboundRuns: [],
   }
 }
 

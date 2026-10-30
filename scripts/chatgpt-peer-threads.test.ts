@@ -6,12 +6,13 @@ import {
   diffThreadList,
   listAllThreads,
   newPageAnswers,
+  nodeComplete,
   nodeIdsOf,
   pendingHumanTurns,
   type Conversation,
 } from './chatgpt-peer/threads'
 
-type Spec = { id: string; parent: string | null; role: 'user' | 'assistant' | 'tool' | 'system' | null; t?: number; end?: boolean; text?: string; ctype?: string }
+type Spec = { id: string; parent: string | null; role: 'user' | 'assistant' | 'tool' | 'system' | null; t?: number; end?: boolean; text?: string; ctype?: string; status?: string }
 
 /** The shape /backend-api/conversation/<id> returned on 2026-10-29 (root has message null). */
 function conversation(current: string, specs: Spec[]): Conversation {
@@ -25,7 +26,7 @@ function conversation(current: string, specs: Spec[]): Conversation {
       author: { role: s.role },
       create_time: s.t ?? null,
       end_turn: s.end ?? null,
-      status: 'finished_successfully',
+      status: s.status ?? 'finished_successfully',
       content: { content_type: s.ctype ?? 'text', parts: [s.text ?? ''] },
     },
   }
@@ -224,5 +225,44 @@ describe('answerAfter (R2-F9)', () => {
       { id: 'a2old', parent: 'u2', role: 'assistant', t: 21, end: true, text: 'old' },
       { id: 'a2new', parent: 'u2', role: 'assistant', t: 25, end: true, text: 'new' }]
     expect(answerAfter(conversation('a2new', specs), 'u2')?.id).toBe('a2new')
+  })
+})
+
+/**
+ * R2-F9 + NEW-3: a node that is still being written is not the answer.
+ *
+ * Both trees below are real shapes from the page: the first says so with
+ * `status: 'in_progress'`, the second with `end_turn: false` while the status
+ * string already claims success. Treating either as the answer settles a turn
+ * on a placeholder ("working..."), which is NEW-3's defect.
+ */
+describe('a nonterminal assistant node is not the answer (R2-F9, NEW-3)', () => {
+  test('an in-progress assistant node is walked past to the finished answer', () => {
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'question' },
+      { id: 'wip', parent: 'u2', role: 'assistant', t: 21, end: false, status: 'in_progress', text: 'thinking out loud' },
+      { id: 'a2', parent: 'wip', role: 'assistant', t: 22, end: true, text: 'the real answer' }]
+    const c = conversation('a2', specs)
+    expect(nodeComplete(c.mapping.wip)).toBe(false)
+    expect(answerAfter(c, 'u2')?.id).toBe('a2')
+  })
+
+  test('end_turn false outranks a finished status: the working node is skipped', () => {
+    // The page writes `working...` as a normal assistant node whose status is
+    // already `finished_successfully` but whose `end_turn` is false.
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'question' },
+      { id: 'wip', parent: 'u2', role: 'assistant', t: 21, end: false, status: 'finished_successfully', text: 'working...' },
+      { id: 'a2', parent: 'wip', role: 'assistant', t: 22, end: true, text: 'final' }]
+    const c = conversation('a2', specs)
+    expect(nodeComplete(c.mapping.wip)).toBe(false)
+    expect(answerAfter(c, 'u2')?.id).toBe('a2')
+  })
+
+  test('a terminal node is still the answer when nothing follows it', () => {
+    const specs: Spec[] = [...base,
+      { id: 'u2', parent: 'a1', role: 'user', t: 20, text: 'question' },
+      { id: 'a2', parent: 'u2', role: 'assistant', t: 21, end: true, text: 'the answer' }]
+    expect(answerAfter(conversation('a2', specs), 'u2')?.id).toBe('a2')
   })
 })

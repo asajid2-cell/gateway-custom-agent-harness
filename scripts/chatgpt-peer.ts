@@ -29,7 +29,7 @@ import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, pathOf, pendingHumanTurns, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
-  ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, COMMAND_RECEIPTS_MAX, DELIVERED_FILES_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
+  ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, COMMAND_RECEIPTS_MAX, DELIVERED_FILES_MAX, INBOUND_RUNS_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
   PENDING_ATTRIBUTION_MAX, PENDING_ATTRIBUTION_TEXT_MAX, PENDING_TURNS_MAX, PENDING_TURN_TTL_MS, pendingTurnSchema, saveJson,
   type BridgeState, type HostState, type PendingAttribution,
 } from './chatgpt-peer/state.ts'
@@ -404,6 +404,18 @@ export class ChatGptHost {
   private readonly attachedTurns = new Set<string>()
 
   /**
+   * Inbound message ids THIS process began FRESH (no transcript on disk).
+   *
+   * The durable per-inbound transcript (`inboundRuns`) marks an inbound whose
+   * command already ran; a replay of it must execute nothing more (R1-F9). A
+   * turn this process started fresh is in this set, so its own later commands
+   * are not mistaken for a replay. A turn taken over from the transcript
+   * (recoverOwed after a restart) is deliberately NOT added, so every command
+   * it would emit is refused.
+   */
+  private readonly freshTurns = new Set<string>()
+
+  /**
    * When each unresolved send was first observed with the page STOPPED.
    *
    * The expiry clock for a pending attribution is measured from completion, not
@@ -412,16 +424,6 @@ export class ChatGptHost {
    * the entry across a persist/reload without changing the on-disk shape.
    */
   private readonly attributionDoneAt = new Map<string, number>()
-
-  /**
-   * When a bridge was bound to the thread it now observes (R1-F10).
-   *
-   * Without it, a null cursor is baselined to the LAST node on the first
-   * observation - and a message a person typed between the bind and that first
-   * read is then "history" that is never handled. Only explicit binds set this;
-   * a bridge loaded from disk keeps its persisted cursor instead.
-   */
-  private readonly boundAt = new WeakMap<Bridge, number>()
 
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
@@ -1091,7 +1093,8 @@ export class ChatGptHost {
         bridge = created
         // Adopting binds this peer to an existing conversation right now; a
         // message typed while the primer is being posted is work, not history.
-        this.boundAt.set(created, Date.now())
+        // Stored in bridge state so the anchor survives a restart (R1-F10).
+        created.state.boundAt = now()
         // `use` adopts a tab that already shows the thread without reloading
         // it, and validates that the page really landed there otherwise.
         const reply = await this.driver.call({ op: 'use', threadId: chosen.id }, TURN_TIMEOUT_MS)
@@ -2435,11 +2438,11 @@ export class ChatGptHost {
    * first send into a fresh chat all pass through here, so they cannot diverge.
    */
   private setThread(bridge: Bridge, threadId: string | null): void {
-    // A bind to a real thread leaves a time anchor: the first observation must
-    // tell history from what was typed after the bind (R1-F10).
-    if (threadId) this.boundAt.set(bridge, Date.now())
-    else this.boundAt.delete(bridge)
     const state = bridge.state
+    // A bind to a real thread leaves a time anchor, persisted with the state:
+    // the first observation must tell history from what was typed after the
+    // bind, even if the host restarts before that observation (R1-F10).
+    state.boundAt = threadId ? now() : null
     state.threadId = threadId
     state.primedThreadId = null
     state.primerSha256 = null
@@ -2533,21 +2536,24 @@ export class ChatGptHost {
     await this.resumePendingTurns(bridge, conversation)
     await this.resumeDeferredTurns(bridge)
     if (!bridge.state.cursor) {
-      const bound = this.boundAt.get(bridge)
-      if (bound === undefined) {
+      const boundMs = bridge.state.boundAt ? Date.parse(bridge.state.boundAt) : Number.NaN
+      if (!Number.isFinite(boundMs)) {
         // Loaded with no cursor and no bind anchor: what is already there is
         // history, not work.
         bridge.state.cursor = chainOf(conversation).at(-1)?.id ?? pathOf(conversation).at(-1) ?? null
         await this.persistBridgeState(bridge)
         return
       }
-      // Bound to this thread at `bound`: everything created before it is
+      // Bound to this thread at `boundAt`: everything created before it is
       // history, everything after it is work this host still owes. Baselining
       // to the last node would swallow a message a person typed between the
-      // bind and this first observation (R1-F10).
+      // bind and this first observation - even across a restart (R1-F10).
       const history = chainOf(conversation).filter(turn =>
-        typeof turn.createTime === 'number' && turn.createTime * 1000 < bound - PENDING_WINDOW_BEFORE_MS)
+        typeof turn.createTime === 'number' && turn.createTime * 1000 < boundMs - PENDING_WINDOW_BEFORE_MS)
       bridge.state.cursor = history.at(-1)?.id ?? pathOf(conversation)[0] ?? null
+      // The anchor has done its one job: the cursor now carries the boundary,
+      // so a later restart must not re-baseline against a stale bind time.
+      if (bridge.state.cursor) bridge.state.boundAt = null
       await this.persistBridgeState(bridge)
       if (!bridge.state.cursor) return
     }
@@ -2897,6 +2903,9 @@ export class ChatGptHost {
       await this.notePendingTurn(bridge, job)
       // The observation pass must leave this job alone while this turn is alive.
       this.attachedTurns.add(message.id)
+      // Only a turn with no transcript on disk may execute commands: a replay
+      // of one that already ran is refused by `executeCommand` (R1-F9).
+      if (!bridge.state.inboundRuns.some(entry => entry.messageId === message.id)) this.freshTurns.add(message.id)
       // The ack is per-request and idempotent: the page names the send it
       // accepted, so a primer posting its own node can never acknowledge this
       // inbound, and rounds 2..n do not acknowledge it twice.
@@ -3004,6 +3013,7 @@ export class ChatGptHost {
       else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
     } finally {
       this.attachedTurns.delete(message.id)
+      this.freshTurns.delete(message.id)
       await bridge.transport?.update({ status: 'idle' }).catch(() => {})
       if (!bridge.removed) this.refreshOwed(bridge)
       await this.persistBridgeState(bridge)
@@ -3322,12 +3332,32 @@ export class ChatGptHost {
         await this.persistHostState()
         return { line: existing.line, replied: existing.replied, ...(existing.repliedTo ? { repliedTo: existing.repliedTo } : {}) }
       }
+      // The per-command key above cannot be relied on across a restart: the page
+      // may regenerate the turn and word the same command differently, which is
+      // a new key and a second dispatch (R1-F9). The inbound's own id can be
+      // relied on. Once THIS inbound has executed anything, a turn this process
+      // did not begin fresh is a replay: it executes nothing more and reports
+      // what already ran.
+      const ran = bridge.state.inboundRuns.find(entry => entry.messageId === messageId)
+      if (ran && !this.freshTurns.has(messageId)) {
+        const recorded = ran.results.length > 0 ? ` (${one(ran.results.join('; '), 260)})` : ''
+        const notice = `replay notice: this turn already ran before the host restarted${recorded}; the new command was not executed`
+        audit(this.hostState, { op: command.op, target, result: one(notice, 300), messageId })
+        await this.persistHostState()
+        return { line: notice, replied: false }
+      }
       // Write-ahead receipt with a placeholder line; persist before the side
       // effect so a crash between here and the dispatch is idempotent.
       const isReply = command.op === 'reply'
       const repliedTo = isReply ? (command as { toMessageId?: string }).toMessageId : undefined
       const placeholder = { key: receiptKey, line: 'recorded before the side effect', replied: isReply, ...(repliedTo ? { repliedTo } : {}) }
       bridge.state.commandReceipts = [...bridge.state.commandReceipts, placeholder].slice(-COMMAND_RECEIPTS_MAX)
+      // The inbound's transcript is durable BEFORE its first side effect, so a
+      // crash between the dispatch and the receipt still blocks a replay whose
+      // command text was regenerated (R1-F9).
+      if (!bridge.state.inboundRuns.some(entry => entry.messageId === messageId)) {
+        bridge.state.inboundRuns = [...bridge.state.inboundRuns, { messageId, results: [], at: now() }].slice(-INBOUND_RUNS_MAX)
+      }
       await this.persistBridgeState(bridge, true)
       let result: { line: string; replied: boolean; repliedTo?: string }
       try {
@@ -3342,6 +3372,13 @@ export class ChatGptHost {
       const idx = bridge.state.commandReceipts.findIndex(entry => entry.key === receiptKey)
       if (idx !== -1) {
         bridge.state.commandReceipts[idx] = { key: receiptKey, line: result.line.slice(0, 500), replied: result.replied, ...(result.repliedTo ? { repliedTo: result.repliedTo } : {}) }
+      }
+      // Record what this turn already ran, so a replay of the same inbound
+      // reports it instead of executing a differently-worded command (R1-F9).
+      const runAt = bridge.state.inboundRuns.findIndex(entry => entry.messageId === messageId)
+      if (runAt !== -1) {
+        const run = bridge.state.inboundRuns[runAt]!
+        bridge.state.inboundRuns[runAt] = { ...run, results: [...run.results, result.line.slice(0, 500)].slice(-20) }
       }
       await this.persistBridgeState(bridge)
       await this.persistHostState()
