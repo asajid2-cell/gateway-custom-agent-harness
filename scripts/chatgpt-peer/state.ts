@@ -212,10 +212,12 @@ export const inboundRunSchema = z.object({
 /**
  * An inbound turn the host has posted but not yet answered (D5b).
  *
- * The turn is a JOB: the page is asked with `wait:false`, the record is written
- * BEFORE the send, and the answer is delivered later - by the turn's own loop
- * while this process lives, or by the observation pass after a restart. It is
- * never dropped without a delivery or a failure line.
+ * The turn is a JOB: the record is written BEFORE the send, and the answer is
+ * delivered from the synchronous `wait:true` reply when the page finishes
+ * inside the send's own wait. Only a send that outlives its wait (the page is
+ * still generating) leaves the turn owed, to the turn's own loop while this
+ * process lives or to the observation pass after a restart. It is never
+ * dropped without a delivery or a failure line.
  */
 export const pendingTurnSchema = z.object({
   /** Null only for a brand-new chat: the page has not named a thread yet. */
@@ -247,6 +249,15 @@ export const pendingTurnSchema = z.object({
    * records written before this field existed, which fall back to the cursor.
    */
   anchorNodeId: z.string().max(64).nullable().optional(),
+  /**
+   * The turn's command nonce, as minted when this inbound began. Every answer to
+   * this turn - direct, deferred (the page was mid-turn), or recovered after a
+   * restart - must be parsed against the SAME nonce, so a deferred or recovered
+   * answer runs its commands exactly like a direct one. Absent only on records
+   * written before this field existed; such a turn refuses a command block by
+   * name (nonce mismatch) rather than swallowing it.
+   */
+  turnNonce: z.string().max(64).optional(),
 }).strict()
 
 export const PENDING_TURNS_MAX = 8

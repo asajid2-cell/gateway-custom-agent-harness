@@ -156,7 +156,11 @@ class FakeDriver {
       this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
       this.sentAtMs.push(Date.now())
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
@@ -334,21 +338,30 @@ async function primedBridge(): Promise<{ alpha: BridgeState }> {
  */
 async function postedThenStopped(dir: string, driver: FakeDriver, bridge: BridgeState, sender: GatewaySessionTransport, text = 'ask the page'): Promise<string> {
   const host = await startHost(dir, driver)
+  const sendsBefore = driver.sentAtMs.length
   try {
     const receipt = await sender.send(bridge.sessionId, text, text, undefined, 'inquiry', true) as { id: string }
     // The crash shape is "the page took the text, the host died before the
     // answer". The write-ahead record is written BEFORE the send, so waiting on
-    // `postedAt` alone can stop the host between the record and the type (or
-    // before the inbound is acknowledged, leaving it queued for `drain` to
-    // re-run as new). Wait for the durable post AND the bus acknowledgement,
-    // both read from the live host, then stop inside the wait for an answer.
+    // `postedAt` alone can stop the host between the record and the type. Wait
+    // for the durable post AND the page having received the send, then stop
+    // inside the wait for an answer.
+    //
+    // The inbound is deliberately left UNACKNOWLEDGED: with `wait:true` the
+    // acknowledgement is deferred until the first answer round, so a crash
+    // mid-turn leaves it queued - exactly the live record. The pending job is
+    // what tells the next host this inbound is already posted, so `drain` must
+    // not re-run it as new.
+    //
+    // With `wait:true` a send that outlives its wait carries no node id, so a
+    // crash mid-turn may leave `userNodeId` null: the page took the text but
+    // the record names no node. Recovery must find it by identity, which is
+    // exactly what these tests exercise.
     const live = (host as unknown as { bridges: Map<string, { state: BridgeState; transport?: GatewaySessionTransport }> }).bridges.get(bridge.sessionId)!
     await waitFor(() => {
       const job = live.state.pendingTurns.find(turn => turn.messageId === receipt.id)
-      const acked = live.transport?.inbox().some(record => record.message.id === receipt.id && record.state === 'delivered') ?? false
-      if (!acked || !job || job.postedAt === null) return undefined
-      // A page that renders nothing (`lags`) legitimately records no node.
-      if (!driver.lags && typeof job.userNodeId !== 'string') return undefined
+      if (!job || job.postedAt === null) return undefined
+      if (driver.sentAtMs.length <= sendsBefore) return undefined
       return true
     }, 15_000)
     return receipt.id
@@ -377,7 +390,9 @@ describe('R-LIVE-6: a restart reads the page before re-posting a turn', () => {
       const messageId = await postedThenStopped(dir, driver, alpha, sender)
       const job = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(turn => turn.messageId === messageId)!
       expect(job.postedAt).not.toBe(null)
-      expect(typeof job.userNodeId).toBe('string')
+      // The page took the text; a send that outlived its wait carries no node
+      // id, so recovery must find the node by identity below.
+      expect(driver.sentAtMs.length).toBe(1)
       // The page finishes the turn after the crash. This is exactly the live
       // shape: the answer is on the page, the sender is still owed.
       driver.pageNode(THREAD_A, 'the answer that was already on the page')
@@ -566,12 +581,11 @@ describe('R-LIVE-7: the bus decides what is owed, and a mark is not a delivery',
     try {
       const messageId = await postedThenStopped(dir, driver, alpha, sender)
       const state = await readBridge(dir, alpha.sessionId)
-      const job = state.pendingTurns.find(turn => turn.messageId === messageId)!
-      expect(typeof job.userNodeId).toBe('string')
-      // The crashed process ran markAnswered BEFORE sending: the answer was
-      // obtained from the page, so the write-ahead mark exists - but the bus
-      // has no reply for it, so the sender is still owed one.
-      state.answeredTurns = [...state.answeredTurns, `m:${messageId}`, `u:${job.userNodeId}`]
+      // The crashed process wrote the answer-obtained mark BEFORE sending. With
+      // `wait:true` a mid-turn crash names no node, so the write-ahead key is
+      // the message's own (`m:`) key. The bus has no reply for it, so the
+      // sender is still owed one.
+      state.answeredTurns = [...state.answeredTurns, `m:${messageId}`]
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), state)
 
       driver.pageNode(THREAD_A, 'the answer the write-ahead mark hid')

@@ -54,6 +54,12 @@ class FakeDriver {
     if (op === 'use') return { ok: true, op, threadId: String(request.threadId ?? ''), url: `https://chatgpt.com/c/${String(request.threadId ?? '')}`, adopted: true }
     if (op === 'send') {
       this.current = typeof request.threadId === 'string' ? request.threadId : this.current
+      // `wait:true` promises the answer on this request. A page that is still
+      // generating has none: the real child reports `timedOut` rather than
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && this.signal === 'generating') {
+        return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId: this.current }
+      }
       return { ok: true, op, text: this.answer, threadId: this.current, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'status') {
@@ -169,13 +175,14 @@ async function hostAudit(dir: string): Promise<{ op: string; target: string | nu
 }
 
 describe('R-LIVE-5: a driver fault is not the page\'s word', () => {
-  test('a status read that fails mid-turn keeps the page\'s last word and never fails the turn as a model turn', async () => {
+  test('a send whose wait ends mid-turn keeps the page\'s last word and never fails the turn as a model turn', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = await primedBridge()
     await seedHost(dir, [alpha])
     const driver = new FakeDriver()
-    // Call 1 is the post gate (the page is idle, so the job posts), call 2 is
-    // the first poll (generating), and every later one is the driver failing.
+    // Call 1 is the post gate (the page is idle, so the job posts). The page
+    // then generates, so the synchronous send outlives its wait and answers
+    // `timedOut` - a state of the page, not a refusal.
     driver.faultStatusFrom = 3
     const host = await startHost(dir, driver, 2_000)
     const sender = await busPeer(dir, 'sender')

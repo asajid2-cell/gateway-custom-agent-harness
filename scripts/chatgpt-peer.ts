@@ -1507,11 +1507,17 @@ export class ChatGptHost {
    * The page has accepted the text; the answer is observed, not awaited. This
    * is what keeps the page lock free while a turn that takes minutes runs.
    */
-  private async pageTurnAsync(bridge: Bridge, text: string, onAccepted?: () => void): Promise<{ threadId: string | null; userNodeId: string | null }> {
+  private async pageTurnAsync(
+    bridge: Bridge,
+    text: string,
+    options: { wait?: boolean; onAccepted?: () => void } = {},
+  ): Promise<{ threadId: string | null; userNodeId: string | null; text: string | null }> {
     const requested = bridge.state.threadId
+    const wait = options.wait === true
+    const onAccepted = options.onAccepted
     const reply = await this.sendRecorded(bridge, text, {
       threadId: requested,
-      wait: false,
+      ...(wait ? { wait: true } : { wait: false }),
       ...(onAccepted ? { onAccepted } : {}),
       landed: async threadId => {
         if (requested && threadId.toLowerCase() !== requested.toLowerCase()) throw new Error(threadGone(requested, threadId))
@@ -1540,7 +1546,14 @@ export class ChatGptHost {
     this.absorbPage(bridge, reply)
     this.health = { state: 'serving', at: now() }
     const landed = typeof reply.threadId === 'string' && reply.threadId ? reply.threadId : bridge.state.threadId
-    return { threadId: landed ?? null, userNodeId: typeof reply.ownNodeId === 'string' && reply.ownNodeId ? reply.ownNodeId : null }
+    return {
+      threadId: landed ?? null,
+      userNodeId: typeof reply.ownNodeId === 'string' && reply.ownNodeId ? reply.ownNodeId : null,
+      // The synchronous send returns the completed answer on the same request.
+      // When `wait` was not asked for (or the driver reports no text), there is
+      // no answer here and the caller falls back to the observation path.
+      text: wait && typeof reply.text === 'string' ? reply.text : null,
+    }
   }
 
   /**
@@ -2163,10 +2176,12 @@ export class ChatGptHost {
   /**
    * Post one already-recorded job, once the page is idle.
    *
-   * Returns false when the page stayed mid-turn: the record is left DEFERRED,
-   * nothing was typed, and the observation pass posts it after the transition.
+   * `posted` is false when the page stayed mid-turn: the record is left
+   * DEFERRED, nothing was typed, and the observation pass posts it after the
+   * transition. When it does post, `text` is the answer the synchronous send
+   * returned on the same request (null only if the driver did not carry one).
    */
-  private async postPendingTurn(bridge: Bridge, record: PendingTurn, waitMs = 30_000, locked = false): Promise<boolean> {
+  private async postPendingTurn(bridge: Bridge, record: PendingTurn, waitMs = 30_000, locked = false): Promise<{ posted: boolean; text: string | null }> {
     const deadline = Date.now() + waitMs
     for (;;) {
       if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
@@ -2188,7 +2203,7 @@ export class ChatGptHost {
       if (gate.state !== 'generating') return await this.postRecordedTurn(bridge, record, locked)
       if (Date.now() >= deadline) {
         log(`"${bridge.state.name}": the page is still mid-turn; ${shortId(record.messageId)} stays queued`)
-        return false
+        return { posted: false, text: null }
       }
       await new Promise(resolve => setTimeout(resolve, this.waitPoll))
     }
@@ -2200,7 +2215,7 @@ export class ChatGptHost {
    * `locked` says the caller already holds the page lock (the observation pass
    * does), so this must not queue on it a second time.
    */
-  private async postRecordedTurn(bridge: Bridge, record: PendingTurn, locked = false): Promise<boolean> {
+  private async postRecordedTurn(bridge: Bridge, record: PendingTurn, locked = false): Promise<{ posted: boolean; text: string | null }> {
     record.postedAt = now()
     record.userNodeId = null
     record.threadId = bridge.state.threadId
@@ -2210,7 +2225,7 @@ export class ChatGptHost {
     // no create_time was then before the anchor for every later pass.
     record.anchorNodeId = bridge.state.cursor ?? null
     await this.notePendingTurn(bridge, record)
-    let posted: { threadId: string | null; userNodeId: string | null } | undefined
+    let posted: { threadId: string | null; userNodeId: string | null; text: string | null } | undefined
     // R8-H3: acceptance is the SEND's own fact, tracked here - not this
     // function's return value. `pageTurnAsync` can throw AFTER the driver took
     // the text: the post-send snapshot's read or persist (`recordOurs`) is the
@@ -2223,7 +2238,10 @@ export class ChatGptHost {
       // flight. The send is the irreversible step, so refuse it here too.
       const post = () => {
         if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
-        return this.pageTurnAsync(bridge, record.text, () => { accepted = true })
+        // wait:true: the driver returns the answer on this same request, so the
+        // reply does not depend on a later observation read (which the page
+        // throttles). The answer is handed back through `postPendingTurn`.
+        return this.pageTurnAsync(bridge, record.text, { wait: true, onAccepted: () => { accepted = true } })
       }
       if (locked) {
         // Real work, so the idle countdown restarts even though the lock is
@@ -2237,7 +2255,7 @@ export class ChatGptHost {
       record.threadId = posted.threadId
       record.userNodeId = posted.userNodeId
       await this.notePendingTurn(bridge, record)
-      return true
+      return { posted: true, text: posted.text }
     } catch (error) {
       // NEW-2 / R8-H3: `posted` OR `accepted` means the page already took the
       // text and a LATER step threw. Clearing `postedAt` then would say "never
@@ -2277,7 +2295,7 @@ export class ChatGptHost {
       } else {
         log(`"${bridge.state.name}": ${shortId(record.messageId)} was not posted (${reason}); it stays queued`)
       }
-      return false
+      return { posted: false, text: null }
     }
   }
 
@@ -2539,7 +2557,11 @@ export class ChatGptHost {
       }
       const answer = userNodeId ? this.answerFor(conversation, userNodeId) : null
       if (answer) {
-        await this.deliverSolicited(bridge, record, answer)
+        // The observation pass already holds the page lock, and an answer that
+        // is a command block runs (one round is this post, the next is a page
+        // turn), so the follow-up rounds must not queue on that lock again.
+        const message = this.inboundMessageOf(bridge, record)
+        await this.settleTurnAnswer(bridge, record, message, nodeTextOf(answer), true)
         // R8-C: ownership was persisted above, and that alone stops the next
         // pass re-handling this delivery - `pendingHumanTurns` skips `ours`, and
         // `newPageAnswers` excludes a governing user node in `ourNodeIds`. The
@@ -2567,9 +2589,14 @@ export class ChatGptHost {
     const gate = await this.cheapStatus(threadId)
     if (gate.state === 'generating') return
     const posted = await this.postPendingTurn(bridge, deferred, 0, true)
-    if (posted) {
+    if (posted.posted) {
       audit(this.hostState, { op: 'turn', target: deferred.senderSessionId, result: `deferred job posted after the turn ended [${bridge.state.name}]`, messageId: deferred.messageId })
       await this.persistHostState()
+      // A deferred turn is a COMMAND turn like any other: with the synchronous
+      // answer in hand, settle it here (this pass holds the page lock). With no
+      // text the first round reads the thread, exactly as the direct path does.
+      const message = this.inboundMessageOf(bridge, deferred)
+      await this.settleTurnAnswer(bridge, deferred, message, posted.text, true)
     }
   }
 
@@ -2587,56 +2614,127 @@ export class ChatGptHost {
   }
 
   /**
-   * One solicited answer to the sender. Explicitly NOT untrusted page speech.
+   * The request as this host saw it on the bus, for a turn the observation pass
+   * settled rather than its own loop.
    *
-   * R8-H2: the answer NODE is carried in from the caller that read it. This
-   * used to re-read the node by id, and a failed second read produced `raw = ''`
-   * and a false terminal line ("a command block only; nothing was sent") for an
-   * answer the page had already finished. With no node in hand the caller must
-   * leave the turn owed and send nothing.
+   * The inbox record is the authority on `kind`/`expectReply`/`summary`. A
+   * record the inbox no longer holds (pruned after an acknowledgement) still
+   * has a sender and an id in the job, which is enough to answer it - and it is
+   * never handed a summary naming a different message.
    */
-  private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: ConversationNode): Promise<void> {
-    const key = this.turnKey(record)
+  private inboundMessageOf(bridge: Bridge, job: PendingTurn): { id: string; fromSessionId: string; summary: string; kind?: string; expectReply?: boolean; replyTo?: string } {
+    const found = bridge.transport?.inbox().find(item => item.message.id === job.messageId)
+    if (found) return found.message
+    return { id: job.messageId, fromSessionId: job.senderSessionId, summary: job.messageId, kind: job.kind }
+  }
+
+  /**
+   * Settle ONE posted turn's answer through the one answer path.
+   *
+   * The observation pass (a turn whose answer the page finished after this
+   * process stopped watching it), the deferred post (the page was mid-turn when
+   * it arrived) and recovery-after-restart all settle here. The direct turn's
+   * own loop runs the same `runCommandTurn`/`settleReply` pair inline, with its
+   * `expects` gate. In every case the answer text is parsed against THIS turn's
+   * nonce, every permitted
+   * command runs through `executeCommand` with the per-message budget, and the
+   * sender gets the receipts. A command block is an ACTION, never a body to
+   * forward and never a reason to say "nothing was sent" - a block that cannot
+   * run is refused by name (see `settleReply`).
+   *
+   * `firstText` is the answer already in hand: the text the synchronous send
+   * returned, or the node the observation pass just read. Null means it has not
+   * been read yet, and the first round reads the thread - the same fallback the
+   * direct path uses. It is NEVER a second post: one inbound is one page turn.
+   *
+   * `locked` says the observation pass already holds the page lock, so any
+   * follow-up round must not queue on it again.
+   */
+  private async settleTurnAnswer(
+    bridge: Bridge,
+    job: PendingTurn,
+    message: { id: string; fromSessionId: string; summary: string; kind?: string; expectReply?: boolean; replyTo?: string },
+    firstText: string | null,
+    locked: boolean,
+  ): Promise<void> {
+    const key = this.turnKey(job)
     // The bus is authoritative for what has been answered, not the mark. A
-    // write-ahead mark says the answer was OBTAINED from the page
-    // (`markAnswered` runs before the reply leaves), so it is only a delivery
-    // once the transport history holds a 'sent' entry for this message
-    // (R-LIVE-7). With the mark but no sent entry the sender is still owed, so
-    // every caller - the observation pass and the startup recovery alike -
-    // delivers rather than retiring.
-    if (bridge.state.answeredTurns.includes(key) && this.replySent(bridge, record.messageId)) {
-      await this.retirePendingTurn(bridge, record.messageId)
+    // write-ahead mark says the answer was OBTAINED from the page, so it is
+    // only a delivery once the transport history holds a 'sent' entry for this
+    // message (R-LIVE-7). With the mark but no sent entry the sender is still
+    // owed.
+    if (bridge.state.answeredTurns.includes(key) && this.replySent(bridge, job.messageId)) {
+      await this.retirePendingTurn(bridge, job.messageId)
       return
     }
-    // Write-ahead: the answer is marked BEFORE it is sent, so a crash from here
-    // to the receipt is judged by the bus rather than by the mark. R7-F4: the
-    // JOB is no longer removed here - deleting it before the send was the same
-    // crash window as `markAnswered`, leaving an owed reply with nothing to
-    // settle from. It stays until the sent entry exists.
-    this.settling.add(record.messageId)
+    this.settling.add(job.messageId)
     try {
       bridge.state.answeredTurns = [...bridge.state.answeredTurns.filter(item => item !== key), key].slice(-ANSWERED_TURNS_MAX)
       await this.persistBridgeState(bridge, true)
-      const raw = nodeTextOf(answer)
-      const { prose, commandShaped } = proseFromTurn(raw)
-      const visible = prose || (commandShaped ? '' : raw)
-      const shaped = await this.shapeAnswer(bridge, visible, answer.id)
-      const body = shaped.answerPath
-        ? `${shaped.text}\n\nFull answer: ${shaped.answerPath} (${shaped.bytes} bytes, sha256 ${(shaped.sha256 ?? '').slice(0, 16)})`
-        : (shaped.text || 'the page answered with a command block only; nothing was sent')
-      try {
-        await bridge.transport?.send(record.senderSessionId, sanitizePeerText(body), `Re: ${record.messageId.slice(0, 8)}`.slice(0, 200), record.messageId, record.kind, false)
-        this.logDeliveredAnswer(record.messageId, record.postedAt)
-        audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `delivered the observed answer${shaped.answerPath ? ' (spilled)' : ''} [${bridge.state.name}]`, messageId: record.messageId })
-      } catch (error) {
-        audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `failed: ${one((error as Error).message, 160)}`, messageId: record.messageId })
+      let seeded = firstText
+      // The command's ordinal within the turn (see `executeCommand`): a replay
+      // re-runs the same sequence from zero and lands on the same receipt keys.
+      let ordinal = 0
+      const outcome = await runCommandTurn(job.text, job.turnNonce ?? '', {
+        generate: async () => {
+          if (seeded !== null) {
+            const text = seeded
+            seeded = null
+            return { ok: true, text }
+          }
+          try {
+            const answer = await this.awaitAnswer(bridge, job.userNodeId, {
+              acceptedAt: job.postedAt ? Date.parse(job.postedAt) : undefined,
+              sentText: job.text,
+            })
+            return { ok: true, text: answer.text }
+          } catch (error) {
+            // "Still generating" / "unproven" are STATES, never a model
+            // failure: let them out so the turn stays owed.
+            if (error instanceof GeneratingTurn || error instanceof PageUnproven) throw error
+            return { ok: false, error: (error as Error).message }
+          }
+        },
+        execute: command => this.executeCommand(bridge, command, 'model', job.messageId, ordinal++),
+      })
+      // The write-ahead mark above (`turnKey`) is this path's equivalent of
+      // `markAnswered`: the observation pass already knows the node, and the
+      // extra `m:` key would be a second claim on the same delivery.
+      // Every settled pending turn is delivered, whether or not the sender
+      // asked for a reply: this is the observation/recovery path, where the
+      // page already produced the answer the sender's turn was owed. (The
+      // direct path keeps `settleReply`'s `expects` gate.) Retire only once the
+      // bus holds our sent entry; a failed send leaves the record to the next
+      // pass rather than dropping the answer.
+      await this.settleReply(bridge, message, true, outcome)
+      if (this.replySent(bridge, job.messageId)) await this.retirePendingTurn(bridge, job.messageId)
+    } catch (error) {
+      if (error instanceof GeneratingTurn) {
+        // The page is still generating, or nothing could be asked: not a
+        // verdict on the turn. A driver fault is no evidence about the page.
+        const line = `${error.message} [${error.driverFault ? 'no evidence: the driver failed, not the page; ' : ''}still owed]`
+        audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `${line} [${bridge.state.name}]`, messageId: job.messageId })
+        await this.persistHostState()
+        return
       }
-      // Retire only on a sent reply; a failed send leaves the record so the
-      // next observation pass (or the restarted host) delivers the answer the
-      // page already gave rather than posting the prompt again.
-      if (this.replySent(bridge, record.messageId)) await this.retirePendingTurn(bridge, record.messageId)
+      if (error instanceof PageUnproven) {
+        // The page stopped but no finished answer could be read. That is a
+        // state, never a refusal: the turn stays owed for the next pass.
+        audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `${error.message}; still owed [${bridge.state.name}]`, messageId: job.messageId })
+        await this.persistHostState()
+        return
+      }
+      if (bridge.removed || bridge.stopping) return
+      const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
+      if (isDriverFault(reason)) {
+        audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `no evidence (the driver failed, not the page): ${reason}`, messageId: job.messageId })
+        await this.persistHostState()
+        return
+      }
+      audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `failed: ${reason}`, messageId: job.messageId })
+      await this.deliverSolicitedFailure(bridge, job, reason)
     } finally {
-      this.settling.delete(record.messageId)
+      this.settling.delete(job.messageId)
     }
     await this.persistHostState()
   }
@@ -2768,7 +2866,9 @@ export class ChatGptHost {
       text,
       ...(options.threadId ? { threadId: options.threadId } : { newChat: true }),
       ...(options.attach ? { attach: options.attach } : {}),
-      ...(options.wait === false ? { wait: false } : {}),
+      // Only send `wait` when the caller asked for it (or explicitly refused it):
+      // the plain synchronous `pageTurn` keeps the driver's own default.
+      ...(options.wait === undefined ? {} : { wait: options.wait }),
     }, { timeoutMs: this.turnTimeout, ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
     if (reply.ok !== true) return reply
     const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
@@ -3801,7 +3901,11 @@ export class ChatGptHost {
     }
     const answer = this.answerFor(conversation, userNodeId)
     if (!answer) return 'present'
-    await this.deliverSolicited(bridge, job, answer)
+    // One answer path: a recovered answer that is a command block runs exactly
+    // like a direct one. This is called from `recoverOwed` at startup, where
+    // the page lock is NOT held.
+    const message = this.inboundMessageOf(bridge, job)
+    await this.settleTurnAnswer(bridge, job, message, nodeTextOf(answer), false)
     // R8-C: the node was added to `ourNodeIds` above; that is the barrier that
     // keeps the next pass from re-handling it. The cursor is not moved.
     return 'delivered'
@@ -3919,6 +4023,9 @@ export class ChatGptHost {
         messageId: message.id,
         kind,
         postedAt: null,
+        // Persisted with the job, so a deferred or recovered answer is parsed
+        // against the SAME nonce this inbound was prompted with.
+        turnNonce,
       }
       await this.notePendingTurn(bridge, job)
       // The observation pass must leave this job alone while this turn is alive.
@@ -3948,7 +4055,7 @@ export class ChatGptHost {
       })
       alive()
       const seeded = await this.postPendingTurn(bridge, job, 30_000)
-      if (!seeded) {
+      if (!seeded.posted) {
         // Deferred, never refused: nothing was typed, and the next idle
         // transition posts the job (this pass or the observation pass).
         acknowledge()
@@ -3957,12 +4064,14 @@ export class ChatGptHost {
         log(`turn ${shortId(message.id)}: ${line}`)
         return
       }
-      // The seed WAS round 1's page turn. Waiting for its answer here (rather
-      // than posting the same prompt again) is what keeps one inbound to one
-      // page turn.
+      // The seed WAS round 1's page turn, and with `wait:true` the driver
+      // returned the answer on that same request. That text IS round 1: no
+      // post-turn observation read is needed to deliver it (the page throttles
+      // those reads, and they were the roundtrip this path paid for).
       alive()
       acknowledge()
       let seededAnswer = true
+      let seededText = seeded.text
       // The command's ordinal within the turn. Two identical commands differ by
       // position, so the durable receipt key cannot collapse them; a restart
       // replay re-runs the same sequence from zero and lands on the same keys.
@@ -3973,6 +4082,11 @@ export class ChatGptHost {
             alive()
             if (seededAnswer) {
               seededAnswer = false
+              if (seededText !== null) {
+                const text = seededText
+                seededText = null
+                return { ok: true, text }
+              }
               const answer = await this.awaitAnswer(bridge, job!.userNodeId, {
                 acceptedAt: job!.postedAt ? Date.parse(job!.postedAt) : undefined,
                 sentText: job!.text,
@@ -4082,16 +4196,19 @@ export class ChatGptHost {
    * first. Commands printed by an earlier round of a dead host are not replayed;
    * the answer is what is owed, and it is delivered.
    */
-  private async generateRound(bridge: Bridge, job: PendingTurn, subject: string, acknowledge: () => void): Promise<string> {
+  private async generateRound(bridge: Bridge, job: PendingTurn, subject: string, acknowledge: () => void, locked = false): Promise<string> {
     const text = sanitizePeerText(subject)
     job.text = text
     job.ourText = text.slice(0, 4096)
     job.userNodeId = null
     job.postedAt = null
     await this.notePendingTurn(bridge, job)
-    const posted = await this.postPendingTurn(bridge, job, 120_000)
-    if (!posted) throw new Error('the page stayed mid-turn; this round was not posted')
+    const posted = await this.postPendingTurn(bridge, job, 120_000, locked)
+    if (!posted.posted) throw new Error('the page stayed mid-turn; this round was not posted')
     acknowledge()
+    // The synchronous send already carried the answer for this round; reading
+    // it again from the thread would only spend a throttled observation read.
+    if (posted.text !== null) return posted.text
     const answer = await this.awaitAnswer(bridge, job.userNodeId, {
       acceptedAt: job.postedAt ? Date.parse(job.postedAt) : undefined,
       sentText: job.text,
@@ -4179,45 +4296,70 @@ export class ChatGptHost {
     ].join('\n')
   }
 
-  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[]; executed: { line: string }[] }): Promise<void> {
+  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[]; executed: { line: string }[]; unresolved: string[] }): Promise<void> {
     // A reply to some other message is not an answer to this one.
     if (outcome.repliedTargets.includes(message.id)) return
     if (!expects) return
+    // What this turn's commands actually did, and what it asked for that could
+    // not run. Both are part of the answer: a command is an ACTION whose
+    // receipts are the evidence, never a body to forward and never a reason to
+    // answer "nothing was sent".
+    const receipts = outcome.executed.map(entry => entry.line)
+    const refused = outcome.unresolved.filter(line => !receipts.includes(line))
     if (outcome.failed) return this.replyError(bridge, message, `the page could not answer: ${one(outcome.problems.at(-1) ?? 'no answer', 180)}`)
     if (outcome.budgetSpent) {
       // If commands ran on the final round, the side effects already happened.
       // Telling the sender "budget spent" invites a retry that would duplicate
       // them. Report what ran instead; the word "budget" must not appear.
-      if (outcome.executed.length > 0) {
-        const text = `the last round's commands ran: ${outcome.executed.map(entry => entry.line).join('; ')}`
-        const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
-        try {
-          await bridge.transport?.send(message.fromSessionId, text, summary, message.id, 'inquiry', false)
-          audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: 'receipt of final-round commands sent', messageId: message.id })
-        } catch (error) {
-          audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
-        }
-        return
-      }
+      if (receipts.length > 0) return this.answerPeer(bridge, message, `the last round's commands ran: ${receipts.join('; ')}`, 'receipt of final-round commands sent')
       return this.replyError(bridge, message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
     }
-    // A fence is an action, not an answer. If the only thing the page produced
-    // was a command block that was refused (a stale or invented nonce), the
-    // peer gets an error - never the fence text as if it were prose. This also
-    // covers an unterminated fence: it runs to end-of-text and is still an
-    // action.
     const { prose: visibleText, commandShaped } = proseFromTurn(outcome.finalText)
-    if (commandShaped) {
-      return this.replyError(bridge, message, 'the page answered with a command block that was refused (missing or stale nonce); nothing was sent')
+    const prose = visibleText.trim()
+    // Commands that RAN are the answer: hand over the receipts, and name
+    // anything the page asked for that could not run, beside them.
+    if (receipts.length > 0) {
+      const tail = refused.length > 0 ? `; not run: ${refused.join('; ')}` : ''
+      const body = prose
+        ? `${prose}\n\n(from the page's commands: ${receipts.join('; ')}${tail})`
+        : `the page's commands ran: ${receipts.join('; ')}${tail}`
+      return this.answerPeer(bridge, message, body, 'command receipts sent')
     }
-    const prose = sanitizePeerText(visibleText).trim()
+    // A fence is an action, not an answer. If the only thing the page produced
+    // was a command block that could not run, the peer is told WHY - stale or
+    // missing nonce, unknown op, malformed JSON - and never handed the fence
+    // text, nor a neutral body claiming nothing happened. This also covers an
+    // unterminated fence: it runs to end-of-text and is still an action.
+    if (commandShaped) {
+      const why = refused.length > 0
+        ? refused.join('; ')
+        : one(outcome.problems.at(-1) ?? 'the command did not match this turn', 240)
+      return this.replyError(bridge, message, `the page answered with a command block that could not run: ${why}`)
+    }
     if (!prose) return this.replyError(bridge, message, 'no answer was produced for this message')
+    // Long prose keeps the outbox spill: the bus carries a gist and the file
+    // carries the whole answer.
+    const shaped = await this.shapeAnswer(bridge, prose, null)
+    const body = shaped.answerPath
+      ? `${shaped.text}\n\nFull answer: ${shaped.answerPath} (${shaped.bytes} bytes, sha256 ${(shaped.sha256 ?? '').slice(0, 16)})`
+      : shaped.text
+    return this.answerPeer(bridge, message, body, shaped.answerPath ? 'prose answer sent (spilled)' : 'prose answer sent')
+  }
+
+  /**
+   * The one place a settled turn's body leaves for the sender.
+   *
+   * The audit line says what was actually delivered (prose, receipts, or a
+   * spilled answer), so `op: 'reply'` can never read as a delivery for a body
+   * that carried nothing.
+   */
+  private async answerPeer(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string }, body: string, note: string): Promise<void> {
     const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
     const postedAt = bridge.state.pendingTurns.find(item => item.messageId === message.id)?.postedAt ?? null
     try {
-      await bridge.transport?.send(message.fromSessionId, prose, summary, message.id, 'inquiry', false)
+      await bridge.transport?.send(message.fromSessionId, sanitizePeerText(body), summary, message.id, 'inquiry', false)
       this.logDeliveredAnswer(message.id, postedAt)
-      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: 'prose answer sent', messageId: message.id })
+      audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: note, messageId: message.id })
     } catch (error) {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
     }

@@ -186,7 +186,11 @@ class FakeDriver {
         return { ok: false, op, reason: 'timeout', error: 'driver timed out after 600s', threadId }
       }
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
@@ -434,9 +438,11 @@ async function crashMidTurn(dir: string, alpha: BridgeState, driver: FakeDriver,
       const found = state.pendingTurns.find(item => item.messageId === receipt.id)
       return found && found.postedAt !== null && found.userNodeId !== null ? found : undefined
     }, 15_000)
-    // The ack is what keeps the record out of the drain path on restart; the
-    // recoverOwed path is the one under test.
-    await waitFor(async () => (await acknowledged(dir, alpha.sessionId, receipt.id) ? true : undefined), 10_000)
+    // The inbound is deliberately left UNACKNOWLEDGED. With `wait:true` the
+    // acknowledgement is deferred until the first answer round, so a turn that
+    // is still generating when the host dies leaves it queued - the live shape.
+    // The durable pending record is what keeps `drain` from re-running it as
+    // new; `recoverOwed` is the path under test.
     return { messageId, turn }
   } finally {
     await host.stop()

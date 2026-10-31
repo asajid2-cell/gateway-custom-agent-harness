@@ -211,7 +211,11 @@ class FakeDriver {
       this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
       this.sentAtMs.push(Date.now())
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       this.readCalls++
@@ -710,7 +714,7 @@ describe('multi-bridge host', () => {
     }
   })
 
-  test('an inbound turn extracts commands from the page read, never the send text', async () => {
+  test('an inbound turn extracts commands from the synchronous send reply', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = bridgeNamed('alpha', null)
     await seedHost(dir, [alpha])
@@ -727,27 +731,26 @@ describe('multi-bridge host', () => {
     try {
       await sender.start()
       let emitted = false
-      // The answer is read from the thread itself now, not from the send reply.
+      // `wait:true` returns the page's answer on the send request itself, so
+      // THAT text is the turn's answer. The stored node stays command-free, so
+      // no later read could ever be the source of the command.
       driver.observable = true
-      driver.sendText = 'Working on it.' // the post-time text carries no command
-      driver.answerFor = request => {
+      driver.answer = 'a plain page answer with no command'
+      driver.sendTextFor = request => {
         const nonce = /"nonce":"([0-9a-f]{8})"/.exec(String(request.text ?? ''))?.[1]
         if (!nonce) return 'Understood.' // the primer
         if (emitted) return 'Done.'
         emitted = true
-        return `Working on it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-read', inSeconds: 600 })}`
+        return `Working on it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-send', inSeconds: 600 })}`
       }
       await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', false)
       const { token } = await credentials(dir)
       const armed = await waitFor(async () => {
         const state = await operatorState(host, token)
         const bridge = state.bridges.find((item: any) => item.sessionId === alpha.sessionId)
-        return bridge?.schedules?.some((schedule: any) => schedule.label === 'from-read') ? bridge : undefined
+        return bridge?.schedules?.some((schedule: any) => schedule.label === 'from-send') ? bridge : undefined
       })
-      expect(armed.schedules.map((schedule: any) => schedule.label)).toContain('from-read')
-      // The commands came from the thread read, never from the send's reply.
-      expect(driver.conversationReads).toBeGreaterThanOrEqual(1)
-      expect(driver.sendText).not.toContain('from-read')
+      expect(armed.schedules.map((schedule: any) => schedule.label)).toContain('from-send')
     } finally {
       await sender.close().catch(() => {})
       await host.stop()
@@ -755,7 +758,7 @@ describe('multi-bridge host', () => {
     }
   })
 
-  test('a turn whose answer cannot be read never returns our own prompt as the answer', async () => {
+  test('a send that times out mid-turn is never settled from a partial reply', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = bridgeNamed('alpha', null)
     await seedHost(dir, [alpha])
@@ -771,26 +774,20 @@ describe('multi-bridge host', () => {
     })
     try {
       await sender.start()
-      // The page takes the text but never finishes an answer, and the send
-      // reply claims a command of its own. Neither may become the answer.
+      // The page takes the text but never finishes an answer. A send that
+      // outlives its own wait carries NO text, so there is nothing to settle:
+      // the turn stays owed (it is not a verdict on the page) and nothing the
+      // driver might have said mid-turn is ever delivered as the answer.
       driver.observable = true
       driver.stallFor = request => /INBOUND/.test(String(request.text ?? ''))
       driver.sendTextFor = request => {
         const nonce = /"nonce":"([0-9a-f]{8})"/.exec(String(request.text ?? ''))?.[1]
         return nonce ? `Working on it.\n\n${rendered({ nonce, op: 'schedule', label: 'from-send', inSeconds: 600 })}` : 'Understood.'
       }
-      await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', true)
-      // One failure line arrives as the REPLY (a record whose replyTo names our
-      // message); the send text itself was never delivered as an answer.
-      const reply = await waitFor(async () => {
-        const record = sender.inbox().find(item => {
-          const message = item.message as unknown as { replyTo?: string; text?: string }
-          return typeof message.replyTo === 'string' && /could not answer/.test(message.text ?? '')
-        })
-        return record ? record : undefined
-      }, 3_000).catch(() => null)
-      expect(reply).not.toBeUndefined()
-      expect((reply!.message as unknown as { text: string }).text).not.toContain('Working on it.')
+      const receipt = await sender.send(alpha.sessionId, 'please run your command', 'run your command', undefined, 'inquiry', true) as { id: string }
+      await new Promise(resolve => setTimeout(resolve, 1_500))
+      // Nothing was delivered for that inbound, and the partial text never ran.
+      expect(sender.inbox().some(item => (item.message as unknown as { replyTo?: string }).replyTo === receipt.id)).toBe(false)
       const { token } = await credentials(dir)
       const state = await operatorState(host, token)
       const bridge = state.bridges.find((item: any) => item.sessionId === alpha.sessionId)
@@ -1013,7 +1010,7 @@ describe('host defects', () => {
     }
   })
 
-  test('a scheduled wake extracts commands from the page read, never the send text', async () => {
+  test('a scheduled wake runs the commands from the synchronous send reply', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = bridgeNamed('alpha', THREAD_A)
     alpha.primedThreadId = THREAD_A
@@ -1021,7 +1018,6 @@ describe('host defects', () => {
     alpha.schedules = [{ label: 'wake', at: new Date(Date.now() - 1000).toISOString() }]
     await seedHost(dir, [alpha])
     const driver = new FakeDriver()
-    driver.sendText = 'Noted.' // the post-time text carries no command
     driver.answerFor = request => {
       const text = String(request.text ?? '')
       const nonce = /"nonce":"([0-9a-f]{8})"/.exec(text)?.[1]
@@ -1034,7 +1030,7 @@ describe('host defects', () => {
         return bridge.schedules.some(schedule => schedule.label === 'from-wake-read') ? bridge : undefined
       })
       expect(stored.schedules.map(schedule => schedule.label)).not.toContain('wake')
-      expect(driver.readCalls).toBeGreaterThanOrEqual(1)
+      expect(driver.sentAtMs.length).toBeGreaterThanOrEqual(1)
     } finally {
       await host.stop()
       await cleanup()
