@@ -1428,7 +1428,9 @@ describe('R10-F1/F2: recovery never adopts old text as the send', () => {
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
       const host = await startHost(dir, driver)
       try {
-        await new Promise(resolve => setTimeout(resolve, 1_500))
+        // The observation pass is where recovery attributes a node; drive it.
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
         expect(repliesTo(sender, messageId).some(text => text.includes('the answer to the quoted prompt'))).toBe(false)
         const state = await readBridge(dir, alpha.sessionId)
         expect(state.ourNodeIds).not.toContain(quote)
@@ -1460,7 +1462,8 @@ describe('R10-F1/F2: recovery never adopts old text as the send', () => {
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
       const host = await startHost(dir, driver)
       try {
-        await new Promise(resolve => setTimeout(resolve, 1_500))
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
         expect(repliesTo(sender, messageId).some(text => text.includes('the days-old answer'))).toBe(false)
         const state = await readBridge(dir, alpha.sessionId)
         expect(state.ourNodeIds).not.toContain(old)
