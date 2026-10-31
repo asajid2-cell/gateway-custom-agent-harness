@@ -132,6 +132,22 @@ class PageUnproven extends Error {
 }
 
 /**
+ * A send the driver could not prove either way.
+ *
+ * R10-F3: the driver no longer re-clicks Send when the page is ambiguous (two
+ * new user nodes, an unreadable baseline, or a new node that does not carry our
+ * text). It says `reason: 'ambiguous'`: the prompt MAY already be on the page.
+ * That is the same record state as a still-generating turn - the send was
+ * initiated and its node is unknown - so it must never be treated as "never
+ * posted", or the recovery path would type the prompt a second time.
+ */
+class SendAmbiguous extends Error {
+  constructor(readonly threadId: string | null, message: string) {
+    super(message)
+  }
+}
+
+/**
  * What the page's last push says about one thread.
  *
  * `unknown` is deliberate: nothing has been pushed (or the driver could not be
@@ -1362,6 +1378,12 @@ export class ChatGptHost {
     })
     if (reply.ok !== true) {
       if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+      // R10-F3: the driver refuses to re-click Send when it cannot prove the
+      // post either way. The prompt may have landed, so this is the
+      // "initiated, node unknown" state, never a refusal (see postRecordedTurn).
+      if (reply.reason === 'ambiguous') {
+        throw new SendAmbiguous(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, one(reply.error, 300) || 'the send may have landed')
+      }
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
       if (isDriverFaultReply(reply)) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
@@ -2076,14 +2098,16 @@ export class ChatGptHost {
           record.userNodeId = posted.userNodeId ?? record.userNodeId
         }
         await this.notePendingTurn(bridge, record).catch(() => {})
-      } else if (error instanceof GeneratingTurn || error instanceof PageUnproven) {
+      } else if (error instanceof GeneratingTurn || error instanceof PageUnproven || error instanceof SendAmbiguous) {
         // R7-F3: the send was INITIATED - the driver may have typed the prompt
         // and then failed to answer the call (a timeout or a replacement maps
         // to GeneratingTurn). Clearing `postedAt` here would say "never posted"
         // and the recovery path would type the same prompt a second time. Keep
         // the post and let evidence-first settle decide; the error is rethrown
         // below so the turn stays owed rather than being answered or failed.
-        if (error instanceof GeneratingTurn && error.threadId) record.threadId = error.threadId
+        // R10-F3: `ambiguous` is the same state - the send MAY have landed, so
+        // keep `postedAt`/`threadId` and let recovery find the node by identity.
+        if ((error instanceof GeneratingTurn || error instanceof SendAmbiguous) && error.threadId) record.threadId = error.threadId
         record.userNodeId = null
         await this.notePendingTurn(bridge, record).catch(() => {})
       } else {
@@ -2092,8 +2116,14 @@ export class ChatGptHost {
         await this.notePendingTurn(bridge, record)
       }
       const reason = one((error as Error).message, 160)
-      if (!/mid-turn|not-posted|never left the composer/i.test(reason)) throw error
-      log(`"${bridge.state.name}": ${shortId(record.messageId)} was not posted (${reason}); it stays queued`)
+      // R10-F3: `ambiguous` is a "may have landed" state, so it is swallowed
+      // like the other not-a-refusal reasons and the turn stays queued.
+      if (!(error instanceof SendAmbiguous) && !/mid-turn|not-posted|never left the composer|ambiguous/i.test(reason)) throw error
+      if (error instanceof SendAmbiguous) {
+        log(`"${bridge.state.name}": ${shortId(record.messageId)} may have been posted (${reason}); it stays queued`)
+      } else {
+        log(`"${bridge.state.name}": ${shortId(record.messageId)} was not posted (${reason}); it stays queued`)
+      }
       return false
     }
   }
@@ -2163,17 +2193,29 @@ export class ChatGptHost {
    * and nodes another pending turn holds are skipped, and the newest match
    * wins - the fail-closed direction is unchanged (a person who retypes our
    * exact words becomes the send's node, never the other way round).
+   *
+   * R10-F2: text alone is bounded by time. A candidate carrying the sent text
+   * at an hour-old timestamp is a person quoting us, not our send, so DATED
+   * candidates must fall inside the posting window; UNDATED candidates keep the
+   * unbounded reach (they carry no time claim at all).
    */
   private textMatchAnywhere(
     conversation: Conversation,
     text: string,
     ours: ReadonlySet<string>,
     exclude: ReadonlySet<string>,
+    postedMs: number,
   ): string | null {
     const matches = chainOf(conversation).filter(turn => turn.role === 'user'
       && !ours.has(turn.id)
       && !exclude.has(turn.id)
-      && promptMatches(text, turn.text))
+      && promptMatches(text, turn.text)
+      // R10-F2: old text is not this send. A DATED candidate must fall inside
+      // the posting window, exactly like `ownUserNodeOf`'s dated candidates;
+      // an UNDATED one keeps the full reach (the R8-B live record had no
+      // `create_time` at all, and its text identity is the only evidence).
+      && (typeof turn.createTime !== 'number'
+        || (Number.isFinite(postedMs) && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)))
     return matches.at(-1)?.id ?? null
   }
 
@@ -2194,6 +2236,11 @@ export class ChatGptHost {
    * preserved positional anchor, and an undated node with no anchor not at all.
    * No evidence, no adoption - the turn stays unresolved rather than forwards a
    * historical answer.
+   *
+   * R10-F1: `afterId` must be the record's PRESERVED `anchorNodeId`, never the
+   * live cursor. A dated node at or before a resolved anchor is refused on
+   * position regardless of its stamp; only an unresolvable anchor leaves the
+   * posting window as the sole claim.
    *
    * Still narrower than `promptMatches`, which stays equal-or-prefix only:
    * containment is accepted ONLY here, ONLY for a body of at least
@@ -2219,8 +2266,15 @@ export class ChatGptHost {
       && normalizePromptText(turn.text).includes(sent)
       // The same eligibility `ownUserNodeOf` applies: a numeric stamp is a
       // posting-window claim, ANYTHING else is undated and needs a position.
+      // R10-F1: the stamp alone is not enough. A dated node at or BEFORE the
+      // record's preserved anchor is old text being quoted, whatever its
+      // create_time says, so a resolved anchor gates dated candidates too. With
+      // no preserved anchor there is no positional evidence, and the posting
+      // window remains the only claim - the live doubled node is exactly that
+      // case (dated ~0.84 s early, no stored anchor) and must stay admissible.
       && (typeof turn.createTime === 'number'
-        ? turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS
+        ? (anchor < 0 || index > anchor)
+          && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS
         : !ours.has(turn.id) && anchor >= 0 && index > anchor))
     return matches.length === 1 ? matches[0]!.id : null
   }
@@ -2268,14 +2322,20 @@ export class ChatGptHost {
       // R8-A: the record's own anchor when it has one, so a cursor that advanced
       // after the post cannot move the boundary out from under the record.
       const anchorNodeId = record.anchorNodeId ?? bridge.state.cursor
+      // R10-F1: the containment gate keys on the PRESERVED anchor only - the
+      // cursor is not evidence of where this send sits, and a cursor past the
+      // node (the live doubled node) must not be read as "before the anchor".
+      const preservedAnchor = record.anchorNodeId ?? null
       const userNodeId = record.userNodeId ?? (Number.isFinite(postedMs)
         ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
           // R8-B: the anchored match is time and position; the text is identity.
-          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
+          // R10-F2: dated text matches are bounded by the posting window.
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs)
           // R8-A2: last resort, recovery only - a node carrying the whole body
           // (the live doubled node). R9-F2: it must also fall in the posting
-          // window, not merely carry old text. Unique or nothing.
-          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, anchorNodeId)
+          // window, not merely carry old text. R10-F1: and a dated candidate
+          // must sit after the preserved anchor when that anchor resolves.
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, preservedAnchor)
         : null)
       if (userNodeId) claimed.add(userNodeId)
       // R8-H1c: the claimed node is OURS before anything is classified. It is
@@ -3443,13 +3503,18 @@ export class ChatGptHost {
     // whole-chain text identity still names the node (the live record has no
     // anchor and its cursor had already moved past the send node).
     const anchorNodeId = job.anchorNodeId ?? bridge.state.cursor
+    // R10-F1: the containment gate keys on the PRESERVED anchor only (see the
+    // observation pass).
+    const preservedAnchor = job.anchorNodeId ?? null
     const userNodeId = (job.userNodeId && conversation.mapping[job.userNodeId] ? job.userNodeId : null)
       ?? (Number.isFinite(postedMs)
         ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
-          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
+          // R10-F2: dated text matches are bounded by the posting window.
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs)
           // R8-A2: recovery only, unique whole-body containment (see there).
           // R9-F2: with the record's posting window and anchor.
-          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, anchorNodeId)
+          // R10-F1: a dated candidate must sit after the preserved anchor.
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, preservedAnchor)
         : null)
     // R8-H1d: "no node matched" is not "the send never landed".
     if (!userNodeId) return await this.absenceOf(bridge, conversation, job, matchText, ours, postedMs)
