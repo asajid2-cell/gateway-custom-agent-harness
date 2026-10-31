@@ -239,6 +239,14 @@ export const pendingTurnSchema = z.object({
    * then into the running turn), so it is posted on the next idle transition.
    */
   postedAt: z.string().nullable().default(null),
+  /**
+   * R8-A: the bridge cursor AT POST TIME - the last node this host had handled
+   * when it typed. The positional matcher needs a boundary that the live cursor
+   * cannot move: the cursor advances as the page is walked, and a record whose
+   * node has no `create_time` is otherwise lost behind it. Null/absent only for
+   * records written before this field existed, which fall back to the cursor.
+   */
+  anchorNodeId: z.string().max(64).nullable().optional(),
 }).strict()
 
 export const PENDING_TURNS_MAX = 8
