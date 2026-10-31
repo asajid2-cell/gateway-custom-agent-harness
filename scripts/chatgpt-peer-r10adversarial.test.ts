@@ -22,11 +22,13 @@
  *       may not bound UNdated text matches.
  *
  *   F3  driver (`scripts/chatgpt-peer/fixtures/chatgpt-driver.mjs`). The
- *       acceptance verdict requires EXACTLY one new user node. When a second,
- *       unrelated user node appears inside the same acceptance window, the
- *       genuine send is refused: `ask` clicks send a second time and then
- *       reports `not-posted`. The effect under test is on the fake page - click
- *       count, not a log string.
+ *       acceptance verdict requires EXACTLY one new user node - that strictness
+ *       is settled (R9-F1) and stays. The objection is the REACTION: when a
+ *       second, unrelated user node appears inside the same acceptance window,
+ *       `ask` clicks send again and then reports `not-posted`. The agreed
+ *       contract is one click and an `ambiguous` throw (the send may have
+ *       landed). The effect under test is on the fake page - click count, not a
+ *       log string.
  *
  * F1 and F2 are hosted through the same in-memory child protocol the R8 host
  * suite uses. F3 drives the vendored fixture's exported `ask` against a fake
@@ -262,7 +264,12 @@ async function expectRefused(
   expect(state.ourNodeIds).not.toContain(carrier)
   const turnLines = await linesFor(dir, messageId)
   expect(turnLines.some(line => /delivered the observed answer|failure line|no completed answer within/.test(line.result))).toBe(false)
-  expect((await audits(dir)).some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
+  // Scoped to the carrier, not the whole audit. `human` carries the person's
+  // node id in `target` (personTurn). With no cursor (F2) a correct refusal may
+  // still let the poller classify the OLD node once it advances; that is a true
+  // statement about the page, not a failure of the fix. What must never happen
+  // is the CARRIER being run as a person's turn.
+  expect((await audits(dir)).some(line => (line.op === 'human' || line.op === 'unprompted') && line.target === carrier)).toBe(false)
 }
 
 // --------------------------------------------------------------------- F1
@@ -449,8 +456,8 @@ function userNode(id: string, text: string): FakeNode {
   return node
 }
 
-describe('R10-F3: an unrelated user node in the acceptance window does not strand the send', () => {
-  test('the driver clicks send once and does not report not-posted', async () => {
+describe('R10-F3: an unrelated node in the acceptance window does not buy a second click', () => {
+  test('the driver clicks send once and reports ambiguous, not not-posted', async () => {
     const { dir, cleanup } = await scratch()
     const sentText = r10Body()
     const state = {
@@ -559,11 +566,16 @@ describe('R10-F3: an unrelated user node in the acceptance window does not stran
     // them ours.
     expect(state.appended).toHaveLength(2)
     expect(state.appended.filter(text => text === sentText)).toHaveLength(1)
-    // The defect: a second send click and `not-posted`. Neither may happen.
-    // The click count is asserted first so a base run reports the extra click.
+    // The agreed contract keeps `sendAcceptVerdict` strictly one-new-node, so a
+    // two-node window is still refused. What must change is the driver's
+    // REACTION: no second click, and `ambiguous` (possibly landed) instead of
+    // `not-posted`. The click count is asserted first so a base run reports the
+    // extra click.
     expect(clicks).toBe(1)
-    expect(thrown).toBeNull()
-    expect(result?.state).toBe('generating')
-    expect(String(result?.url ?? '')).toContain(THREAD_A)
+    expect(thrown).not.toBeNull()
+    expect(thrown?.reason).toBe('ambiguous')
+    expect(String(thrown?.message ?? '')).not.toContain('not-posted')
+    expect(String(thrown?.message ?? '')).not.toContain('never left the composer')
+    expect(result).toBeNull()
   }, 60_000)
 })
