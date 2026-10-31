@@ -1265,3 +1265,61 @@ describe('R8-A2: the whole-body recovery matcher', () => {
     expect(promptMatches('short', 'short')).toBe(true)
   })
 })
+
+describe('R9: a send refused acceptance amid two new user nodes', () => {
+  test('the observation pass still settles it by identity and never adopts the stranger', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = 'POSTED PROMPT: two new user nodes must not strand this turn'
+      driver.appendNode(THREAD_A, 'user', 'an earlier question')
+      const anchor = driver.appendNode(THREAD_A, 'assistant', 'an earlier answer')
+      alpha.cursor = anchor
+      // The send went out while a person typed, so TWO new user nodes sit after
+      // the anchor. The driver refuses to call either one "the accepted send",
+      // and the host records the job as posted with no node id and no ack.
+      const clock = Date.now() / 1000
+      const stranger = driver.appendNode(THREAD_A, 'user', 'a person typed this during the send', { createTime: clock - 0.5 })
+      driver.appendNode(THREAD_A, 'assistant', 'the page answer to the person', { createTime: clock - 0.4 })
+      const sendNode = driver.appendNode(THREAD_A, 'user', prompt, { createTime: clock - 0.2 })
+      driver.appendNode(THREAD_A, 'assistant', 'the answer our sender is owed', { createTime: clock - 0.1 })
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      // The post-time anchor is the cursor when the send went out.
+      alpha.pendingTurns[alpha.pendingTurns.length - 1]!.anchorNodeId = anchor
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const record = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(item => item.messageId === messageId)!
+      // The refusal's shape: posted, no node id, the anchor preserved.
+      expect(record.postedAt).not.toBeNull()
+      expect(record.userNodeId).toBeNull()
+      expect(record.anchorNodeId).toBe(anchor)
+      const host = await startHost(dir, driver)
+      try {
+        await host.pollOnce()
+        await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        // Ours by identity/text: delivered once, and nothing was typed again.
+        expect(repliesTo(sender, messageId).length).toBe(1)
+        expect(repliesTo(sender, messageId)[0]).toContain('the answer our sender is owed')
+        expect(repliesTo(sender, messageId).join('\n')).not.toContain('the page answer to the person')
+        expect(sendCount(driver)).toBe(0)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.pendingTurns.some(item => item.messageId === messageId)).toBe(false)
+        expect(state.ourNodeIds).toContain(sendNode)
+        // The unrelated human node is neither adopted nor marked ours.
+        expect(state.ourNodeIds).not.toContain(stranger)
+        expect((await audits(dir)).some(line => /no completed answer within/.test(line.result))).toBe(false)
+        expect((await audits(dir)).some(line => line.op === 'unprompted')).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+})
