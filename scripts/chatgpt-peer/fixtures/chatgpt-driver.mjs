@@ -890,18 +890,102 @@ function newDomUserTexts(baseline, after) {
  *
  * `before` is `{ users, dom }`: the pre-send count and the identity list taken
  * by `readDomUserTurns`. A null baseline can never prove a node is new.
+ *
+ * The return value is the last OBSERVATION, never a bare boolean: the caller has
+ * to tell "provably not posted" (a readable baseline and zero new user nodes)
+ * from "ambiguous" (a new user node that is not ours, several of them, or a
+ * baseline that could not be read). Editing the second click on the second
+ * question is what used to duplicate a send that had already landed.
+ *
+ * `{ accepted, readable, newNodes }` - `newNodes` is the last observable array,
+ * or null when the baseline or the final read was unreadable.
  */
 async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs
   const baseline = Array.isArray(before?.dom) ? before.dom : null
   const priorUsers = Math.max(baseline ? baseline.length : 0, Number(before?.users) || 0)
-  if (!baseline) return false
+  if (!baseline) return { accepted: false, readable: false, newNodes: null }
+  let last = null
   while (Date.now() < deadline) {
-    const after = await readDomUserTurns(page, priorUsers)
-    if (sendAcceptVerdict({ newNodes: newDomUserTexts(baseline, after), sentText: composedText })) return true
+    const observed = newDomUserTexts(baseline, await readDomUserTurns(page, priorUsers))
+    // A read that failed is not evidence of a zero delta, so it clears `last`.
+    last = Array.isArray(observed) ? observed : null
+    if (sendAcceptVerdict({ newNodes: observed, sentText: composedText })) {
+      return { accepted: true, readable: true, newNodes: observed }
+    }
     await new Promise(resolve => setTimeout(resolve, 250))
   }
-  return false
+  return { accepted: false, readable: true, newNodes: last }
+}
+
+/**
+ * Does a failed window positively prove the click did not submit?
+ *
+ * Only one shape does: the page was readable before the send and the window
+ * showed no new user node at all. Everything else leaves the send unaccounted
+ * for, and an unaccounted send is never clicked twice.
+ */
+function provablyNotPosted(outcome) {
+  return !!outcome && outcome.readable === true
+    && Array.isArray(outcome.newNodes) && outcome.newNodes.length === 0
+}
+
+/** What a failed window saw, in words: the evidence named in the error and the log. */
+function acceptanceEvidence(outcome) {
+  if (!outcome?.readable) return 'the page could not be read before the send'
+  if (!Array.isArray(outcome.newNodes)) return 'the page could not be read at the end of the window'
+  if (outcome.newNodes.length === 0) return 'no new user turn appeared'
+  if (outcome.newNodes.length === 1) return 'one new user turn appeared whose text is not ours'
+  return `${outcome.newNodes.length} new user turns appeared`
+}
+
+/**
+ * Click Send once, then decide from evidence what that click did.
+ *
+ * A second click is issued ONLY on proof that the first did not submit: a
+ * readable baseline and zero new user nodes in the window. Anything else that
+ * is not acceptance - one new node carrying other text, two new nodes, or a
+ * baseline that could not be read - is AMBIGUOUS: the message may already be in
+ * the thread, so clicking again could put a second copy there. The turn then
+ * fails as `ambiguous`, which tells the host to observe the thread instead of
+ * re-sending; it is deliberately not one of the reasons the host re-queues.
+ */
+async function submitTurn(page, { baseline, text, treeBaseline = null }) {
+  const readiness = await waitForSendReady(page)
+  if (!readiness.ready) {
+    throw new TurnError(`the page never became ready to send (${readiness.reason}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
+  }
+  try { await readiness.send.click() } catch (error) { await log(`send click failed: ${error.message}`) }
+  await log(`sent ${text.length} chars`)
+  let outcome = await waitForAcceptance(page, baseline, text, ACCEPTANCE_TIMEOUT_MS)
+  if (outcome.accepted) return
+  if (!provablyNotPosted(outcome)) {
+    throw new TurnError(`the send may have landed: ${acceptanceEvidence(outcome)}, so nothing was clicked again - watch the thread for it rather than re-sending`, { reason: 'ambiguous' })
+  }
+  // A click that lands on a composer still settling can be swallowed. Try the
+  // same readiness rule once more, then fail the turn rather than sit out the
+  // reply timeout on a message that never left the box.
+  await log('send was not accepted (no new user turn); retrying once')
+  const retry = await waitForSendReady(page, 60_000)
+  if (retry.ready) await retry.send.click().catch(() => {})
+  outcome = await waitForAcceptance(page, baseline, text, ACCEPTANCE_TIMEOUT_MS)
+  if (outcome.accepted) return
+  if (!provablyNotPosted(outcome)) {
+    throw new TurnError(`the retried send may have landed: ${acceptanceEvidence(outcome)}, so nothing was clicked again - watch the thread for it rather than re-sending`, { reason: 'ambiguous' })
+  }
+  // The page may expose no user nodes at all (a renamed attribute must not
+  // brick sending). Confirm with evidence that does not depend on that
+  // selector - our text on a NEW user turn in the thread tree - and never from
+  // a cleared composer or an unspecific rise in the message count: either is
+  // what a swallowed click looks like.
+  if (await confirmDegradedSend(page, text, treeBaseline)) {
+    await log('acceptance: no user-node delta on this page; confirmed by exactly one new user turn carrying the sent text')
+    return
+  }
+  // `not-posted`, never `timedOut`: a turn that was never posted cannot be the
+  // turn that is generating, and saying so would make the host wait on an
+  // answer nobody asked for.
+  throw new TurnError('the message was composed but never left the composer (the send did not take); no reply is coming', { reason: 'not-posted' })
 }
 
 /** Collapse runs of whitespace and trim - the only normalization the page's own text is compared under. */
@@ -1041,6 +1125,8 @@ async function confirmDegradedSend(page, text, baseline) {
 }
 
 const SEND_READY_TIMEOUT_MS = Number(process.env.CHATGPT_SEND_READY_MS || 10 * 60_000)
+/** How long one acceptance window watches the page before its evidence is judged. */
+const ACCEPTANCE_TIMEOUT_MS = Number(process.env.CHATGPT_ACCEPTANCE_MS || 30_000)
 
 /**
  * Wait for the composer to be able to send, not merely to contain the text.
@@ -1425,38 +1511,8 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   if (!composed) {
     throw new TurnError('the composer did not hold exactly the intended text; nothing was sent, so no reply is coming', { reason: 'not-posted' })
   }
-  const readiness = await waitForSendReady(page)
-  if (!readiness.ready) {
-    throw new TurnError(`the page never became ready to send (${readiness.reason}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
-  }
-  try { await readiness.send.click() } catch (error) { await log(`send click failed: ${error.message}`) }
-  await log(`sent ${text.length} chars`)
   const acceptanceBaseline = { users: beforeUsers, dom: beforeDom ? beforeDom.identities : null }
-  let accepted = await waitForAcceptance(page, acceptanceBaseline, text)
-  if (!accepted) {
-    // A click that lands on a composer still settling can be swallowed. Try the
-    // same readiness rule once more, then fail the turn rather than sit out the
-    // reply timeout on a message that never left the box.
-    await log('send was not accepted; retrying once')
-    const retry = await waitForSendReady(page, 60_000)
-    if (retry.ready) await retry.send.click().catch(() => {})
-    accepted = await waitForAcceptance(page, acceptanceBaseline, text)
-  }
-  if (!accepted) {
-    // The page may expose no user nodes at all (a renamed attribute must not
-    // brick sending). Confirm with evidence that does not depend on that
-    // selector - our text on a user turn in the thread tree - and never from a
-    // cleared composer or an unspecific rise in the message count: either is
-    // what a swallowed click looks like.
-    accepted = await confirmDegradedSend(page, text, beforeTree)
-    if (accepted) await log('acceptance: no user-node delta on this page; confirmed by exactly one new user turn carrying the sent text')
-  }
-  if (!accepted) {
-    // `not-posted`, never `timedOut`: a turn that was never posted cannot be
-    // the turn that is generating, and saying so would make the host wait on an
-    // answer nobody asked for.
-    throw new TurnError('the message was composed but never left the composer (the send did not take); no reply is coming', { reason: 'not-posted' })
-  }
+  await submitTurn(page, { baseline: acceptanceBaseline, text, treeBaseline: beforeTree })
   if (onAccepted) onAccepted(threadOf(page.url()))
   // A rejection replaces this turn with its own correction, so it is decided
   // as soon as the send lands - waiting for the answer first would spend the
@@ -2665,7 +2721,7 @@ export {
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
   normalizedTurnText, promptMatches, sendAcceptVerdict, userTreeNodes, newUserNodes, newDomUserTexts,
-  degradedSendVerdict, launchVerdict, ownerCarriesProfile,
+  degradedSendVerdict, provablyNotPosted, acceptanceEvidence, submitTurn, launchVerdict, ownerCarriesProfile,
   composeExactlyOnce, clearComposer, composerTextOf,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
