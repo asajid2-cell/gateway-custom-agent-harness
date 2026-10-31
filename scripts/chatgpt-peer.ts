@@ -1083,7 +1083,13 @@ export class ChatGptHost {
           await this.ensurePrimerAndThread(bridge)
           return this.grantTranscript(bridge, resolved.sessionId, 'operator')
         })
-        if (!granted.ok) return this.send(response, 502, { ok: false, op, error: granted.error })
+        if (!granted.ok) {
+          // R12-F1: an ambiguous upload is not a refusal - the transcript may
+          // be on the page, so answer "unproven" and never invite a retry. Only
+          // a genuine refusal keeps the 502.
+          if (granted.landed === 'unknown') return this.send(response, 200, { ok: true, op, landed: 'unknown', line: ATTACHMENT_UNPROVEN })
+          return this.send(response, 502, { ok: false, op, error: granted.error })
+        }
         return this.send(response, 200, { ok: true, op, line: `attached the transcript of ${resolved.label}` })
       }
       if (op === 'attachFile') {
@@ -4036,12 +4042,29 @@ export class ChatGptHost {
       await this.persistBridgeState(bridge)
       return
     }
-    await this.grantTranscript(bridge, requested, `peer ${requested.slice(0, 8)}`, messageId)
+    const granted = await this.grantTranscript(bridge, requested, `peer ${requested.slice(0, 8)}`, messageId)
     // A refusal already told the model, in the thread, what happened.
+    // R12-F1: this path has no reply surface - the grant arrived as an inbound
+    // message, and the sender's own turn answer says nothing about the file. An
+    // unproven upload therefore gets no thread line (it may be there) and is
+    // never retried; the durable audit is the record, stated here against the
+    // bus request so it can be tied to the message that asked for it.
+    if (!granted.ok && granted.landed === 'unknown') {
+      audit(this.hostState, { op: 'attachment', target: requested, result: ATTACHMENT_UNPROVEN, messageId })
+      await this.persistHostState()
+    }
   }
 
-  /** Resolve one rollout and upload it, whole, as a real file. */
-  private async grantTranscript(bridge: Bridge, sessionId: string, grantedBy: string, messageId?: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  /**
+   * Resolve one rollout and upload it, whole, as a real file.
+   *
+   * R12-F1: three states, not two. `landed: 'unknown'` is the ambiguous upload
+   * `uploadDocument` already audited and persisted: the document may be on the
+   * page, so it must never be flattened into a refusal (a caller would retry
+   * and duplicate it) and must never be reported as success (nobody has proved
+   * it landed).
+   */
+  private async grantTranscript(bridge: Bridge, sessionId: string, grantedBy: string, messageId?: string): Promise<{ ok: true } | { ok: false; error: string; landed?: 'unknown' }> {
     const resolved = await this.resolveTranscript(sessionId)
     if (!resolved.ok) {
       await this.pageTurn(bridge, `ATTACHMENT REFUSED: ${resolved.error}.`)
@@ -4062,6 +4085,10 @@ export class ChatGptHost {
       await this.uploadDocument(bridge, name, 'text/plain', buffer, grantedBy, messageId)
       return { ok: true }
     } catch (error) {
+      // R12-F1: the third state. `uploadDocument` has already audited and
+      // persisted ATTACHMENT_UNPROVEN; it must reach the caller as unproven,
+      // not as a failure that reads like "nothing was sent, retry it".
+      if (error instanceof UploadAmbiguous) return { ok: false, error: ATTACHMENT_UNPROVEN, landed: 'unknown' }
       return { ok: false, error: (error as Error).message }
     }
   }

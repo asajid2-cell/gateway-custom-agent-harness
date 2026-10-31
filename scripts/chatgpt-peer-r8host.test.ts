@@ -301,10 +301,10 @@ async function readBridge(dir: string, sessionId: string): Promise<BridgeState> 
   return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
 }
 
-/** The bearer token the host writes for this instance on start. */
-async function credentials(dir: string): Promise<{ token: string }> {
-  const body = JSON.parse(await readFile(join(privateHome(dir), 'instances', 'test.json'), 'utf8')) as { token: string }
-  return { token: body.token }
+/** The bearer token and bridge session ids the host writes for this instance on start. */
+async function credentials(dir: string): Promise<{ token: string; sessionIds: string[] }> {
+  const body = JSON.parse(await readFile(join(privateHome(dir), 'instances', 'test.json'), 'utf8')) as { token: string; sessionIds?: string[] }
+  return { token: body.token, sessionIds: body.sessionIds ?? [] }
 }
 
 /** One operator request against the host's own loopback port. */
@@ -1847,6 +1847,104 @@ describe('R11-F3: an ambiguous attach is reported as unproven, never as a failur
       expect(sendCount(driver)).toBe(1)
       expect((await audits(dir)).some(line => /may have landed/.test(line.result))).toBe(false)
     } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+})
+
+describe('R12-F1: an ambiguous transcript attach is reported as unproven, never 502', () => {
+  /** The rollout `resolveTranscript` must find, under this host's config home. */
+  async function seedRollout(dir: string, sessionId: string): Promise<void> {
+    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
+    await writeFile(join(dir, 'projects', 'p', `${sessionId}.jsonl`), '{"type":"user"}\n', 'utf8')
+  }
+
+  test('attachTranscript answers ok:true/landed:unknown, sends once, and audits may-have-landed', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    await seedRollout(dir, alpha.sessionId)
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      // The live shape: the transcript landed, but the driver cannot prove it.
+      driver.ambiguousSend = 'the send may have landed'
+      const { token } = await credentials(dir)
+      // The bridge's own session is a live peer, so the operator route resolves.
+      const result = await operatorCall(host, token, { op: 'attachTranscript', bridge: alpha.sessionId, peer: alpha.sessionId })
+      expect(result.status).toBe(200)
+      expect(result.body.ok).toBe(true)
+      expect(result.body.op).toBe('attachTranscript')
+      expect(result.body.landed).toBe('unknown')
+      expect(String(result.body.line)).toBe('may have landed (the driver\'s send result was ambiguous and nothing was retried)')
+      expect(String(result.body.error ?? '')).not.toContain('did not accept')
+      // Exactly one send: nothing was re-posted on the ambiguous reply.
+      expect(sendCount(driver)).toBe(1)
+      const lines = await audits(dir)
+      expect(lines.some(line => line.op === 'attachment'
+        && line.target === `${alpha.sessionId}-transcript.txt` && line.result.startsWith('may have landed'))).toBe(true)
+      expect(lines.some(line => /the page did not accept/.test(line.result))).toBe(false)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a genuine transcript refusal keeps the 502 and its message', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    await seedRollout(dir, alpha.sessionId)
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      // A named reason other than `ambiguous` is a refusal, exactly as before.
+      driver.sendFailure = { reason: 'refused', error: 'the page rejected the composer' }
+      const refused = await operatorCall(host, token, { op: 'attachTranscript', bridge: alpha.sessionId, peer: alpha.sessionId })
+      expect(refused.status).toBe(502)
+      expect(refused.body.ok).toBe(false)
+      expect(String(refused.body.error)).toBe('the page rejected the composer')
+      // A bare `{ok:false}` with no reason keeps the generic message.
+      driver.sendFailure = {}
+      const bare = await operatorCall(host, token, { op: 'attachTranscript', bridge: alpha.sessionId, peer: alpha.sessionId })
+      expect(bare.status).toBe(502)
+      expect(bare.body.ok).toBe(false)
+      expect(String(bare.body.error)).toBe('the page did not accept the attachment')
+      expect(sendCount(driver)).toBe(2)
+      expect((await audits(dir)).some(line => /may have landed/.test(line.result))).toBe(false)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a peer-requested transcript that is unproven is audited against the request, not spoken as a refusal', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      await seedRollout(dir, senderId)
+      driver.ambiguousSend = 'the send may have landed'
+      // The peer grants its OWN transcript; the upload may have landed.
+      const receipt = await sender.send(alpha.sessionId, `attachment: session ${senderId}`, 'grant my own transcript', undefined, 'inquiry', true) as { id: string }
+      // This path has no reply surface, so the durable audit is the record.
+      await waitFor(async () => (await audits(dir)).some(line => line.op === 'attachment'
+        && line.target === senderId && line.result.startsWith('may have landed')) ? true : undefined, 15_000)
+      const unproven = (await audits(dir)).filter(line => line.op === 'attachment'
+        && line.target === senderId && line.result.startsWith('may have landed'))
+      expect(unproven.length).toBe(1)
+      expect(unproven[0]!.messageId).toBe(receipt.id)
+      // Nothing was spoken into the thread as a refusal, and nothing re-sent.
+      const typed = driver.calls.filter(call => call.op === 'send').map(call => String(call.text ?? ''))
+      expect(typed.some(text => text.startsWith('ATTACHMENT REFUSED'))).toBe(false)
+      expect(typed.filter(text => text.includes(`ATTACHED DOCUMENT ${senderId}-transcript.txt`)).length).toBe(1)
+    } finally {
+      await sender.close()
       await host.stop()
       await cleanup()
     }
