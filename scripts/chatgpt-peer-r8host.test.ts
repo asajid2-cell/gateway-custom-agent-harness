@@ -335,6 +335,8 @@ type Internals = {
   postRecordedTurn: (bridge: LiveBridge, record: PendingRecord, locked?: boolean) => Promise<boolean>
   recordOurs: (bridge: LiveBridge, before: Set<string>, sent: string) => Promise<string[]>
   settlePostedTurn: (bridge: LiveBridge, job: PendingRecord, claimed: Set<string>) => Promise<'delivered' | 'present' | 'absent' | 'unreadable'>
+  textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>) => string | null
+  bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>) => string | null
 }
 const internals = (host: ChatGptHost): Internals => host as unknown as Internals
 
@@ -1050,4 +1052,137 @@ describe('R8-H3: acceptance survives a thrown ledger write', () => {
       await cleanup()
     }
   }, 40_000)
+})
+
+/** The shared matcher, loaded per test: on a base without it the test, not the file, goes red. */
+const promptMatchesOf = async (): Promise<(sent: string, seen: string) => boolean> =>
+  (await import('./chatgpt-peer/threads.ts')).promptMatches
+
+/** A hand-built conversation on one visible path, root first. */
+function visibleConversation(nodes: { id: string; parent: string | null; role: 'user' | 'assistant'; text: string }[]): Conversation {
+  const mapping: Record<string, unknown> = {}
+  for (const node of nodes) {
+    mapping[node.id] = {
+      id: node.id,
+      parent: node.parent,
+      children: [],
+      message: {
+        id: node.id,
+        author: { role: node.role },
+        create_time: null,
+        end_turn: node.role === 'assistant' ? true : null,
+        status: 'finished_successfully',
+        content: { content_type: 'text', parts: [node.text] },
+      },
+    }
+  }
+  return { current_node: nodes.at(-1)!.id, mapping } as unknown as Conversation
+}
+
+describe('R8-A2: the whole-body recovery matcher', () => {
+  test('a node holding only a 512+ char PARTIAL run in its middle is still not a match', async () => {
+    const prompt = longBody()
+    const quoted = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: `Quoted before the paste. ${prompt.slice(1_000, 1_800)} And quoted after it.` },
+    ])
+    const none = new Set<string>()
+    // A pure text comparison: no host state is read.
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    expect(internals(host).bodyContainedIn(quoted, prompt, none, none)).toBeNull()
+    expect(internals(host).textMatchAnywhere(quoted, prompt, none, none)).toBeNull()
+    const promptMatches = await promptMatchesOf()
+    expect(promptMatches(prompt, `Quoted before the paste. ${prompt.slice(1_000, 1_800)} And quoted after it.`)).toBe(false)
+  })
+
+  test('containment needs UNIQUENESS: two carriers prove nothing, one names the node', () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const two = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: `${prompt} first` },
+      { id: 'a1', parent: 'u1', role: 'assistant', text: 'an answer' },
+      { id: 'u2', parent: 'a1', role: 'user', text: `second ${prompt}` },
+    ])
+    expect(internals(host).bodyContainedIn(two, prompt, none, none)).toBeNull()
+    const one = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: `before ${prompt} after` },
+    ])
+    expect(internals(host).bodyContainedIn(one, prompt, none, none)).toBe('u1')
+  })
+
+  test('the live doubled node is named on the recovery path and its answer is delivered exactly once, nothing typed', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      driver.appendNode(THREAD_A, 'user', 'an earlier question')
+      driver.appendNode(THREAD_A, 'assistant', 'an earlier answer')
+      const prompt = longBody()
+      // The live shape: the driver pasted the body twice into one composer, so
+      // the node starts mid-prompt, holds the WHOLE body, then the rest.
+      const cut = prompt.indexOf('section 5:')
+      expect(cut).toBeGreaterThan(0)
+      const doubled = prompt.slice(0, cut) + prompt + prompt.slice(cut)
+      expect(doubled.length).toBeGreaterThan(prompt.length)
+      expect(doubled.includes(prompt)).toBe(true)
+      const sendNode = driver.appendNode(THREAD_A, 'user', doubled, { createTime: null })
+      const answerNode = driver.appendNode(THREAD_A, 'assistant', 'the answer the doubled prompt earned')
+      // Live state: the cursor sits on the answer, past the send node.
+      alpha.cursor = answerNode
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const record = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(item => item.messageId === messageId)!
+      const host = await startHost(dir, driver)
+      try {
+        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const none = new Set<string>()
+        // Premise: the legacy record has no anchor, the send node has no clock,
+        // the cursor is past it, and equal-or-prefix still rejects the doubling.
+        expect(record.anchorNodeId ?? null).toBeNull()
+        expect(internals(host).ownUserNodeOf(
+          read.conversation, record.text, Date.parse(record.postedAt!), none, true, none, true, alpha.cursor,
+        )).toBeNull()
+        expect(internals(host).textMatchAnywhere(read.conversation, record.text, none, none)).toBeNull()
+        const promptMatches = await promptMatchesOf()
+        expect(promptMatches(record.text, doubled)).toBe(false)
+        // ... so containment is the only path left, and it names exactly this node.
+        expect(internals(host).bodyContainedIn(read.conversation, record.text, none, none)).toBe(sendNode)
+        await host.pollOnce()
+        await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).length).toBe(1)
+        expect(repliesTo(sender, messageId)[0]).toContain('the answer the doubled prompt earned')
+        expect(sendCount(driver)).toBe(0)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.pendingTurns.some(item => item.messageId === messageId)).toBe(false)
+        expect(state.ourNodeIds).toContain(sendNode)
+        // Ownership is the barrier; the cursor is untouched.
+        expect(state.cursor).toBe(answerNode)
+        expect((await audits(dir)).some(line => /no completed answer within/.test(line.result))).toBe(false)
+        expect((await audits(dir)).some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('promptMatches stays strictly equal-or-prefix (containment does not leak into it)', async () => {
+    const promptMatches = await promptMatchesOf()
+    const body = longBody()
+    expect(promptMatches(body, body)).toBe(true)
+    expect(promptMatches(body, `${body} appended`)).toBe(true)
+    expect(promptMatches(`${body} appended`, body)).toBe(true)
+    // A mid-string run is neither equality nor a prefix.
+    expect(promptMatches(body, `xx${body}yy`)).toBe(false)
+    // A prefix shorter than the floor is a guess, not a match.
+    expect(promptMatches(body, body.slice(0, 511))).toBe(false)
+    expect(promptMatches('short', 'short')).toBe(true)
+  })
 })

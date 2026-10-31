@@ -26,7 +26,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
-import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
+import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, PROMPT_PREFIX_MIN, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
 import {
   ANSWERED_TURNS_MAX, audit, bridgeFromLegacy, BRIDGE_NAME_PATTERN, COMMAND_RECEIPTS_MAX, DELIVERED_FILES_MAX, listBridgeStates, loadHostState, newBridgeState, newHostState,
@@ -2178,6 +2178,36 @@ export class ChatGptHost {
   }
 
   /**
+   * R8-A2: recovery-only acceptance for a node that CONTAINS the whole body.
+   *
+   * The live doubled node carried our 9,642-char prompt twice over (the driver
+   * pasted it twice into one composer), so neither equality nor prefix could
+   * name it - and its `create_time` was null, so time could not either. What it
+   * still held was the ENTIRE normalized send as a contiguous run.
+   *
+   * This is deliberately narrower than `promptMatches`, which stays
+   * equal-or-prefix only: containment is accepted ONLY here, ONLY for a body of
+   * at least `PROMPT_PREFIX_MIN` normalized chars, and ONLY when exactly ONE
+   * unowned, unclaimed user node carries it. Two candidates prove nothing, so
+   * the answer is null and the caller's absence check stands. A node quoting a
+   * section of our text does not contain the whole body and is never named.
+   */
+  private bodyContainedIn(
+    conversation: Conversation,
+    text: string,
+    ours: ReadonlySet<string>,
+    exclude: ReadonlySet<string>,
+  ): string | null {
+    const sent = normalizePromptText(text)
+    if (sent.length < PROMPT_PREFIX_MIN) return null
+    const matches = chainOf(conversation).filter(turn => turn.role === 'user'
+      && !ours.has(turn.id)
+      && !exclude.has(turn.id)
+      && normalizePromptText(turn.text).includes(sent))
+    return matches.length === 1 ? matches[0]!.id : null
+  }
+
+  /**
    * Deliver the answers of pending turns from the observation pass.
    *
    * This is the restart path AND the duplicate-observation guard: a turn this
@@ -2224,6 +2254,9 @@ export class ChatGptHost {
         ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
           // R8-B: the anchored match is time and position; the text is identity.
           ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
+          // R8-A2: last resort, recovery only - a node carrying the whole body
+          // (the live doubled node). Unique or nothing.
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed)
         : null)
       if (userNodeId) claimed.add(userNodeId)
       // R8-H1c: the claimed node is OURS before anything is classified. It is
@@ -3395,6 +3428,8 @@ export class ChatGptHost {
       ?? (Number.isFinite(postedMs)
         ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
           ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
+          // R8-A2: recovery only, unique whole-body containment (see there).
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed)
         : null)
     // R8-H1d: "no node matched" is not "the send never landed".
     if (!userNodeId) return await this.absenceOf(bridge, conversation, job, matchText, ours, postedMs)
