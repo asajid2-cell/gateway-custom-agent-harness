@@ -353,6 +353,13 @@ async function credentials(dir: string): Promise<{ token: string; sessionIds: st
 }
 
 async function operator(host: ChatGptHost, token: string, body: Record<string, unknown>): Promise<{ status: number; body: any }> {
+  // Peer work is HTTP-free now. The in-process seams run the same host code the
+  // removed ops used to call, so these rows assert the same shapes without a
+  // network path. Rows that probe the surface itself POST directly.
+  if (body.op === 'prompt') return host.promptForTest(body.bridge, body)
+  if (body.op === 'wait') return host.waitForIdleForTest(body.bridge, body)
+  if (body.op === 'files') return host.deliverFilesForTest(body.bridge, body)
+  if (body.op === 'cancelSchedule') return host.commandForTest(body.bridge, body)
   const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
@@ -1136,6 +1143,184 @@ describe('operator body limit', () => {
       expect(response.status).toBe(413)
       expect(await response.json()).toEqual({ error: 'body too large' })
     } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('single peer entrypoint', () => {
+  /** The real POST /operator: these rows probe the surface, not the seam. */
+  async function post(host: ChatGptHost, token: string, body: Record<string, unknown>): Promise<{ status: number; body: any }> {
+    const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return { status: response.status, body: await response.json() }
+  }
+
+  test('prompt, wait and files are withdrawn: 410 names the bus, and the page is never asked', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      for (const body of [
+        { op: 'prompt', bridge: alpha.sessionId, text: 'hello' },
+        { op: 'wait', bridge: alpha.sessionId, timeoutMs: 1_000 },
+        { op: 'files', bridge: alpha.sessionId, to: 'listener', nodeId: 'no-such-node' },
+      ]) {
+        const before = driver.calls.length
+        const refused = await post(host, token, body)
+        expect(refused.status).toBe(410)
+        expect(refused.body.ok).toBe(false)
+        // The refusal names the bus, in this bridge's own address, and quotes
+        // its own send line so the caller has somewhere to go next.
+        expect(String(refused.body.error)).toContain('peer work does not go through /operator')
+        expect(String(refused.body.error)).toContain(`gateway:${alpha.sessionId}`)
+        expect(String(refused.body.error)).toContain(alpha.sessionId)
+        // The page was never touched: no send, no read, no file fetch.
+        expect(driver.calls.length).toBe(before)
+      }
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('unknown and aliased ops are 400 with the allowed list and the bus pointer', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      // send/ask/turn/read/reply are the names people reach for; snippet is a
+      // plain unknown. None may reach the page.
+      for (const op of ['send', 'ask', 'turn', 'read', 'reply', 'snippet']) {
+        const before = driver.calls.length
+        const refused = await post(host, token, { op, bridge: alpha.sessionId })
+        expect(refused.status).toBe(400)
+        const error = String(refused.body.error)
+        expect(error).toContain(`"${op}"`)
+        expect(error).toContain('allowed ops:')
+        expect(error).toContain(`gateway:${alpha.sessionId}`)
+        expect(driver.calls.length).toBe(before)
+      }
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('an inbound bus message yields exactly one reply on success', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver)
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir), sessionId: randomUUID(), name: 'sender', cwd: dir, purpose: 'test sender', policy: 'accept',
+    })
+    try {
+      await sender.start()
+      await sender.send(alpha.sessionId, 'please answer', 'please answer', undefined, 'inquiry', true)
+      const reply = await waitFor(async () => {
+        const record = sender.inbox().find(item => typeof (item.message as unknown as { replyTo?: string }).replyTo === 'string')
+        return record ? record : undefined
+      }, 12_000).catch(() => null)
+      expect(reply).not.toBeNull()
+      expect(String((reply!.message as unknown as { text: string }).text)).toContain('answered on the page')
+      // Exactly one: the bridge answered once and did not double-deliver.
+      const replies = sender.inbox().filter(item => typeof (item.message as unknown as { replyTo?: string }).replyTo === 'string')
+      expect(replies.length).toBe(1)
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('an inbound bus message yields exactly one failure reply when the page refuses', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.sendError = 'the page refused the turn'
+    const host = await startHost(dir, driver)
+    const sender = new GatewaySessionTransport({
+      directory: sessionsDir(dir), sessionId: randomUUID(), name: 'sender', cwd: dir, purpose: 'test sender', policy: 'accept',
+    })
+    try {
+      await sender.start()
+      await sender.send(alpha.sessionId, 'please answer', 'please answer', undefined, 'inquiry', true)
+      const reply = await waitFor(async () => {
+        const record = sender.inbox().find(item => typeof (item.message as unknown as { replyTo?: string }).replyTo === 'string')
+        return record ? record : undefined
+      }, 12_000).catch(() => null)
+      expect(reply).not.toBeNull()
+      expect(String((reply!.message as unknown as { text: string }).text)).toContain('could not answer')
+      const replies = sender.inbox().filter(item => typeof (item.message as unknown as { replyTo?: string }).replyTo === 'string')
+      expect(replies.length).toBe(1)
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('attachFile and attachTranscript post only into the bridge named', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    const beta = bridgeNamed('beta', THREAD_B)
+    for (const bridge of [alpha, beta]) {
+      bridge.primedThreadId = bridge.threadId
+      bridge.primerSha256 = await primerSha()
+    }
+    await seedHost(dir, [alpha, beta])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    const listenerId = randomUUID()
+    const listener = new GatewaySessionTransport({
+      directory: sessionsDir(dir), sessionId: listenerId, name: 'listener', cwd: dir, purpose: 'test recipient', policy: 'accept',
+    })
+    await listener.start()
+    // The listener's own rollout, so its transcript is readable.
+    await mkdir(join(dir, 'projects', 'p'), { recursive: true })
+    await writeFile(join(dir, 'projects', 'p', `${listenerId}.jsonl`), 'x'.repeat(64), 'utf8')
+    const file = join(dir, 'note.txt')
+    await writeFile(file, 'hello')
+    try {
+      const { token } = await credentials(dir)
+      const uploads = (): Call[] => driver.calls.filter(call => call.op === 'send' && call.attach !== undefined)
+      const uploadName = (call: Call): string => String((call.attach as { name?: string } | undefined)?.name ?? '')
+
+      const attached = await operator(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(attached.status).toBe(200)
+      expect(uploads().length).toBe(1)
+      expect(uploads()[0]!.threadId).toBe(THREAD_A)
+
+      const granted = await operator(host, token, { op: 'attachTranscript', bridge: beta.sessionId, peer: 'listener' })
+      expect(granted.status).toBe(200)
+      expect(uploads().length).toBe(2)
+      expect(uploads()[1]!.threadId).toBe(THREAD_B)
+      // Neither upload leaked into the other bridge's thread.
+      expect(uploads().some(call => call.threadId === THREAD_A && uploadName(call).includes('transcript'))).toBe(false)
+      expect(uploads().some(call => call.threadId === THREAD_B && uploadName(call).includes('note.txt'))).toBe(false)
+    } finally {
+      await listener.close()
       await host.stop()
       await cleanup()
     }

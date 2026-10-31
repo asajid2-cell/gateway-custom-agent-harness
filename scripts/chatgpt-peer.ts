@@ -122,6 +122,27 @@ const WAIT_POLL_MS = 2000
 const READ_TIMEOUT_MS = 45_000
 
 /**
+ * The operator ops that were withdrawn: peer work is bus-only now.
+ *
+ * A caller that POSTed `{op:"prompt"}` and read the answer out of the HTTP
+ * reply was driving the page through a side channel: the page ran, but nothing
+ * rendered in the harness. These answer 410 - an explicit, testable refusal -
+ * and never fall through to the generic unknown-op 400. A map, not a list, so
+ * adding one is a visible entry and everything else stays "unknown".
+ */
+const REMOVED_OPERATOR_OPS: Record<string, true> = { prompt: true, wait: true, files: true }
+
+/** Op names people reach for meaning "do peer work"; none is an operator op. */
+const PEER_WORK_ALIASES = new Set(['send', 'ask', 'turn', 'read', 'reply'])
+
+/**
+ * Everything POST /operator still answers. The rest is refused: bridge
+ * lifecycle, read-only diagnostics, the two documented attachment paths (which
+ * post only into the bridge's own thread) and page recovery.
+ */
+const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'recover', 'thread', 'attachTranscript', 'attachFile'] as const
+
+/**
  * A page turn that outlived the driver's send budget while still running.
  *
  * It is a state, not a failure: the turn is on the page and its answer is
@@ -1010,6 +1031,16 @@ export class ChatGptHost {
     catch { return this.send(response, 400, { error: 'invalid JSON' }) }
     const body = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as Record<string, unknown>
     const op = String(body.op ?? '')
+    // Peer work is bus-only. Withdrawn ops are refused by name with the bus
+    // address (410); anything else not on the kept list is refused with the
+    // allowed-op list (400). Both happen before any bridge work, so the refusal
+    // never depends on which bridge the caller happens to name.
+    if (REMOVED_OPERATOR_OPS[op] === true) {
+      return this.send(response, 410, { ok: false, op, error: this.busPointer(this.bridgeFor(body.bridge)) })
+    }
+    if (!(OPERATOR_OPS as readonly string[]).includes(op)) {
+      return this.send(response, 400, { ok: false, op, error: this.unknownOpLine(op, this.bridgeFor(body.bridge)) })
+    }
     try {
       // --- bridge lifecycle (host-level) -------------------------------------
       if (op === 'threads') {
@@ -1034,57 +1065,10 @@ export class ChatGptHost {
       // --- everything below acts through one bridge --------------------------
       const bridge = this.bridgeFor(body.bridge)
       if (typeof bridge === 'string') return this.send(response, 400, { ok: false, error: bridge })
-      if (op === 'prompt') {
-        const text = one(body.text, 64 * 1024)
-        if (!text) return this.send(response, 400, { ok: false, error: 'prompt requires text' })
-        // The job shape: post and return. The page turn is running; its answer
-        // is observed, never awaited under a request.
-        if (body.async === true) {
-          const posted = await this.pageWork(async () => {
-            await this.ensurePrimerAndThread(bridge)
-            return this.pageTurnAsync(bridge, String(body.text))
-          })
-          return this.send(response, 200, { ok: true, op, accepted: true, threadId: posted.threadId, state: 'generating' })
-        }
-        try {
-          const answer = await this.pageWork(async () => {
-            await this.ensurePrimerAndThread(bridge)
-            return this.pageTurn(bridge, String(body.text))
-          })
-          const shaped = await this.shapeAnswer(bridge, answer)
-          return this.send(response, 200, { ok: true, op, line: 'page answered', ...shaped })
-        } catch (error) {
-          // A live turn that outran the driver is not a host failure. The
-          // answer is on the page; `status` or `wait` brings it back.
-          if (error instanceof GeneratingTurn) {
-            audit(this.hostState, {
-              op: 'turn', target: error.threadId ?? bridge.state.threadId,
-              result: `still generating; the page turn is running, not refused [${bridge.state.name}]`,
-            })
-            await this.persistHostState()
-            return this.send(response, 200, { ok: true, op, state: 'generating', timedOut: true, threadId: error.threadId ?? bridge.state.threadId })
-          }
-          throw error
-        }
-      }
       if (op === 'status') {
         // Cheap by default: no page read, safe to call every two seconds.
         const status = await this.statusOf(bridge, body.deep === true)
         return this.send(response, 200, { ok: true, op, ...status })
-      }
-      if (op === 'wait') {
-        const timeoutMs = Math.min(Math.max(Number(body.timeoutMs ?? 120_000) || 120_000, 1000), 20 * 60_000)
-        const waited = await this.waitForIdle(bridge, timeoutMs)
-        return this.send(response, 200, { ok: true, op, ...waited })
-      }
-      if (op === 'files') {
-        const to = String(body.to ?? '')
-        if (!to) return this.send(response, 400, { ok: false, error: 'files requires to (the peer to deliver to)' })
-        const indexes = Array.isArray(body.indexes)
-          ? body.indexes.filter(value => typeof value === 'number' && Number.isInteger(value) && value >= 0).slice(0, OUTBOX_MAX_FILES)
-          : undefined
-        const delivered = await this.deliverFiles(bridge, to, typeof body.nodeId === 'string' && body.nodeId ? body.nodeId : undefined, indexes)
-        return this.send(response, 200, { ok: true, op, ...delivered })
       }
       if (op === 'recover') {
         const threadId = bridge.state.threadId
@@ -1155,13 +1139,116 @@ export class ChatGptHost {
         }
         return this.send(response, 200, { ok: true, op, line: `attached ${fileBasename} (${buffer.length} bytes)` })
       }
-      const command = parseCommand(body)
-      if (!command.ok) return this.send(response, 400, { ok: false, error: command.error })
-      const result = await this.executeCommand(bridge, command.command, 'operator')
-      return this.send(response, 200, { ok: true, op, line: result.line })
+      // Unreachable: every kept op is handled above and every other op was
+      // refused before the try. Answer anyway rather than leave the request
+      // hanging if the two lists ever drift apart.
+      return this.send(response, 400, { ok: false, op, error: this.unknownOpLine(op, bridge) })
     } catch (error) {
       return this.send(response, 500, { ok: false, error: (error as Error).message })
     }
+  }
+
+  /**
+   * Where peer work actually goes, in the bridge's own address.
+   *
+   * One sentence, used by both the 410 (a withdrawn op) and the 400 (anything
+   * not on the kept list), so every refusal names the same path out. When the
+   * request named no bridge and the host cannot pick one, it names the session
+   * the caller must choose instead of inventing an id.
+   */
+  private busPointer(bridge: Bridge | string): string {
+    const tail = '/operator only brings a bridge in, selects its thread, attaches a file, and recovers the page'
+    if (typeof bridge === 'string') {
+      return `peer work does not go through /operator: send it over the bus to the bridge's own gateway session (name one with bridge); ${tail}`
+    }
+    const sessionId = bridge.state.sessionId
+    return `peer work does not go through /operator: send it over the bus to gateway:${sessionId} (this bridge: ${this.sendLine(sessionId)}); ${tail}`
+  }
+
+  /** The 400 for an op /operator no longer answers: name it, list the kept ops, name the bus. */
+  private unknownOpLine(op: string, bridge: Bridge | string): string {
+    const allowed = OPERATOR_OPS.join(', ')
+    const head = op
+      ? (PEER_WORK_ALIASES.has(op) ? `"${op}" is peer work, not an operator op` : `unknown operator op "${op}"`)
+      : 'operator op is required'
+    return `${head}; allowed ops: ${allowed}. ${this.busPointer(bridge)}`
+  }
+
+  // ------------------------------------------------------------ test seams
+  //
+  // Peer work no longer travels over /operator, but the suites still need to
+  // drive a turn, wait for one, deliver its files and run a model command
+  // through the very code the removed HTTP ops used to call. These in-process
+  // seams keep that coverage identical without reopening a network or CLI path:
+  // the HTTP dispatcher above never routes to them.
+
+  /** What the removed `prompt` op returned: a page turn posted and answered. */
+  async promptForTest(bridgeRef: unknown, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+    const bridge = this.bridgeFor(bridgeRef)
+    if (typeof bridge === 'string') return { status: 400, body: { ok: false, error: bridge } }
+    const text = one(body.text, 64 * 1024)
+    if (!text) return { status: 400, body: { ok: false, error: 'prompt requires text' } }
+    try {
+      // The job shape: post and return. The page turn is running; its answer
+      // is observed, never awaited under a request.
+      if (body.async === true) {
+        const posted = await this.pageWork(async () => {
+          await this.ensurePrimerAndThread(bridge)
+          return this.pageTurnAsync(bridge, String(body.text))
+        })
+        return { status: 200, body: { ok: true, op: 'prompt', accepted: true, threadId: posted.threadId, state: 'generating' } }
+      }
+      const answer = await this.pageWork(async () => {
+        await this.ensurePrimerAndThread(bridge)
+        return this.pageTurn(bridge, String(body.text))
+      })
+      const shaped = await this.shapeAnswer(bridge, answer)
+      return { status: 200, body: { ok: true, op: 'prompt', line: 'page answered', ...shaped } }
+    } catch (error) {
+      // A live turn that outran the driver is not a host failure. The answer
+      // is on the page; `status` observes it.
+      if (error instanceof GeneratingTurn) {
+        audit(this.hostState, {
+          op: 'turn', target: error.threadId ?? bridge.state.threadId,
+          result: `still generating; the page turn is running, not refused [${bridge.state.name}]`,
+        })
+        await this.persistHostState()
+        return { status: 200, body: { ok: true, op: 'prompt', state: 'generating', timedOut: true, threadId: error.threadId ?? bridge.state.threadId } }
+      }
+      return { status: 500, body: { ok: false, error: (error as Error).message } }
+    }
+  }
+
+  /** What the removed `wait` op returned: the settled answer, read at most once per signal. */
+  async waitForIdleForTest(bridgeRef: unknown, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+    const bridge = this.bridgeFor(bridgeRef)
+    if (typeof bridge === 'string') return { status: 400, body: { ok: false, error: bridge } }
+    const timeoutMs = Math.min(Math.max(Number(body.timeoutMs ?? 120_000) || 120_000, 1000), 20 * 60_000)
+    const waited = await this.waitForIdle(bridge, timeoutMs)
+    return { status: 200, body: { ok: true, op: 'wait', ...waited } }
+  }
+
+  /** What the removed `files` op returned: at most five page files, delivered once. */
+  async deliverFilesForTest(bridgeRef: unknown, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+    const bridge = this.bridgeFor(bridgeRef)
+    if (typeof bridge === 'string') return { status: 400, body: { ok: false, error: bridge } }
+    const to = String(body.to ?? '')
+    if (!to) return { status: 400, body: { ok: false, error: 'files requires to (the peer to deliver to)' } }
+    const indexes = Array.isArray(body.indexes)
+      ? body.indexes.filter(value => typeof value === 'number' && Number.isInteger(value) && value >= 0).slice(0, OUTBOX_MAX_FILES)
+      : undefined
+    const delivered = await this.deliverFiles(bridge, to, typeof body.nodeId === 'string' && body.nodeId ? body.nodeId : undefined, indexes)
+    return { status: 200, body: { ok: true, op: 'files', ...delivered } }
+  }
+
+  /** What the removed command fallthrough returned: one model command, run by the host. */
+  async commandForTest(bridgeRef: unknown, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+    const bridge = this.bridgeFor(bridgeRef)
+    if (typeof bridge === 'string') return { status: 400, body: { ok: false, error: bridge } }
+    const command = parseCommand(body)
+    if (!command.ok) return { status: 400, body: { ok: false, error: command.error } }
+    const result = await this.executeCommand(bridge, command.command, 'operator')
+    return { status: 200, body: { ok: true, op: String(body.op ?? ''), line: result.line } }
   }
 
   // ------------------------------------------------------- operator lifecycle
@@ -4816,9 +4903,12 @@ async function main(): Promise<void> {
       '  --titles-every <n>  seconds between title walks (default 120; 0 = never)',
       '',
       'The instance file (~/.chatgpt-web/instances/<slug>.json) holds a bearer token.',
-      'It is the whole control surface and it is agent-facing: an agent reads it and',
-      'POSTs {op:"adopt"} / {op:"newBridge"} to /operator to bring a bridge into',
-      'being. Nobody is expected to read the token file by hand.',
+      'It is the control surface, and /operator is NOT a messaging path: peer work',
+      '(posting a turn, waiting for an answer, delivering files) travels only on',
+      'the bus, to the bridge\'s own gateway session. /operator only brings a',
+      'bridge into being ({op:"adopt"} / {op:"newBridge"}), selects its thread,',
+      'attaches a file, and recovers the page. Nobody is expected to read the token',
+      'file by hand.',
       'A bridge is addressed by the line its adopt/newBridge reply returns.',
       '',
       'Thread uplink: an answer the page writes on its own may carry one gateway',

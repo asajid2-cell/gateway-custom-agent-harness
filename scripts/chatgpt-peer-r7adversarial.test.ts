@@ -404,6 +404,9 @@ async function credentials(dir: string): Promise<{ token: string }> {
 }
 
 async function operator(host: ChatGptHost, token: string, body: Record<string, unknown>): Promise<{ status: number; body: any }> {
+  // Peer work is HTTP-free now; the seam runs the same host code the removed
+  // `files` op used to call, so these rows assert unchanged.
+  if (body.op === 'files') return host.deliverFilesForTest(body.bridge, body)
   const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
