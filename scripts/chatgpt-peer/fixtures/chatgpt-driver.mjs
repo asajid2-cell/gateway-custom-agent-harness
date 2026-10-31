@@ -81,22 +81,31 @@ function clampReply(text, max = MAX_REPLY) {
 }
 const SEND_TIMEOUT_MS = Number(process.env.CHATGPT_TIMEOUT_MS || 240_000)
 
-const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+// One linear class scan. The previous validator was
+// /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/, whose
+// repeated group recursed once per 4-character group: on an 11 MB payload node
+// threw "Maximum call stack size exceeded" and bun silently returned false, so
+// a canonical attachment was refused as non-canonical. Alphabet membership is
+// all this test adds - the length check below rejects a truncated group, and
+// the round-trip re-encode proves the padding and the trailing bits.
+const BASE64_ALPHABET = /[^A-Za-z0-9+/=]/
 
 /**
  * Decode a field the caller called base64, or refuse it.
  *
  * `Buffer.from(value, 'base64')` skips every character it does not recognise,
  * so `%%%%` decodes to zero bytes and the upload reports `attached` for a file
- * that does not exist. Accept only canonical base64 (alphabet, padding, and a
- * re-encode that reproduces the input exactly), check the size cap from the
- * encoded length before allocating, and check it again after decoding.
+ * that does not exist. Accept only canonical base64 (alphabet, a whole number
+ * of 4-character groups, and a re-encode that reproduces the input exactly -
+ * which is what catches bad padding and non-zero trailing bits), check the size
+ * cap from the encoded length before allocating, and check it again after
+ * decoding.
  */
 function decodeBase64(value, label = 'attachment') {
   if (typeof value !== 'string' || !value) throw new Error(`${label}: no base64 payload was supplied`)
   // A caller may wrap long lines; whitespace is not part of the encoding.
   const text = value.replace(/\s+/g, '')
-  if (!text || !BASE64.test(text)) throw new Error(`${label}: the payload is not canonical base64`)
+  if (!text || text.length % 4 !== 0 || BASE64_ALPHABET.test(text)) throw new Error(`${label}: the payload is not canonical base64`)
   const padding = (text.match(/=+$/) || [''])[0].length
   const estimated = Math.floor(text.length * 3 / 4) - padding
   if (estimated > MAX_ATTACHMENT_BYTES) throw new Error(`${label}: ${estimated} bytes exceeds the ${MAX_ATTACHMENT_BYTES}-byte cap`)
