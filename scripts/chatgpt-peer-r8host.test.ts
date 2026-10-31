@@ -346,11 +346,12 @@ type Internals = {
   ownUserNodeOf: (
     conversation: unknown, text: string, sinceMs: number, ours: ReadonlySet<string>,
     includeOwned?: boolean, exclude?: ReadonlySet<string>, earliest?: boolean, afterId?: string | null,
+    preservedAnchorId?: string | null,
   ) => string | null
   postRecordedTurn: (bridge: LiveBridge, record: PendingRecord, locked?: boolean) => Promise<boolean>
   recordOurs: (bridge: LiveBridge, before: Set<string>, sent: string) => Promise<string[]>
   settlePostedTurn: (bridge: LiveBridge, job: PendingRecord, claimed: Set<string>) => Promise<'delivered' | 'present' | 'absent' | 'unreadable'>
-  textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number) => string | null
+  textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, preservedAnchorId?: string | null) => string | null
   bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, afterId: string | null) => string | null
 }
 const internals = (host: ChatGptHost): Internals => host as unknown as Internals
@@ -849,6 +850,13 @@ describe('R8-A: the post-time anchor outlives the cursor', () => {
       const host2 = await startHost(dir, driver)
       try {
         const read = await internals(host2).readConversation(THREAD_A) as { conversation: unknown }
+        // Premise, self-diagnosing: the probe's inputs really are in the read.
+        // If the snapshot ever loses the anchor or the send node, this names the
+        // read rather than letting the probe below report a bare `null`.
+        const readChain = chainOf(read.conversation as Conversation).map(turn => turn.id)
+        expect(readChain).toContain(earlier)
+        expect(readChain).toContain(sendNode)
+        expect(readChain.indexOf(sendNode)).toBeGreaterThan(readChain.indexOf(earlier))
         // The positional branch, asked both ways with ownership held out of the
         // argument: the record's own anchor names the node, the live cursor
         // (which moved past it) cannot.
@@ -1377,6 +1385,48 @@ describe('R10-F1: a dated candidate before a RESOLVED preserved anchor', () => {
   })
 })
 
+describe('R10-F1b: ownUserNodeOf refuses a dated exact-text node before the preserved anchor', () => {
+  test('the positional anchor gates the dated branch; the window still stands alone', () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const check = (conversation: Conversation, afterId: string | null, preserved: string | null = null, postedMs = Date.now()): string | null =>
+      internals(host).ownUserNodeOf(conversation, prompt, postedMs, none, true, none, true, afterId, preserved)
+    const nowMs = Date.now()
+    const nowSec = nowMs / 1000
+    // EXACT text (equality under promptMatches), dated T-5s, before the anchor.
+    const quoteBeforeAnchor = visibleConversation([
+      { id: 'quote', parent: null, role: 'user', text: prompt, createTime: nowSec - 5 },
+      { id: 'anchor', parent: 'quote', role: 'assistant', text: 'the answer to the quote', createTime: nowSec - 4 },
+    ])
+    // Window alone (no preserved anchor) still adopts it - the trade-off is unchanged.
+    expect(check(quoteBeforeAnchor, null, null)).toBe('quote')
+    // A RESOLVED preserved anchor refuses it on position (the F1 defect, one
+    // matcher earlier: `ownUserNodeOf` runs before containment).
+    expect(check(quoteBeforeAnchor, null, 'anchor')).toBeNull()
+    // The same node AFTER the anchor is adopted.
+    const afterAnchor = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 6 },
+      { id: 'send', parent: 'anchor', role: 'user', text: prompt, createTime: nowSec - 0.8 },
+    ])
+    expect(check(afterAnchor, 'anchor', 'anchor')).toBe('send')
+    // The undated branch is untouched: it still uses afterId (the cursor
+    // fallback) and needs no preserved anchor.
+    const undated = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 6 },
+      { id: 'send', parent: 'anchor', role: 'user', text: prompt },
+    ])
+    expect(check(undated, 'anchor', null)).toBe('send')
+    // ... and a preserved anchor must NOT gate an undated node after the cursor.
+    const undatedBeforePreserved = visibleConversation([
+      { id: 'cursor', parent: null, role: 'assistant', text: 'cursor', createTime: nowSec - 6 },
+      { id: 'send', parent: 'cursor', role: 'user', text: prompt },
+      { id: 'anchor', parent: 'send', role: 'assistant', text: 'preserved anchor', createTime: nowSec - 4 },
+    ])
+    expect(check(undatedBeforePreserved, 'cursor', 'anchor')).toBe('send')
+  })
+})
+
 describe('R10-F2: dated text matches are bounded by the posting window', () => {
   test('a days-old dated prefix is not this send; the undated reach is unchanged', async () => {
     const prompt = longBody()
@@ -1467,6 +1517,42 @@ describe('R10-F1/F2: recovery never adopts old text as the send', () => {
         expect(repliesTo(sender, messageId).some(text => text.includes('the days-old answer'))).toBe(false)
         const state = await readBridge(dir, alpha.sessionId)
         expect(state.ourNodeIds).not.toContain(old)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('a dated EXACT-text human node before the anchor is never forwarded as the send', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = 'POSTED PROMPT: a dated exact-text quote must not be taken for the send'
+      const fiveAgo = Date.now() / 1000 - 5
+      // EXACTLY our body (equality under promptMatches), dated T-5s, before the
+      // pre-send anchor - so the FIRST matcher, `ownUserNodeOf`, is the one that
+      // must refuse it (containment never gets consulted).
+      const quote = driver.appendNode(THREAD_A, 'user', prompt, { createTime: fiveAgo })
+      const anchor = driver.appendNode(THREAD_A, 'assistant', 'the answer to the human quote', { createTime: fiveAgo + 1 })
+      alpha.cursor = anchor
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      alpha.pendingTurns[alpha.pendingTurns.length - 1]!.anchorNodeId = anchor
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).some(text => text.includes('the answer to the human quote'))).toBe(false)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.ourNodeIds).not.toContain(quote)
       } finally {
         await host.stop()
       }

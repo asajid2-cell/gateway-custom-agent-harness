@@ -2140,6 +2140,13 @@ export class ChatGptHost {
    * be handed the other's answer. `earliest` binds in post order - the oldest
    * unclaimed node at or after this turn's own post - which is what assigns
    * n1 to the first turn and n2 to the second.
+   *
+   * R10-F1b: `preservedAnchorId` is the record's PRESERVED anchor only, and it
+   * gates the DATED branch the same way `bodyContainedIn` does. A node dated
+   * T-5 s whose text is exactly our body, sitting before the pre-send anchor,
+   * is a person quoting us - the stamp is a claim, the resolved anchor is
+   * evidence. The undated branch stays on `afterId` (the cursor fallback is the
+   * only position an undated node has), and `earliest` ordering is unchanged.
    */
   private ownUserNodeOf(
     conversation: Conversation,
@@ -2150,6 +2157,7 @@ export class ChatGptHost {
     exclude: ReadonlySet<string> = new Set(),
     earliest = false,
     afterId: string | null = null,
+    preservedAnchorId: string | null = null,
   ): string | null {
     const chain = chainOf(conversation)
     // R8 addendum: a node with NO create_time is invisible to every time-based
@@ -2158,6 +2166,8 @@ export class ChatGptHost {
     // (the cursor); only a node after it can be this send's own. With no
     // cursor there is no position to trust, so such a node is not accepted.
     const anchor = afterId ? chain.findIndex(turn => turn.id === afterId) : -1
+    // R10-F1b: the preserved anchor, never the cursor, for dated candidates.
+    const preserved = preservedAnchorId ? chain.findIndex(turn => turn.id === preservedAnchorId) : -1
     const eligible = chain
       .filter((turn, index) => turn.role === 'user'
         // `!ours` finds the send's node among NEW nodes. A recorded turn with no
@@ -2172,8 +2182,10 @@ export class ChatGptHost {
         && promptMatches(text, turn.text)
         && (typeof turn.createTime === 'number'
           // A numeric create_time is always checked against the window: the
-          // page's own clock is the strongest evidence there is.
-          ? turn.createTime * 1000 >= sinceMs - PENDING_WINDOW_BEFORE_MS
+          // page's own clock is the strongest evidence there is. R10-F1b: a
+          // resolved preserved anchor refuses a dated node at or before it.
+          ? (preserved < 0 || index > preserved)
+            && turn.createTime * 1000 >= sinceMs - PENDING_WINDOW_BEFORE_MS
           // The positional fallback: not ours already, and after the anchor.
           : !ours.has(turn.id) && anchor >= 0 && index > anchor))
     return (earliest ? eligible[0] : eligible.at(-1))?.id ?? null
@@ -2198,6 +2210,11 @@ export class ChatGptHost {
    * at an hour-old timestamp is a person quoting us, not our send, so DATED
    * candidates must fall inside the posting window; UNDATED candidates keep the
    * unbounded reach (they carry no time claim at all).
+   *
+   * R10-F1b: and, like the other two matchers, a DATED candidate at or before
+   * the record's PRESERVED anchor is refused on position - a stamp is a claim,
+   * a resolved pre-send anchor is evidence. Without this gate this matcher
+   * re-adopts exactly the exact-text quote `ownUserNodeOf` just refused.
    */
   private textMatchAnywhere(
     conversation: Conversation,
@@ -2205,8 +2222,11 @@ export class ChatGptHost {
     ours: ReadonlySet<string>,
     exclude: ReadonlySet<string>,
     postedMs: number,
+    preservedAnchorId: string | null = null,
   ): string | null {
-    const matches = chainOf(conversation).filter(turn => turn.role === 'user'
+    const chain = chainOf(conversation)
+    const preserved = preservedAnchorId ? chain.findIndex(turn => turn.id === preservedAnchorId) : -1
+    const matches = chain.filter((turn, index) => turn.role === 'user'
       && !ours.has(turn.id)
       && !exclude.has(turn.id)
       && promptMatches(text, turn.text)
@@ -2215,7 +2235,8 @@ export class ChatGptHost {
       // an UNDATED one keeps the full reach (the R8-B live record had no
       // `create_time` at all, and its text identity is the only evidence).
       && (typeof turn.createTime !== 'number'
-        || (Number.isFinite(postedMs) && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)))
+        || ((preserved < 0 || index > preserved)
+          && Number.isFinite(postedMs) && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)))
     return matches.at(-1)?.id ?? null
   }
 
@@ -2327,10 +2348,10 @@ export class ChatGptHost {
       // node (the live doubled node) must not be read as "before the anchor".
       const preservedAnchor = record.anchorNodeId ?? null
       const userNodeId = record.userNodeId ?? (Number.isFinite(postedMs)
-        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
+        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId, preservedAnchor)
           // R8-B: the anchored match is time and position; the text is identity.
           // R10-F2: dated text matches are bounded by the posting window.
-          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs)
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs, preservedAnchor)
           // R8-A2: last resort, recovery only - a node carrying the whole body
           // (the live doubled node). R9-F2: it must also fall in the posting
           // window, not merely carry old text. R10-F1: and a dated candidate
@@ -3508,9 +3529,9 @@ export class ChatGptHost {
     const preservedAnchor = job.anchorNodeId ?? null
     const userNodeId = (job.userNodeId && conversation.mapping[job.userNodeId] ? job.userNodeId : null)
       ?? (Number.isFinite(postedMs)
-        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
+        ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId, preservedAnchor)
           // R10-F2: dated text matches are bounded by the posting window.
-          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs)
+          ?? this.textMatchAnywhere(conversation, matchText, ours, claimed, postedMs, preservedAnchor)
           // R8-A2: recovery only, unique whole-body containment (see there).
           // R9-F2: with the record's posting window and anchor.
           // R10-F1: a dated candidate must sit after the preserved anchor.
