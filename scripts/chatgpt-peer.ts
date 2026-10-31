@@ -148,6 +148,20 @@ class SendAmbiguous extends Error {
 }
 
 /**
+ * R11-F3: the driver could not prove an attach send either way.
+ *
+ * The live round-11 upload landed (node `b770f5aa`, attachment
+ * `file_00000000d49881fd810e26b00bc685a3`) while the driver, correctly, refused
+ * to claim or repeat the click. That is not a page failure, so it must not be
+ * reported as one: the operator is told the upload may have landed and must
+ * check the thread, never retry blindly.
+ */
+class UploadAmbiguous extends Error {}
+
+/** The one sentence an ambiguous upload writes to the audit and the operator. */
+const ATTACHMENT_UNPROVEN = 'may have landed (the driver\'s send result was ambiguous and nothing was retried)'
+
+/**
  * What the page's last push says about one thread.
  *
  * `unknown` is deliberate: nothing has been pushed (or the driver could not be
@@ -1090,10 +1104,19 @@ export class ChatGptHost {
           return this.send(response, 413, { ok: false, op, error: refusal })
         }
         const buffer = await this.files.readFile(file)
-        await this.pageWork(async () => {
-          await this.ensurePrimerAndThread(bridge)
-          await this.uploadDocument(bridge, fileBasename, mimeType, buffer, 'operator')
-        })
+        try {
+          await this.pageWork(async () => {
+            await this.ensurePrimerAndThread(bridge)
+            await this.uploadDocument(bridge, fileBasename, mimeType, buffer, 'operator')
+          })
+        } catch (error) {
+          // R11-F3: an ambiguous result is not a failure. The operator learns
+          // the upload may have landed and that it must be checked, not retried.
+          if (error instanceof UploadAmbiguous) {
+            return this.send(response, 200, { ok: true, op, landed: 'unknown', line: ATTACHMENT_UNPROVEN })
+          }
+          throw error
+        }
         return this.send(response, 200, { ok: true, op, line: `attached ${fileBasename} (${buffer.length} bytes)` })
       }
       const command = parseCommand(body)
@@ -4106,7 +4129,19 @@ export class ChatGptHost {
         }
       },
     })
-    if (reply.ok !== true) throw new Error(one(reply.error, 300) || 'the page did not accept the attachment')
+    if (reply.ok !== true) {
+      // R11-F3: `ambiguous` means the driver took the text but cannot prove the
+      // post, so the document may be on the page. That is not a refusal: it is
+      // never retried here, never absorbed, and reported as unproven rather
+      // than failed - a 500 would invite the blind retry that posts it twice.
+      if (reply.reason === 'ambiguous') {
+        audit(this.hostState, { op: 'attachment', target: name, result: ATTACHMENT_UNPROVEN, messageId: messageId ?? null })
+        await this.persistHostState()
+        await this.persistBridgeState(bridge)
+        throw new UploadAmbiguous(`the upload of ${name} may have landed; check the thread before retrying, and do not retry blindly`)
+      }
+      throw new Error(one(reply.error, 300) || 'the page did not accept the attachment')
+    }
     const attachment = reply.attachment as { state?: string; reason?: string } | undefined
     if (attachment && attachment.state === 'rejected') {
       const reason = one(attachment.reason, 200) || 'the page rejected the attachment'
