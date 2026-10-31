@@ -53,6 +53,11 @@ class FakeDriver {
    * fires `accepted`. This is the driver's new refusal to re-click Send.
    */
   ambiguousSend: string | null = null
+  /**
+   * R11-F3: a plain send refusal - the page never took the text, so no node is
+   * appended and `reason` carries whatever the driver said.
+   */
+  sendFailure: { reason?: string; error?: string } | null = null
   wedgeAfterSend = false
   /** Do not grow an assistant node on send: the turn stays unfinished. */
   noAnswer = false
@@ -169,6 +174,12 @@ class FakeDriver {
     if (op === 'send') {
       const threadId = this.current ?? THREAD_A
       const text = String(request.text ?? '')
+      if (this.sendFailure) {
+        // A refusal: the page took nothing, so no node exists for this send.
+        const failure = this.sendFailure
+        this.sendFailure = null
+        return { ok: false, op, ...failure, threadId }
+      }
       this.appendNode(threadId, 'user', text)
       if (this.ambiguousSend) {
         // The node landed, but the driver will not claim it: no `accepted`
@@ -288,6 +299,22 @@ const primerSha = async (): Promise<string> =>
 
 async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
   return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
+}
+
+/** The bearer token the host writes for this instance on start. */
+async function credentials(dir: string): Promise<{ token: string }> {
+  const body = JSON.parse(await readFile(join(privateHome(dir), 'instances', 'test.json'), 'utf8')) as { token: string }
+  return { token: body.token }
+}
+
+/** One operator request against the host's own loopback port. */
+async function operatorCall(host: ChatGptHost, token: string, body: Record<string, unknown>): Promise<{ status: number; body: any }> {
+  const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return { status: response.status, body: await response.json() }
 }
 
 async function busPeer(dir: string, name: string): Promise<{ transport: GatewaySessionTransport; id: string }> {
@@ -1737,4 +1764,91 @@ describe('R11-F1: recovery never adopts an undated pre-anchor quote', () => {
       await cleanup()
     }
   }, 60_000)
+})
+
+describe('R11-F3: an ambiguous attach is reported as unproven, never as a failure', () => {
+  test('attachFile answers ok:true/landed:unknown, sends once, and audits may-have-landed', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const file = join(dir, 'note.txt')
+      await writeFile(file, 'hello')
+      // The live shape: the node and the attachment landed, but the driver
+      // cannot prove it and never re-clicks Send.
+      driver.ambiguousSend = 'the send may have landed'
+      const { token } = await credentials(dir)
+      const result = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      // Not a 500: the operator is told the truth, and told not to retry.
+      expect(result.status).toBe(200)
+      expect(result.body.ok).toBe(true)
+      expect(result.body.op).toBe('attachFile')
+      expect(result.body.landed).toBe('unknown')
+      expect(String(result.body.line)).toBe('may have landed (the driver\'s send result was ambiguous and nothing was retried)')
+      expect(String(result.body.error ?? '')).not.toContain('did not accept')
+      // Exactly one send: nothing was re-posted on the ambiguous reply.
+      expect(sendCount(driver)).toBe(1)
+      const lines = await audits(dir)
+      expect(lines.some(line => line.op === 'attachment' && line.target === 'note.txt' && line.result.startsWith('may have landed'))).toBe(true)
+      expect(lines.some(line => /the page did not accept/.test(line.result))).toBe(false)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a driver refusal keeps the existing failure path and message', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const file = join(dir, 'note.txt')
+      await writeFile(file, 'hello')
+      const { token } = await credentials(dir)
+      // A named reason other than `ambiguous` is a refusal, exactly as before.
+      driver.sendFailure = { reason: 'refused', error: 'the page rejected the composer' }
+      const refused = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(refused.status).toBe(500)
+      expect(refused.body.ok).toBe(false)
+      expect(String(refused.body.error)).toBe('the page rejected the composer')
+      // A bare `{ok:false}` with no reason keeps the generic message.
+      driver.sendFailure = {}
+      const bare = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(bare.status).toBe(500)
+      expect(bare.body.ok).toBe(false)
+      expect(String(bare.body.error)).toBe('the page did not accept the attachment')
+      expect(sendCount(driver)).toBe(2)
+      expect((await audits(dir)).some(line => /may have landed/.test(line.result))).toBe(false)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('reason not-posted keeps the existing failure path', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const file = join(dir, 'note.txt')
+      await writeFile(file, 'hello')
+      const { token } = await credentials(dir)
+      driver.sendFailure = { reason: 'not-posted', error: 'the send never left the composer' }
+      const result = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(result.status).toBe(500)
+      expect(result.body.ok).toBe(false)
+      expect(String(result.body.error)).toBe('the send never left the composer')
+      expect(sendCount(driver)).toBe(1)
+      expect((await audits(dir)).some(line => /may have landed/.test(line.result))).toBe(false)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 40_000)
 })
