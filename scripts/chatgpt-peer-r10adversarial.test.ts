@@ -560,8 +560,9 @@ describe('R10-F3: an unrelated user node in the acceptance window does not stran
     expect(state.appended).toHaveLength(2)
     expect(state.appended.filter(text => text === sentText)).toHaveLength(1)
     // The defect: a second send click and `not-posted`. Neither may happen.
-    expect(thrown).toBeNull()
+    // The click count is asserted first so a base run reports the extra click.
     expect(clicks).toBe(1)
+    expect(thrown).toBeNull()
     expect(result?.state).toBe('generating')
     expect(String(result?.url ?? '')).toContain(THREAD_A)
   }, 60_000)
