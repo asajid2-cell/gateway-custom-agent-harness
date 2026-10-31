@@ -1055,14 +1055,22 @@ async function treeSendEvidence(page, text, baseline, timeoutMs = TREE_PROBE_REA
  * reaches its TTL. That is the accepted availability trade: the driver will
  * sometimes leave a turn unposted rather than risk posting it twice.
  */
-async function submitTurn(page, { baseline, text, treeBaseline = null }) {
+async function submitTurn(page, { baseline, text, treeBaseline = null, phaseLabel = null, phaseStartedAt = null }) {
+  const readyAt = Date.now()
   const readiness = await waitForSendReady(page)
+  const readyMs = Date.now() - readyAt
   if (!readiness.ready) {
     throw new TurnError(`the page never became ready to send (${readiness.reason}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
   }
   // The only click this function is allowed to make.
   try { await readiness.send.click() } catch (error) { await log(`send click failed: ${error.message}`) }
   const clickedAt = Date.now()
+  // Measurement only, and after the click so the click path is unchanged: the
+  // send-ready wait, and the whole pre-click span ask() began timing.
+  if (phaseLabel) {
+    await log(`phase ${phaseLabel} ready ${readyMs}ms`)
+    if (phaseStartedAt) await log(`phase ${phaseLabel} preclick ${clickedAt - phaseStartedAt}ms`)
+  }
   await log(`sent ${text.length} chars`)
   // The DOM window and the scheduled tree probes run together, and the first
   // acceptance wins. Every operation after the click is a read.
@@ -1520,10 +1528,24 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   if (PUSHED.phase === 'streaming' && PUSHED.at && Date.now() - PUSHED.at < 10 * 60_000) {
     throw new TurnError('the page is mid-turn; your message was not typed', { reason: 'busy', state: 'generating', threadId: PUSHED.threadId })
   }
+  // Measurement only: where does the wall-clock before the Send click go? Each
+  // line wraps an operation that already runs - no extra page call, no extra
+  // wait - and `phase <name> preclick` is emitted by submitTurn once the click
+  // has happened. Nothing here reads the page on its own.
+  const phaseT0 = Date.now()
+  let phaseAt = phaseT0
+  const phaseName = newChat ? 'newchat' : 'send'
+  const phaseMark = async label => {
+    const now = Date.now()
+    await log(`phase ${phaseName} ${label} ${now - phaseAt}ms`)
+    phaseAt = now
+  }
   if (newChat || (threadId && threadOf(page.url()) !== threadId)) {
     const target = threadId ? `https://chatgpt.com/c/${threadId}` : CHAT_URL
     await page.goto(target, { waitUntil: 'domcontentloaded' })
+    await phaseMark('goto')
     await waitForLogin(page, 60_000)
+    await phaseMark('login')
     // A redirect or a deleted thread lands somewhere else, and posting into
     // whatever page happens to be open would put the message in another
     // conversation. The caller asked for a thread; require that thread.
@@ -1535,6 +1557,7 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     }
   }
   const composer = await waitForComposer(page)
+  await phaseMark('composer')
   if (!composer) {
     const state = await pageState(page)
     throw new Error(`No composer on screen (url=${state.url}, loggedIn=${state.loggedIn}, challenge=${state.challenge})`)
@@ -1557,9 +1580,12 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
       .map(item => `ATTACHMENT REJECTED: ${item.name} — ${item.reason}. The previous note does not describe a file that exists; do not refer to it.`)
       .join('\n')
   }
+  const baselineAt = Date.now()
+  phaseAt = baselineAt
   const beforeCount = await page.locator(ASSISTANT).count()
   // The acceptance proof is a NEW user node whose full text carries ours, so
   // the DOM's user turns (identity list) are snapshotted before the send.
+  const domAt = Date.now()
   const beforeDom = await readDomUserTurns(page)
   const beforeUsers = beforeDom ? beforeDom.identities.length : 0
   // The thread tree is the evidence that survives a stale DOM: the user-message
@@ -1573,17 +1599,24 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // `readUserTreeOnPage` keeps both meanings: `null` is an unreadable backend
   // (cannot prove anything), an empty Map is the new-chat route (nothing was
   // there yet).
+  const treeAt = Date.now()
   const beforeTree = await readUserTreeOnPage(page)
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
+  const textAt = Date.now()
+  await log(`phase ${phaseName} baseline_dom ${domAt - baselineAt}ms`)
+  await log(`phase ${phaseName} baseline_tree ${treeAt - domAt}ms`)
+  await log(`phase ${phaseName} baseline_text ${textAt - treeAt}ms`)
+  await phaseMark('baselines')
   // Type the text EXACTLY once and verify it before pressing send. A rejected
   // fill that had already written the prompt must never be "repaired" by
   // inserting a second copy at the caret.
   const composed = await composeExactlyOnce(page, composer, text)
+  await phaseMark('compose')
   if (!composed) {
     throw new TurnError('the composer did not hold exactly the intended text; nothing was sent, so no reply is coming', { reason: 'not-posted' })
   }
   const acceptanceBaseline = { users: beforeUsers, dom: beforeDom ? beforeDom.identities : null }
-  await submitTurn(page, { baseline: acceptanceBaseline, text, treeBaseline: beforeTree })
+  await submitTurn(page, { baseline: acceptanceBaseline, text, treeBaseline: beforeTree, phaseLabel: phaseName, phaseStartedAt: phaseT0 })
   if (onAccepted) onAccepted(threadOf(page.url()))
   // A rejection replaces this turn with its own correction, so it is decided
   // as soon as the send lands - waiting for the answer first would spend the
