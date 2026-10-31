@@ -1583,9 +1583,9 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   const baselineAt = Date.now()
   phaseAt = baselineAt
   const beforeCount = await page.locator(ASSISTANT).count()
+  const countAt = Date.now()
   // The acceptance proof is a NEW user node whose full text carries ours, so
   // the DOM's user turns (identity list) are snapshotted before the send.
-  const domAt = Date.now()
   const beforeDom = await readDomUserTurns(page)
   const beforeUsers = beforeDom ? beforeDom.identities.length : 0
   // The thread tree is the evidence that survives a stale DOM: the user-message
@@ -1599,13 +1599,20 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // `readUserTreeOnPage` keeps both meanings: `null` is an unreadable backend
   // (cannot prove anything), an empty Map is the new-chat route (nothing was
   // there yet).
-  const treeAt = Date.now()
+  const domAt = Date.now()
   const beforeTree = await readUserTreeOnPage(page)
-  const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
+  const treeAt = Date.now()
+  // There is no last assistant node on a fresh chat. An unbounded `innerText()`
+  // made Playwright wait its default 30 s for an element that will never exist,
+  // and `.catch('')` hid it - 30 of the ~38 s before the Send click on every
+  // newBridge. A present node answers in milliseconds, so 2 s cannot clip a
+  // real value; an absent node still yields '' exactly as before.
+  const beforeText = await page.locator(ASSISTANT).last().innerText({ timeout: 2_000 }).then(text => text.trim()).catch(() => '')
   const textAt = Date.now()
-  await log(`phase ${phaseName} baseline_dom ${domAt - baselineAt}ms`)
+  await log(`phase ${phaseName} baseline_count ${countAt - baselineAt}ms`)
+  await log(`phase ${phaseName} baseline_dom ${domAt - countAt}ms`)
   await log(`phase ${phaseName} baseline_tree ${treeAt - domAt}ms`)
-  await log(`phase ${phaseName} baseline_text ${textAt - treeAt}ms`)
+  await log(`phase ${phaseName} baseline_lasttext ${textAt - treeAt}ms`)
   await phaseMark('baselines')
   // Type the text EXACTLY once and verify it before pressing send. A rejected
   // fill that had already written the prompt must never be "repaired" by
