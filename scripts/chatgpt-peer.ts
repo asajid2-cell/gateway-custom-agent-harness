@@ -2208,8 +2208,15 @@ export class ChatGptHost {
    *
    * R10-F2: text alone is bounded by time. A candidate carrying the sent text
    * at an hour-old timestamp is a person quoting us, not our send, so DATED
-   * candidates must fall inside the posting window; UNDATED candidates keep the
-   * unbounded reach (they carry no time claim at all).
+   * candidates must fall inside the posting window.
+   *
+   * R11-F1: and an UNDATED candidate carries no time claim at all, so text
+   * alone is not identity either once the record has a RESOLVED anchor. A
+   * person's un-stamped old message quoting our body would otherwise be adopted
+   * after `ownUserNodeOf` refused exactly that node on position, and its old
+   * answer forwarded. Both branches now sit after the preserved anchor; only
+   * `preserved < 0` (no stored anchor - the R8-B live record) keeps the whole
+   * chain reach.
    *
    * R10-F1b: and, like the other two matchers, a DATED candidate at or before
    * the record's PRESERVED anchor is refused on position - a stamp is a claim,
@@ -2231,12 +2238,16 @@ export class ChatGptHost {
       && !exclude.has(turn.id)
       && promptMatches(text, turn.text)
       // R10-F2: old text is not this send. A DATED candidate must fall inside
-      // the posting window, exactly like `ownUserNodeOf`'s dated candidates;
-      // an UNDATED one keeps the full reach (the R8-B live record had no
-      // `create_time` at all, and its text identity is the only evidence).
+      // the posting window, exactly like `ownUserNodeOf`'s dated candidates.
+      // R11-F1: an UNDATED candidate carries no time claim, so text alone is
+      // still not identity once the record has a RESOLVED anchor - it must sit
+      // after it, exactly as `ownUserNodeOf` demands. No anchor (`preserved < 0`)
+      // keeps the full reach: the R8-B live record had `create_time: null`, no
+      // stored `anchorNodeId`, and a cursor already past the node, so falling
+      // back to the cursor here would refuse the real send.
+      && (preserved < 0 || index > preserved)
       && (typeof turn.createTime !== 'number'
-        || ((preserved < 0 || index > preserved)
-          && Number.isFinite(postedMs) && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)))
+        || (Number.isFinite(postedMs) && turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS)))
     return matches.at(-1)?.id ?? null
   }
 

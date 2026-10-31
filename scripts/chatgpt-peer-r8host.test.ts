@@ -1608,3 +1608,133 @@ describe('R10-F3: an ambiguous send is never treated as "not posted"', () => {
     }
   }, 40_000)
 })
+
+describe('R11-F1: textMatchAnywhere gates UNDATED candidates on the preserved anchor', () => {
+  test('an undated exact-text node BEFORE the anchor is refused; after it, and with no anchor, it is still reached', () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const check = (conversation: Conversation, anchor: string | null, postedMs = Date.now()): string | null =>
+      internals(host).textMatchAnywhere(conversation, prompt, none, none, postedMs, anchor)
+    const nowSec = Date.now() / 1000
+    // The reviewer repro, one matcher along: an UNDATED (create_time null)
+    // exact-text human node BEFORE the record's preserved anchor. The text is
+    // exact, but the anchor proves our send came later, so it is not eligible -
+    // the same positional refusal `ownUserNodeOf` just made.
+    const undatedBeforeAnchor = visibleConversation([
+      { id: 'quote', parent: null, role: 'user', text: prompt, createTime: null },
+      { id: 'anchor', parent: 'quote', role: 'assistant', text: 'the answer to the quote', createTime: nowSec - 4 },
+    ])
+    expect(check(undatedBeforeAnchor, 'anchor')).toBeNull() // red at c58d8ec
+    // The same undated node AFTER the anchor is the send.
+    const undatedAfterAnchor = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the pre-send anchor', createTime: nowSec - 6 },
+      { id: 'send', parent: 'anchor', role: 'user', text: prompt, createTime: null },
+    ])
+    expect(check(undatedAfterAnchor, 'anchor')).toBe('send')
+    // R8-B positive control: NO stored anchor and the cursor already past the
+    // node. `preserved < 0` must keep the whole-chain reach, or the live send
+    // (create_time null, no anchorNodeId) is lost.
+    const undatedNoAnchor = visibleConversation([
+      { id: 'cursor', parent: null, role: 'assistant', text: 'the live cursor', createTime: nowSec - 6 },
+      { id: 'send', parent: 'cursor', role: 'user', text: prompt, createTime: null },
+    ])
+    expect(check(undatedNoAnchor, null)).toBe('send')
+  })
+})
+
+describe('R11-F1: recovery never adopts an undated pre-anchor quote', () => {
+  test('a create_time:null exact-text human node before the preserved anchor is never answered', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = longBody()
+      const fiveAgo = Date.now() / 1000 - 5
+      // The reviewer repro with an UNSTAMPED quote: a person posts our exact
+      // body with no create_time, the page answers, and that answer is the
+      // record's preserved pre-send anchor. Our own send then never lands.
+      // `ownUserNodeOf` refuses the quote on position; without the same gate
+      // the second matcher re-adopts it and forwards the historical answer.
+      const quote = driver.appendNode(THREAD_A, 'user', prompt, { createTime: null })
+      const anchor = driver.appendNode(THREAD_A, 'assistant', 'the answer to the unstamped quote', { createTime: fiveAgo })
+      alpha.cursor = anchor
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      alpha.pendingTurns[alpha.pendingTurns.length - 1]!.anchorNodeId = anchor
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        // The observation pass is where recovery attributes a node; drive it.
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        // Nothing forwarded: not the historical answer, nothing at all.
+        expect(repliesTo(sender, messageId).length).toBe(0)
+        expect(repliesTo(sender, messageId).some(text => text.includes('the answer to the unstamped quote'))).toBe(false)
+        expect(sendCount(driver)).toBe(0)
+        const state = await readBridge(dir, alpha.sessionId)
+        const turn = state.pendingTurns.find(item => item.messageId === messageId)!
+        // The turn stays owed and unattributed; the quote is never claimed.
+        expect(turn).toBeDefined()
+        expect(turn.userNodeId).toBeNull()
+        expect(state.ourNodeIds).not.toContain(quote)
+        // No delivery, no failure/TTL line, and the quote was never read as a
+        // person typing or as page speech.
+        const lines = await audits(dir)
+        expect(lines.some(line => /no completed answer within/.test(line.result))).toBe(false)
+        expect(lines.some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('the same undated node with NO stored anchor is still recovered once and delivered once', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      // R8-B positive control, end to end: the send node has no create_time,
+      // the record stores no anchor, and the cursor sits past it - so only the
+      // whole-chain text reach can name it. `preserved < 0` must stay wide.
+      const prompt = longBody()
+      driver.appendNode(THREAD_A, 'user', 'an earlier question')
+      driver.appendNode(THREAD_A, 'assistant', 'an earlier answer')
+      const sendNode = driver.appendNode(THREAD_A, 'user', prompt, { createTime: null })
+      const answerNode = driver.appendNode(THREAD_A, 'assistant', 'the answer under the unstamped node')
+      alpha.cursor = answerNode
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        await host.pollOnce()
+        await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).length).toBe(1)
+        expect(repliesTo(sender, messageId)[0]).toContain('the answer under the unstamped node')
+        expect(sendCount(driver)).toBe(0)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.pendingTurns.some(item => item.messageId === messageId)).toBe(false)
+        expect(state.ourNodeIds).toContain(sendNode)
+        const lines = await audits(dir)
+        expect(lines.some(line => /no completed answer within/.test(line.result))).toBe(false)
+        expect(lines.some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+})
