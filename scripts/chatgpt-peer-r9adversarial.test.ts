@@ -113,9 +113,14 @@ describe('R9-F1: acceptance is the send\'s own node, never any new user node', (
       users: [...F1_BASELINE, { id: 'u11', text: 'unrelated message' }],
       composer: '',
     })
-    const accepted = await waitForAcceptance(page, F1_BEFORE, F1_PROMPT, 700)
-    // The count delta alone is not identity: our send never landed.
-    expect(accepted).toBe(false)
+    const outcome = await waitForAcceptance(page, F1_BEFORE, F1_PROMPT, 700)
+    // The count delta alone is not identity: our send never landed. The verdict
+    // is a record now, so the row also names the evidence it is refusing: one
+    // new node, and it does not carry our prompt.
+    expect(outcome.accepted).toBe(false)
+    expect(outcome.readable).toBe(true)
+    expect(outcome.newNodes).toEqual(['unrelated message'])
+    expect(outcome.newNodes.some((text: string) => text.includes(F1_PROMPT))).toBe(false)
   }, 10_000)
 
   test('a genuine NEW node carrying our prompt is still accepted', async () => {
@@ -125,8 +130,29 @@ describe('R9-F1: acceptance is the send\'s own node, never any new user node', (
       users: [...F1_BASELINE, { id: 'u11', text: F1_PROMPT }],
       composer: '',
     })
-    const accepted = await waitForAcceptance(page, F1_BEFORE, F1_PROMPT, 2_000)
-    expect(accepted).toBe(true)
+    const outcome = await waitForAcceptance(page, F1_BEFORE, F1_PROMPT, 2_000)
+    expect(outcome.accepted).toBe(true)
+    expect(outcome.readable).toBe(true)
+    // The acceptance carries its own evidence: exactly the one new node, and it
+    // is our text - not a count delta and not a loosened boolean.
+    expect(outcome.newNodes).toEqual([F1_PROMPT])
+  }, 10_000)
+
+  test('an UNREADABLE baseline is refused, not treated as an empty one', async () => {
+    process.env.CHATGPT_PROFILE = process.env.CHATGPT_PROFILE || join(tmpdir(), 'r9-driver-profile')
+    const { waitForAcceptance } = await import(DRIVER_MODULE)
+    // The page would otherwise look like a clean accept: a new node carrying our
+    // prompt. But a baseline with no identity list cannot prove any node is NEW,
+    // so the verdict must say it could not read - the third state a bare boolean
+    // could not express, and the one `provablyNotPosted` refuses to retry on.
+    const page = pageStub({
+      users: [...F1_BASELINE, { id: 'u11', text: F1_PROMPT }],
+      composer: '',
+    })
+    const outcome = await waitForAcceptance(page, { ...F1_BEFORE, dom: null }, F1_PROMPT, 700)
+    expect(outcome.readable).toBe(false)
+    expect(outcome.accepted).toBe(false)
+    expect(outcome.newNodes).toBeNull()
   }, 10_000)
 })
 
