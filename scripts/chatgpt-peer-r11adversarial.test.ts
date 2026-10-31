@@ -19,15 +19,15 @@
  *       window with ZERO new user nodes is treated as proof the click did not
  *       submit, so `submitTurn` clicks Send again. But the DOM selector can stop
  *       exposing new nodes while the first click HAS landed in the conversation
- *       tree; the retry then posts a second copy. The tree is never consulted
- *       before the retry. After the fix the first click stands and the turn
- *       fails `ambiguous` (it may have landed) - never a second click, never
- *       `not-posted`.
+ *       tree; the retry then posts a second copy. Here the page's tree DOES hold
+ *       the sent text after the single click - a POSITIVE tree sighting - so
+ *       under the round-12 contract the send is ACCEPTED (one click, one copy),
+ *       never a second click and never `ambiguous`.
  *
  *       THIS ROW IS RED AGAINST THE VENDORED FIXTURE AT THIS BASE and goes green
  *       once the driver fix is vendored. It drives the exported `ask` so the
- *       effect (click count, thrown reason) is asserted on the fake page, not a
- *       log string.
+ *       effect (click count, tree copies, acceptance) is asserted on the fake
+ *       page, not a log string.
  *
  * Self-contained: neighbouring lanes' test files register suites at import
  * time, so their harnesses cannot be imported without running them.
@@ -362,7 +362,7 @@ function domUserNode(id: string, text: string): FakeNode {
 }
 
 describe('R11-F2: a zero-new-node DOM window is not proof the send did not land', () => {
-  test('the driver clicks send once and reports ambiguous, not not-posted', async () => {
+  test('one click, one copy, and the positive tree sighting accepts the send', async () => {
     const { dir, cleanup } = await scratch()
     const sentText = r11Body()
     // The DOM selector exposes the baseline turns and never the new one.
@@ -483,12 +483,11 @@ describe('R11-F2: a zero-new-node DOM window is not proof the send did not land'
     // The send really did land once in the tree, and the DOM exposed none of it.
     expect(treeUserTexts.filter(text => text === sentText)).toHaveLength(1)
     expect(domUsers).toHaveLength(2)
-    // The agreed contract: one click, and `ambiguous` (may have landed), never
-    // `not-posted`.
-    expect(thrown).not.toBeNull()
-    expect(thrown?.reason).toBe('ambiguous')
-    expect(String(thrown?.message ?? '')).not.toContain('not-posted')
-    expect(String(thrown?.message ?? '')).not.toContain('never left the composer')
-    expect(result).toBeNull()
+    // The round-12 contract: a NEW tree user turn carrying the sent text is the
+    // positive sighting, so the send is accepted - one click, one copy, no throw
+    // and no ambiguous "possible duplicate" report.
+    expect(thrown).toBeNull()
+    expect(result).not.toBeNull()
+    expect((result as { state?: string }).state).toBe('generating')
   }, 60_000)
 })
