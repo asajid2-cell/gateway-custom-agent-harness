@@ -940,15 +940,38 @@ function acceptanceEvidence(outcome) {
 }
 
 /**
+ * Does the thread tree prove the click did not submit?
+ *
+ * The DOM alone cannot answer that: a rerender can stop exposing new user nodes
+ * while the send landed, and the DOM then looks exactly like a swallowed click.
+ * So the tree is asked before ANY retry click. No thread id, an unreadable
+ * baseline, an unreadable body, or a new node that already carries our text all
+ * mean "cannot prove" - and only a proof licenses the second click.
+ */
+async function treeProvesNotPosted(page, text, baseline) {
+  if (!(baseline instanceof Map)) return false
+  const threadId = threadOf(page.url())
+  if (!threadId) return false
+  const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
+  if (!read?.ok) return false
+  const fresh = newUserNodes(baseline, userTreeNodes(read.body))
+  if (fresh === null) return false
+  if (fresh.some(said => promptMatches(text, said))) return false
+  return true
+}
+
+/**
  * Click Send once, then decide from evidence what that click did.
  *
  * A second click is issued ONLY on proof that the first did not submit: a
- * readable baseline and zero new user nodes in the window. Anything else that
- * is not acceptance - one new node carrying other text, two new nodes, or a
- * baseline that could not be read - is AMBIGUOUS: the message may already be in
- * the thread, so clicking again could put a second copy there. The turn then
- * fails as `ambiguous`, which tells the host to observe the thread instead of
- * re-sending; it is deliberately not one of the reasons the host re-queues.
+ * readable DOM baseline, zero new user nodes in the window, AND a thread tree
+ * that is readable, has grown, and does not carry our text. Anything else that
+ * is not acceptance - one new node carrying other text, two new nodes, a
+ * baseline that could not be read, or a tree that already holds the message or
+ * cannot be read - is AMBIGUOUS: the message may already be in the thread, so
+ * clicking again could put a second copy there. The turn then fails as
+ * `ambiguous`, which tells the host to observe the thread instead of re-sending;
+ * it is deliberately not one of the reasons the host re-queues.
  */
 async function submitTurn(page, { baseline, text, treeBaseline = null }) {
   const readiness = await waitForSendReady(page)
@@ -962,10 +985,17 @@ async function submitTurn(page, { baseline, text, treeBaseline = null }) {
   if (!provablyNotPosted(outcome)) {
     throw new TurnError(`the send may have landed: ${acceptanceEvidence(outcome)}, so nothing was clicked again - watch the thread for it rather than re-sending`, { reason: 'ambiguous' })
   }
+  // Zero new DOM nodes is not proof by itself: the selector may simply have
+  // stopped exposing new nodes after a rerender, with the send landed. Ask the
+  // thread tree before the second click; if it holds our text - or cannot be
+  // read - the click could only duplicate a message that is already there.
+  if (!(await treeProvesNotPosted(page, text, treeBaseline))) {
+    throw new TurnError(`the send may have landed: ${acceptanceEvidence(outcome)}, and the thread tree either already holds this text or could not be read before the retry; nothing was clicked again - watch the thread for it rather than re-sending`, { reason: 'ambiguous' })
+  }
   // A click that lands on a composer still settling can be swallowed. Try the
   // same readiness rule once more, then fail the turn rather than sit out the
   // reply timeout on a message that never left the box.
-  await log('send was not accepted (no new user turn); retrying once')
+  await log('send was not accepted (no new user turn) and the thread tree does not hold it; retrying once')
   const retry = await waitForSendReady(page, 60_000)
   if (retry.ready) await retry.send.click().catch(() => {})
   outcome = await waitForAcceptance(page, baseline, text, ACCEPTANCE_TIMEOUT_MS)
@@ -1490,19 +1520,18 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // the DOM's user turns (identity list) are snapshotted before the send.
   const beforeDom = await readDomUserTurns(page)
   const beforeUsers = beforeDom ? beforeDom.identities.length : 0
-  // Where the DOM shows no user node at all, the acceptance proof falls back to
-  // the thread tree - and "our text is in the tree" is not a proof of THIS send
-  // when an older turn has the same words. Snapshot the user nodes (identity
-  // and full text) before the send, so only a node that is genuinely NEW can
-  // count. Normal pages pay nothing: the degraded path only runs when the DOM
-  // exposed none of them.
+  // The thread tree is the evidence that survives a stale DOM: the user-message
+  // selector can stop exposing new nodes after a rerender while the send itself
+  // landed. Snapshot its user nodes (identity and full text) before EVERY send,
+  // so both the degraded acceptance check and the pre-retry gate can ask "is
+  // there a node in the tree that was not there before, and does it carry our
+  // text?". "Our text is in the tree" is never proof of THIS send when an older
+  // turn has the same words, which is why the snapshot is taken before typing.
   //
-  // `null`, not an empty set, when the DOM DID show user nodes: the check is
-  // reached on any failed acceptance, so a page that renames or soft-navigates
-  // its selector mid-turn would otherwise present a no-history baseline for a
-  // conversation that has history, and any older node with our words would
-  // accept a swallowed send.
-  const beforeTree = beforeUsers === 0 ? await readUserTreeOnPage(page) : null
+  // `readUserTreeOnPage` keeps both meanings: `null` is an unreadable backend
+  // (cannot prove anything), an empty Map is the new-chat route (nothing was
+  // there yet).
+  const beforeTree = await readUserTreeOnPage(page)
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
   // Type the text EXACTLY once and verify it before pressing send. A rejected
   // fill that had already written the prompt must never be "repaired" by
@@ -2721,7 +2750,7 @@ export {
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
   normalizedTurnText, promptMatches, sendAcceptVerdict, userTreeNodes, newUserNodes, newDomUserTexts,
-  degradedSendVerdict, provablyNotPosted, acceptanceEvidence, submitTurn, launchVerdict, ownerCarriesProfile,
+  degradedSendVerdict, provablyNotPosted, treeProvesNotPosted, acceptanceEvidence, submitTurn, launchVerdict, ownerCarriesProfile,
   composeExactlyOnce, clearComposer, composerTextOf,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
