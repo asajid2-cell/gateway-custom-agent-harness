@@ -906,26 +906,86 @@ function newDomUserTexts(baseline, after) {
  * baseline that could not be read). Editing the second click on the second
  * question is what used to duplicate a send that had already landed.
  *
- * `{ accepted, readable, newNodes }` - `newNodes` is the last observable array,
- * or null when the baseline or the final read was unreadable.
+ * The thread tree is asked CONCURRENTLY with the DOM window instead of only
+ * after it. On a real page the DOM can stop exposing the new user turn while
+ * the tree answers within a second or two; deferring that read to the end of
+ * the window made every send cost a fixed ~30 s before acceptance. The probe
+ * schedule below is offset from the click and scaled DOWN for a shortened
+ * window (the test harness), never stretched, so the first probe is always
+ * early. Six probes inside the window plus the one evidence read at the
+ * ceiling in `submitTurn` bound a send to seven tree reads, never more.
+ *
+ * A probe uses exactly the same POSITIVE predicate as the final read
+ * (`treeSendEvidence` -> `degradedSendVerdict`): exactly one user node absent
+ * from the pre-send identity baseline and carrying the sent text. A negative,
+ * stale or unreadable probe is "no evidence yet" and is simply waited past; it
+ * never accepts, concludes, or licenses anything.
+ *
+ * `{ accepted, readable, newNodes, path, elapsedMs, domPolls, treeProbes }` -
+ * `newNodes` is the last observable DOM array, or null when the baseline or the
+ * last DOM read was unreadable; `path` is `'dom'`, `'tree'` or null.
  */
-async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30_000) {
-  const deadline = Date.now() + timeoutMs
+async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30_000, options = {}) {
+  const startedAt = Date.now()
+  const deadline = startedAt + timeoutMs
   const baseline = Array.isArray(before?.dom) ? before.dom : null
   const priorUsers = Math.max(baseline ? baseline.length : 0, Number(before?.users) || 0)
-  if (!baseline) return { accepted: false, readable: false, newNodes: null }
-  let last = null
-  while (Date.now() < deadline) {
-    const observed = newDomUserTexts(baseline, await readDomUserTurns(page, priorUsers))
-    // A read that failed is not evidence of a zero delta, so it clears `last`.
-    last = Array.isArray(observed) ? observed : null
-    if (sendAcceptVerdict({ newNodes: observed, sentText: composedText })) {
-      return { accepted: true, readable: true, newNodes: observed }
-    }
-    await new Promise(resolve => setTimeout(resolve, 250))
+  if (!baseline) {
+    return { accepted: false, readable: false, newNodes: null, path: null, elapsedMs: 0, domPolls: 0, treeProbes: 0 }
   }
-  return { accepted: false, readable: true, newNodes: last }
+  const treeBaseline = options.treeBaseline instanceof Map ? options.treeBaseline : null
+  // Offsets from the click, in the shape of the production window; a shortened
+  // window gets proportionally earlier probes, never later ones.
+  const scale = Math.min(1, timeoutMs / TREE_PROBE_WINDOW_MS)
+  const probeOffsets = treeBaseline ? TREE_PROBE_OFFSETS_MS.map(offset => Math.round(offset * scale)) : []
+  let nextProbe = 0
+  let domPolls = 0
+  let treeProbes = 0
+  let last = null
+  let nextDomAt = startedAt
+  while (Date.now() < deadline) {
+    const now = Date.now()
+    if (now >= nextDomAt) {
+      const observed = newDomUserTexts(baseline, await readDomUserTurns(page, priorUsers))
+      domPolls += 1
+      // A read that failed is not evidence of a zero delta, so it clears `last`.
+      last = Array.isArray(observed) ? observed : null
+      if (sendAcceptVerdict({ newNodes: observed, sentText: composedText })) {
+        return { accepted: true, readable: true, newNodes: observed, path: 'dom', elapsedMs: Date.now() - startedAt, domPolls, treeProbes }
+      }
+      nextDomAt = Date.now() + 250
+    }
+    if (nextProbe < probeOffsets.length && Date.now() >= startedAt + probeOffsets[nextProbe]) {
+      const remaining = deadline - Date.now()
+      treeProbes += 1
+      if (remaining > 0) {
+        const tree = await treeSendEvidence(page, composedText, treeBaseline, Math.min(TREE_PROBE_READ_TIMEOUT_MS, remaining))
+        if (tree.accepted) {
+          return { accepted: true, readable: true, newNodes: null, path: 'tree', elapsedMs: Date.now() - startedAt, domPolls, treeProbes }
+        }
+      }
+      nextProbe += 1
+      // A probe that outlived its slot skips the slots it missed, so a failed
+      // or slow read backs off instead of hammering.
+      while (nextProbe < probeOffsets.length && startedAt + probeOffsets[nextProbe] <= Date.now()) nextProbe += 1
+      continue
+    }
+    const waits = [nextDomAt]
+    if (nextProbe < probeOffsets.length) waits.push(startedAt + probeOffsets[nextProbe])
+    const wait = Math.min(...waits) - Date.now()
+    await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.min(wait, 250))))
+  }
+  return { accepted: false, readable: true, newNodes: last, path: null, elapsedMs: Date.now() - startedAt, domPolls, treeProbes }
 }
+
+/**
+ * Where the concurrent tree probes fall in a production acceptance window, as
+ * offsets from the click. Six inside the window; the seventh and last read is
+ * the ceiling evidence read in `submitTurn`.
+ */
+const TREE_PROBE_OFFSETS_MS = [1500, 3000, 5000, 8000, 12_000, 18_000]
+const TREE_PROBE_WINDOW_MS = 30_000
+const TREE_PROBE_READ_TIMEOUT_MS = 15_000
 
 /** What a failed window saw, in words: the evidence named in the error and the log. */
 function acceptanceEvidence(outcome) {
@@ -937,8 +997,8 @@ function acceptanceEvidence(outcome) {
 }
 
 /**
- * The ONE thread-tree read after a failed DOM window, used two ways: as
- * acceptance evidence, and as the sentence a refusal names.
+ * One thread-tree read, used three ways: a concurrent in-window probe, the
+ * ceiling acceptance evidence, and the sentence a refusal names.
  *
  * The DOM cannot answer "did it land" - a rerender can stop exposing new user
  * nodes while the send succeeded. The tree can, but only POSITIVELY. "The tree
@@ -952,12 +1012,15 @@ function acceptanceEvidence(outcome) {
  * DOM count is deliberately not consulted - a stale selector may show older
  * user nodes and still miss the new one - so the shared predicate is asked with
  * `userNodes: 0`, which is the statement that only the tree speaks here.
+ *
+ * `timeoutMs` bounds the backend read only: an in-window probe passes the time
+ * left so it can never outlive the acceptance ceiling.
  */
-async function treeSendEvidence(page, text, baseline) {
+async function treeSendEvidence(page, text, baseline, timeoutMs = TREE_PROBE_READ_TIMEOUT_MS) {
   if (!(baseline instanceof Map)) return { accepted: false, why: 'could not be read before the send' }
   const threadId = threadOf(page.url())
   if (!threadId) return { accepted: false, why: 'has no thread to read' }
-  const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, 15_000).catch(() => null)
+  const read = await backendGetOn(page, `/backend-api/conversation/${threadId}`, timeoutMs).catch(() => null)
   if (!read?.ok) return { accepted: false, why: 'could not be read' }
   const fresh = newUserNodes(baseline, userTreeNodes(read.body))
   if (fresh === null) return { accepted: false, why: 'could not be read' }
@@ -980,9 +1043,10 @@ async function treeSendEvidence(page, text, baseline) {
  * Decision table:
  *   1. send control never ready         -> not-posted (nothing was typed or sent)
  *   2. click Send exactly once
- *   3. acceptance window accepted       -> return
- *   4. ONE tree read shows exactly one NEW user turn carrying our text
- *                                       -> accepted (log it, return)
+ *   3. the DOM window or a concurrent tree probe accepts
+ *                                       -> return, logging path + elapsed
+ *   4. the ceiling evidence read shows exactly one NEW user turn carrying our
+ *      text                             -> accepted (log it, return)
  *   5. anything else                    -> ambiguous, naming what was seen;
  *                                          the host observes the thread
  *
@@ -998,15 +1062,26 @@ async function submitTurn(page, { baseline, text, treeBaseline = null }) {
   }
   // The only click this function is allowed to make.
   try { await readiness.send.click() } catch (error) { await log(`send click failed: ${error.message}`) }
+  const clickedAt = Date.now()
   await log(`sent ${text.length} chars`)
-  const outcome = await waitForAcceptance(page, baseline, text, ACCEPTANCE_TIMEOUT_MS)
-  if (outcome.accepted) return
-  // One tree read, used two ways: positive acceptance, or the evidence named
-  // in the refusal. A tree that merely shows nothing is a negative observation
-  // (a stale backend can serve a pre-click snapshot) and licenses nothing.
+  // The DOM window and the scheduled tree probes run together, and the first
+  // acceptance wins. Every operation after the click is a read.
+  const outcome = await waitForAcceptance(page, baseline, text, ACCEPTANCE_TIMEOUT_MS, { treeBaseline })
+  if (outcome.accepted) {
+    const elapsed = Date.now() - clickedAt
+    await log(outcome.path === 'dom'
+      ? `acceptance in ${elapsed}ms: DOM, exactly one new user turn carrying the sent text`
+      : `acceptance in ${elapsed}ms: thread tree, exactly one new turn carrying the sent text`)
+    return
+  }
+  // Nothing inside the window accepted. One evidence read at the ceiling, used
+  // two ways: positive acceptance, or the evidence named in the refusal. A tree
+  // that merely shows nothing is a negative observation (a stale backend can
+  // serve a pre-click snapshot) and licenses nothing. This is the seventh and
+  // last tree read of this send, never a reason to click again.
   const tree = await treeSendEvidence(page, text, treeBaseline)
   if (tree.accepted) {
-    await log('acceptance: the DOM exposed no new user turn; the thread tree shows exactly one new turn carrying the sent text')
+    await log(`acceptance in ${Date.now() - clickedAt}ms: the DOM exposed no new user turn; the thread tree shows exactly one new turn carrying the sent text`)
     return
   }
   throw new TurnError(`the send may have landed: ${acceptanceEvidence(outcome)}, and the thread tree ${tree.why}; nothing was clicked again - watch the thread for it rather than re-sending`, { reason: 'ambiguous' })
