@@ -3245,7 +3245,14 @@ export class ChatGptHost {
       for (;;) {
         const transport = bridge.transport
         if (!transport) break
-        const record = transport.inbox().find(item => item.state === 'queued' && !bridge.handled.has(item.message.id))
+        const record = transport.inbox().find(item => item.state === 'queued'
+          && !bridge.handled.has(item.message.id)
+          // R8-H1a/drain: a queued inbound whose job was already POSTED is not
+          // new work. The ack is fire-and-forget, so a kill in the accept window
+          // leaves exactly this state, and starting a turn from it would type
+          // the prompt a second time and race the evidence path on the same
+          // message. Evidence settles it; this only selects what to START.
+          && !this.postedJobOf(bridge, item.message.id))
         if (!record) break
         await this.handleRecord(bridge, record)
       }
@@ -3258,10 +3265,25 @@ export class ChatGptHost {
       // true and returned at the top. Re-check once so that wakeup is not
       // lost - otherwise the record waits for the next message or a restart.
       const transport = bridge.transport
-      if (!bridge.stopping && !bridge.removed && transport && transport.inbox().some(item => item.state === 'queued' && !bridge.handled.has(item.message.id))) {
+      if (!bridge.stopping && !bridge.removed && transport && transport.inbox().some(item => item.state === 'queued'
+        && !bridge.handled.has(item.message.id)
+        && !this.postedJobOf(bridge, item.message.id))) {
         setTimeout(() => { void this.drain(bridge) }, 0).unref?.()
       }
     }
+  }
+
+  /**
+   * Whether this message id already has a job the page was ASKED to do.
+   *
+   * `postedAt !== null` is the durable fact that the prompt left the composer.
+   * Such a message is finished by `settlePostedTurn`/`resumePendingTurns` from
+   * page evidence; a drain must never turn it into a second page turn. A
+   * DEFERRED job (`postedAt === null`) is not covered: nothing was typed, so
+   * resuming it through the normal post path is correct.
+   */
+  private postedJobOf(bridge: Bridge, messageId: string): boolean {
+    return bridge.state.pendingTurns.some(item => item.messageId === messageId && item.postedAt !== null)
   }
 
   /**

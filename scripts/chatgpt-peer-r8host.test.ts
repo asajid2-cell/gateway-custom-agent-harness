@@ -24,7 +24,7 @@
  * import time, so their harnesses cannot be imported without running them.
  */
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -358,12 +358,14 @@ async function crashLiveTurn(options: {
 }): Promise<{ messageId: string; userNode: string }> {
   const { dir, alpha, sender, body, driver } = options
   const host = await startHost(dir, driver)
+  let messageId = ''
   try {
     // The page keeps generating: the answer comes later, so the node this send
     // became is the only thing on the page for now.
     driver.noAnswer = true
     driver.wedgeAfterSend = true
     const receipt = await sender.send(alpha.sessionId, body, 'r8 host turn', undefined, 'inquiry', true) as { id: string }
+    messageId = receipt.id
     // The driver is wedged after the send: the page took the text, the record
     // keeps `postedAt` and no node id, and no failure line is sent.
     await waitFor(() => (driver.faultError ? true : undefined), 15_000)
@@ -376,7 +378,31 @@ async function crashLiveTurn(options: {
     return { messageId: receipt.id, userNode: driver.lastUserNode! }
   } finally {
     await host.stop()
+    // DETERMINISM: the acknowledgement is fire-and-forget, so whether the crash
+    // beat it is a race, not a property of the fix. Model the worst case the
+    // crash window can leave - the record still QUEUED with a posted job - so
+    // the restart always starts from the state a kill in the accept window
+    // leaves behind. (The ack's actual state is asserted below.)
+    if (messageId) await forceInboxQueued(dir, alpha.sessionId, messageId)
   }
+}
+
+/** The inbox file one session owns, read and written the way the transport does. */
+async function forceInboxQueued(dir: string, sessionId: string, messageId: string): Promise<void> {
+  const path = join(sessionsDir(dir), `${sessionId}.inbox`)
+  const inbox = JSON.parse(await readFile(path, 'utf8')) as {
+    records: { message: { id: string }; state: string }[]
+    history?: { direction: string; message: { id: string }; status?: string }[]
+  }
+  const record = inbox.records.find(item => item.message.id === messageId)
+  // The record always exists: it was delivered into this inbox. If the ack did
+  // land it says 'delivered'; the crash window says 'queued'. Force the window.
+  if (!record) throw new Error(`no inbox record for ${messageId}`)
+  record.state = 'queued'
+  for (const entry of inbox.history ?? []) {
+    if (entry.direction === 'received' && entry.message.id === messageId) entry.status = 'queued'
+  }
+  await writeFile(path, JSON.stringify(inbox))
 }
 
 describe('R8-H1a: the sent body is the identity, not its 4,096-char slot', () => {
@@ -395,6 +421,15 @@ describe('R8-H1a: the sent body is the identity, not its 4,096-char slot', () =>
       // The live shape: the body is longer than the matcher slot.
       expect(turn.text.length).toBeGreaterThan(4096)
       expect(turn.ourText.length).toBe(4096)
+      // The restart state is EXPLICIT, not a race: the inbound is queued (the
+      // kill-before-ack window, forced by `crashLiveTurn`) and the job is
+      // posted with no anchor. A drain must not start a second turn from it.
+      const inbox = JSON.parse(await readFile(join(sessionsDir(dir), `${alpha.sessionId}.inbox`), 'utf8')) as {
+        records: { message: { id: string }; state: string }[]
+      }
+      expect(inbox.records.find(item => item.message.id === messageId)!.state).toBe('queued')
+      expect(turn.postedAt).not.toBeNull()
+      expect(turn.anchorNodeId ?? null).toBeNull()
       // The live state at 22:53:49Z: the attribution entry had expired, so
       // adoption cannot rescue this turn - ownUserNodeOf is the only path.
       crashed.pendingAttribution = []
@@ -773,6 +808,11 @@ describe('R8-A: the post-time anchor outlives the cursor', () => {
       } finally {
         await host.stop()
       }
+      // The crash window: the wedged send never returned true, so no ack left,
+      // and the inbound is still `queued` while its job is posted - exactly the
+      // state a kill between accept and ack leaves. Forced so a drain that starts
+      // a second page turn for this record cannot hide behind a lucky ack.
+      await forceInboxQueued(dir, alpha.sessionId, messageId)
       // The page finishes; the send node loses its clock; the live cursor moves
       // PAST it (the live state). Only the record's own anchor can name it.
       driver.faultError = null
@@ -781,22 +821,26 @@ describe('R8-A: the post-time anchor outlives the cursor', () => {
       const moved = await readBridge(dir, alpha.sessionId)
       moved.cursor = answerNode
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), moved)
+      // The durable record as the crash left it, read from disk rather than from
+      // the restarted host: the recovery is allowed to settle or retire it, and
+      // neither may change the inputs of the probe below.
+      const record = moved.pendingTurns.find(item => item.messageId === messageId)!
+      expect(record.postedAt).not.toBeNull()
+      expect(record.anchorNodeId).toBe(earlier)
       // The live send above is already on `driver.calls`; only a NEW one matters.
       const sendsBefore = sendCount(driver)
       const host2 = await startHost(dir, driver)
       try {
-        const live = internals(host2).bridges.get(alpha.sessionId)!
         const read = await internals(host2).readConversation(THREAD_A) as { conversation: unknown }
-        const job = live.state.pendingTurns.find(item => item.messageId === messageId)!
         // The positional branch, asked both ways with ownership held out of the
         // argument: the record's own anchor names the node, the live cursor
         // (which moved past it) cannot.
         const noOne = new Set<string>()
         expect(internals(host2).ownUserNodeOf(
-          read.conversation, job.text, Date.parse(job.postedAt!), noOne, true, new Set(), true, job.anchorNodeId,
+          read.conversation, record.text, Date.parse(record.postedAt!), noOne, true, new Set(), true, record.anchorNodeId,
         )).toBe(sendNode)
         expect(internals(host2).ownUserNodeOf(
-          read.conversation, job.text, Date.parse(job.postedAt!), noOne, true, new Set(), true, live.state.cursor,
+          read.conversation, record.text, Date.parse(record.postedAt!), noOne, true, new Set(), true, moved.cursor,
         )).toBeNull()
         await host2.pollOnce()
         await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
