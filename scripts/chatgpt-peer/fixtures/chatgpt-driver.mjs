@@ -637,6 +637,58 @@ async function waitForComposer(page, timeoutMs = 30_000) {
   return null
 }
 
+/** The composer's own text, whitespace-normalized, or null when it cannot be read. */
+async function composerTextOf(composer) {
+  const raw = await composer.evaluate(el => (el.innerText ?? el.textContent ?? '')).catch(() => null)
+  return raw === null ? null : normalizedTurnText(raw)
+}
+
+/**
+ * Clear the composer and PROVE it is empty; false when it will not clear.
+ *
+ * The composer is a contenteditable, so there is no `.value = ''`: selection and
+ * a delete key are the only ways to empty it, and the result has to be read back
+ * rather than assumed - a swallowed click leaves the caret somewhere the delete
+ * never reached.
+ */
+async function clearComposer(page, composer) {
+  await composer.click().catch(() => {})
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if ((await composerTextOf(composer)) === '') return true
+    await page.keyboard.press('Control+A').catch(() => {})
+    await page.keyboard.press('Delete').catch(() => {})
+    await page.keyboard.press('Backspace').catch(() => {})
+  }
+  return (await composerTextOf(composer)) === ''
+}
+
+/**
+ * Put `text` into the composer EXACTLY once, and prove it before any send.
+ *
+ * `locator.fill` selects all and inserts, but it can REJECT after the text has
+ * landed - or after a partial insert. The old code answered every rejected fill
+ * with `keyboard.insertText(text)` at the CURRENT caret, so a full first copy
+ * plus the fallback appended a second one. Live 2026-10-30: a 9,642-char prompt
+ * went out doubled, one user node, second copy spliced at char 9,495. Here the
+ * fallback runs ONLY on a composer proven empty, and the content must equal the
+ * intended text (normalized) or the caller refuses the turn instead of sending
+ * a doubled message.
+ */
+async function composeExactlyOnce(page, composer, text) {
+  const want = normalizedTurnText(text)
+  if (!want) return false
+  await composer.click().catch(() => {})
+  if (!(await clearComposer(page, composer))) return false
+  const filled = await composer.fill(text).then(() => true).catch(() => false)
+  if (filled && (await composerTextOf(composer)) === want) return true
+  // fill was rejected, or it left something other than our text: never insert on
+  // top of unknown content - clear first and, only then, type the text once.
+  if (!(await clearComposer(page, composer))) return false
+  if ((await composerTextOf(composer)) !== '') return false
+  await page.keyboard.insertText(text).catch(() => {})
+  return (await composerTextOf(composer)) === want
+}
+
 const ASSISTANT = '[data-markdown-text-style="assistant-message"]'
 /** The person's own messages: the node a successful send adds. */
 const USER_MESSAGE = '[data-message-author-role="user"]'
@@ -1302,9 +1354,13 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // accept a swallowed send.
   const beforeTree = beforeUsers === 0 ? await readUserTreeOnPage(page) : null
   const beforeText = await page.locator(ASSISTANT).last().innerText().then(text => text.trim()).catch(() => '')
-  await composer.click()
-  const typed = await composer.fill(text).then(() => true).catch(() => false)
-  if (!typed) await page.keyboard.insertText(text)
+  // Type the text EXACTLY once and verify it before pressing send. A rejected
+  // fill that had already written the prompt must never be "repaired" by
+  // inserting a second copy at the caret.
+  const composed = await composeExactlyOnce(page, composer, text)
+  if (!composed) {
+    throw new TurnError('the composer did not hold exactly the intended text; nothing was sent, so no reply is coming', { reason: 'not-posted' })
+  }
   const readiness = await waitForSendReady(page)
   if (!readiness.ready) {
     throw new TurnError(`the page never became ready to send (${readiness.reason}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
@@ -2544,6 +2600,7 @@ export {
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
   normalizedTurnText, userTreeNodes, newUserNodes, degradedSendVerdict, launchVerdict, ownerCarriesProfile,
+  composeExactlyOnce, clearComposer, composerTextOf,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
 }
