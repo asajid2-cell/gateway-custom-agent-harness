@@ -338,7 +338,7 @@ describe('R9-F2: a historical node is never adopted as this send\'s own', () => 
       // nor a prefix of what was posted (the quote leads), so only containment
       // can name it - and containment must not.
       const historical = Math.floor(Date.now() / 1000) - 3 * 86_400
-      driver.appendNode(THREAD_A, 'user', `Here is the full prompt I received: ${body}`, { createTime: historical })
+      const historicalNode = driver.appendNode(THREAD_A, 'user', `Here is the full prompt I received: ${body}`, { createTime: historical })
       driver.appendNode(THREAD_A, 'assistant', 'the historical answer about the old prompt')
       const messageId = randomUUID()
       // The post happens now, long after that node was written.
@@ -357,10 +357,13 @@ describe('R9-F2: a historical node is never adopted as this send\'s own', () => 
         const kept = state.pendingTurns.find(item => item.messageId === messageId)
         expect(kept).toBeDefined()
         expect(kept!.userNodeId).toBeNull()
-        // Exactly one audit line explains the turn; it is not a delivery line.
-        const lines = await linesFor(dir, messageId)
-        expect(lines.length).toBe(1)
-        expect(lines[0]!.result).not.toMatch(/delivered the observed answer/)
+        expect(state.ourNodeIds).not.toContain(historicalNode)
+        // The observation pass declines to name a node here and makes no
+        // absence claim, so it writes no per-pass line (absence explanations
+        // live in the settle path). What it must NOT do is claim delivery, send
+        // a failure/TTL line, or run the old turn as a person's.
+        const turnLines = await linesFor(dir, messageId)
+        expect(turnLines.some(line => /delivered the observed answer|failure line|no completed answer within/.test(line.result))).toBe(false)
         // Nothing was run as a person's turn or as page speech either.
         expect((await audits(dir)).some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
       } finally {
@@ -427,7 +430,7 @@ describe('R9-F2: a historical node is never adopted as this send\'s own', () => 
       // An undated node carrying the body, then the node the bridge had already
       // handled when it posted. Only `after the anchor` can make a node with no
       // clock this send's own; this one is behind the anchor.
-      driver.appendNode(THREAD_A, 'user', doubled(body), { createTime: null })
+      const offside = driver.appendNode(THREAD_A, 'user', doubled(body), { createTime: null })
       const anchor = driver.appendNode(THREAD_A, 'assistant', 'the anchor answer')
       alpha.cursor = anchor
       const messageId = randomUUID()
@@ -444,9 +447,13 @@ describe('R9-F2: a historical node is never adopted as this send\'s own', () => 
         const kept = state.pendingTurns.find(item => item.messageId === messageId)
         expect(kept).toBeDefined()
         expect(kept!.userNodeId).toBeNull()
-        const lines = await linesFor(dir, messageId)
-        expect(lines.length).toBe(1)
-        expect(lines[0]!.result).not.toMatch(/delivered the observed answer/)
+        expect(state.ourNodeIds).not.toContain(offside)
+        // Same true negatives as the dated case: the observation pass keeps the
+        // turn without claiming delivery, without a failure/TTL line, and
+        // without classifying the node as a person's.
+        const turnLines = await linesFor(dir, messageId)
+        expect(turnLines.some(line => /delivered the observed answer|failure line|no completed answer within/.test(line.result))).toBe(false)
+        expect((await audits(dir)).some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
       } finally {
         await host.stop()
       }
