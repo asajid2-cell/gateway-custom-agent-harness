@@ -336,7 +336,7 @@ type Internals = {
   recordOurs: (bridge: LiveBridge, before: Set<string>, sent: string) => Promise<string[]>
   settlePostedTurn: (bridge: LiveBridge, job: PendingRecord, claimed: Set<string>) => Promise<'delivered' | 'present' | 'absent' | 'unreadable'>
   textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>) => string | null
-  bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>) => string | null
+  bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, afterId: string | null) => string | null
 }
 const internals = (host: ChatGptHost): Internals => host as unknown as Internals
 
@@ -1059,7 +1059,7 @@ const promptMatchesOf = async (): Promise<(sent: string, seen: string) => boolea
   (await import('./chatgpt-peer/threads.ts')).promptMatches
 
 /** A hand-built conversation on one visible path, root first. */
-function visibleConversation(nodes: { id: string; parent: string | null; role: 'user' | 'assistant'; text: string }[]): Conversation {
+function visibleConversation(nodes: { id: string; parent: string | null; role: 'user' | 'assistant'; text: string; createTime?: number | null }[]): Conversation {
   const mapping: Record<string, unknown> = {}
   for (const node of nodes) {
     mapping[node.id] = {
@@ -1069,7 +1069,7 @@ function visibleConversation(nodes: { id: string; parent: string | null; role: '
       message: {
         id: node.id,
         author: { role: node.role },
-        create_time: null,
+        create_time: node.createTime === undefined ? null : node.createTime,
         end_turn: node.role === 'assistant' ? true : null,
         status: 'finished_successfully',
         content: { content_type: 'text', parts: [node.text] },
@@ -1082,32 +1082,64 @@ function visibleConversation(nodes: { id: string; parent: string | null; role: '
 describe('R8-A2: the whole-body recovery matcher', () => {
   test('a node holding only a 512+ char PARTIAL run in its middle is still not a match', async () => {
     const prompt = longBody()
+    const quotedText = `Quoted before the paste. ${prompt.slice(1_000, 1_800)} And quoted after it.`
     const quoted = visibleConversation([
-      { id: 'u1', parent: null, role: 'user', text: `Quoted before the paste. ${prompt.slice(1_000, 1_800)} And quoted after it.` },
+      { id: 'u1', parent: null, role: 'user', text: quotedText, createTime: Date.now() / 1000 },
     ])
     const none = new Set<string>()
-    // A pure text comparison: no host state is read.
+    // A pure text comparison: no host state is read, so the node is otherwise
+    // perfectly eligible (fresh) and still refused - the run is partial.
     const host = Object.create(ChatGptHost.prototype) as ChatGptHost
-    expect(internals(host).bodyContainedIn(quoted, prompt, none, none)).toBeNull()
+    expect(internals(host).bodyContainedIn(quoted, prompt, none, none, Date.now(), null)).toBeNull()
     expect(internals(host).textMatchAnywhere(quoted, prompt, none, none)).toBeNull()
     const promptMatches = await promptMatchesOf()
-    expect(promptMatches(prompt, `Quoted before the paste. ${prompt.slice(1_000, 1_800)} And quoted after it.`)).toBe(false)
+    expect(promptMatches(prompt, quotedText)).toBe(false)
   })
 
-  test('containment needs UNIQUENESS: two carriers prove nothing, one names the node', () => {
+  test('containment needs UNIQUENESS and TEMPORAL eligibility (R9-F2)', () => {
     const prompt = longBody()
     const none = new Set<string>()
     const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const nowMs = Date.now()
+    const nowSec = nowMs / 1000
+    const check = (conversation: Conversation, postedMs = nowMs, afterId: string | null = null): string | null =>
+      internals(host).bodyContainedIn(conversation, prompt, none, none, postedMs, afterId)
+
+    // Two in-window carriers: uniqueness fails closed even though both are fresh.
     const two = visibleConversation([
-      { id: 'u1', parent: null, role: 'user', text: `${prompt} first` },
-      { id: 'a1', parent: 'u1', role: 'assistant', text: 'an answer' },
-      { id: 'u2', parent: 'a1', role: 'user', text: `second ${prompt}` },
+      { id: 'u1', parent: null, role: 'user', text: `${prompt} first`, createTime: nowSec },
+      { id: 'a1', parent: 'u1', role: 'assistant', text: 'an answer', createTime: nowSec },
+      { id: 'u2', parent: 'a1', role: 'user', text: `second ${prompt}`, createTime: nowSec },
     ])
-    expect(internals(host).bodyContainedIn(two, prompt, none, none)).toBeNull()
+    expect(check(two)).toBeNull()
+
+    // Exactly one fresh carrier inside the posting window: named.
     const one = visibleConversation([
-      { id: 'u1', parent: null, role: 'user', text: `before ${prompt} after` },
+      { id: 'u1', parent: null, role: 'user', text: `before ${prompt} after`, createTime: nowSec },
     ])
-    expect(internals(host).bodyContainedIn(one, prompt, none, none)).toBe('u1')
+    expect(check(one)).toBe('u1')
+
+    // R9-F2: the same text an HOUR before the post is a historical quote, not
+    // our send. It fails `ownUserNodeOf`'s window and containment's copy of it.
+    const old = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: `before ${prompt} after`, createTime: nowSec - 3_600 },
+    ])
+    expect(check(old)).toBeNull()
+
+    // An undated carrier is eligible only AFTER the preserved positional anchor.
+    const undated = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec },
+      { id: 'u1', parent: 'anchor', role: 'user', text: `before ${prompt} after` },
+    ])
+    expect(check(undated, nowMs, 'anchor')).toBe('u1')
+    // ... with no anchor at all there is no positional evidence: refused.
+    expect(check(undated, nowMs, null)).toBeNull()
+    // ... and a node BEFORE the anchor cannot be the send: refused.
+    const preAnchor = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: `before ${prompt} after` },
+      { id: 'anchor', parent: 'u1', role: 'assistant', text: 'the cursor when we posted', createTime: nowSec },
+    ])
+    expect(check(preAnchor, nowMs, 'anchor')).toBeNull()
   })
 
   test('the live doubled node is named on the recovery path and its answer is delivered exactly once, nothing typed', async () => {
@@ -1128,7 +1160,9 @@ describe('R8-A2: the whole-body recovery matcher', () => {
       const doubled = prompt.slice(0, cut) + prompt + prompt.slice(cut)
       expect(doubled.length).toBeGreaterThan(prompt.length)
       expect(doubled.includes(prompt)).toBe(true)
-      const sendNode = driver.appendNode(THREAD_A, 'user', doubled, { createTime: null })
+      // The live node `aaee556a`: create_time 1793400052.371 against a post at
+      // 1793400053.214 - DATED but ~0.84s BEFORE the post, inside the 30s window.
+      const sendNode = driver.appendNode(THREAD_A, 'user', doubled, { createTime: Date.now() / 1000 - 0.843 })
       const answerNode = driver.appendNode(THREAD_A, 'assistant', 'the answer the doubled prompt earned')
       // Live state: the cursor sits on the answer, past the send node.
       alpha.cursor = answerNode
@@ -1140,8 +1174,9 @@ describe('R8-A2: the whole-body recovery matcher', () => {
       try {
         const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
         const none = new Set<string>()
-        // Premise: the legacy record has no anchor, the send node has no clock,
-        // the cursor is past it, and equal-or-prefix still rejects the doubling.
+        // Premise: the legacy record has no anchor, the send node's clock is
+        // INSIDE the posting window, the cursor is past it, and equal-or-prefix
+        // still rejects the doubling.
         expect(record.anchorNodeId ?? null).toBeNull()
         expect(internals(host).ownUserNodeOf(
           read.conversation, record.text, Date.parse(record.postedAt!), none, true, none, true, alpha.cursor,
@@ -1149,8 +1184,11 @@ describe('R8-A2: the whole-body recovery matcher', () => {
         expect(internals(host).textMatchAnywhere(read.conversation, record.text, none, none)).toBeNull()
         const promptMatches = await promptMatchesOf()
         expect(promptMatches(record.text, doubled)).toBe(false)
-        // ... so containment is the only path left, and it names exactly this node.
-        expect(internals(host).bodyContainedIn(read.conversation, record.text, none, none)).toBe(sendNode)
+        // ... so containment is the only path left, and it accepts this node on
+        // BOTH counts: whole body and inside the posting window (R9-F2).
+        expect(internals(host).bodyContainedIn(
+          read.conversation, record.text, none, none, Date.parse(record.postedAt!), record.anchorNodeId ?? alpha.cursor,
+        )).toBe(sendNode)
         await host.pollOnce()
         await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
         await new Promise(resolve => setTimeout(resolve, 300))
@@ -1164,6 +1202,47 @@ describe('R8-A2: the whole-body recovery matcher', () => {
         expect(state.cursor).toBe(answerNode)
         expect((await audits(dir)).some(line => /no completed answer within/.test(line.result))).toBe(false)
         expect((await audits(dir)).some(line => line.op === 'human' || line.op === 'unprompted')).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('R9-F2: a historical message quoting the whole prompt is never adopted or answered (reviewer repro)', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = longBody()
+      const dayAgo = Date.now() / 1000 - 24 * 3_600
+      // A person discussed the prompt a day earlier, quoting it in full.
+      const oldUser = driver.appendNode(THREAD_A, 'user', `Here is the full prompt I received: ${prompt}`, { createTime: dayAgo })
+      driver.appendNode(THREAD_A, 'assistant', 'the historical answer to the quoted prompt', { createTime: dayAgo + 5 })
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        const live = internals(host).bridges.get(alpha.sessionId)!
+        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const none = new Set<string>()
+        const job = live.state.pendingTurns.find(item => item.messageId === messageId)
+        const postedMs = Date.parse(job?.postedAt ?? new Date().toISOString())
+        // The verdict, deterministic: containment refuses the historical node
+        // because it falls far outside the posting window.
+        expect(internals(host).bodyContainedIn(read.conversation, prompt, none, none, postedMs, null)).toBeNull()
+        // Let recovery run. It may legitimately re-post (the send never landed),
+        // but it must never adopt the historical node or forward its answer.
+        await new Promise(resolve => setTimeout(resolve, 1_500))
+        expect(repliesTo(sender, messageId).some(text => text.includes('the historical answer'))).toBe(false)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.ourNodeIds).not.toContain(oldUser)
       } finally {
         await host.stop()
       }

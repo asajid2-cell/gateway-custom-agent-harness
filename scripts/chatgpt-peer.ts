@@ -2182,28 +2182,46 @@ export class ChatGptHost {
    *
    * The live doubled node carried our 9,642-char prompt twice over (the driver
    * pasted it twice into one composer), so neither equality nor prefix could
-   * name it - and its `create_time` was null, so time could not either. What it
-   * still held was the ENTIRE normalized send as a contiguous run.
+   * name it. What it still held was the ENTIRE normalized send as a contiguous
+   * run.
    *
-   * This is deliberately narrower than `promptMatches`, which stays
-   * equal-or-prefix only: containment is accepted ONLY here, ONLY for a body of
-   * at least `PROMPT_PREFIX_MIN` normalized chars, and ONLY when exactly ONE
-   * unowned, unclaimed user node carries it. Two candidates prove nothing, so
-   * the answer is null and the caller's absence check stands. A node quoting a
-   * section of our text does not contain the whole body and is never named.
+   * R9-F2: text alone is not identity. A person can quote our whole prompt in a
+   * historical message ("here is the full prompt I received: ..."), and old
+   * text is exactly as containable as a fresh paste. A candidate is therefore
+   * eligible only on the SAME temporal/positional evidence `ownUserNodeOf`
+   * demands of its own candidates: a dated node only inside the posting window
+   * (`>= postedMs - PENDING_WINDOW_BEFORE_MS`), an undated node only after the
+   * preserved positional anchor, and an undated node with no anchor not at all.
+   * No evidence, no adoption - the turn stays unresolved rather than forwards a
+   * historical answer.
+   *
+   * Still narrower than `promptMatches`, which stays equal-or-prefix only:
+   * containment is accepted ONLY here, ONLY for a body of at least
+   * `PROMPT_PREFIX_MIN` normalized chars, and ONLY when exactly ONE eligible,
+   * unowned, unclaimed user node carries it. Two candidates prove nothing.
    */
   private bodyContainedIn(
     conversation: Conversation,
     text: string,
     ours: ReadonlySet<string>,
     exclude: ReadonlySet<string>,
+    postedMs: number,
+    afterId: string | null,
   ): string | null {
     const sent = normalizePromptText(text)
     if (sent.length < PROMPT_PREFIX_MIN) return null
-    const matches = chainOf(conversation).filter(turn => turn.role === 'user'
+    if (!Number.isFinite(postedMs)) return null
+    const chain = chainOf(conversation)
+    const anchor = afterId ? chain.findIndex(turn => turn.id === afterId) : -1
+    const matches = chain.filter((turn, index) => turn.role === 'user'
       && !ours.has(turn.id)
       && !exclude.has(turn.id)
-      && normalizePromptText(turn.text).includes(sent))
+      && normalizePromptText(turn.text).includes(sent)
+      // The same eligibility `ownUserNodeOf` applies: a numeric stamp is a
+      // posting-window claim, ANYTHING else is undated and needs a position.
+      && (typeof turn.createTime === 'number'
+        ? turn.createTime * 1000 >= postedMs - PENDING_WINDOW_BEFORE_MS
+        : !ours.has(turn.id) && anchor >= 0 && index > anchor))
     return matches.length === 1 ? matches[0]!.id : null
   }
 
@@ -2255,8 +2273,9 @@ export class ChatGptHost {
           // R8-B: the anchored match is time and position; the text is identity.
           ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
           // R8-A2: last resort, recovery only - a node carrying the whole body
-          // (the live doubled node). Unique or nothing.
-          ?? this.bodyContainedIn(conversation, matchText, ours, claimed)
+          // (the live doubled node). R9-F2: it must also fall in the posting
+          // window, not merely carry old text. Unique or nothing.
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, anchorNodeId)
         : null)
       if (userNodeId) claimed.add(userNodeId)
       // R8-H1c: the claimed node is OURS before anything is classified. It is
@@ -3429,7 +3448,8 @@ export class ChatGptHost {
         ? this.ownUserNodeOf(conversation, matchText, postedMs, ours, true, claimed, true, anchorNodeId)
           ?? this.textMatchAnywhere(conversation, matchText, ours, claimed)
           // R8-A2: recovery only, unique whole-body containment (see there).
-          ?? this.bodyContainedIn(conversation, matchText, ours, claimed)
+          // R9-F2: with the record's posting window and anchor.
+          ?? this.bodyContainedIn(conversation, matchText, ours, claimed, postedMs, anchorNodeId)
         : null)
     // R8-H1d: "no node matched" is not "the send never landed".
     if (!userNodeId) return await this.absenceOf(bridge, conversation, job, matchText, ours, postedMs)
