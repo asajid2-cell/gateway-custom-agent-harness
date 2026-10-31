@@ -47,6 +47,12 @@ class FakeDriver {
   signal: { phase: string | null; threadId: string | null; at: number | null } = { phase: 'complete', threadId: null, at: null }
   /** Every call fails from the first send on: the driver is gone, the page is not. */
   faultError: string | null = null
+  /**
+   * R10-F3: the next send PUTS THE NODE ON THE PAGE but reports
+   * `reason: 'ambiguous'` - it cannot prove the post either way, so it never
+   * fires `accepted`. This is the driver's new refusal to re-click Send.
+   */
+  ambiguousSend: string | null = null
   wedgeAfterSend = false
   /** Do not grow an assistant node on send: the turn stays unfinished. */
   noAnswer = false
@@ -164,6 +170,15 @@ class FakeDriver {
       const threadId = this.current ?? THREAD_A
       const text = String(request.text ?? '')
       this.appendNode(threadId, 'user', text)
+      if (this.ambiguousSend) {
+        // The node landed, but the driver will not claim it: no `accepted`
+        // event, and the reply says the post is unproven.
+        const error = this.ambiguousSend
+        this.ambiguousSend = null
+        if (!this.noAnswer) this.appendNode(threadId, 'assistant', this.answer)
+        this.signal = { phase: this.noAnswer ? 'streaming' : 'complete', threadId, at: Date.now() }
+        return { ok: false, op, reason: 'ambiguous', error, threadId }
+      }
       // The child reports acceptance as an event, before the call returns.
       if (options.onAccepted) { this.accepted.push(text.slice(0, 32)); options.onAccepted(String(request.id ?? '')) }
       if (!this.noAnswer) this.appendNode(threadId, 'assistant', this.answer)
@@ -331,11 +346,12 @@ type Internals = {
   ownUserNodeOf: (
     conversation: unknown, text: string, sinceMs: number, ours: ReadonlySet<string>,
     includeOwned?: boolean, exclude?: ReadonlySet<string>, earliest?: boolean, afterId?: string | null,
+    preservedAnchorId?: string | null,
   ) => string | null
   postRecordedTurn: (bridge: LiveBridge, record: PendingRecord, locked?: boolean) => Promise<boolean>
   recordOurs: (bridge: LiveBridge, before: Set<string>, sent: string) => Promise<string[]>
   settlePostedTurn: (bridge: LiveBridge, job: PendingRecord, claimed: Set<string>) => Promise<'delivered' | 'present' | 'absent' | 'unreadable'>
-  textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>) => string | null
+  textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, preservedAnchorId?: string | null) => string | null
   bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, afterId: string | null) => string | null
 }
 const internals = (host: ChatGptHost): Internals => host as unknown as Internals
@@ -834,6 +850,13 @@ describe('R8-A: the post-time anchor outlives the cursor', () => {
       const host2 = await startHost(dir, driver)
       try {
         const read = await internals(host2).readConversation(THREAD_A) as { conversation: unknown }
+        // Premise, self-diagnosing: the probe's inputs really are in the read.
+        // If the snapshot ever loses the anchor or the send node, this names the
+        // read rather than letting the probe below report a bare `null`.
+        const readChain = chainOf(read.conversation as Conversation).map(turn => turn.id)
+        expect(readChain).toContain(earlier)
+        expect(readChain).toContain(sendNode)
+        expect(readChain.indexOf(sendNode)).toBeGreaterThan(readChain.indexOf(earlier))
         // The positional branch, asked both ways with ownership held out of the
         // argument: the record's own anchor names the node, the live cursor
         // (which moved past it) cannot.
@@ -1091,7 +1114,7 @@ describe('R8-A2: the whole-body recovery matcher', () => {
     // perfectly eligible (fresh) and still refused - the run is partial.
     const host = Object.create(ChatGptHost.prototype) as ChatGptHost
     expect(internals(host).bodyContainedIn(quoted, prompt, none, none, Date.now(), null)).toBeNull()
-    expect(internals(host).textMatchAnywhere(quoted, prompt, none, none)).toBeNull()
+    expect(internals(host).textMatchAnywhere(quoted, prompt, none, none, Date.now())).toBeNull()
     const promptMatches = await promptMatchesOf()
     expect(promptMatches(prompt, quotedText)).toBe(false)
   })
@@ -1181,13 +1204,15 @@ describe('R8-A2: the whole-body recovery matcher', () => {
         expect(internals(host).ownUserNodeOf(
           read.conversation, record.text, Date.parse(record.postedAt!), none, true, none, true, alpha.cursor,
         )).toBeNull()
-        expect(internals(host).textMatchAnywhere(read.conversation, record.text, none, none)).toBeNull()
+        expect(internals(host).textMatchAnywhere(read.conversation, record.text, none, none, Date.parse(record.postedAt!))).toBeNull()
         const promptMatches = await promptMatchesOf()
         expect(promptMatches(record.text, doubled)).toBe(false)
         // ... so containment is the only path left, and it accepts this node on
-        // BOTH counts: whole body and inside the posting window (R9-F2).
+        // BOTH counts: whole body and inside the posting window (R9-F2). R10-F1:
+        // the gate keys on the PRESERVED anchor (null here), never the cursor -
+        // the live cursor sits PAST this node and must not read as "before it".
         expect(internals(host).bodyContainedIn(
-          read.conversation, record.text, none, none, Date.parse(record.postedAt!), record.anchorNodeId ?? alpha.cursor,
+          read.conversation, record.text, none, none, Date.parse(record.postedAt!), record.anchorNodeId ?? null,
         )).toBe(sendNode)
         await host.pollOnce()
         await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 15_000)
@@ -1322,4 +1347,264 @@ describe('R9: a send refused acceptance amid two new user nodes', () => {
       await cleanup()
     }
   }, 60_000)
+})
+
+describe('R10-F1: a dated candidate before a RESOLVED preserved anchor', () => {
+  test('the reviewer repro: an in-window quote before the anchor is refused on position', () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const check = (conversation: Conversation, anchor: string | null, postedMs = Date.now()): string | null =>
+      internals(host).bodyContainedIn(conversation, prompt, none, none, postedMs, anchor)
+    const nowMs = Date.now()
+    const nowSec = nowMs / 1000
+    // T-5s: a person quotes the whole prompt with an intro line, so neither
+    // equality nor prefix matches. T-4s: the page answers, and THAT assistant
+    // node is the record's pre-send anchor. At T our send never lands.
+    const quoteBeforeAnchor = visibleConversation([
+      { id: 'quote', parent: null, role: 'user', text: `Here is the prompt: ${prompt}`, createTime: nowSec - 5 },
+      { id: 'anchor', parent: 'quote', role: 'assistant', text: 'the answer to the quoted prompt', createTime: nowSec - 4 },
+    ])
+    // R9-F2 alone would adopt it: it is dated and inside the 30 s window.
+    expect(check(quoteBeforeAnchor, null)).toBe('quote')
+    // R10-F1: with the preserved anchor resolved, position refuses it.
+    expect(check(quoteBeforeAnchor, 'anchor')).toBeNull()
+    // A dated candidate AFTER the anchor is still admissible ...
+    const afterAnchor = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 5 },
+      { id: 'send', parent: 'anchor', role: 'user', text: `before ${prompt} after`, createTime: nowSec - 0.8 },
+    ])
+    expect(check(afterAnchor, 'anchor')).toBe('send')
+    // ... but uniqueness still fails closed after the anchor.
+    const two = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 5 },
+      { id: 'u1', parent: 'anchor', role: 'user', text: `${prompt} one`, createTime: nowSec - 0.9 },
+      { id: 'u2', parent: 'u1', role: 'user', text: `${prompt} two`, createTime: nowSec - 0.8 },
+    ])
+    expect(check(two, 'anchor')).toBeNull()
+  })
+})
+
+describe('R10-F1b: ownUserNodeOf refuses a dated exact-text node before the preserved anchor', () => {
+  test('the positional anchor gates the dated branch; the window still stands alone', () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const check = (conversation: Conversation, afterId: string | null, preserved: string | null = null, postedMs = Date.now()): string | null =>
+      internals(host).ownUserNodeOf(conversation, prompt, postedMs, none, true, none, true, afterId, preserved)
+    const nowMs = Date.now()
+    const nowSec = nowMs / 1000
+    // EXACT text (equality under promptMatches), dated T-5s, before the anchor.
+    const quoteBeforeAnchor = visibleConversation([
+      { id: 'quote', parent: null, role: 'user', text: prompt, createTime: nowSec - 5 },
+      { id: 'anchor', parent: 'quote', role: 'assistant', text: 'the answer to the quote', createTime: nowSec - 4 },
+    ])
+    // Window alone (no preserved anchor) still adopts it - the trade-off is unchanged.
+    expect(check(quoteBeforeAnchor, null, null)).toBe('quote')
+    // A RESOLVED preserved anchor refuses it on position (the F1 defect, one
+    // matcher earlier: `ownUserNodeOf` runs before containment).
+    expect(check(quoteBeforeAnchor, null, 'anchor')).toBeNull()
+    // The same node AFTER the anchor is adopted.
+    const afterAnchor = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 6 },
+      { id: 'send', parent: 'anchor', role: 'user', text: prompt, createTime: nowSec - 0.8 },
+    ])
+    expect(check(afterAnchor, 'anchor', 'anchor')).toBe('send')
+    // The undated branch is untouched: it still uses afterId (the cursor
+    // fallback) and needs no preserved anchor.
+    const undated = visibleConversation([
+      { id: 'anchor', parent: null, role: 'assistant', text: 'the cursor when we posted', createTime: nowSec - 6 },
+      { id: 'send', parent: 'anchor', role: 'user', text: prompt },
+    ])
+    expect(check(undated, 'anchor', null)).toBe('send')
+    // ... and a preserved anchor must NOT gate an undated node after the cursor.
+    const undatedBeforePreserved = visibleConversation([
+      { id: 'cursor', parent: null, role: 'assistant', text: 'cursor', createTime: nowSec - 6 },
+      { id: 'send', parent: 'cursor', role: 'user', text: prompt },
+      { id: 'anchor', parent: 'send', role: 'assistant', text: 'preserved anchor', createTime: nowSec - 4 },
+    ])
+    expect(check(undatedBeforePreserved, 'cursor', 'anchor')).toBe('send')
+  })
+})
+
+describe('R10-F2: dated text matches are bounded by the posting window', () => {
+  test('a days-old dated prefix is not this send; the undated reach is unchanged', async () => {
+    const prompt = longBody()
+    const none = new Set<string>()
+    const host = Object.create(ChatGptHost.prototype) as ChatGptHost
+    const nowMs = Date.now()
+    const nowSec = nowMs / 1000
+    // Equality/prefix both hold; only the DATE says this is old text.
+    const seen = `${prompt}\nAdditional context`
+    const promptMatches = await promptMatchesOf()
+    expect(promptMatches(prompt, seen)).toBe(true)
+    const old = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: seen, createTime: nowSec - 2 * 24 * 3_600 },
+    ])
+    expect(internals(host).textMatchAnywhere(old, prompt, none, none, nowMs)).toBeNull()
+    // A fresh dated carrier is still named.
+    const fresh = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: seen, createTime: nowSec - 5 },
+    ])
+    expect(internals(host).textMatchAnywhere(fresh, prompt, none, none, nowMs)).toBe('u1')
+    // An UNDATED carrier makes no time claim, so its reach stays as wide as it
+    // was (the R8-B live record had no create_time at all).
+    const undated = visibleConversation([
+      { id: 'u1', parent: null, role: 'user', text: seen },
+    ])
+    expect(internals(host).textMatchAnywhere(undated, prompt, none, none, nowMs)).toBe('u1')
+  })
+})
+
+describe('R10-F1/F2: recovery never adopts old text as the send', () => {
+  test('an in-window quote sitting BEFORE the preserved anchor is never answered', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = longBody()
+      const fiveAgo = Date.now() / 1000 - 5
+      // The reviewer repro: a person quoted the whole prompt at T-5s with an
+      // intro line, the page answered at T-4s, and that answer is the anchor.
+      const quote = driver.appendNode(THREAD_A, 'user', `Here is the prompt: ${prompt}`, { createTime: fiveAgo })
+      const anchor = driver.appendNode(THREAD_A, 'assistant', 'the answer to the quoted prompt', { createTime: fiveAgo + 1 })
+      alpha.cursor = anchor
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      alpha.pendingTurns[alpha.pendingTurns.length - 1]!.anchorNodeId = anchor
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        // The observation pass is where recovery attributes a node; drive it.
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).some(text => text.includes('the answer to the quoted prompt'))).toBe(false)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.ourNodeIds).not.toContain(quote)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('a days-old DATED post carrying the whole body is never answered', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = longBody()
+      const daysAgo = Date.now() / 1000 - 2 * 24 * 3_600
+      // F2 repro: `prompt` is a 512+ char prefix of this old post, so equality/
+      // prefix says "match" and only the timestamp says "not our send".
+      const old = driver.appendNode(THREAD_A, 'user', `${prompt}\nAdditional context`, { createTime: daysAgo })
+      driver.appendNode(THREAD_A, 'assistant', 'the days-old answer', { createTime: daysAgo + 5 })
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).some(text => text.includes('the days-old answer'))).toBe(false)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.ourNodeIds).not.toContain(old)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+
+  test('a dated EXACT-text human node before the anchor is never forwarded as the send', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const prompt = 'POSTED PROMPT: a dated exact-text quote must not be taken for the send'
+      const fiveAgo = Date.now() / 1000 - 5
+      // EXACTLY our body (equality under promptMatches), dated T-5s, before the
+      // pre-send anchor - so the FIRST matcher, `ownUserNodeOf`, is the one that
+      // must refuse it (containment never gets consulted).
+      const quote = driver.appendNode(THREAD_A, 'user', prompt, { createTime: fiveAgo })
+      const anchor = driver.appendNode(THREAD_A, 'assistant', 'the answer to the human quote', { createTime: fiveAgo + 1 })
+      alpha.cursor = anchor
+      const messageId = randomUUID()
+      postedTurn(alpha, { messageId, senderSessionId: senderId, text: prompt })
+      alpha.pendingTurns[alpha.pendingTurns.length - 1]!.anchorNodeId = anchor
+      await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
+      const host = await startHost(dir, driver)
+      try {
+        await host.pollOnce()
+        await new Promise(resolve => setTimeout(resolve, 300))
+        expect(repliesTo(sender, messageId).some(text => text.includes('the answer to the human quote'))).toBe(false)
+        const state = await readBridge(dir, alpha.sessionId)
+        expect(state.ourNodeIds).not.toContain(quote)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 60_000)
+})
+
+describe('R10-F3: an ambiguous send is never treated as "not posted"', () => {
+  test('it keeps postedAt, types nothing more, and settles once by identity', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    try {
+      const host = await startHost(dir, driver)
+      try {
+        const live = internals(host).bridges.get(alpha.sessionId)!
+        const prompt = 'POSTED PROMPT: the driver could not prove this post either way'
+        // The driver puts the node on the page but will not claim `accepted`.
+        driver.ambiguousSend = 'the send is ambiguous: the prompt may have landed'
+        const record: PendingRecord = {
+          threadId: THREAD_A, userNodeId: null, ourText: prompt, text: prompt,
+          senderSessionId: senderId, messageId: randomUUID(), kind: 'inquiry', postedAt: new Date().toISOString(),
+        }
+        // Swallowed: the send MAY have landed, so the turn stays queued.
+        await expect(internals(host).postRecordedTurn(live, record)).resolves.toBe(false)
+        expect(sendCount(driver)).toBe(1)
+        const posted = await readBridge(dir, alpha.sessionId)
+        const turn = posted.pendingTurns.find(item => item.messageId === record.messageId)!
+        // NOT "never posted": the record still claims the post.
+        expect(turn.postedAt).not.toBeNull()
+        expect(turn.userNodeId).toBeNull()
+        // The node the page took is ours by identity; the next pass delivers.
+        await host.pollOnce()
+        await waitFor(() => (repliesTo(sender, record.messageId).length >= 1 ? true : undefined), 15_000)
+        expect(repliesTo(sender, record.messageId).length).toBe(1)
+        expect(repliesTo(sender, record.messageId)[0]).toContain('answered on the page')
+        // Never typed a second time, and settled once.
+        expect(sendCount(driver)).toBe(1)
+        const settled = await readBridge(dir, alpha.sessionId)
+        expect(settled.pendingTurns.some(item => item.messageId === record.messageId)).toBe(false)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 40_000)
 })
