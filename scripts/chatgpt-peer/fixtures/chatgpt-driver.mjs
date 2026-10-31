@@ -1602,12 +1602,17 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   const domAt = Date.now()
   const beforeTree = await readUserTreeOnPage(page)
   const treeAt = Date.now()
-  // There is no last assistant node on a fresh chat. An unbounded `innerText()`
-  // made Playwright wait its default 30 s for an element that will never exist,
-  // and `.catch('')` hid it - 30 of the ~38 s before the Send click on every
-  // newBridge. A present node answers in milliseconds, so 2 s cannot clip a
-  // real value; an absent node still yields '' exactly as before.
-  const beforeText = await page.locator(ASSISTANT).last().innerText({ timeout: 2_000 }).then(text => text.trim()).catch(() => '')
+  // There is no last assistant node on a fresh chat, so there is nothing to
+  // read: when the count taken for `baseline_count` is zero, skip the locator
+  // outright instead of paying the 2 s bound for an element that cannot exist
+  // (a flat ~2 s of every new-chat pre-click). An unbounded `innerText()` used
+  // to wait Playwright's default 30 s here and `.catch('')` hid it - 30 of the
+  // ~38 s before the Send click on every newBridge. A present node answers in
+  // milliseconds, so 2 s cannot clip a real value, and `beforeCount > 0` keeps
+  // that bounded read for a stale count whose node has gone ('' either way).
+  const beforeText = beforeCount > 0
+    ? await page.locator(ASSISTANT).last().innerText({ timeout: 2_000 }).then(text => text.trim()).catch(() => '')
+    : ''
   const textAt = Date.now()
   await log(`phase ${phaseName} baseline_count ${countAt - baselineAt}ms`)
   await log(`phase ${phaseName} baseline_dom ${domAt - countAt}ms`)
