@@ -36,6 +36,7 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import { ChatGptHost } from './chatgpt-peer.ts'
 import type { DriverChild, DriverReply } from './chatgpt-peer/driver.js'
@@ -92,11 +93,18 @@ const F1_BEFORE = { users: F1_BASELINE.length, answers: 4, dom: F1_BASELINE.map(
 
 const F1_PROMPT = `R9-F1: prove the send landed before reporting acceptance ${'p'.repeat(160)}`
 
+/**
+ * The vendored driver, resolved as a URL and imported through a computed
+ * specifier: tsc does not try to find declarations for a path it cannot fold,
+ * and the events suite resolves its vendored driver the same way.
+ */
+const DRIVER_MODULE = pathToFileURL(join(import.meta.dir, 'chatgpt-peer', 'fixtures', 'chatgpt-driver.mjs')).href
+
 describe('R9-F1: acceptance is the send\'s own node, never any new user node', () => {
   test('a NEW user node that is NOT our prompt, with the composer emptied, is NOT accepted', async () => {
     // The shipped driver reads CHATGPT_PROFILE at import time.
     process.env.CHATGPT_PROFILE = process.env.CHATGPT_PROFILE || join(tmpdir(), 'r9-driver-profile')
-    const { waitForAcceptance } = await import('./chatgpt-peer/fixtures/chatgpt-driver.mjs')
+    const { waitForAcceptance } = await import(DRIVER_MODULE)
     expect(typeof waitForAcceptance).toBe('function')
     // Pre-click baseline: ten turns, our prompt in the composer. After the
     // click: eleven turns, the newest is somebody else's words, the composer is
@@ -112,7 +120,7 @@ describe('R9-F1: acceptance is the send\'s own node, never any new user node', (
 
   test('a genuine NEW node carrying our prompt is still accepted', async () => {
     process.env.CHATGPT_PROFILE = process.env.CHATGPT_PROFILE || join(tmpdir(), 'r9-driver-profile')
-    const { waitForAcceptance } = await import('./chatgpt-peer/fixtures/chatgpt-driver.mjs')
+    const { waitForAcceptance } = await import(DRIVER_MODULE)
     const page = pageStub({
       users: [...F1_BASELINE, { id: 'u11', text: F1_PROMPT }],
       composer: '',
