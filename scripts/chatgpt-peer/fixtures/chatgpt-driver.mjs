@@ -830,42 +830,75 @@ async function assistantText(page) {
 }
 
 /**
+ * The page's user turns as (identity, text) pairs, or null when it cannot be read.
+ *
+ * Identity is the closest ancestor's `data-message-id` (or the node's own), so a
+ * node that was already on screen before the send can never be mistaken for the
+ * new one. Only the nodes at or after the pre-send count can be new, so their
+ * text is read and older text is skipped - a long thread pays nothing for the poll.
+ */
+async function readDomUserTurns(page, priorUsers = 0) {
+  return page.evaluate(([selector, prior]) => {
+    const nodes = [...document.querySelectorAll(selector)]
+    return {
+      identities: nodes.map(node => {
+        const turn = node.closest && node.closest('[data-message-id]')
+        return (turn && turn.getAttribute('data-message-id')) || node.getAttribute('data-message-id') || node.id || null
+      }),
+      texts: nodes.map((node, index) => (index >= prior ? (node.innerText || '') : null)),
+    }
+  }, [USER_MESSAGE, Math.max(0, Number(priorUsers) || 0)]).catch(() => null)
+}
+
+/**
+ * The full normalized texts of the DOM user nodes present now but absent from
+ * the pre-send baseline, or null when either read is unusable.
+ *
+ * With stable ids on both reads the identity set decides what is new, so a count
+ * that stays the same while a node is replaced cannot accept. Without ids the
+ * count delta is the best "new" signal available, and every node past the
+ * baseline still has to carry our text for the verdict to accept.
+ */
+function newDomUserTexts(baseline, after) {
+  if (!Array.isArray(baseline)) return null
+  if (!after || !Array.isArray(after.identities) || !Array.isArray(after.texts)) return null
+  const known = new Set(baseline)
+  const identified = baseline.length > 0 && baseline.every(id => typeof id === 'string' && id)
+    && after.identities.length > 0 && after.identities.every(id => typeof id === 'string' && id)
+  if (identified) {
+    const fresh = []
+    after.identities.forEach((identity, index) => {
+      if (!known.has(identity)) fresh.push(normalizedTurnText(after.texts[index]))
+    })
+    return fresh
+  }
+  if (!(after.identities.length > baseline.length)) return []
+  return after.texts.slice(baseline.length).map(text => normalizedTurnText(text))
+}
+
+/**
  * True once the page has taken the text: the turn is in the thread, whether or
  * not an answer exists yet. The host acknowledges on this signal, because
  * "delivered" on the bus means handed off, not answered.
  *
- * The proof is a NEW USER NODE - the identity/count delta. Neither of the two
- * cheaper signals is proof: a busy indicator can be the previous generation's
- * still-visible stop button, and a cleared composer can be a rerender after a
- * click that was swallowed. Both of those used to answer `accepted` for a turn
- * that was never posted, and the caller then waited out the reply timeout.
+ * The proof is a NEW USER NODE whose FULL text carries what we sent - the same
+ * evidence the degraded path asks for. Neither cheaper signal is proof: a busy
+ * indicator can be the previous generation's still-visible stop button, and a
+ * cleared composer can be a rerender after a swallowed click. The old rule
+ * accepted any new user node once the composer was empty, which let an unrelated
+ * message that appeared at the same moment acknowledge a send that never landed.
  *
- * `before` is the { users, answers } count taken before the click.
+ * `before` is `{ users, dom }`: the pre-send count and the identity list taken
+ * by `readDomUserTurns`. A null baseline can never prove a node is new.
  */
 async function waitForAcceptance(page, before, composedText = '', timeoutMs = 30_000) {
-  const startedAt = Date.now()
-  const deadline = startedAt + timeoutMs
-  const needle = (composedText || '').trim().slice(0, 40)
-  const priorUsers = Number(before?.users) || 0
+  const deadline = Date.now() + timeoutMs
+  const baseline = Array.isArray(before?.dom) ? before.dom : null
+  const priorUsers = Math.max(baseline ? baseline.length : 0, Number(before?.users) || 0)
+  if (!baseline) return false
   while (Date.now() < deadline) {
-    const state = await page.evaluate(([userSelector, needle]) => {
-      const node = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"]')
-      const composer = node ? (node.innerText || '').trim() : ''
-      const users = [...document.querySelectorAll(userSelector)]
-      const last = users.at(-1)
-      return {
-        users: users.length,
-        lastUserText: last ? (last.innerText || '').replace(/\s+/g, ' ').trim() : '',
-        composerHolds: needle ? composer.includes(needle) : composer.length > 0,
-      }
-    }, [USER_MESSAGE, needle]).catch(() => null)
-    if (state) {
-      const freshUser = state.users > priorUsers
-      // The new node carries the text we sent. A page that reflows or trims the
-      // text can fail the includes(); the count delta plus an emptied composer
-      // covers exactly that case, and still needs the NEW NODE.
-      if (freshUser && (!needle || state.lastUserText.includes(needle) || !state.composerHolds)) return true
-    }
+    const after = await readDomUserTurns(page, priorUsers)
+    if (sendAcceptVerdict({ newNodes: newDomUserTexts(baseline, after), sentText: composedText })) return true
     await new Promise(resolve => setTimeout(resolve, 250))
   }
   return false
@@ -911,29 +944,58 @@ function newUserNodes(baseline, after) {
   return fresh
 }
 
+/** The shortest side a prefix match may rest on: a truncated paste, never a guess. */
+const PROMPT_PREFIX_MIN = 512
+
 /**
- * The acceptance decision for a page that exposes no user nodes at all.
+ * Does a user node's text carry the prompt we sent? The SAME rule the host
+ * applies to a posted turn (chatgpt-peer/threads.ts promptMatches).
  *
- * Pure: the evidence is arguments. Acceptance must be THIS send and nothing
- * else - exactly ONE new user node, carrying the FULL normalized text we sent.
- * A shared prefix is not identity: the host's bus prompts share a long
- * boilerplate opening, so a swallowed click plus any turn that merely starts
- * like ours would otherwise pass. Two new nodes are ambiguous and refused, a
- * node already present at the baseline can never accept, a page with no
- * baseline has shown nothing, and a page that DOES show user nodes is decided
- * by the DOM path. A cleared composer or a visible stop button is not
- * acceptance here either.
+ * Equal after whitespace normalization, or one side a strict prefix of the
+ * other with the shorter side at least PROMPT_PREFIX_MIN chars - a page that
+ * trims or truncates a long body. A mid-string substring is never a match: that
+ * would name a node that merely quotes us (the host's comment says exactly this,
+ * and there is no "contains" clause there either).
+ */
+function promptMatches(sentText, seenText) {
+  const sent = normalizedTurnText(sentText)
+  const seen = normalizedTurnText(seenText)
+  if (!sent || !seen) return false
+  if (sent === seen) return true
+  const shorter = sent.length <= seen.length ? sent : seen
+  if (shorter.length < PROMPT_PREFIX_MIN) return false
+  return (shorter === sent ? seen : sent).startsWith(shorter)
+}
+
+/**
+ * Did OUR send land? The one decision the primary and degraded paths share.
+ *
+ * The evidence must be THIS send and nothing else - exactly ONE new user node
+ * (absent from the pre-send baseline), carrying what we sent under the host's
+ * full-text rule. A shared 40-char opener is not identity, a node already
+ * present can never be the new one, and an unreadable or empty node proves
+ * nothing.
+ *
+ * Two new nodes (ours plus an unrelated one in the same window) are AMBIGUOUS
+ * and are refused here on purpose: this path cannot tell which one the host
+ * will call ours, and a wrong "it landed" is worse than no answer. It cannot
+ * strand the turn, because the host settles such a turn by node identity and
+ * text on its own observation pass, outside this send-acceptance question.
+ */
+function sendAcceptVerdict({ newNodes, sentText }) {
+  if (!Array.isArray(newNodes)) return false
+  if (newNodes.length !== 1) return false
+  return promptMatches(sentText, newNodes[0])
+}
+
+/**
+ * The degraded path: only runs when the DOM exposed no user nodes at all, then
+ * asks the same question as the primary path.
  */
 function degradedSendVerdict({ userNodes, newNodes, sentText }) {
   // A page that shows user nodes is decided by the DOM path, never here.
   if (Number(userNodes) > 0) return false
-  // No baseline (or an unreadable one) means nothing can be called new.
-  if (!Array.isArray(newNodes)) return false
-  // Exactly one new turn, or the evidence is ambiguous.
-  if (newNodes.length !== 1) return false
-  const want = normalizedTurnText(sentText)
-  if (!want) return false
-  return normalizedTurnText(newNodes[0]) === want
+  return sendAcceptVerdict({ newNodes, sentText })
 }
 
 /**
@@ -1338,8 +1400,10 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
       .join('\n')
   }
   const beforeCount = await page.locator(ASSISTANT).count()
-  // The acceptance proof is a NEW user node, so its count is taken here too.
-  const beforeUsers = await page.locator(USER_MESSAGE).count()
+  // The acceptance proof is a NEW user node whose full text carries ours, so
+  // the DOM's user turns (identity list) are snapshotted before the send.
+  const beforeDom = await readDomUserTurns(page)
+  const beforeUsers = beforeDom ? beforeDom.identities.length : 0
   // Where the DOM shows no user node at all, the acceptance proof falls back to
   // the thread tree - and "our text is in the tree" is not a proof of THIS send
   // when an older turn has the same words. Snapshot the user nodes (identity
@@ -1367,7 +1431,8 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   }
   try { await readiness.send.click() } catch (error) { await log(`send click failed: ${error.message}`) }
   await log(`sent ${text.length} chars`)
-  let accepted = await waitForAcceptance(page, { users: beforeUsers, answers: beforeCount }, text)
+  const acceptanceBaseline = { users: beforeUsers, dom: beforeDom ? beforeDom.identities : null }
+  let accepted = await waitForAcceptance(page, acceptanceBaseline, text)
   if (!accepted) {
     // A click that lands on a composer still settling can be swallowed. Try the
     // same readiness rule once more, then fail the turn rather than sit out the
@@ -1375,7 +1440,7 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     await log('send was not accepted; retrying once')
     const retry = await waitForSendReady(page, 60_000)
     if (retry.ready) await retry.send.click().catch(() => {})
-    accepted = await waitForAcceptance(page, { users: beforeUsers, answers: beforeCount }, text)
+    accepted = await waitForAcceptance(page, acceptanceBaseline, text)
   }
   if (!accepted) {
     // The page may expose no user nodes at all (a renamed attribute must not
@@ -2599,7 +2664,8 @@ export {
   // a live page (origin check, base64 validation, install probe, acceptance,
   // browser identity).
   isChatGPTUrl, decodeBase64, chromePath, waitForAcceptance, parseBrowserUrl, attachVerdict, statusVerdict,
-  normalizedTurnText, userTreeNodes, newUserNodes, degradedSendVerdict, launchVerdict, ownerCarriesProfile,
+  normalizedTurnText, promptMatches, sendAcceptVerdict, userTreeNodes, newUserNodes, newDomUserTexts,
+  degradedSendVerdict, launchVerdict, ownerCarriesProfile,
   composeExactlyOnce, clearComposer, composerTextOf,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
