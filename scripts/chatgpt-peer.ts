@@ -2487,15 +2487,6 @@ export class ChatGptHost {
   }
 
   /**
-   * One solicited answer to the sender. Explicitly NOT untrusted page speech.
-   *
-   * R8-H2: the answer NODE is carried in from the caller that read it. This
-   * used to re-read the node by id, and a failed second read produced `raw = ''`
-   * and a false terminal line ("a command block only; nothing was sent") for an
-   * answer the page had already finished. With no node in hand the caller must
-   * leave the turn owed and send nothing.
-   */
-  /**
    * The greppable delivery measurement: how long a posted turn waited for its
    * answer. Log only (`postedAt` is the durable post time); the audit schema is
    * strict and carries no field for this.
@@ -2508,6 +2499,15 @@ export class ChatGptHost {
     log(`delivered answer for ${messageId} in ${seconds}s (posted ${postedAt})`)
   }
 
+  /**
+   * One solicited answer to the sender. Explicitly NOT untrusted page speech.
+   *
+   * R8-H2: the answer NODE is carried in from the caller that read it. This
+   * used to re-read the node by id, and a failed second read produced `raw = ''`
+   * and a false terminal line ("a command block only; nothing was sent") for an
+   * answer the page had already finished. With no node in hand the caller must
+   * leave the turn owed and send nothing.
+   */
   private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: ConversationNode): Promise<void> {
     const key = this.turnKey(record)
     // The bus is authoritative for what has been answered, not the mark. A
