@@ -2675,23 +2675,36 @@ export class ChatGptHost {
       // The command's ordinal within the turn (see `executeCommand`): a replay
       // re-runs the same sequence from zero and lands on the same receipt keys.
       let ordinal = 0
+      let seededAnswer = true
       const outcome = await runCommandTurn(job.text, job.turnNonce ?? '', {
-        generate: async () => {
-          if (seeded !== null) {
-            const text = seeded
-            seeded = null
-            return { ok: true, text }
-          }
+        generate: async subject => {
           try {
-            const answer = await this.awaitAnswer(bridge, job.userNodeId, {
-              acceptedAt: job.postedAt ? Date.parse(job.postedAt) : undefined,
-              sentText: job.text,
-            })
-            return { ok: true, text: answer.text }
+            if (seededAnswer) {
+              seededAnswer = false
+              if (seeded !== null) {
+                const text = seeded
+                seeded = null
+                return { ok: true, text }
+              }
+              const answer = await this.awaitAnswer(bridge, job.userNodeId, {
+                acceptedAt: job.postedAt ? Date.parse(job.postedAt) : undefined,
+                sentText: job.text,
+              })
+              return { ok: true, text: answer.text }
+            }
+            // Round 2+: the command result lines go back to the page as a real
+            // new turn, exactly as the direct path posts them. Re-reading the
+            // seeded node instead would replay our own answer - the run loop
+            // treats the repeat as "already ran this exact command", the budget
+            // burns, and the model's follow-up prose is lost.
+            return { ok: true, text: await this.generateRound(bridge, job, subject, () => {}, locked) }
           } catch (error) {
             // "Still generating" / "unproven" are STATES, never a model
             // failure: let them out so the turn stays owed.
             if (error instanceof GeneratingTurn || error instanceof PageUnproven) throw error
+            // A follow-up round that could not be posted because the page
+            // stayed mid-turn is that same state: the turn is owed, not failed.
+            if (/stayed mid-turn/.test((error as Error).message)) throw new GeneratingTurn(bridge.state.threadId)
             return { ok: false, error: (error as Error).message }
           }
         },
@@ -2706,7 +2719,7 @@ export class ChatGptHost {
       // direct path keeps `settleReply`'s `expects` gate.) Retire only once the
       // bus holds our sent entry; a failed send leaves the record to the next
       // pass rather than dropping the answer.
-      await this.settleReply(bridge, message, true, outcome)
+      await this.settleReply(bridge, message, true, outcome, job.userNodeId)
       if (this.replySent(bridge, job.messageId)) await this.retirePendingTurn(bridge, job.messageId)
     } catch (error) {
       if (error instanceof GeneratingTurn) {
@@ -4113,7 +4126,7 @@ export class ChatGptHost {
       alive()
       await this.markAnswered(bridge, job)
       alive()
-      await this.settleReply(bridge, message, expects, outcome)
+      await this.settleReply(bridge, message, expects, outcome, job?.userNodeId ?? null)
       // R7-F2: only now, and only when the debt is actually settled, does the
       // job leave the ledger. `settleReply` catches a failed `transport.send`
       // and returns normally, so retiring on the strength of reaching here
@@ -4296,7 +4309,7 @@ export class ChatGptHost {
     ].join('\n')
   }
 
-  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[]; executed: { line: string }[]; unresolved: string[] }): Promise<void> {
+  private async settleReply(bridge: Bridge, message: { id: string; fromSessionId: string; summary: string; kind?: string }, expects: boolean, outcome: { repliedExplicitly: boolean; repliedTargets: string[]; failed: boolean; budgetSpent: boolean; finalText: string; problems: string[]; executed: { line: string }[]; unresolved: string[] }, answerNodeId: string | null = null): Promise<void> {
     // A reply to some other message is not an answer to this one.
     if (outcome.repliedTargets.includes(message.id)) return
     if (!expects) return
@@ -4339,7 +4352,7 @@ export class ChatGptHost {
     if (!prose) return this.replyError(bridge, message, 'no answer was produced for this message')
     // Long prose keeps the outbox spill: the bus carries a gist and the file
     // carries the whole answer.
-    const shaped = await this.shapeAnswer(bridge, prose, null)
+    const shaped = await this.shapeAnswer(bridge, prose, answerNodeId)
     const body = shaped.answerPath
       ? `${shaped.text}\n\nFull answer: ${shaped.answerPath} (${shaped.bytes} bytes, sha256 ${(shaped.sha256 ?? '').slice(0, 16)})`
       : shaped.text
