@@ -58,6 +58,19 @@ const POLL_MAX_BACKOFF_MS = 300_000
 const TRIGGER_DEBOUNCE_MS = 300
 
 /**
+ * Follow-up observation gaps while a posted turn is still owed.
+ *
+ * The pushed `signal` is the intended latency path, but a missed push (or a
+ * read that was throttled when it fired) used to leave the answer sitting until
+ * the next reconcile pass - up to `observeEvery` seconds later. While a bridge
+ * has a POSTED pending turn, walk this bounded schedule instead: at most one
+ * extra observation per gap, stopping the moment the pending set empties.
+ * Seven follow-ups cover the first ~86 s, long enough for a normal answer and
+ * short enough not to hammer the page. Tests inject a shorter schedule.
+ */
+const PENDING_WATCH_GAPS_MS = [2_000, 3_000, 5_000, 8_000, 13_000, 21_000, 34_000]
+
+/**
  * How long an unanswered send is remembered, and how wide a create_time window
  * counts as "this node is that send".
  *
@@ -252,6 +265,8 @@ type Config = {
   waitPollMs?: number
   /** How long one conversation read may take. Overridden in tests; never widened. */
   readTimeoutMs?: number
+  /** The bounded follow-up cadence while a posted turn is owed. Tests shorten it. */
+  pendingWatchGapsMs?: number[]
 }
 
 /** One bridged thread: its durable memory and its live transport. */
@@ -267,6 +282,12 @@ type Bridge = {
    * the wake itself rescheduled keeps its NEW timer tracked and cancellable.
    */
   schedules: Map<string, { generation: number; handle: NodeJS.Timeout }>
+  /**
+   * The bounded follow-up observation while this bridge has a POSTED pending
+   * turn. Runtime only: it is cancelled on delivery, thread change, removal and
+   * host stop, and it never outlives the state that justifies it.
+   */
+  pendingWatch?: { timer: NodeJS.Timeout; step: number; ids: Set<string> }
   draining: boolean
   stopping: boolean
   removed: boolean
@@ -319,6 +340,7 @@ export function resolveConfig(partial: Partial<Config>): Config {
     titlesEvery: Number.isFinite(partial.titlesEvery)
       ? Number(partial.titlesEvery)
       : Number(process.env.CHATGPT_WEB_TITLES_EVERY ?? 120),
+    pendingWatchGapsMs: partial.pendingWatchGapsMs,
   }
 }
 
@@ -621,6 +643,9 @@ export class ChatGptHost {
       // A message accepted into a thread and then killed mid-turn is still owed
       // an answer. Each bridge knows which of its own messages those are.
       void this.recoverOwed(bridge)
+      // A restart may inherit a POSTED turn whose answer is still on the page.
+      // Watch it on the bounded cadence too, so it does not wait for reconcile.
+      this.armPendingWatch(bridge)
     }
   }
 
@@ -676,7 +701,11 @@ export class ChatGptHost {
     const transport = new GatewaySessionTransport({
       directory: this.config.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions'),
       sessionId: bridge.state.sessionId,
-      name: bridge.state.name,
+      // Registered-name prefix only. `bridge.state.name` stays bare everywhere
+      // else (operator display, bridgeView, audits, `bridgeFor` matching, and
+      // uniqueness). The prefix is what a peer reply line renders as
+      // "from web; <name>".
+      name: `web; ${bridge.state.name}`,
       cwd: process.cwd(),
       purpose: this.purposeFor(bridge),
       route: this.route(bridge),
@@ -766,6 +795,7 @@ export class ChatGptHost {
   private async discardBridge(bridge: Bridge): Promise<void> {
     bridge.stopping = true
     bridge.removed = true
+    this.disarmPendingWatch(bridge)
     this.bridges.delete(bridge.state.sessionId)
     for (const { handle } of bridge.schedules.values()) clearTimeout(handle)
     bridge.schedules.clear()
@@ -2008,12 +2038,19 @@ export class ChatGptHost {
     }
     bridge.state.pendingTurns = [...list, fresh]
     await this.persistBridgeState(bridge, true)
+    // The turn is now durably owed an answer: watch it on a bounded cadence
+    // instead of waiting for the next reconcile pass.
+    this.armPendingWatch(bridge)
   }
 
   private async retirePendingTurn(bridge: Bridge, messageId: string): Promise<void> {
     const before = bridge.state.pendingTurns.length
     bridge.state.pendingTurns = bridge.state.pendingTurns.filter(item => item.messageId !== messageId)
-    if (bridge.state.pendingTurns.length !== before) await this.persistBridgeState(bridge)
+    if (bridge.state.pendingTurns.length !== before) {
+      await this.persistBridgeState(bridge)
+      // Nothing posted is owed any more: stop the follow-up cadence at once.
+      if (this.pendingWatchIds(bridge).size === 0) this.disarmPendingWatch(bridge)
+    }
   }
 
   /**
@@ -2458,6 +2495,19 @@ export class ChatGptHost {
    * answer the page had already finished. With no node in hand the caller must
    * leave the turn owed and send nothing.
    */
+  /**
+   * The greppable delivery measurement: how long a posted turn waited for its
+   * answer. Log only (`postedAt` is the durable post time); the audit schema is
+   * strict and carries no field for this.
+   */
+  private logDeliveredAnswer(messageId: string, postedAt: string | null | undefined): void {
+    if (!postedAt) return
+    const postedMs = Date.parse(postedAt)
+    if (!Number.isFinite(postedMs)) return
+    const seconds = Math.max(0, Math.round((Date.now() - postedMs) / 1000))
+    log(`delivered answer for ${messageId} in ${seconds}s (posted ${postedAt})`)
+  }
+
   private async deliverSolicited(bridge: Bridge, record: PendingTurn, answer: ConversationNode): Promise<void> {
     const key = this.turnKey(record)
     // The bus is authoritative for what has been answered, not the mark. A
@@ -2489,6 +2539,7 @@ export class ChatGptHost {
         : (shaped.text || 'the page answered with a command block only; nothing was sent')
       try {
         await bridge.transport?.send(record.senderSessionId, sanitizePeerText(body), `Re: ${record.messageId.slice(0, 8)}`.slice(0, 200), record.messageId, record.kind, false)
+        this.logDeliveredAnswer(record.messageId, record.postedAt)
         audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `delivered the observed answer${shaped.answerPath ? ' (spilled)' : ''} [${bridge.state.name}]`, messageId: record.messageId })
       } catch (error) {
         audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `failed: ${one((error as Error).message, 160)}`, messageId: record.messageId })
@@ -2861,6 +2912,70 @@ export class ChatGptHost {
     }
   }
 
+  /** The message ids of this bridge's turns that were actually posted. */
+  private pendingWatchIds(bridge: Bridge): Set<string> {
+    return new Set(bridge.state.pendingTurns
+      .filter(record => record.postedAt !== null)
+      .map(record => record.messageId))
+  }
+
+  private disarmPendingWatch(bridge: Bridge): void {
+    if (bridge.pendingWatch) clearTimeout(bridge.pendingWatch.timer)
+    bridge.pendingWatch = undefined
+  }
+
+  /**
+   * Arm (or keep armed) the bounded follow-up cadence for a posted turn.
+   *
+   * Called wherever a posted-but-unanswered turn is durably recorded, so the
+   * answer does not wait for the reconcile tick. It is a no-op while the same
+   * turn is already watched; a NEW posted turn earns its own cadence. With no
+   * posted turn left it disarms, which is how a delivery stops the watch.
+   */
+  private armPendingWatch(bridge: Bridge): void {
+    if (this.stopping || bridge.removed || bridge.stopping) return
+    const ids = this.pendingWatchIds(bridge)
+    if (ids.size === 0) { this.disarmPendingWatch(bridge); return }
+    const watch = bridge.pendingWatch
+    if (watch) {
+      if ([...ids].every(id => watch.ids.has(id))) return
+      // A newer posted turn restarts the schedule: the old turn's remaining
+      // gaps are not a budget this one should inherit.
+      this.disarmPendingWatch(bridge)
+    }
+    this.schedulePendingWatch(bridge, 0, ids)
+  }
+
+  private schedulePendingWatch(bridge: Bridge, step: number, ids: Set<string>): void {
+    if (this.stopping || bridge.removed || bridge.stopping) return
+    const gaps = this.config.pendingWatchGapsMs ?? PENDING_WATCH_GAPS_MS
+    const gap = gaps[step]
+    if (gap === undefined) return
+    const handle = setTimeout(() => this.pendingWatchTick(bridge, step), gap)
+    handle.unref?.()
+    bridge.pendingWatch = { timer: handle, step, ids }
+  }
+
+  /**
+   * One bounded follow-up: only while the turn is still owed.
+   *
+   * Always through `triggerObserve`, so the `polling` mutex, the debounce and
+   * the page lock are the existing ones - no second observation path. A 429 or
+   * unreadable read keeps the cadence (the observation pass already owns that
+   * behaviour); nothing here retries a read or moves a cursor.
+   */
+  private pendingWatchTick(bridge: Bridge, step: number): void {
+    const watch = bridge.pendingWatch
+    if (!watch || watch.step !== step) return
+    bridge.pendingWatch = undefined
+    if (this.stopping || bridge.removed || bridge.stopping) return
+    if (this.pendingWatchIds(bridge).size === 0) return
+    const threadId = bridge.state.threadId
+    if (!threadId) return
+    this.triggerObserve('pending-watch', { threadId })
+    this.schedulePendingWatch(bridge, step + 1, watch.ids)
+  }
+
   /**
    * Ask for an observation pass, coalesced.
    *
@@ -2975,6 +3090,9 @@ export class ChatGptHost {
    * first send into a fresh chat all pass through here, so they cannot diverge.
    */
   private setThread(bridge: Bridge, threadId: string | null): void {
+    // A watch is scoped to the thread it was armed for: a stale one must never
+    // observe the new thread.
+    this.disarmPendingWatch(bridge)
     const state = bridge.state
     // A bind to a real thread leaves a time anchor, persisted with the state:
     // the first observation must tell history from what was typed after the
@@ -4008,8 +4126,10 @@ export class ChatGptHost {
     const prose = sanitizePeerText(visibleText).trim()
     if (!prose) return this.replyError(bridge, message, 'no answer was produced for this message')
     const summary = `Re: ${one(message.summary, 180)}`.slice(0, 200)
+    const postedAt = bridge.state.pendingTurns.find(item => item.messageId === message.id)?.postedAt ?? null
     try {
       await bridge.transport?.send(message.fromSessionId, prose, summary, message.id, 'inquiry', false)
+      this.logDeliveredAnswer(message.id, postedAt)
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: 'prose answer sent', messageId: message.id })
     } catch (error) {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
@@ -4660,6 +4780,7 @@ export class ChatGptHost {
     this.detachEvents = undefined
     for (const bridge of this.bridges.values()) {
       bridge.stopping = true
+      this.disarmPendingWatch(bridge)
       for (const { handle } of bridge.schedules.values()) clearTimeout(handle)
       bridge.schedules.clear()
       await this.persistBridgeState(bridge)

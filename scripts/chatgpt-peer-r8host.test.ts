@@ -260,7 +260,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number } = {}): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number; pendingWatchGapsMs?: number[] } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -272,9 +272,13 @@ async function startHost(dir: string, driver: FakeDriver, options: { turnTimeout
     idleUnloadMinutes: 0,
     number: 1,
     pollSeconds: 0,
+    // The reconcile timer is DISABLED for every test here: a delivery proved
+    // below cannot be the 60 s (or 300 s) safety net.
+    observeEvery: 0,
     titlesEvery: 0,
     turnTimeoutMs: options.turnTimeoutMs ?? 900,
     waitPollMs: 20,
+    pendingWatchGapsMs: options.pendingWatchGapsMs,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -364,11 +368,18 @@ type LiveBridge = {
   state: BridgeState
   removed: boolean
   stopping: boolean
+  pendingWatch?: { timer: unknown; step: number; ids: Set<string> }
   transport?: { send: (...args: unknown[]) => Promise<unknown>; historyEntries(): unknown[]; inbox(): unknown[] }
 }
 type Internals = {
   bridges: Map<string, LiveBridge>
   settling: Set<string>
+  bridgeFor: (value: unknown) => LiveBridge | string
+  sendLine: (sessionId: string) => string
+  armPendingWatch: (bridge: LiveBridge) => void
+  disarmPendingWatch: (bridge: LiveBridge) => void
+  setThread: (bridge: LiveBridge, threadId: string | null) => void
+  removeBridge: (bridge: LiveBridge) => Promise<string>
   readConversation: (threadId: string) => Promise<unknown>
   ownUserNodeOf: (
     conversation: unknown, text: string, sinceMs: number, ours: ReadonlySet<string>,
@@ -1950,3 +1961,143 @@ describe('R12-F1: an ambiguous transcript attach is reported as unproven, never 
     }
   }, 40_000)
 })
+
+describe('chatgpt-peer: the registered peer name carries the web; prefix', () => {
+  test('the transport registers as "web; <bare>", state.name stays bare, and both ids resolve', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      // The registration other sessions discover carries the prefix.
+      const registration = JSON.parse(
+        await readFile(join(sessionsDir(dir), `${alpha.sessionId}.json`), 'utf8'),
+      ) as { peer: { name: string; sessionId: string } }
+      expect(registration.peer.name).toBe('web; alpha')
+      expect(registration.peer.sessionId).toBe(alpha.sessionId)
+      // Everything the operator sees and matches on stays bare.
+      const live = internals(host).bridges.get(alpha.sessionId)!
+      expect(live.state.name).toBe('alpha')
+      expect(internals(host).bridgeFor('alpha')).toBe(live)
+      expect(internals(host).bridgeFor(alpha.sessionId)).toBe(live)
+      // Addressing on the bus is still by session id.
+      expect(internals(host).sendLine(alpha.sessionId)).toContain(alpha.sessionId)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+})
+
+describe('pending-watch: a posted turn is delivered within seconds, not at reconcile', () => {
+  test('the watch observes a late answer and delivers it while observeEvery is disabled', async () => {
+    const { dir, cleanup } = await scratch()
+    const driver = new FakeDriver()
+    driver.observable = true
+    const userText = 'a question the page answers after startup'
+    const userNode = driver.appendNode(THREAD_A, 'user', userText)
+    const alpha = await primedBridge()
+    // The record names the send's own node and the cursor sits on it, so the
+    // first pass after arming is a real observation, not a baseline walk.
+    alpha.cursor = userNode
+    const { transport: sender, id: senderId } = await busPeer(dir, 'sender')
+    const messageId = randomUUID()
+    postedTurn(alpha, { messageId, senderSessionId: senderId, text: userText })
+    alpha.pendingTurns.at(-1)!.userNodeId = userNode
+    await seedHost(dir, [alpha])
+    // observeEvery is 0 in startHost: the reconcile timer is off for this test,
+    // so a delivery can only come from the pending watch.
+    const host = await startHost(dir, driver)
+    try {
+      const live = internals(host).bridges.get(alpha.sessionId)!
+      await waitFor(() => (live.pendingWatch ? true : undefined), 5_000)
+      const readsBefore = driver.conversationReads
+      const started = Date.now()
+      // The answer appears on the page with no push event: exactly the live
+      // shape where delivery used to wait for the next reconcile tick.
+      driver.appendNode(THREAD_A, 'assistant', 'the answer the watch found')
+      await waitFor(() => (repliesTo(sender, messageId).length >= 1 ? true : undefined), 8_000)
+      const elapsed = Date.now() - started
+      expect(repliesTo(sender, messageId).length).toBe(1)
+      expect(repliesTo(sender, messageId)[0]).toContain('the answer the watch found')
+      // Delivered by the first (2 s) follow-up, far inside the 60 s window.
+      expect(elapsed).toBeLessThan(6_000)
+      // Bounded: one extra observation for the turn, never more than seven.
+      const extras = driver.conversationReads - readsBefore
+      expect(extras).toBeGreaterThanOrEqual(1)
+      expect(extras).toBeLessThanOrEqual(7)
+      // Settled: the watch is gone and no further observation runs.
+      expect(live.pendingWatch).toBeUndefined()
+      const readsAfter = driver.conversationReads
+      await new Promise(resolve => setTimeout(resolve, 1_500))
+      expect(driver.conversationReads).toBe(readsAfter)
+      expect(repliesTo(sender, messageId).length).toBe(1)
+    } finally {
+      await sender.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('the watch is cleared on setThread and on bridge removal', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      const live = internals(host).bridges.get(alpha.sessionId)!
+      postedTurn(live.state, { messageId: randomUUID(), senderSessionId: randomUUID(), text: 'a posted turn' })
+      internals(host).armPendingWatch(live)
+      expect(live.pendingWatch).toBeDefined()
+      // A thread change must drop a watch scoped to the old thread.
+      internals(host).setThread(live, null)
+      expect(live.pendingWatch).toBeUndefined()
+      // Removal must drop it too, not leave a timer holding the bridge alive.
+      internals(host).armPendingWatch(live)
+      expect(live.pendingWatch).toBeDefined()
+      await internals(host).removeBridge(live)
+      expect(live.removed).toBe(true)
+      expect(live.pendingWatch).toBeUndefined()
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('the bounded cadence never exceeds seven extra observations for one turn', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    // A tiny injected cadence (each gap > the 300 ms debounce, so each follow-up
+    // is a distinct pass) exercises the whole schedule without sleeping 86 s.
+    const gaps = [400, 400, 400, 400, 400, 400, 400]
+    const host = await startHost(dir, driver, { pendingWatchGapsMs: gaps })
+    try {
+      const live = internals(host).bridges.get(alpha.sessionId)!
+      postsyntheticPending(live, randomUUID())
+      const readsBefore = driver.conversationReads
+      internals(host).armPendingWatch(live)
+      // The schedule exhausts itself (the turn is never answered); the watcher
+      // must stop rather than run forever.
+      await waitFor(() => (live.pendingWatch === undefined ? true : undefined), 15_000)
+      // Let the last debounced (300 ms) observation run.
+      await new Promise(resolve => setTimeout(resolve, 700))
+      const extras = driver.conversationReads - readsBefore
+      expect(extras).toBeGreaterThanOrEqual(1)
+      expect(extras).toBeLessThanOrEqual(gaps.length)
+      expect(live.pendingWatch).toBeUndefined()
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+/** One posted record on a loaded bridge, without disturbing the page or inbox. */
+function postsyntheticPending(bridge: LiveBridge, messageId: string): void {
+  postedTurn(bridge.state, { messageId, senderSessionId: randomUUID(), text: 'a bounded-watch turn' })
+}
