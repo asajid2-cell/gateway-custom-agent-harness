@@ -999,6 +999,7 @@ export class ChatGptHost {
       inbox: this.inboxView(bridge),
       owed: bridge.state.owed,
       schedules: bridge.state.schedules,
+      queuedNotices: bridge.state.queuedNotices,
     }
   }
 
@@ -1019,6 +1020,9 @@ export class ChatGptHost {
       inbox: first ? this.inboxView(first) : [],
       owed: first?.state.owed ?? [],
       schedules: first?.state.schedules ?? [],
+      // Measurable from the host status: how many "still queued" notices this
+      // host has sent across its bridges.
+      queuedNotices: bridgeList.reduce((total, bridge) => total + bridge.state.queuedNotices, 0),
       audit: this.hostState.audit.slice(-20),
     }
   }
@@ -2282,8 +2286,15 @@ export class ChatGptHost {
         record.userNodeId = null
         await this.notePendingTurn(bridge, record).catch(() => {})
       } else {
+        // A DEFINITE "not posted" - not a mid-turn deferral. Remember when and
+        // why, so the observation pass can tell the sender once if the page
+        // stays unable to take it (a signed-out tab is otherwise a silent,
+        // indefinite wait). `queuedSince` is the first such failure: a later
+        // transient failure must not restart the clock.
         record.postedAt = null
         record.userNodeId = null
+        record.queuedSince ??= now()
+        record.queuedReason = one((error as Error).message, 200)
         await this.notePendingTurn(bridge, record)
       }
       const reason = one((error as Error).message, 160)
@@ -2597,6 +2608,45 @@ export class ChatGptHost {
       // text the first round reads the thread, exactly as the direct path does.
       const message = this.inboundMessageOf(bridge, deferred)
       await this.settleTurnAnswer(bridge, deferred, message, posted.text, true)
+    }
+  }
+
+  /**
+   * Tell the sender ONCE that a turn could not be typed and still stays queued.
+   *
+   * The page being mid-turn is TRANSIENT: `resumeDeferredTurns` posts that job
+   * at the next idle transition, so such a record never carries `queuedSince`.
+   * A turn whose post failed for any other reason does, and if it is still
+   * unposted after the pending-watch ladder has run its full span - the host's
+   * existing bounded cadence, not a second timer - the sender is told, because
+   * a signed-out tab must not read as an indefinite silent wait.
+   *
+   * `queuedNoticeAt` is written BEFORE the send: one notice per turn, durable
+   * across a restart, exactly like the answer path. Nothing is cancelled,
+   * retried or re-posted, and a turn that posts later still gets its answer.
+   */
+  private async noticeQueuedTurns(bridge: Bridge): Promise<void> {
+    const threshold = (this.config.pendingWatchGapsMs ?? PENDING_WATCH_GAPS_MS)
+      .reduce((total, gap) => total + gap, 0)
+    for (const record of [...bridge.state.pendingTurns]) {
+      if (record.postedAt !== null) continue
+      if (!record.queuedSince || record.queuedNoticeAt) continue
+      const since = Date.parse(record.queuedSince)
+      if (!Number.isFinite(since) || Date.now() - since < threshold) continue
+      record.queuedNoticeAt = now()
+      await this.notePendingTurn(bridge, record)
+      const reason = one(record.queuedReason ?? 'the page could not take it', 180)
+      const line = `your turn is still queued: ${reason}; it was not typed and stays queued - this is the only notice for this message`
+      const message = this.inboundMessageOf(bridge, record)
+      try {
+        await bridge.transport?.send(record.senderSessionId, sanitizePeerText(line), `Re: ${one(message.summary, 180)}`.slice(0, 200), record.messageId, record.kind, false)
+        bridge.state.queuedNotices += 1
+        await this.persistBridgeState(bridge)
+        audit(this.hostState, { op: 'queued', target: record.senderSessionId, result: `notice sent: ${one(reason, 160)} [${bridge.state.name}]`, messageId: record.messageId })
+      } catch (error) {
+        audit(this.hostState, { op: 'queued', target: record.senderSessionId, result: `notice could not be sent: ${one((error as Error).message, 120)}`, messageId: record.messageId })
+      }
+      await this.persistHostState()
     }
   }
 
@@ -3391,7 +3441,15 @@ export class ChatGptHost {
     // finishes a turn the host died in the middle of), then post the oldest
     // deferred job if the page is now idle.
     await this.resumePendingTurns(bridge, conversation)
-    await this.resumeDeferredTurns(bridge)
+    try {
+      await this.resumeDeferredTurns(bridge)
+    } finally {
+      // A turn that could not be typed gets its one notice. The post attempt
+      // can throw on a page that cannot take text at all, and that throw must
+      // not cost the sender the only word it will get; a turn that posts here
+      // is retired first, so a notice never races an answer.
+      await this.noticeQueuedTurns(bridge)
+    }
     if (!bridge.state.cursor) {
       const boundMs = bridge.state.boundAt ? Date.parse(bridge.state.boundAt) : Number.NaN
       if (!Number.isFinite(boundMs)) {
