@@ -3670,7 +3670,21 @@ export class ChatGptHost {
       case 'ready':
         // The child announcing itself; the host has no use for the pid.
         return
-      case 'page-ready':
+      case 'page-ready': {
+        // A `document` ready is ONE thread's news: a cross-thread send
+        // navigates the tab, and licensing every bridge there buys a read and a
+        // tab navigation per bridge for a page that changed one thread. Only a
+        // thread a live bridge owns can be scoped to; `attach` (the first look
+        // after a child spawn), a missing reason, or a thread no bridge owns
+        // keeps the wide catch-up below.
+        const scopeThread = event.reason === 'document' ? this.bridgeForThread(threadId) : undefined
+        if (scopeThread) {
+          scopeThread.reads.licence = 1
+          log(`page ready (document) for thread ${shortId(threadId)} of "${scopeThread.state.name}"; observing that thread only`)
+          this.triggerObserve('page-ready:document', { threadId })
+          void this.pollTitles()
+          return
+        }
         log('page ready; observing every bound thread')
         // A loaded page is one event, not a tick: license exactly one read per
         // live thread, so a restart or a reload still catches up on what the
@@ -3682,6 +3696,7 @@ export class ChatGptHost {
         this.triggerObserve('page-ready', { full: true })
         void this.pollTitles()
         return
+      }
       case 'page-lost':
         // No spin: the reconcile timer and the next real event are the recovery.
         log('the page went away; waiting for it to come back')
