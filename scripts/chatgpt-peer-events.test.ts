@@ -129,7 +129,12 @@ class FakeDriver {
     if (op === 'conversations' && this.observable) {
       const offset = Number(request.offset ?? 0)
       const limit = Number(request.limit ?? 100)
-      return { ok: true, op, items: this.threads.slice(offset, offset + limit) }
+      // `update_time` moves when a thread grows a node, as the real child
+      // reports it; the host licenses one read of a thread whose value moved.
+      const items = this.threads
+        .slice(offset, offset + limit)
+        .map(thread => ({ ...thread, update_time: Object.keys(this.treeOf(thread.id).mapping).length }))
+      return { ok: true, op, items }
     }
     if (op === 'read') return { ok: true, op, threadId: this.current, text: 'ok', evidence: 'state-complete' }
     if (op === 'send') return { ok: true, op, threadId: this.current, text: 'ok', model: 'GPT-6', effort: 'High' }
@@ -236,6 +241,10 @@ describe('page events trigger observation', () => {
     try {
       await host.pollOnce()
       const before = driver.conversationReads()
+      // The page grows before the pass: the account-wide list walk sees
+      // update_time move and licenses exactly one read of this thread, which is
+      // what the in-flight pass then blocks on.
+      driver.humanTypes(THREAD_A, 'a turn arrives', 'and an answer')
       const block = driver.blockNextConversation()
       const pass = host.pollOnce()
       // Wait until the pass is inside its read, then fire a burst at it.
@@ -331,6 +340,9 @@ describe('page events trigger observation', () => {
     try {
       await host.pollOnce()
       const before = driver.conversationReads()
+      // A page change licenses one read through update_time, so the first pass
+      // has genuine work to be blocked inside of.
+      driver.humanTypes(THREAD_A, 'a turn arrives', 'and an answer')
       const block = driver.blockNextConversation()
       const pass = host.pollOnce()
       while (driver.conversationReads() - before < 1) await new Promise(resolve => setTimeout(resolve, 5))
@@ -421,6 +433,10 @@ describe('uplink is relayed at most once', () => {
       const stored = await readBridge(dir, alpha.sessionId)
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), { ...stored, cursor: driver.rootId(THREAD_A) })
       reborn = await startHost(dir, driver)
+      // The real child reports page-ready when it attaches; that report is what
+      // licenses the first observation of a freshly restarted host.
+      driver.emit({ event: 'page-ready' })
+      await reborn.flushTriggers()
       await reborn.pollOnce()
       expect(delivered()).toBe(1)
       const audit = await hostAudit(dir)
@@ -475,6 +491,10 @@ describe('uplink is relayed at most once', () => {
       const stored = await readBridge(dir, alpha.sessionId)
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), { ...stored, cursor: driver.rootId(THREAD_A) })
       reborn = await startHost(dir, driver)
+      // The real child reports page-ready when it attaches; that report is what
+      // licenses the first observation of a freshly restarted host.
+      driver.emit({ event: 'page-ready' })
+      await reborn.flushTriggers()
       await reborn.pollOnce()
       expect(delivered()).toBe(0)
       const audit = await hostAudit(dir)

@@ -24,6 +24,7 @@ import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createHash, randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import { ChatGptHost } from './chatgpt-peer.ts'
 import type { DriverChild, DriverReply } from './chatgpt-peer/driver.ts'
 import { newBridgeState, newHostState, saveJson, type BridgeState } from './chatgpt-peer/state.ts'
@@ -220,7 +221,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, options: { readBackoffBaseMs?: number } = {}): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { readBackoffBaseMs?: number; titlesEvery?: number } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -232,7 +233,7 @@ async function startHost(dir: string, driver: FakeDriver, options: { readBackoff
     idleUnloadMinutes: 0,
     number: 1,
     pollSeconds: 0,
-    titlesEvery: 0,
+    titlesEvery: options.titlesEvery ?? 0,
     turnTimeoutMs: 5_000,
     waitPollMs: 20,
     readBackoffBaseMs: options.readBackoffBaseMs ?? 50,
@@ -259,6 +260,28 @@ async function operator(host: ChatGptHost, token: string, body: Record<string, u
 
 const bridgeNamed = (name: string, threadId: string | null): BridgeState => newBridgeState({ sessionId: randomUUID(), name, threadId })
 
+async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
+  return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
+}
+
+async function busPeer(dir: string, name: string): Promise<GatewaySessionTransport> {
+  const transport = new GatewaySessionTransport({
+    directory: sessionsDir(dir), sessionId: randomUUID(), name, cwd: dir, purpose: 'test sender', policy: 'accept',
+  })
+  await transport.start()
+  return transport
+}
+
+async function waitFor<T>(probe: () => T | undefined, timeoutMs = 8_000): Promise<T> {
+  const started = Date.now()
+  for (;;) {
+    const value = probe()
+    if (value !== undefined) return value
+    if (Date.now() - started > timeoutMs) throw new Error('waitFor timed out')
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+}
+
 const sha256 = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 
 const primerSha = async (): Promise<string> =>
@@ -276,29 +299,38 @@ async function baselinedBridge(name: string, threadId: string): Promise<BridgeSt
   return bridge
 }
 
-/** Every call a reconcile pass could make to read a thread or its status. */
-const pageReads = (driver: FakeDriver): Call[] =>
-  driver.calls.filter(call => ['conversation', 'conversations', 'status', 'read'].includes(String(call.op)))
+/** Every per-thread read a reconcile pass could make. */
+const perThreadReads = (driver: FakeDriver): Call[] =>
+  driver.calls.filter(call => ['conversation', 'status', 'read'].includes(String(call.op)))
 
-describe('directive C: an idle host reads nothing', () => {
-  test('four idle bridges put no read of any kind on the page across ten ticks', async () => {
+/** Every account-wide list walk. */
+const listWalks = (driver: FakeDriver): Call[] =>
+  driver.calls.filter(call => String(call.op) === 'conversations')
+
+describe('directive C: an idle host reads nothing per thread', () => {
+  test('four idle bridges put no per-thread read on the page across ten ticks, and exactly one list walk per titles interval', async () => {
     const { dir, cleanup } = await scratch()
     const names = ['review', 'chatgpt-web', 'cnow', 'round12-retro']
     const bridges = await Promise.all(names.map((name, index) => baselinedBridge(name, IDLE_THREADS[index]!)))
     await seedHost(dir, bridges)
     const driver = new FakeDriver()
     driver.observable = true
-    const host = await startHost(dir, driver)
+    // A real titles interval, so the coalescing is the one production runs.
+    const host = await startHost(dir, driver, { titlesEvery: 30_000 })
     try {
       for (let tick = 0; tick < 10; tick++) {
         await host.pollOnce()
-        // The timer path, not a forced walk: the title list is account-wide and
-        // an idle host must not pay for it either.
+        // The timer path as well as the reconcile pass: both go through the
+        // interval, so ten ticks inside one interval pay for one walk.
         await host.pollTitles()
       }
-      // No conversation read, no status read, no list walk, no `read` op.
-      expect(pageReads(driver)).toEqual([])
+      // No conversation read, no status read, no `read` op - for any thread.
+      expect(perThreadReads(driver)).toEqual([])
       for (const threadId of IDLE_THREADS) expect(driver.readsOf(threadId)).toBe(0)
+      // The account-wide walk itself is NOT gated on anything being owed: it
+      // runs once, on the first tick, and the interval coalesces the rest. That
+      // is the only page traffic an idle host makes.
+      expect(listWalks(driver).length).toBe(1)
 
       // The numbers ride the operator's status line, read-only, so reads/min is
       // reportable from the host. Asking status is the operator's own explicit
@@ -307,6 +339,8 @@ describe('directive C: an idle host reads nothing', () => {
       const status = await operator(host, token, { op: 'status', bridge: bridges[0]!.sessionId })
       expect(status.status).toBe(200)
       expect(String(status.body.line)).toContain('reads 0 attempted')
+      // The list walk is instrumented too, so its cost is never invisible.
+      expect(String(status.body.line)).toContain('list 1 attempted')
       // And it says why: every pass was skipped while the bridge owed nothing.
       expect(String(status.body.line)).toMatch(/[1-9]\d* idle/)
     } finally {
@@ -398,6 +432,63 @@ describe('directive C: a delivery read outranks another bridge\'s backoff', () =
       await host.pollOnce()
       expect(driver.readsOf(THREAD_B)).toBe(1)
     } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+describe('directive C: a delivery read refused by its OWN window stays owed', () => {
+  // The window bounds the READ, not the turn. A bridge throttled while a
+  // sender is waiting must not answer that sender with an error, must not post
+  // the turn a second time, and must deliver exactly once when the window
+  // closes. This is the same-bridge half of row (3): the per-bridge window can
+  // never be confused with a failure of the page.
+  test('the turn waits out its own window, then answers once with no error reply', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await baselinedBridge('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    const host = await startHost(dir, driver, { readBackoffBaseMs: 50 })
+    const sender = await busPeer(dir, 'sender-own')
+    try {
+      // Baseline: the idle bridge has nothing owed, so the first tick reads no
+      // thread. Only the account-wide list walk runs.
+      await host.pollOnce()
+      expect(driver.readsOf(THREAD_A)).toBe(0)
+
+      // The page throttles this bridge for a known window.
+      driver.rateLimit(THREAD_A, 700)
+
+      const sent = (await sender.send(alpha.sessionId, 'what is on the page?', 'new', undefined, 'inquiry', true)) as { id?: string }
+      const m1 = sent.id ?? ''
+      expect(m1).not.toBe('')
+
+      // The post-send delivery read is the one the page refuses; it is asked
+      // exactly once and then the gate, not the page, answers.
+      await waitFor(() => (driver.readsOf(THREAD_A) >= 1 ? true : undefined))
+      expect(driver.readsOf(THREAD_A)).toBe(1)
+
+      // Inside the window: still owed, no reply yet, and another pass does not
+      // ask the driver a second time.
+      await host.pollOnce()
+      expect(driver.readsOf(THREAD_A)).toBe(1)
+      const owed = await readBridge(dir, alpha.sessionId)
+      expect(owed.pendingTurns.length).toBeGreaterThan(0)
+      expect(sender.inbox().filter(item => (item.message as unknown as { replyTo?: string }).replyTo === m1).length).toBe(0)
+
+      // The window closes: the read is allowed and the SAME turn is delivered.
+      driver.clearRateLimit(THREAD_A)
+      const reply = await waitFor(() => sender.inbox().find(item => (item.message as unknown as { replyTo?: string }).replyTo === m1))
+      const text = String((reply.message as unknown as { text: string }).text)
+      expect(text).toContain('answered on the page')
+      // No error to the sender, one reply, and one send on the page.
+      expect(text).not.toContain('could not answer')
+      expect(sender.inbox().filter(item => (item.message as unknown as { replyTo?: string }).replyTo === m1).length).toBe(1)
+      expect(driver.calls.filter(call => String(call.op) === 'send').length).toBe(1)
+    } finally {
+      await sender.close()
       await host.stop()
       await cleanup()
     }

@@ -1047,6 +1047,11 @@ async function startPeerHost(dir: string, driver: PageDriver | ScriptedDriver, o
     titlesEvery: 0,
     turnTimeoutMs: overrides.turnTimeoutMs ?? 5_000,
     waitPollMs: 20,
+    // Real backoff windows (5 s base, up to 1.5x with jitter) overlap this
+    // suite's 5 s turn timeout, so a throttled read would race the turn clock
+    // instead of exercising the row. A 50 ms base keeps the same shape -
+    // refusal, wait, retry, settle - without that race.
+    readBackoffBaseMs: 50,
     directory: peerSessionsDir(dir),
     privateHome: peerPrivateHome(dir),
   }, driver as unknown as DriverChild)

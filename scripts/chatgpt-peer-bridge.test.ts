@@ -233,7 +233,14 @@ class FakeDriver {
     if (op === 'conversations' && this.observable) {
       const offset = Number(request.offset ?? 0)
       const limit = Number(request.limit ?? 100)
-      return { ok: true, op, items: this.threads.filter(thread => !this.deleted.has(thread.id)).slice(offset, offset + limit) }
+      // The real child maps `update_time` per thread (chatgpt.mjs). A thread
+      // that grows a node moves it; the host uses exactly that to license the
+      // one observation read a changed thread earns.
+      const items = this.threads
+        .filter(thread => !this.deleted.has(thread.id))
+        .slice(offset, offset + limit)
+        .map(thread => ({ ...thread, update_time: Object.keys(this.treeOf(thread.id).mapping).length }))
+      return { ok: true, op, items }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') {
@@ -344,6 +351,9 @@ async function startHost(dir: string, driver: FakeDriver, options: { idleUnloadM
     // fast enough that a suite finishes while still exercising many polls.
     turnTimeoutMs: options.turnTimeoutMs ?? 5_000,
     waitPollMs: 20,
+    // A test that flips a 429 off must not wait the production 5s base. The
+    // exponential shape is covered by chatgpt-peer-429backoff-host.
+    readBackoffBaseMs: 10,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -1402,6 +1412,11 @@ describe('thread watcher', () => {
     driver.reopen()
     driver.humanTypes(THREAD_A, 'while you were away: schedule something', rendered({ nonce: 'ask', op: 'schedule' }))
     const again = await startHost(dir, driver)
+    // A restarted host attaches to a page whose observer is already installed;
+    // the real child reports `page-ready` on attach (chatgpt-driver.mjs). That
+    // is the licence for one read per bridge, which is how a turn typed while
+    // the host was down is caught without a per-tick poll.
+    driver.emit({ event: 'page-ready' })
     try {
       await again.pollOnce()
       expect(sends(driver).filter(text => text.includes('HUMAN TURN')).length).toBe(1)
@@ -2697,6 +2712,9 @@ describe('pending inbound turns (D5b)', () => {
       expect((await hostAudit(dir)).some(entry => entry.op === 'observe' && /rate-limited/.test(entry.result))).toBe(true)
 
       driver.rateLimited = false
+      // The 429 opened a per-bridge window (base 10ms here); a pass inside it
+      // is refused without a driver call, which is the property under test.
+      await new Promise(resolve => setTimeout(resolve, 40))
       await host.pollOnce()
       expect(sender.inbox().length).toBe(1)
       await host.pollOnce()

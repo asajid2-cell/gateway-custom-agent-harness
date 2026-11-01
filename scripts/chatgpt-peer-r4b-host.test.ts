@@ -175,7 +175,12 @@ class FakeDriver {
     if (op === 'conversations' && this.observable) {
       const offset = Number(request.offset ?? 0)
       const limit = Number(request.limit ?? 100)
-      return { ok: true, op, items: this.threads.slice(offset, offset + limit) }
+      // `update_time` moves when a thread grows a node, as the real child
+      // reports it; the host licenses one read of a thread whose value moved.
+      const items = this.threads
+        .slice(offset, offset + limit)
+        .map(thread => ({ ...thread, update_time: Object.keys(this.treeOf(thread.id).mapping).length }))
+      return { ok: true, op, items }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') {

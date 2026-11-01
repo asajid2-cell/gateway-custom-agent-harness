@@ -337,6 +337,27 @@ const newReadGate = (): ReadGate => ({
   failures: 0, backoffMs: 0, backoffUntil: 0, licence: 0,
 })
 
+/**
+ * The account-wide list walk's figures, and its own 429 window.
+ *
+ * The discovery path costs one list read per titles interval, so the claim has
+ * to be measurable next to the per-thread reads. A throttled list is backed off
+ * on the same exponential as a throttled thread read: retrying a 429 on a fixed
+ * interval is the burst this change exists to remove.
+ */
+type ListGate = {
+  attempted: number
+  rateLimited: number
+  skipped: number
+  failures: number
+  backoffMs: number
+  backoffUntil: number
+}
+
+const newListGate = (): ListGate => ({
+  attempted: 0, rateLimited: 0, skipped: 0, failures: 0, backoffMs: 0, backoffUntil: 0,
+})
+
 /** One bridged thread: its durable memory and its live transport. */
 type Bridge = {
   state: BridgeState
@@ -471,6 +492,20 @@ function retryAfterMsOf(reply: DriverReply): number | undefined {
   return undefined
 }
 
+/**
+ * The exponential backoff both gates use: base x 2^(failures-1), spread by the
+ * jitter so two bridges cannot synchronise, capped, with a Retry-After the
+ * driver reported as a FLOOR (the server's own number is never undercut).
+ */
+function grownBackoffMs(failures: number, baseMs: number, reply?: DriverReply): number {
+  const grown = baseMs * 2 ** (Math.max(1, failures) - 1)
+  const jitter = 1 - READ_BACKOFF_JITTER + Math.random() * READ_BACKOFF_JITTER * 2
+  let ms = Math.min(READ_BACKOFF_MAX_MS, Math.round(grown * jitter))
+  const hinted = reply ? retryAfterMsOf(reply) : undefined
+  if (hinted !== undefined) ms = Math.max(ms, hinted)
+  return ms
+}
+
 type GatewayBlock = Record<string, unknown>
 
 /** The gateway blocks in one answer, parsed; a block that is not JSON is prose. */
@@ -551,8 +586,25 @@ export class ChatGptHost {
   private scheduleGeneration = 0
   /** When a 429 observation was last audited, so throttling is one line, not a flood. */
   private lastRateLimitAudit = 0
+  /** The same throttle for the list walk's 429 audit line. */
+  private lastListRateLimitAudit = 0
   /** The thread list as last walked (id -> title), for the unbridged-thread diff. */
   private knownThreads = new Map<string, string>()
+  /**
+   * The list's `update_time` per thread, as of the last walk.
+   *
+   * This is the discovery path for a thread the driver is not showing: the
+   * controlled tab's observer cannot see another tab, so a human turn there is
+   * noticed only by this account-wide read. A moved value licenses exactly ONE
+   * conversation read of the owning bridge - the same one-shot licence a page
+   * event grants - so discovery costs a list read per interval, not a
+   * conversation read per bridge per pass.
+   */
+  private threadUpdated = new Map<string, number | null>()
+  /** The list walk's own counters and 429 window (host-level, not per bridge). */
+  private readonly listGate = newListGate()
+  /** When the list was last walked; coalesces the reconcile pass with the timer. */
+  private lastListAt = 0
   /** The first walk is the baseline: every existing thread is "new" to it. */
   private threadBaseline = false
   /**
@@ -1738,7 +1790,13 @@ export class ChatGptHost {
         deepFor = key
         proofAt = Date.now()
         const read = await this.readConversation(bridge, threadId, 'delivery')
-        if (read && "conversation" in read) {
+        if (read && "rateLimited" in read) {
+          // This bridge's own 429 window refused a LIVE delivery read. That is
+          // the page asking for a pause, not evidence about the turn: re-arm the
+          // signal licence and let the deadline slide past the window (below),
+          // so a throttled post-send read never fails a turn that is still owed.
+          deepFor = null
+        } else if (read && "conversation" in read) {
           // An answer belongs to a USER NODE, never to "the newest assistant
           // node". When the send's own node could not be recorded (a 429 on
           // the post-send read), identify it from the text we sent within the
@@ -1786,12 +1844,23 @@ export class ChatGptHost {
         // R-LIVE-8: a DRIVER that failed during the wait explains the silence
         // just as well. The page may be generating happily and finish later, so
         // no deadline conclusion may be drawn about it: the turn stays owed.
-        const driverFailed = driverFaultAt !== 0 && Date.now() - driverFaultAt <= Math.max(this.waitPoll * 4, 5_000)
-        if (driverFailed) throw new GeneratingTurn(threadId, true)
-        // `unknown` is the page saying nothing - not the turn stopping. It is
-        // no evidence of failure, so it is never reported as one either.
-        if (last.state === 'generating' || last.state === 'unknown') throw new GeneratingTurn(threadId)
-        throw new PageUnproven('not-complete', 'the page said the turn stopped but no finished answer could be read')
+        //
+        // A bridge whose own 429 window refused the read is in the same class:
+        // the page asked for a pause and never answered the delivery read, so
+        // the clock slides past the window and the live turn stays owed until
+        // the page has actually been asked. Only idle observation can be
+        // silenced by backoff; a delivery read is always tried again.
+        const refusedUntil = bridge.reads.backoffUntil
+        if (Date.now() < refusedUntil) {
+          deadline = refusedUntil + this.waitPoll
+        } else {
+          const driverFailed = driverFaultAt !== 0 && Date.now() - driverFaultAt <= Math.max(this.waitPoll * 4, 5_000)
+          if (driverFailed) throw new GeneratingTurn(threadId, true)
+          // `unknown` is the page saying nothing - not the turn stopping. It is
+          // no evidence of failure, so it is never reported as one either.
+          if (last.state === 'generating' || last.state === 'unknown') throw new GeneratingTurn(threadId)
+          throw new PageUnproven('not-complete', 'the page said the turn stopped but no finished answer could be read')
+        }
       }
       await new Promise(resolve => setTimeout(resolve, this.waitPoll))
     }
@@ -2046,7 +2115,15 @@ export class ChatGptHost {
     if (gate.idleSkips) parts.push(`${gate.idleSkips} idle`)
     const waitMs = gate.backoffUntil - Date.now()
     if (waitMs > 0) parts.push(`backoff ${Math.ceil(waitMs / 1000)}s`)
-    return `reads ${parts.join(', ')}`
+    // The list walk is account-wide, not per bridge, but it is a page read and
+    // the 0.5/min claim has to be measurable from the same status line.
+    const list = this.listGate
+    const listParts = [`${list.attempted} attempted`]
+    if (list.rateLimited) listParts.push(`${list.rateLimited} x429`)
+    if (list.skipped) listParts.push(`${list.skipped} skipped`)
+    const listWait = list.backoffUntil - Date.now()
+    if (listWait > 0) listParts.push(`backoff ${Math.ceil(listWait / 1000)}s`)
+    return `reads ${parts.join(', ')}; list ${listParts.join(', ')}`
   }
 
   /**
@@ -2880,6 +2957,17 @@ export class ChatGptHost {
    * paid for in 429s. A never-baselined thread is owed exactly one read; a
    * posted or deferred turn and an unresolved send are owed reads until they
    * settle or the bounded watch gives up.
+   *
+   * The bound on an UNSOLICITED turn: a person typing into an idle bound thread
+   * is noticed by the account-wide list walk in `pollTitles` and nowhere else.
+   * That walk runs at most once per titles interval (`titlesEvery`, 120 s by
+   * default) and licenses exactly one read per thread whose `update_time` moved
+   * or which vanished - so an idle bridge reads nothing at all until that walk
+   * sees the change, and the page learns of the turn within one interval, not
+   * instantly. Latency, never loss. The one fast path is the tab the driver
+   * controls: its `signal`/`navigated` push shortens that to the push itself.
+   * Other tabs are separate documents the driver never observes, so for them
+   * the list walk is the ONLY notice and the interval is the whole bound.
    */
   private owesObservation(bridge: Bridge): boolean {
     const state = bridge.state
@@ -2912,14 +3000,28 @@ export class ChatGptHost {
     const gate = bridge.reads
     gate.rateLimited += 1
     gate.failures = Math.min(gate.failures + 1, 12)
-    const base = this.config.readBackoffBaseMs ?? READ_BACKOFF_BASE_MS
-    const grown = base * 2 ** (gate.failures - 1)
-    const jitter = 1 - READ_BACKOFF_JITTER + Math.random() * READ_BACKOFF_JITTER * 2
-    let ms = Math.min(READ_BACKOFF_MAX_MS, Math.round(grown * jitter))
-    const hinted = retryAfterMsOf(reply)
-    if (hinted !== undefined) ms = Math.max(ms, hinted)
-    gate.backoffMs = ms
-    gate.backoffUntil = Date.now() + ms
+    gate.backoffMs = grownBackoffMs(gate.failures, this.config.readBackoffBaseMs ?? READ_BACKOFF_BASE_MS, reply)
+    gate.backoffUntil = Date.now() + gate.backoffMs
+  }
+
+  /**
+   * The account-wide list was throttled. Same exponential as a thread read:
+   * a fixed retry interval against a 429 is exactly the burst being removed.
+   */
+  private noteListRateLimited(reply?: DriverReply): void {
+    const gate = this.listGate
+    gate.rateLimited += 1
+    gate.failures = Math.min(gate.failures + 1, 12)
+    gate.backoffMs = grownBackoffMs(gate.failures, this.config.readBackoffBaseMs ?? READ_BACKOFF_BASE_MS, reply)
+    gate.backoffUntil = Date.now() + gate.backoffMs
+    log(`the thread list was rate-limited (backoff ${Math.round(gate.backoffMs / 1000)}s)`)
+    // One line per five minutes, like the observation throttle: operator
+    // evidence, not a line per retry.
+    if (Date.now() - this.lastListRateLimitAudit > 300_000) {
+      this.lastListRateLimitAudit = Date.now()
+      audit(this.hostState, { op: 'observe', target: 'threads', result: 'the thread list was rate-limited; keeping the last list' })
+      void this.persistHostState().catch(() => {})
+    }
   }
 
   /**
@@ -3249,6 +3351,10 @@ export class ChatGptHost {
   async pollOnce(): Promise<void> {
     if (this.stopping || this.polling) return
     const failedAt = this.readErrors
+    // The list walk is the discovery path (see pollTitles): it runs before the
+    // pass, so a thread whose update_time moved licenses exactly one read that
+    // this pass then consumes.
+    await this.pollTitles()
     try {
       await this.runPass({ full: true, threads: new Set() }, 'reconcile')
     } catch (error) {
@@ -3260,21 +3366,38 @@ export class ChatGptHost {
   }
 
   /**
-   * The title walk, on its own timer and once on page-ready. Public for tests.
+   * The account-wide thread list, on its own timer and once on page-ready.
+   * Public for tests.
    *
-   * `force` is for an operator or a test that wants the list NOW; the timer
-   * path does not pass it, so an idle host (no owed turn, no unresolved send,
-   * no un-baselined thread) pays no list read at all.
+   * This is the relay's discovery path, so it is NOT gated on owed work: the
+   * driver observes ONE tab, and a person typing in a bound thread shown in any
+   * other tab produces no `signal` and no `navigated`. Only this list read sees
+   * that thread change - so a human turn is noticed within one titles interval
+   * (120 s by default, `--titles-every`). The list endpoint is a different path
+   * from `/backend-api/conversation/<id>`; the observed 429s were all on the
+   * latter.
+   *
+   * `force` is for an operator or a test that wants the list NOW. A non-forced
+   * call inside the titles interval is coalesced with the timer's walk, so the
+   * reconcile pass does not add a second account-wide read.
    */
   async pollTitles(force = false): Promise<void> {
     if (this.stopping) return
-    // The list read is account-wide and buys nothing when every bridge is idle:
-    // no owed turn, no unresolved send, no un-baselined thread. Skipping it is
-    // the other half of "zero reads for a bridge with no pending turn".
-    if (!force && ![...this.bridges.values()].some(bridge => !bridge.removed && !bridge.stopping && this.owesObservation(bridge))) return
+    const gap = (this.config.titlesEvery ?? 0) * 1000
+    if (!force && gap > 0 && Date.now() - this.lastListAt < gap) return
+    const gate = this.listGate
+    if (Date.now() < gate.backoffUntil) {
+      gate.skipped += 1
+      return
+    }
+    this.lastListAt = Date.now()
     try {
       await this.pageObserve(() => this.observeTitles())
     } catch (error) {
+      if ((error as { rateLimited?: unknown }).rateLimited === true) {
+        this.noteListRateLimited((error as { reply?: DriverReply }).reply)
+        return
+      }
       log(`title walk failed: ${(error as Error).message}`)
     }
   }
@@ -3877,12 +4000,38 @@ export class ChatGptHost {
    * already on the account would otherwise read as "new".
    */
   private async observeTitles(): Promise<void> {
+    this.listGate.attempted += 1
     const items = await listAllThreads(async (offset, limit) => {
       const reply = await this.driver.call({ op: 'conversations', offset, limit }, 30_000)
-      if (reply.ok !== true) throw new Error(one(reply.error, 200) || 'the thread list could not be read')
-      return { items: Array.isArray(reply.items) ? reply.items as { id: string; title?: string | null }[] : [] }
+      if (reply.ok !== true) {
+        if (reply.status === 429 || /rate.?limit|too many requests/i.test(String(reply.error ?? ''))) {
+          // Carry the driver's own Retry-After (if any) out to the gate.
+          const throttled = new Error('the thread list was rate-limited') as Error & { rateLimited: true; reply: DriverReply }
+          throttled.rateLimited = true
+          throttled.reply = reply
+          throw throttled
+        }
+        throw new Error(one(reply.error, 200) || 'the thread list could not be read')
+      }
+      return {
+        items: Array.isArray(reply.items)
+          ? reply.items as { id: string; title?: string | null; update_time?: number | string | null }[]
+          : [],
+      }
     })
-    const listing = items.map(item => ({ id: item.id.toLowerCase(), title: item.title ?? '' }))
+    // The page answered: the next 429 starts from the base again.
+    this.listGate.failures = 0
+    this.listGate.backoffMs = 0
+    this.listGate.backoffUntil = 0
+    const countOf = (value: unknown): number | null => {
+      const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN
+      return Number.isFinite(number) ? number : null
+    }
+    const listing = items.map(item => ({
+      id: item.id.toLowerCase(),
+      title: item.title ?? '',
+      updated: countOf(item.update_time),
+    }))
     const owned = new Set([...this.bridges.values()].filter(bridge => bridge.state.threadId).map(bridge => bridge.state.threadId!.toLowerCase()))
     if (this.threadBaseline) {
       const diff = diffThreadList(this.knownThreads, listing)
@@ -3897,10 +4046,31 @@ export class ChatGptHost {
         log(`thread ${shortId(gone)} vanished and no bridge owned it`)
       }
     }
+    const firstWalk = !this.threadBaseline
     this.threadBaseline = true
     this.knownThreads = new Map(listing.map(item => [item.id, item.title]))
     const titles = this.knownThreads
-    const bound = [...this.bridges.values()].filter(bridge => bridge.state.threadId && !bridge.removed)
+    const bound = [...this.bridges.values()].filter(bridge => bridge.state.threadId && !bridge.removed && !bridge.stopping)
+    const updatedNow = new Map(listing.map(item => [item.id, item.updated]))
+    const updatedBefore = this.threadUpdated
+    this.threadUpdated = updatedNow
+    // The relay's discovery step: a bound thread whose update_time MOVED since
+    // the last walk, or that has vanished from the list, licenses exactly one
+    // observation read of that bridge. Idle bridges otherwise stay unread.
+    if (!firstWalk) {
+      for (const bridge of bound) {
+        const threadId = bridge.state.threadId!.toLowerCase()
+        const fresh = updatedNow.get(threadId)
+        if (fresh === undefined) {
+          // Gone from the list: one read lets the 404 path mark it missing. The
+          // marker stops it repeating every interval.
+          if (!bridge.state.threadMissingAt) this.triggerObserve('list-missing', { threadId })
+          continue
+        }
+        const before = updatedBefore.get(threadId)
+        if (before !== undefined && fresh !== null && before !== fresh) this.triggerObserve('list-updated', { threadId })
+      }
+    }
     for (const bridge of bound) {
       const title = titles.get(bridge.state.threadId!.toLowerCase())
       if (!title || title === bridge.state.title) continue

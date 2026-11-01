@@ -386,7 +386,7 @@ type Internals = {
   disarmPendingWatch: (bridge: LiveBridge) => void
   setThread: (bridge: LiveBridge, threadId: string | null) => void
   removeBridge: (bridge: LiveBridge) => Promise<string>
-  readConversation: (threadId: string) => Promise<unknown>
+  readConversation: (bridge: LiveBridge, threadId: string, kind?: 'observation' | 'delivery') => Promise<unknown>
   ownUserNodeOf: (
     conversation: unknown, text: string, sinceMs: number, ours: ReadonlySet<string>,
     includeOwned?: boolean, exclude?: ReadonlySet<string>, earliest?: boolean, afterId?: string | null,
@@ -399,6 +399,20 @@ type Internals = {
   bodyContainedIn: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, afterId: string | null) => string | null
 }
 const internals = (host: ChatGptHost): Internals => host as unknown as Internals
+
+/**
+ * The page read one thread, through the host's own read path.
+ *
+ * The production read is per BRIDGE (its per-bridge gate and counters), so the
+ * probe resolves the bridge bound to that thread and asks for a delivery-kind
+ * read - the same kind a settle does, which is the one the gate never treats as
+ * idle traffic.
+ */
+const readThread = (host: ChatGptHost, threadId: string): Promise<unknown> => {
+  const bridge = [...internals(host).bridges.values()].find(live => live.state.threadId === threadId)
+  expect(bridge).toBeDefined()
+  return internals(host).readConversation(bridge!, threadId, 'delivery')
+}
 
 type AuditLine = { op: string; target: string | null; result: string; messageId?: string | null }
 async function audits(dir: string): Promise<AuditLine[]> {
@@ -893,7 +907,7 @@ describe('R8-A: the post-time anchor outlives the cursor', () => {
       const sendsBefore = sendCount(driver)
       const host2 = await startHost(dir, driver)
       try {
-        const read = await internals(host2).readConversation(THREAD_A) as { conversation: unknown }
+        const read = await readThread(host2, THREAD_A) as { conversation: unknown }
         // Premise, self-diagnosing: the probe's inputs really are in the read.
         // If the snapshot ever loses the anchor or the send node, this names the
         // read rather than letting the probe below report a bare `null`.
@@ -952,7 +966,7 @@ describe('R8-B: the live cursor is not on the visible branch', () => {
       await saveJson(join(dir, 'bridges', `${alpha.sessionId}.json`), alpha)
       const host = await startHost(dir, driver)
       try {
-        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const read = await readThread(host, THREAD_A) as { conversation: Conversation }
         const job = internals(host).bridges.get(alpha.sessionId)!.state.pendingTurns.find(item => item.messageId === messageId)!
         // The premise: this is exactly the state the cursor is in.
         expect(chainOf(read.conversation).findIndex(turn => turn.id === orphan)).toBe(-1)
@@ -1012,7 +1026,7 @@ describe('R8-C: ownership alone stops the second pass', () => {
         const fresh = (await audits(dir)).slice(before)
         expect(fresh.some(line => line.op === 'human' && line.target === sendNode)).toBe(false)
         expect(fresh.some(line => line.op === 'unprompted')).toBe(false)
-        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const read = await readThread(host, THREAD_A) as { conversation: Conversation }
         const answers = newPageAnswers(read.conversation, { ours: new Set(state.ourNodeIds), cursor: state.cursor })
         expect(answers.some(item => item.nodeId === answerNode)).toBe(false)
         expect(sendCount(driver)).toBe(0)
@@ -1239,7 +1253,7 @@ describe('R8-A2: the whole-body recovery matcher', () => {
       const record = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(item => item.messageId === messageId)!
       const host = await startHost(dir, driver)
       try {
-        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const read = await readThread(host, THREAD_A) as { conversation: Conversation }
         const none = new Set<string>()
         // Premise: the legacy record has no anchor, the send node's clock is
         // INSIDE the posting window, the cursor is past it, and equal-or-prefix
@@ -1299,7 +1313,7 @@ describe('R8-A2: the whole-body recovery matcher', () => {
       const host = await startHost(dir, driver)
       try {
         const live = internals(host).bridges.get(alpha.sessionId)!
-        const read = await internals(host).readConversation(THREAD_A) as { conversation: Conversation }
+        const read = await readThread(host, THREAD_A) as { conversation: Conversation }
         const none = new Set<string>()
         const job = live.state.pendingTurns.find(item => item.messageId === messageId)
         const postedMs = Date.parse(job?.postedAt ?? new Date().toISOString())
