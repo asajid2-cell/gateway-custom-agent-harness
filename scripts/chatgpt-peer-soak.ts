@@ -272,7 +272,18 @@ function printSummary(options: Options, state: RunState): void {
   }
   lines.push(`  failures        ${kinds.size === 0 ? 'none' : [...kinds.entries()].map(([kind, count]) => `${kind} x${count}`).join('; ')}`)
   lines.push(`  budget          ${state.issued} of ${options.maxRequests} request(s) used`)
-  lines.push(`  stopped early   ${state.interrupted ? 'yes (interrupted; in-flight requests were aborted)' : 'no (the schedule ran out)'}`)
+  // A budget of 15 over 15 grid points is not an early stop; the budget and the
+  // schedule simply end together, and calling that "early" would make two
+  // otherwise identical runs look different.
+  const slots = Math.floor((options.durationMs - 1) / options.cadenceMs) + 1
+  const plannedTotal = Math.min(options.maxRequests, slots * options.bridges.length)
+  const budgetEnded = state.issued >= options.maxRequests && options.maxRequests < plannedTotal
+  const why = state.interrupted
+    ? 'yes (interrupted; in-flight requests were aborted)'
+    : budgetEnded
+      ? 'yes (request budget used)'
+      : 'no (the schedule ran out)'
+  lines.push(`  stopped early   ${why}`)
   process.stdout.write(`${lines.join('\n')}\n`)
 }
 
@@ -499,7 +510,7 @@ async function runTurn(options: Options): Promise<number> {
 function printPlan(options: Options): void {
   const start = Date.now()
   const perBridge = Math.min(
-    Math.ceil(options.durationMs / options.cadenceMs),
+    Math.floor((options.durationMs - 1) / options.cadenceMs) + 1,
     Math.floor(options.maxRequests / options.bridges.length),
   )
   const ticks = Math.min(options.maxRequests, options.bridges.length * perBridge)
