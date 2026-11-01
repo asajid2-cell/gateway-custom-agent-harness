@@ -1,0 +1,21 @@
+# Chrome profile: a signed-in browser, never source
+profile/
+# host state: thread ids, tokens, audit
+peer.json
+*.log
+chrome.pid
+*.png
+*-out.txt
+# scratch probes (the driver is chatgpt.mjs)
+_*
+probe*.mjs
+test-*.mjs
+dom*.mjs
+inspect.mjs
+peek*.mjs
+peers.mjs
+*.ps1
+# dependencies
+node_modules/
+# per-bridge state: one file per bridged thread (runtime)
+bridges/
