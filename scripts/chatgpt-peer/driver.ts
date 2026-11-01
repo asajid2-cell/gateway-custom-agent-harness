@@ -117,13 +117,19 @@ export class DriverChild {
    * them, and when. Only an id whose request is still pending is recorded (the
    * live `accepted for r194 has no live waiter; dropped` line showed the old
    * code recording settled ids, which is what disabled recovery for the child's
-   * life). An id leaves this set when it is settled, its child exits, or its
-   * child is replaced. Its age, read against its own request deadline, decides
-   * in `wedged()` whether a timeout beside it is that request's problem or a
-   * lost reply.
+   * life). An id leaves this set when a reply proves its work done, when its
+   * child exits, or when the child is replaced - NOT when its own request times
+   * out, because the page may still be working on that message. Its age, read
+   * against that request's deadline, is what `wedged()` partitions on: young is
+   * genuine work in flight, past the bound is a lost reply.
    */
   private readonly accepted = new Map<string, { generation: number; at: number }>()
-  /** When each in-flight request's own deadline falls, for a graceful drain. */
+  /**
+   * When each request's own deadline falls. `kill()` reads it for a graceful
+   * drain, and while an accepted id outlives its request's timeout the entry
+   * stays with it, because `lostReplyBoundAt()` measures the age partition
+   * against that deadline rather than the construction ceiling.
+   */
   private readonly deadlines = new Map<string, number>()
   /**
    * When the child last emitted ANY line: a reply, an `accepted`, a push. It is
@@ -179,14 +185,15 @@ export class DriverChild {
    * When an accepted id's reply is presumed lost.
    *
    * The id's OWN request deadline is the ceiling: `call()` records it in
-   * `deadlines` before writing and only `finish()` removes it, and `finish()`
-   * removes the accepted entry too - and acceptance is recorded only while the
-   * id is pending. A recorded accepted id therefore ALWAYS has a deadline, and
-   * the construction-timeout fallback is a defensive floor that cannot be
-   * reached in the current lifecycle. The 21-minute bound in the live incident
-   * was the construction timeout itself; the ceiling that matters is the
-   * per-request deadline, which G-010 will shorten to the child's send ceiling.
-   * The margin is added either way.
+   * `deadlines` before writing and, while the id is accepted, `finish()` leaves
+   * that entry in place (only a reply, the child's exit, or a replacement
+   * retires it). Acceptance is recorded only while the id is pending, so a
+   * recorded accepted id ALWAYS has its own deadline, and the construction
+   * timeout below is a defensive floor that cannot be reached in the current
+   * lifecycle. The 21-minute bound in the live incident was the construction
+   * timeout itself; the ceiling that matters is the per-request deadline, which
+   * G-010 will shorten to the child's send ceiling. The margin is added either
+   * way.
    */
   private lostReplyBoundAt(id: string, acceptedAt: number): number {
     const deadline = this.deadlines.get(id)
@@ -210,7 +217,9 @@ export class DriverChild {
       waiter.finish({ ok: false, id, error: reason })
     }
     for (const [id, entry] of [...this.accepted]) {
-      if (entry.generation === generation) this.accepted.delete(id)
+      if (entry.generation !== generation) continue
+      this.accepted.delete(id)
+      this.deadlines.delete(id)
     }
   }
 
@@ -245,7 +254,9 @@ export class DriverChild {
         this.acceptors.delete(id)
       }
       for (const [id, entry] of [...this.accepted]) {
-        if (entry.generation === generation) this.accepted.delete(id)
+        if (entry.generation !== generation) continue
+        this.accepted.delete(id)
+        this.deadlines.delete(id)
       }
     })
     child.stdin.on('error', () => {})
@@ -312,14 +323,19 @@ export class DriverChild {
     const waiter = this.pending.get(id)
     if (!waiter) {
       // A reply proves nothing was lost, even when the host had already stopped
-      // waiting for it: forget any acceptance recorded for the id so a later
-      // timeout cannot read it as in-flight work (G-008 defect 2).
+      // waiting for it: forget any acceptance recorded for the id, and the
+      // deadline the age partition would have read, so a later timeout cannot
+      // see the id as in-flight work (G-008 defect 2).
       this.accepted.delete(id)
+      this.deadlines.delete(id)
       this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
       return
     }
-    // `finish` owns the cleanup: it deletes the pending entry and the acceptor
-    // together, so a request is settled exactly once from either path.
+    // A reply settles the request and proves its work is done, so the accepted
+    // accounting goes with it. A timeout does NOT: the page may still be working
+    // on that message, and the age partition retires it if no reply ever comes.
+    this.accepted.delete(id)
+    this.deadlines.delete(id)
     this.acceptors.delete(id)
     waiter.finish(message as DriverReply)
   }
@@ -345,8 +361,13 @@ export class DriverChild {
         clearTimeout(timer)
         if (!this.pending.delete(id)) return
         this.acceptors.delete(id)
-        this.accepted.delete(id)
-        this.deadlines.delete(id)
+        // NOT the accepted entry: a timeout here does not mean the page stopped
+        // working on the message. A reply clears it above; a replacement or the
+        // child's exit clears it by generation. Its deadline stays with it for
+        // the same reason - the age partition reads that deadline, and dropping
+        // it would silently demote a settled accepted id to the construction
+        // ceiling.
+        if (!this.accepted.has(id)) this.deadlines.delete(id)
         resolve(reply)
       }
       const timer = setTimeout(() => {
@@ -375,9 +396,10 @@ export class DriverChild {
    * cannot be left in front of the queue, and R-LIVE-5 was right that a slow
    * read beside a working page is not that. The distinction is evidence:
    *
-   * - an accepted id that has outlived the send ceiling plus the margin is a
-   *   LOST reply (G-008): the child is answering later requests, so the frame
-   *   was not merely slow. It is replaced and named in a distinct log;
+   * - an accepted id that has outlived its own request deadline plus the
+   *   margin is a LOST reply (G-008): the child is answering later requests, so
+   *   the frame was not merely slow. It is replaced and named in a distinct
+   *   log;
    * - any OTHER young accepted request of this generation means the child is
    *   busy with real work, so one slow read is not a wedge - the live page
    *   keeps generating and its turn must not be killed under it;

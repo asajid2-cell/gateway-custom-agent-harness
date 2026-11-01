@@ -8,11 +8,11 @@
  * acceptance, including one whose request had already settled - the live log
  * line `accepted for r194 has no live waiter; dropped` is that shape - and the
  * dead id then suppressed recovery for the child's life. Acceptance is now
- * recorded only while its request is pending, so an accepted id cannot outlive
- * its own deadline and the next timeout beside it classifies it against that
- * deadline. There is no bound timer: `finish()` settles the id at its own
- * deadline and clears the acceptance in the same breath, so a timer could
- * never be the thing that ends an accepted id's life.
+ * recorded only while its request is pending, and it survives that request's
+ * own timeout - the page may still be working on the message - so the NEXT
+ * timeout beside it partitions it by age against its own deadline: young is
+ * work in flight, past the deadline plus the margin is a lost reply. There is
+ * no bound timer; the partition is read only when a request times out.
  *
  * The child here is a real OS process speaking the frozen line-JSON protocol.
  * A `send` announces acceptance after `acceptAfterMs` and, only when
@@ -141,6 +141,58 @@ describe('G-008: an accepted id is bounded by its own request', () => {
       const pong = await driver.call({ op: 'ping' }, 1_000)
       expect(pong.ok).toBe(true)
       expect(generationOf(driver)).toBe(generationBefore)
+    } finally {
+      await driver.terminate()
+      await delay(20)
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('(iii) an accepted id past its own deadline plus the margin stops suppressing replacement and is named as lost', async () => {
+    const { dir, cleanup } = await scratch()
+    const logs: string[] = []
+    // A's own deadline is 200 ms and the margin 100 ms, so its reply is presumed
+    // lost after 300 ms. B is accepted beside it with a 1000 ms deadline, so
+    // A's timeout at 200 ms is suppressed by young work in flight (row (i)'s
+    // shape) - and A's acceptance must then SURVIVE that timeout, because the
+    // page may still be working on its message. B's deadline is the later
+    // timeout that this row is about: by then A is far past its bound.
+    const driver = new DriverChild({ script: await fakeChild(dir), timeoutMs: 10_000, wedgeMs: 600_000, lostReplyMarginMs: 100, log: line => logs.push(line) })
+    let idA = ''
+    let idB = ''
+    const sendA = track(driver.call({ op: 'send', text: 'the lost frame' }, { timeoutMs: 200, onAccepted: id => { idA = id } }))
+    const sendB = track(driver.call({ op: 'send', text: 'the later turn' }, { timeoutMs: 1_000, onAccepted: id => { idB = id } }))
+    const generationBefore = generationOf(driver)
+    try {
+      await waitFor(() => (idA && idB) || undefined)
+      expect(idA).not.toBe(idB)
+
+      // A times out first and is young work only from B's point of view: the
+      // child keeps running, and A is NOT named lost.
+      await waitFor(() => sendA.done || undefined)
+      expect(sendB.done).toBe(false)
+      expect(lostLog(logs)).toEqual([])
+      expect(plainTimeoutLog(logs)).toEqual([])
+      expect(logs.some(line => new RegExp(`accepted work in flight: ${idB}`).test(line))).toBe(true)
+
+      // B times out later. A is past its own deadline plus the margin, so it is
+      // no longer in-flight work: the distinct line names A and its age, and the
+      // child is replaced.
+      await waitFor(() => sendB.done || undefined)
+      expect(sendB.reply?.reason).toBe('timeout')
+      const lost = lostLog(logs)
+      expect(lost.length).toBe(1)
+      expect(lost[0]!).toContain(idA)
+      expect(lost[0]!).toMatch(/accepted \d+\.\d+s ago/)
+      expect(lost[0]!).not.toContain(idB)
+      expect(plainTimeoutLog(logs)).toEqual([])
+      // The replacement retired both acceptances along with the generation.
+      expect(acceptedIds(driver)).toEqual([])
+
+      // The replacement is real: the next request is served by a new child.
+      const pong = await driver.call({ op: 'ping' }, 5_000)
+      expect(pong.ok).toBe(true)
+      expect(generationOf(driver)).toBeGreaterThan(generationBefore)
     } finally {
       await driver.terminate()
       await delay(20)
