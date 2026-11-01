@@ -16,7 +16,7 @@
  * rewritten on every start; these files are the host's own memory.
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { z } from 'zod/v4'
 
@@ -604,6 +604,31 @@ export async function listBridgeStates(
  */
 const saving = new Map<string, Promise<void>>()
 
+/**
+ * Delays between rename attempts when Windows refuses the replace.
+ *
+ * A read handle on the target - any process, Node or Bun, a plain `open(path,
+ * 'r')` is enough - blocks the replace and surfaces as EPERM; a rename that
+ * races another rename surfaces as EBUSY. Both are transient holds that last a
+ * few milliseconds, so a save retries instead of being lost. Those are the
+ * only two codes retried: a real permission problem or a missing directory
+ * must fail on the first attempt. One initial attempt plus one per entry, so
+ * the whole budget is ~375 ms.
+ */
+const RENAME_BACKOFF_MS = [25, 100, 250]
+const RETRYABLE_RENAME = new Set(['EPERM', 'EBUSY'])
+
+async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try { await rename(from, to); return }
+    catch (error) {
+      const wait = RENAME_BACKOFF_MS[attempt]
+      if (wait === undefined || !RETRYABLE_RENAME.has(String((error as NodeJS.ErrnoException).code ?? ''))) throw error
+      await new Promise(resolve => setTimeout(resolve, wait))
+    }
+  }
+}
+
 export function saveJson(path: string, value: unknown): Promise<void> {
   const payload = JSON.stringify(value, null, 2)
   const previous = saving.get(path) ?? Promise.resolve()
@@ -611,7 +636,14 @@ export function saveJson(path: string, value: unknown): Promise<void> {
     await mkdir(dirname(path), { recursive: true })
     const temporary = `${path}.${randomUUID()}.tmp`
     await writeFile(temporary, payload, 'utf8')
-    await rename(temporary, path)
+    let renamed = false
+    try { await renameWithRetry(temporary, path); renamed = true }
+    finally {
+      // A successful rename consumed the temporary. A failed one must not
+      // leave it behind: with a reader that never closes, every save would
+      // otherwise add one more file to the directory.
+      if (!renamed) await rm(temporary, { force: true }).catch(() => {})
+    }
   })
   saving.set(path, next)
   next.catch(() => {}).finally(() => { if (saving.get(path) === next) saving.delete(path) })
