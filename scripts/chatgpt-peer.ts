@@ -18,8 +18,9 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { execFile } from 'node:child_process'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { connect } from 'node:net'
 import { homedir } from 'node:os'
-import { basename, extname, join, resolve, sep } from 'node:path'
+import { basename, dirname, extname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewaySessionTransport.js'
 import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
@@ -489,6 +490,17 @@ const nonce = (): string => randomBytes(4).toString('hex')
 
 const shortId = (id: string): string => id.slice(0, 8)
 
+/** Is `pid` a live process here? EPERM means alive but not ours, which counts. */
+function processAlive(pid: number): boolean {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 function age(iso: string): string {
   const ms = Date.now() - Date.parse(iso)
   if (!Number.isFinite(ms) || ms < 0) return '?'
@@ -602,6 +614,9 @@ export class ChatGptHost {
   private readonly pageLock = this.makeLock()
   private readonly primer: { text: string; sha: string }
   private stopping = false
+  /** G-013: the state-file lock this process holds, and when it claimed it. */
+  private stateLockHeld = false
+  private stateLockAt = ''
   /** Does the driver answer the read-only thread ops? Learned on first use; false stops asking. */
   private observes: boolean | undefined
   private polling = false
@@ -779,8 +794,147 @@ export class ChatGptHost {
     return lock
   }
 
+  // ------------------------------------------------------------- state lock
+
+  /**
+   * G-013: one writer per state file.
+   *
+   * A second host on the same `--state` cannot stay up - its bridges are
+   * already registered on the bus, so the transport refuses them - but it dies
+   * only after `listen` has rewritten `healthPort` and `enforceThreadOwnership`
+   * has rewritten the audit array from its own stale copy. It wounds the file
+   * on the way to its own refusal. The claim is therefore taken before anything
+   * is read into memory or written, so a second launch writes nothing at all.
+   *
+   * The record holds the owner's identity, not a heartbeat: `pid` and
+   * `healthPort` are the two facts another process can check from outside, and
+   * `startedAt` / `hostId` are there for the refusal and for a human deciding
+   * whether to delete the file by hand.
+   */
+  private get stateLockPath(): string { return `${this.config.statePath}.lock` }
+
+  private async claimStateLock(): Promise<void> {
+    if (this.stateLockHeld) return
+    const path = this.stateLockPath
+    this.stateLockAt = new Date().toISOString()
+    const mine = {
+      pid: process.pid,
+      startedAt: this.stateLockAt,
+      // Filled in once the host has its own id; the claim itself must not wait
+      // on a load that may legitimately create the file.
+      hostId: null as string | null,
+      instanceId: this.config.instanceId,
+      profile: this.config.profile,
+      healthPort: this.config.healthPort,
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await mkdir(dirname(path), { recursive: true })
+        await writeFile(path, `${JSON.stringify(mine, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+        this.stateLockHeld = true
+        return
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+      const held = await readFile(path, 'utf8').then(raw => JSON.parse(raw) as { pid?: unknown; startedAt?: unknown; hostId?: unknown; healthPort?: unknown }).catch(() => undefined)
+      if (!held || typeof held.pid !== 'number' || !Number.isInteger(held.pid)) {
+        throw new Error(`the state lock ${path} is unreadable, so no owner could be identified and this launch writes nothing; inspect it, and delete it only once you know no host is running`)
+      }
+      const port = typeof held.healthPort === 'number' && Number.isInteger(held.healthPort) && held.healthPort > 0 ? held.healthPort : 0
+      // A stale claim is released only when BOTH halves are gone. A live pid
+      // alone may be a recycled pid - but a port that answers means something
+      // is serving this state's address, and taking over would be a guess.
+      const answered = port > 0 ? await this.lockPortVerdict(port) : 'silent'
+      if (processAlive(held.pid) || answered !== 'silent') {
+        const started = typeof held.startedAt === 'string' ? held.startedAt : 'an unrecorded time'
+        const who = typeof held.hostId === 'string' ? `, hostId ${held.hostId}` : ''
+        const why = answered === 'gateway'
+          ? `127.0.0.1:${port} answers as a gateway host`
+          : answered === 'other'
+            ? `127.0.0.1:${port} answers, though not as a gateway host`
+            : `pid ${held.pid} is still running`
+        throw new Error(`another host already owns ${this.config.statePath}: ${path} was claimed by pid ${held.pid} at ${started}${who}, recorded port ${port || 'none'}, and ${why}; stop it or use a different --state`)
+      }
+      await rm(path, { force: true })
+    }
+    throw new Error(`could not take the state lock ${path}: it reappeared after a stale claim was cleared, so another host is starting`)
+  }
+
+  /** Record the host id in a claim this process already holds. */
+  private async nameStateLock(): Promise<void> {
+    if (!this.stateLockHeld) return
+    const body = JSON.stringify({
+      pid: process.pid,
+      startedAt: this.stateLockAt,
+      hostId: this.hostState.hostId,
+      instanceId: this.config.instanceId,
+      profile: this.config.profile,
+      healthPort: this.hostState.healthPort,
+    }, null, 2)
+    await writeFile(this.stateLockPath, `${body}\n`, 'utf8')
+      .catch(error => log(`could not record the host id in ${this.stateLockPath}: ${(error as Error).message}`))
+  }
+
+  private async releaseStateLock(): Promise<void> {
+    if (!this.stateLockHeld) return
+    this.stateLockHeld = false
+    const path = this.stateLockPath
+    // Never remove a claim that is no longer ours: a lock this process did not
+    // write can only mean something else took it, and deleting it would hand
+    // the file to the next starter.
+    const ours = await readFile(path, 'utf8')
+      .then(raw => (JSON.parse(raw) as { pid?: unknown }).pid === process.pid)
+      .catch(() => false)
+    if (ours) await rm(path, { force: true }).catch(error => log(`could not release ${path}: ${(error as Error).message}`))
+  }
+
+  /**
+   * What, if anything, answers on a loopback port: nothing, a gateway host, or
+   * some other listener. The gateway answer is checked on the same
+   * unauthenticated route the fleet uses, so a port held by an unrelated
+   * service is reported as such rather than assumed to be a host.
+   */
+  private lockPortVerdict(port: number): Promise<'silent' | 'gateway' | 'other'> {
+    return new Promise(resolve => {
+      let reply = ''
+      let connected = false
+      let settled = false
+      const socket = connect({ host: '127.0.0.1', port })
+      const classify = (): 'gateway' | 'other' => reply.startsWith('HTTP/1.1 200') && reply.includes('"provider"') ? 'gateway' : 'other'
+      const done = (value: 'silent' | 'gateway' | 'other'): void => {
+        if (settled) return
+        settled = true
+        socket.destroy()
+        resolve(value)
+      }
+      // A wedged owner accepts the connection and never answers: its pid is
+      // what refuses the takeover, and a silent verdict here only means this
+      // probe learned nothing.
+      socket.setTimeout(500, () => done('silent'))
+      socket.on('error', () => done('silent'))
+      socket.on('connect', () => {
+        connected = true
+        socket.write(`GET /gateway/route-health?provider=${encodeURIComponent(PROVIDER)} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+      })
+      socket.on('data', chunk => { reply += chunk.toString('utf8'); if (reply.length >= 256) done(classify()) })
+      socket.on('end', () => done(classify()))
+      socket.on('close', () => done(reply ? classify() : connected ? 'other' : 'silent'))
+    })
+  }
+
   async start(): Promise<void> {
     await mkdir(this.config.home, { recursive: true })
+    // Ownership is settled before anything is read into memory or written.
+    await this.claimStateLock()
+    try {
+      await this.startOwned()
+    } catch (error) {
+      await this.releaseStateLock()
+      throw error
+    }
+  }
+
+  private async startOwned(): Promise<void> {
     const loaded = await loadHostState(this.config.statePath, () => newHostState({
       profile: this.config.profile,
       healthPort: this.config.healthPort,
@@ -824,6 +978,10 @@ export class ChatGptHost {
     }
 
     await this.listen()
+    // The claim was written before the host had an identity or a port; now it
+    // has both, and a second starter needs the port to tell a live owner from
+    // a recycled pid.
+    await this.nameStateLock()
     await this.loadBridges()
     // Before any transport exists or any observation runs: a thread has at most
     // one owner, even when the files on disk disagree.
@@ -5632,6 +5790,10 @@ export class ChatGptHost {
     for (const bridge of this.bridges.values()) {
       await bridge.transport?.close().catch(error => log(`transport close failed: ${(error as Error).message}`))
     }
+    // Last: the state file is no longer ours to write, and a crash above this
+    // line leaves a claim whose owner is gone - which is exactly the stale
+    // path `claimStateLock` takes over.
+    await this.releaseStateLock()
   }
 }
 
