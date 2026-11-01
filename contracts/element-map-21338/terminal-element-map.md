@@ -74,6 +74,14 @@ command 21338 and prints nothing, so the only cost is that our stripper does
 not count them as frames. No emitter in this tree produces either form (the
 codec's introducer is a constant).
 
+**2a. A stream that begins in the middle of a body is not ours.** With no
+introducer in its input there is nothing to strip, so the fragment - and the
+terminator that closes the orphaned body - pass through as text and `dropped`
+does not move. A ring or replay source that evicts whole chunks can hand a
+stripper exactly this. The fix belongs at the source (strip before the bytes
+reach the ring); the stripper cannot invent an introducer that was never in its
+input.
+
 **3. Strip by command number, regardless of body validity.** A sequence that
 starts with a legal introducer and ends at a terminator is consumed whole -
 valid base64url that decodes to a conforming frame becomes a frame; anything

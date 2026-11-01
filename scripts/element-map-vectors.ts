@@ -208,6 +208,9 @@ function stripCase(name: string, rawChunks: string[]): StripCase {
 
 /** A small frame so the exhaustive split case stays loadable. */
 const tinySequence = encodeOk(minimalFrame)
+/** The base64url body of an encoded sequence, without introducer or ST. */
+const payloadOf = (sequence: string): string =>
+  sequence.slice(INTRODUCER.length, sequence.length - ST.length)
 const splitCases: StripCase[] = []
 for (let offset = 1; offset < tinySequence.length; offset++) {
   splitCases.push(
@@ -270,6 +273,20 @@ const strip: StripCase[] = [
   ]),
   stripCase('frame-followed-by-text', [tinySequence + 'tail text']),
   stripCase('frame-preceded-by-text', ['head text' + tinySequence]),
+  // A ring replay can start inside a body: whole chunks are evicted, so the
+  // head that carries the introducer can be gone while the rest of the body
+  // survives. With no introducer there is nothing to strip, so the fragment
+  // and the terminator that closes it pass through as text (pinned: the ST is
+  // part of text_hex) and `dropped` does not move. The next frame decodes
+  // normally. A ring that replays an unframed body is a ring problem; the
+  // stripper cannot invent an introducer that was never in its input.
+  stripCase('stream-starts-mid-body', [
+    payloadOf(tinySequence).slice(10) + ST,
+    tinySequence,
+  ]),
+  // `replay_state.prefix()` prepends DECSET sequences straight onto ring bytes,
+  // so a stripper's first input is a CSI immediately followed by a frame.
+  stripCase('csi-before-frame', [`${ESC}[?25h` + tinySequence + 'after']),
   stripCase('non-21338-osc-pass-through', [neighbours]),
   stripCase('c1-introducer-and-terminator', [c1Sequence]),
   stripCase('no-semicolon-is-not-ours-passes-through', [
