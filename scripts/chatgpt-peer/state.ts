@@ -258,6 +258,22 @@ export const pendingTurnSchema = z.object({
    * name (nonce mismatch) rather than swallowing it.
    */
   turnNonce: z.string().max(64).optional(),
+  /**
+   * When a post attempt first failed for a reason that is NOT "the page is
+   * mid-turn" (ISO). A mid-turn deferral is transient and will post at the next
+   * idle transition, so it never sets this; a definite failure - a signed-out
+   * tab, a refused send with no composer - does. The observation pass tells the
+   * sender once this is older than the pending-watch ladder.
+   */
+  queuedSince: z.string().max(40).optional(),
+  /** The last definite not-posted reason, for the one notice the sender gets. */
+  queuedReason: z.string().max(200).optional(),
+  /**
+   * When the sender was told this turn stays queued (ISO). Written BEFORE the
+   * notice is sent, so a restart never sends it again: one bounded notice per
+   * turn, not per pass.
+   */
+  queuedNoticeAt: z.string().max(40).optional(),
 }).strict()
 
 export const PENDING_TURNS_MAX = 8
@@ -345,6 +361,11 @@ export const bridgeStateSchema = z.object({
    */
   // R7-F8: no count bound - retention is by turn lifetime (see above).
   inboundRuns: z.array(inboundRunSchema).default([]),
+  /**
+   * How many "your turn stays queued" notices this bridge has sent. Durable and
+   * exposed in the host status so the silence is measurable.
+   */
+  queuedNotices: z.number().int().min(0).default(0),
 }).strict()
 
 export type BridgeState = z.infer<typeof bridgeStateSchema>
@@ -414,6 +435,7 @@ export function newBridgeState(options: {
     answeredTurns: [],
     commandReceipts: [],
     inboundRuns: [],
+    queuedNotices: 0,
   }
 }
 
@@ -443,6 +465,7 @@ export function bridgeFromLegacy(legacy: PeerState, name: string, createdAt = ne
     answeredTurns: [],
     commandReceipts: [],
     inboundRuns: [],
+    queuedNotices: 0,
   }
 }
 
