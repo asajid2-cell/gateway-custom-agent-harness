@@ -61,11 +61,17 @@
 # with a denominator line breaking down the click_begin count and giving the
 # acceptance count separately, so a row count is never read as a turn count.
 #
-# REPLY PAIRING IS BOUNDED. A reply is paired only when it lands within the
-# child's send budget - SEND_TIMEOUT_MS = 240_000 (chatgpt.mjs:82, deployed
-# child). A later reply cannot be this send's answer, because the send has
-# already failed; the row prints `-` and says so. Without the bound a quiet
-# stretch makes a later turn's reply look like a four-minute POST -> reply.
+# REPLY PAIRING IS BOUNDED, ON THE ACCEPTANCE CLOCK. A reply is paired only when
+# it lands within the child's send budget measured from that send's ACCEPTANCE,
+# not from its POST: the child's reply clock does not start until the turn is
+# accepted (chatgpt.mjs:2412), so a later reply cannot answer a send that has
+# already failed. The budget is CHATGPT_TIMEOUT_MS when the environment sets it,
+# else 240_000 (SEND_TIMEOUT_MS, chatgpt.mjs:82). The script reads the same
+# variable the child reads, because a child started with a different value would
+# otherwise be measured against the wrong bound - too long mispairs, too short
+# drops real pairs. The value in force is printed in the denominator line.
+# Without the bound a quiet stretch makes a later turn's reply look like a
+# four-minute POST -> reply.
 #
 # WHAT THE JOIN CANNOT KNOW - read before using it on another host:
 #   `join` pairs each send with the FIRST `op:'reply'` audit entry at or after
@@ -113,14 +119,19 @@ case "$mode" in
     "$PYTHON" - "$LOG" "$PEER" "$cut" <<'PY'
 import datetime
 import json
+import os
 import re
 import sys
 
 log_path, peer_path, cut = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# The child's own send budget (SEND_TIMEOUT_MS, chatgpt.mjs:82). A reply after
-# this cannot answer the send; see REPLY PAIRING IS BOUNDED in the header.
-SEND_BUDGET = datetime.timedelta(seconds=240)
+# The child's own send budget: SEND_TIMEOUT_MS = Number(process.env
+# .CHATGPT_TIMEOUT_MS || 240_000), chatgpt.mjs:82. Measured from ACCEPTANCE,
+# not from the POST - the reply clock starts when the turn is accepted
+# (chatgpt.mjs:2412). See REPLY PAIRING IS BOUNDED in the header.
+BUDGET_MS = int(os.environ.get('CHATGPT_TIMEOUT_MS') or 240_000)
+SEND_BUDGET = datetime.timedelta(milliseconds=BUDGET_MS)
+BUDGET_LABEL = '%g s' % (BUDGET_MS / 1000.0)
 
 BEGIN = re.compile(r'^(\S+Z) phase send click_begin (\d+)ms')
 POST_SEEN = re.compile(r'^(\S+Z) click post: the send POST was seen (\d+)ms after click_begin')
@@ -231,7 +242,7 @@ for send in sends:
             None,
         )
         if hit is None:
-            note = (note + '; ' if note else '') + 'no reply audit inside the 240 s send budget'
+            note = (note + '; ' if note else '') + 'no reply audit inside the %s send budget (from acceptance)' % BUDGET_LABEL
         else:
             reply_at, reply_message = hit
 
@@ -272,8 +283,10 @@ print()
 print(
     'reply-split: %d click_begin = %d page POST + %d CDP-only POST + %d no POST + %d no click post: line; '
     '%d acceptance lines in the same window (not a join denominator - sends with no click phase '
-    'in this file accept too); %d row(s), %d paired with a reply inside the 240 s send budget, %d unpaired.'
-    % (len(windowed), page, cdp, nopost, noline, accept_count, len(rows), paired, len(rows) - paired))
+    'in this file accept too); %d row(s), %d paired with a reply inside the %s send budget '
+    '(CHATGPT_TIMEOUT_MS, from acceptance), %d unpaired.'
+    % (len(windowed), page, cdp, nopost, noline, accept_count, len(rows), paired, BUDGET_LABEL,
+       len(rows) - paired))
 PY
     ;;
   -h|--help|help)
