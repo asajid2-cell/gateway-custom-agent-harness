@@ -100,8 +100,12 @@ function actionFor(
   if (node === focusNode) return { t: 'focus' }
   const handlers = node._eventHandlers as EventHandlerProps | undefined
   if (handlers?.onClick || handlers?.onMouseDown) {
-    const x = Math.min(Math.max(Math.round(rect.x + rect.width / 2), 0), Math.max(cols - 1, 0))
-    const y = Math.min(Math.max(Math.round(rect.y + rect.height / 2), 0), Math.max(rows - 1, 0))
+    // Floor, not round: hit-test treats a rect as half-open [x, x+w) x [y, y+h),
+    // so rounding a half-cell up puts the press on the next row (or column) for
+    // any one-cell-tall control - a whole class of buttons in this UI. Floor of
+    // the centre is inside the rect for every w,h >= 1, so it is never worse.
+    const x = Math.min(Math.max(Math.floor(rect.x + rect.width / 2), 0), Math.max(cols - 1, 0))
+    const y = Math.min(Math.max(Math.floor(rect.y + rect.height / 2), 0), Math.max(rows - 1, 0))
     return { t: 'ptr', x, y, b: 0 }
   }
   return undefined

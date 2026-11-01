@@ -97,6 +97,43 @@ test('onMouseDown is pointer-reachable too; a key handler alone is not guessed a
   expect(els.map(e => e.act?.t ?? 'none')).toEqual(['ptr', 'none'])
 })
 
+test('the press point lands inside a one-cell control, not on the next row', () => {
+  // hitTest is half-open, [y, y+h) x [x, x+w). A one-row control is the common
+  // case (a footer chip, a button), and rounding the half-cell centre up points
+  // the synthetic press at the row below - a different widget or nothing.
+  const row = el('ink-box', [], { onClick: () => {} })
+  const column = el('ink-box', [], { onMouseDown: () => {} })
+  const root = rootOf([row, column])
+  place(row, 3, 7, 9, 1)
+  place(column, 40, 12, 1, 5)
+  const els = collectElementMap(root, 80, 24)
+
+  const press = (element: (typeof els)[number]) => {
+    expect(element.act?.t).toBe('ptr')
+    const { x, y } = element.act as { x: number; y: number }
+    const [rx, ry, rw, rh] = element.r
+    expect(x).toBeGreaterThanOrEqual(rx)
+    expect(x).toBeLessThan(rx + rw)
+    expect(y).toBeGreaterThanOrEqual(ry)
+    expect(y).toBeLessThan(ry + rh)
+  }
+  press(els[0]!)
+  press(els[1]!)
+})
+
+test('floor of the centre is inside the rect for every size', () => {
+  // One assertion per parity/shape rather than one example: the bug was a
+  // rounding edge, so the edges are the test.
+  for (const [w, h] of [[1, 1], [1, 2], [2, 1], [3, 3], [9, 1], [1, 9], [4, 4]] as const) {
+    const control = el('ink-box', [], { onClick: () => {} })
+    const root = rootOf([control])
+    place(control, 5, 5, w, h)
+    const [element] = collectElementMap(root, 80, 24)
+    const { x, y } = element!.act as { x: number; y: number }
+    expect({ w, h, inside: x >= 5 && x < 5 + w && y >= 5 && y < 5 + h }).toEqual({ w, h, inside: true })
+  }
+})
+
 test('the declared cursor node is the focus target, even when it also clicks', () => {
   const input = el('ink-box', [], { onClick: () => {} })
   const root = rootOf([input])
