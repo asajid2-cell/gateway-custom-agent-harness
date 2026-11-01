@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DriverChild } from './chatgpt-peer/driver.ts'
 import { ChatGptHost } from './chatgpt-peer.ts'
+import { GatewaySessionTransport } from '../src/utils/gatewaySessionTransport.js'
 import type { DriverChild as DriverChildType, DriverReply } from './chatgpt-peer/driver.js'
 import { newBridgeState, newHostState, saveJson, type BridgeState } from './chatgpt-peer/state.ts'
 
@@ -83,10 +84,10 @@ async function childScript(dir: string): Promise<string> {
   return path
 }
 
-async function waitFor<T>(probe: () => T | undefined, timeoutMs = 10_000): Promise<T> {
+async function waitFor<T>(probe: () => T | undefined | Promise<T | undefined>, timeoutMs = 10_000): Promise<T> {
   const started = Date.now()
   for (;;) {
-    const value = probe()
+    const value = await probe()
     if (value !== undefined) return value
     if (Date.now() - started > timeoutMs) throw new Error('timed out waiting for the driver')
     await new Promise(resolve => setTimeout(resolve, 10))
@@ -188,8 +189,16 @@ class FakeDriver {
    * given; a row may shorten it so an over-budget advertisement stays fast.
    */
   replyAfterMs: number | null = null
+  /**
+   * G-011: the child answers the send itself, at once, with the reply its own
+   * send budget produces - `{ ok: false, timedOut: true, state: 'generating' }`.
+   * The child is healthy; the host was simply blind behind the running send.
+   */
+  childTimesOut = false
   threads = [{ id: THREAD_A, title: 'Existing work' }]
   private current: string | null = THREAD_A
+  /** The page reports `generating` only while a send is actually in flight. */
+  private sending = false
   private tree = { current: `root-${THREAD_A}`, mapping: { [`root-${THREAD_A}`]: { id: `root-${THREAD_A}`, parent: null, children: [], message: null } } as Record<string, any> }
   private clock = Math.floor(Date.now() / 1000)
 
@@ -220,18 +229,27 @@ class FakeDriver {
     if (op === 'send') {
       const budget = typeof options.timeoutMs === 'number' ? options.timeoutMs : null
       this.lastSendTimeoutMs = budget
-      if (options.onAccepted) options.onAccepted(String(request.id ?? ''))
-      this.append(this.tree.current, 'user', String(request.text ?? ''))
-      // Accepted, never answered: the call ends exactly when its own deadline
-      // says so, which is the deadline this test is measuring.
-      await sleep(this.replyAfterMs ?? budget ?? 0)
-      return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId: this.current }
+      this.sending = true
+      try {
+        if (options.onAccepted) options.onAccepted(String(request.id ?? ''))
+        this.append(this.tree.current, 'user', String(request.text ?? ''))
+        if (this.childTimesOut) {
+          // The child's own wait expired while the page was still generating.
+          return { ok: false, op, timedOut: true, state: 'generating', threadId: this.current }
+        }
+        // Accepted, never answered: the call ends exactly when its own deadline
+        // says so, which is the deadline this test is measuring.
+        await sleep(this.replyAfterMs ?? budget ?? 0)
+        return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId: this.current }
+      } finally {
+        this.sending = false
+      }
     }
     if (op === 'read') return { ok: true, op, threadId: this.current, text: '', evidence: 'state-complete' }
     if (op === 'conversation') return { ok: true, op, conversation: { current_node: this.tree.current, mapping: structuredClone(this.tree.mapping) } }
     if (op === 'conversations') return { ok: true, op, items: this.threads }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
-    if (op === 'status') return { ok: true, op, threadId: this.current, model: 'GPT-6', effort: 'High', state: 'generating', phase: 'streaming', ageMs: 0 }
+    if (op === 'status') return { ok: true, op, threadId: this.current, model: 'GPT-6', effort: 'High', state: this.sending ? 'generating' : 'idle', phase: this.sending ? 'streaming' : null, ageMs: 0 }
     return { ok: false, op, error: `unknown op ${op}` }
   }
 
@@ -283,6 +301,29 @@ async function primedBridge(threadId = THREAD_A): Promise<BridgeState> {
   bridge.cursor = `root-${threadId}`
   return bridge
 }
+
+async function readBridge(dir: string, sessionId: string): Promise<BridgeState> {
+  return JSON.parse(await readFile(join(dir, 'bridges', `${sessionId}.json`), 'utf8')) as BridgeState
+}
+
+async function audits(dir: string): Promise<{ op: string; target: string | null; result: string; messageId?: string | null }[]> {
+  const state = JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')) as { audit: { op: string; target: string | null; result: string; messageId?: string | null }[] }
+  return state.audit
+}
+
+async function busPeer(dir: string, name: string): Promise<{ transport: GatewaySessionTransport; id: string }> {
+  const id = randomUUID()
+  const transport = new GatewaySessionTransport({
+    directory: sessionsDir(dir), sessionId: id, name, cwd: dir, purpose: 'test sender', policy: 'accept',
+  })
+  await transport.start()
+  return { transport, id }
+}
+
+const repliesTo = (transport: GatewaySessionTransport, id: string): string[] =>
+  transport.inbox()
+    .filter(record => (record.message as unknown as { replyTo?: string }).replyTo === id)
+    .map(record => String((record.message as unknown as { text: string }).text))
 
 describe('G-010: the host send call follows ceiling + margin, else the turn timeout', () => {
   test('an advertised ceiling sets the call deadline to ceiling + margin', async () => {
@@ -370,6 +411,48 @@ describe('G-010: the host send call follows ceiling + margin, else the turn time
 
       expect(budgets).toEqual([160, 600, 290])
     } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+})
+
+/**
+ * G-011: the child answering `{ ok: false, timedOut: true, state: 'generating' }`
+ * after its own send budget is not a driver failure. The child is healthy; the
+ * host is blind because every status read queues behind the running send on the
+ * child's one operation chain. The turn must stay owed with no line to the
+ * sender - and the audit must not claim a driver failure, because that is the
+ * line incident triage reads.
+ */
+describe('G-011: a child-reported send timeout is attributed honestly', () => {
+  test('the turn stays owed with no reply, and the audit names no driver failure', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.childTimesOut = true
+    const host = await startHost(dir, driver, { turnTimeoutMs: 3_000, sendCeilingMarginMs: 50 })
+    const sender = await busPeer(dir, 'sender')
+    try {
+      const receipt = await sender.transport.send(alpha.sessionId, 'a question the child times out on', 'g011', undefined, 'inquiry', true) as { id: string }
+      const turnLine = await waitFor(async () => {
+        const audit = await audits(dir)
+        return audit.find(entry => entry.op === 'turn' && entry.messageId === receipt.id)
+      })
+      // (iii) The state is named honestly: no observation, reads queued behind
+      // the send - not "the driver failed".
+      expect(turnLine.result).toContain('still generating')
+      expect(turnLine.result).toContain('no observation')
+      expect(turnLine.result).not.toContain('driver failed')
+      expect(turnLine.result).not.toContain('no evidence')
+      // (i) Nothing is sent to the sender.
+      expect(repliesTo(sender.transport, receipt.id)).toEqual([])
+      // (ii) The turn is still owed, so the observation pass owns the answer.
+      const bridge = await readBridge(dir, alpha.sessionId)
+      expect(bridge.pendingTurns.some(turn => turn.messageId === receipt.id)).toBe(true)
+    } finally {
+      await sender.transport.close()
       await host.stop()
       await cleanup()
     }

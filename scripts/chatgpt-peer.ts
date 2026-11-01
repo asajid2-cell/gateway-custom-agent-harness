@@ -177,9 +177,28 @@ const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'reco
  * of nothing.
  */
 class GeneratingTurn extends Error {
-  constructor(readonly threadId: string | null, readonly driverFault = false) {
+  constructor(readonly threadId: string | null, readonly driverFault = false, readonly childStated = false) {
     super(`the page was still generating${threadId ? ` in thread ${threadId}` : ''} when the host stopped watching; the turn was not refused and is not a model failure`)
   }
+}
+
+/**
+ * G-011: why a still-owed turn was not observed, in the host's own words.
+ *
+ * The child answering `{ timedOut: true, state: 'generating' }` after its own
+ * send budget is NOT a driver failure: the child is healthy and the host is
+ * merely blind, because every status read queues behind the running send on the
+ * child's single operation chain. Calling that "the driver failed" corrupted
+ * exactly the audit line these incidents are triaged from.
+ *
+ * A real driver fault - a replacement, a closed stdin, the driver's own
+ * deadline - keeps its own wording. Neither case changes behaviour: `driverFault`
+ * stays true, so the turn remains owed and no failure line is sent.
+ */
+const unobservedNote = (error: GeneratingTurn): string => {
+  if (error.childStated) return 'no observation: the child reported the page still generating and its status reads were queued behind that send'
+  if (error.driverFault) return 'no evidence: the driver failed, not the page'
+  return ''
 }
 
 /**
@@ -1653,7 +1672,9 @@ export class ChatGptHost {
       // The driver says the turn is still running. That is a state, not a
       // refusal: the answer exists on the page even though this call ended.
       if (reply.timedOut === true) {
-        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+        // G-011: the CHILD stopped waiting, not the driver. Keep the owed-turn
+        // behaviour, and record who said so so the audit can be honest.
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true, true)
       }
       // R-LIVE-5: the DRIVER failed this send, not the page. The page may hold
       // the text, so its state is unproven: leave the turn running and let the
@@ -1701,7 +1722,8 @@ export class ChatGptHost {
       },
     })
     if (reply.ok !== true) {
-      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+      // G-011: the child's own wait expired; the driver did not fail.
+      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true, true)
       // R10-F3: the driver refuses to re-click Send when it cannot prove the
       // post either way. The prompt may have landed, so this is the
       // "initiated, node unknown" state, never a refusal (see postRecordedTurn).
@@ -2987,7 +3009,7 @@ export class ChatGptHost {
       if (error instanceof GeneratingTurn) {
         // The page is still generating, or nothing could be asked: not a
         // verdict on the turn. A driver fault is no evidence about the page.
-        const line = `${error.message} [${error.driverFault ? 'no evidence: the driver failed, not the page; ' : ''}still owed]`
+        const line = `${error.message} [${error.driverFault ? `${unobservedNote(error)}; ` : ''}still owed]`
         audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `${line} [${bridge.state.name}]`, messageId: job.messageId })
         await this.persistHostState()
         return
@@ -4678,7 +4700,7 @@ export class ChatGptHost {
         // as a driver-faulted send does; a failure line here told the sender
         // its question failed while the page went on to answer it.
         if (error.driverFault) {
-          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [no evidence: the driver failed, not the page; left for the observation pass]`, messageId: message.id })
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [${unobservedNote(error)}; left for the observation pass]`, messageId: message.id })
           await this.persistHostState()
           return
         }
