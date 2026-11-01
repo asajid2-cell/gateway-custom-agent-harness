@@ -4822,7 +4822,29 @@ export class ChatGptHost {
         : one(outcome.problems.at(-1) ?? 'the command did not match this turn', 240)
       return this.replyError(bridge, message, `the page answered with a command block that could not run: ${why}`)
     }
-    if (!prose) return this.replyError(bridge, message, 'no answer was produced for this message')
+    if (!prose) {
+      // G-009: the live host logged "still generating when the host stopped
+      // watching; left for the observation pass" and then told the sender
+      // "no answer was produced". A negative verdict is a claim about the TURN,
+      // and only the page may make it: a node the completion test accepts but
+      // that carries no text is a placeholder while the page is still working,
+      // not the answer this turn is owed. So ask the page before saying
+      // anything. `generating` (or `unknown`/`failed`, which prove nothing)
+      // keeps the turn owed and leaves the answer with the observation pass; an
+      // idle page with a genuinely empty answer still says so.
+      const threadId = bridge.state.threadId
+      if (threadId) {
+        const page = await this.cheapStatus(threadId)
+        if (page.state !== 'idle') {
+          const word = page.state === 'generating'
+            ? 'is still generating'
+            : page.state === 'failed' ? 'reported a problem' : 'has not spoken'
+          log(`turn ${shortId(message.id)}: the page ${word}; no answer verdict, the turn stays owed [${bridge.state.name}]`)
+          return
+        }
+      }
+      return this.replyError(bridge, message, 'no answer was produced for this message')
+    }
     // Long prose keeps the outbox spill: the bus carries a gist and the file
     // carries the whole answer.
     const shaped = await this.shapeAnswer(bridge, prose, answerNodeId)
