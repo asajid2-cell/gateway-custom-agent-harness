@@ -1,0 +1,3 @@
+# Fixtures are bytes. Keep the line endings the generator wrote so a checkout
+# on any platform is byte-identical to what the regeneration test compares.
+* -text
