@@ -264,6 +264,8 @@ function manualSchedule() {
       for (const timer of due) timer.fn()
     },
     pending: () => timers.filter(t => !t.cancelled).length,
+    /** Identity of the single live timer, so a test can prove it was not replaced. */
+    live: () => timers.filter(t => !t.cancelled)[0],
   }
 }
 
@@ -309,6 +311,28 @@ test('the heartbeat re-sends the last frame with the same gen', () => {
 
   publisher.stop()
   expect(scheduler.pending()).toBe(0)
+})
+
+test('a publish does not restart the heartbeat countdown', () => {
+  // The re-send is periodic, not a quiet timer. If publishing reset it, a stream
+  // of frames that never change the map would suppress the heartbeat forever
+  // and a relay that restarted mid-stream would never recover.
+  const { emitted, emit } = recorder()
+  const scheduler = manualSchedule()
+  const publisher = new ElementMapPublisher({ emit, schedule: scheduler.schedule })
+
+  publisher.publish(BUTTON, 80, 24)
+  const armed = scheduler.live()
+  expect(armed).toBeDefined()
+
+  publisher.publish([...BUTTON, { id: 'foot', role: 'text', r: [0, 23, 80, 1] }], 80, 24)
+  expect(scheduler.live()).toBe(armed!) // same timer, not a replacement
+
+  publisher.publish([], 80, 24) // the empty map is the one thing that cancels it
+  expect(scheduler.pending()).toBe(0)
+
+  scheduler.fire() // nothing was armed, so nothing is re-sent
+  expect(emitted).toHaveLength(3) // BUTTON, the change, and the empty map
 })
 
 test('an empty map is explicit, and it carries no heartbeat', () => {

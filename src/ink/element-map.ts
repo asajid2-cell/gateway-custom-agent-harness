@@ -385,7 +385,10 @@ function defaultSchedule(fn: () => void, ms: number): () => void {
  *   changed (elements or geometry). A refused frame leaves the previous map
  *   in place and does not burn a generation.
  * - the heartbeat re-sends the last frame unchanged, same `gen`, so a
- *   consumer that dedupes on `gen` pays nothing for it.
+ *   consumer that dedupes on `gen` pays nothing for it. It is periodic (every
+ *   `heartbeatMs` while the map is non-empty), not a quiet timer: publishing a
+ *   frame does not restart it, or a long run of frames that do not change the
+ *   map would suppress it and leave a restarted relay without a map.
  * - the heartbeat runs only while the map is non-empty. An empty map is an
  *   explicit statement - "there are no widgets" - and a consumer must not
  *   paint stale widgets over a blank screen, so it does not need refreshing.
@@ -445,11 +448,29 @@ export class ElementMapPublisher {
     this.cancel = undefined
   }
 
+  /**
+   * Keep one heartbeat in flight while the map is non-empty.
+   *
+   * A publish must not restart the countdown. The re-send is *periodic*, not a
+   * quiet timer: a relay that restarts during a long stretch of frames that do
+   * not change the map (a colour-only animation, say) still recovers within one
+   * period, instead of waiting for the app to stop rendering. An identical
+   * frame costs a consumer that dedupes on `gen` nothing but the bytes.
+   *
+   * An empty map cancels it: there is nothing to recover, and re-sending
+   * "no widgets" would only keep a viewer's stale widgets alive.
+   */
   private armHeartbeat(): void {
-    if (this.cancel) this.cancel()
-    this.cancel = undefined
-    if (!this.last || this.last.frame.els.length === 0) return
+    if (!this.last || this.last.frame.els.length === 0) {
+      if (this.cancel) this.cancel()
+      this.cancel = undefined
+      return
+    }
+    if (this.cancel) return
     this.cancel = this.schedule(() => {
+      // The timer that fired is spent; clear it before re-arming so the guard
+      // above does not mistake ourselves for an already-armed heartbeat.
+      this.cancel = undefined
       if (this.stopped || !this.last) return
       this.emit(this.last.sequence)
       this.armHeartbeat()
