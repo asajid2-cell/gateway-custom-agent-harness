@@ -4324,7 +4324,19 @@ export class ChatGptHost {
       // If commands ran on the final round, the side effects already happened.
       // Telling the sender "budget spent" invites a retry that would duplicate
       // them. Report what ran instead; the word "budget" must not appear.
-      if (receipts.length > 0) return this.answerPeer(bridge, message, `the last round's commands ran: ${receipts.join('; ')}`, 'receipt of final-round commands sent')
+      // Anything the final round also asked for and could not run is named
+      // beside the receipts: still one reply, but the sender learns the reason.
+      if (receipts.length > 0) {
+        const tail = refused.length > 0 ? `; not run: ${refused.join('; ')}` : ''
+        return this.answerPeer(bridge, message, `the last round's commands ran: ${receipts.join('; ')}${tail}`, 'receipt of final-round commands sent')
+      }
+      // Nothing ran, so there is no side effect to protect. The page spent the
+      // budget on blocks that could not run; the sender is told WHY (stale
+      // nonce, unknown op, malformed JSON) rather than handed a budget line
+      // that names no reason. One reply, as always.
+      if (refused.length > 0) {
+        return this.replyError(bridge, message, `the page's command could not run: ${refused.join('; ')}; nothing was run`)
+      }
       return this.replyError(bridge, message, 'the per-message command budget was spent (4 model rounds); any remaining commands were not run')
     }
     const { prose: visibleText, commandShaped } = proseFromTurn(outcome.finalText)

@@ -309,6 +309,15 @@ const sendsIn = (driver: FakeDriver, from: number): Call[] =>
 const replyFor = (sender: GatewaySessionTransport, messageId: string): PeerMessage | undefined =>
   inboxMessages(sender).find(message => message.replyTo === messageId)
 
+/** A live inbound on the bus: the host runs it as the sender's own turn. */
+async function sendInbound(
+  sender: GatewaySessionTransport, to: string, text: string, summary: string,
+): Promise<string> {
+  const receipt = await sender.send(to, text, summary, undefined, 'inquiry', true) as { id?: string }
+  if (!receipt?.id) throw new Error('the sender got no message id')
+  return receipt.id
+}
+
 /** The rendered command block the page hands back: label line, then the object. */
 const rendered = (fields: Record<string, unknown>): string => 'gateway\n' + JSON.stringify(fields)
 
@@ -414,6 +423,42 @@ describe('R14 verification: the settle path at 80ce9f9', () => {
       // Nothing ran.
       const stored = await readBridge(dir, alpha.sessionId)
       expect(stored.schedules.map(schedule => schedule.label)).not.toContain('r14v-stale-deferred')
+      const audit = await hostAudit(dir)
+      expect(audit.some(entry => entry.op === 'schedule' && entry.messageId === messageId)).toBe(false)
+    } finally {
+      await sender.close().catch(() => {})
+      await host.stop().catch(() => {})
+      await cleanup()
+    }
+  }, 40_000)
+
+  // Row 4: stale nonce on the DIRECT path -----------------------------------
+  test('4. a stale nonce in a direct answer runs nothing and the sender is told why', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primed('alpha', THREAD_A)
+    const sender = await busPeer(dir, 'sender')
+    const stale = rendered({ nonce: 'deadbeef', op: 'schedule', label: 'r14v-stale-direct', inSeconds: 600 })
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    // The host mints this turn's own nonce; the page answers a quoted block
+    // carrying a different one, every round.
+    driver.answerFor = () => stale
+    driver.sendTextFor = () => stale
+    const host = await startHost(dir, driver)
+    try {
+      const messageId = await sendInbound(sender, alpha.sessionId, 'quote an old block', 'stale nonce direct')
+      const reply = await waitFor(() => replyFor(sender, messageId), 15_000)
+      await delay(200)
+      const mine = inboxMessages(sender).filter(message => message.replyTo === messageId)
+      expect(mine.length).toBe(1)
+      // A refusal named by reason - not the neutral body, not the fence.
+      expect(reply.text).not.toContain('command block only')
+      expect(reply.text).not.toContain('"nonce":"deadbeef"')
+      expect(reply.text.toLowerCase()).toContain('nonce')
+      // Nothing ran.
+      const stored = await readBridge(dir, alpha.sessionId)
+      expect(stored.schedules.map(schedule => schedule.label)).not.toContain('r14v-stale-direct')
       const audit = await hostAudit(dir)
       expect(audit.some(entry => entry.op === 'schedule' && entry.messageId === messageId)).toBe(false)
     } finally {
