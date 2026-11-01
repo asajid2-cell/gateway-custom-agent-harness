@@ -115,19 +115,20 @@ export class DriverChild {
   private readonly acceptors = new Map<string, (id: string) => void>()
   /**
    * Requests the page told us it took, by id, the child generation that took
-   * them, and when. Used to name the work a timeout recovery abandons; the
-   * timestamp is what separates a long turn from a LOST REPLY - the live defect
-   * where one lost frame kept the accepted id "in flight" for the child's whole
-   * life. An id leaves this set when it is settled or its child exits.
+   * them, and when. Only an id whose request is still pending is recorded (the
+   * live `accepted for r194 has no live waiter; dropped` line showed the old
+   * code recording settled ids, which is what disabled recovery for the child's
+   * life). An id leaves this set when it is settled, its child exits, or its
+   * child is replaced.
    */
   private readonly accepted = new Map<string, { generation: number; at: number }>()
   /**
-   * The bound timer for each accepted id: when it fires, the id is past its own
-   * deadline plus the margin with no reply, so the reply was LOST. One lost
-   * frame must not wait for some later request to time out - the live incident
-   * had no later request for four minutes, and none at all would have meant the
-   * child never recovered. Cleared when the id settles, its child exits, or the
-   * child is replaced.
+   * The bound timer for each accepted id: the backstop that would replace the
+   * child if an accepted id ever outlived its request deadline plus the margin
+   * with no reply. In the current lifecycle it cannot fire - the request's own
+   * deadline settles the id first, and a settled id is never recorded - but it
+   * is kept so a future change to acceptance recording cannot reintroduce the
+   * wedge. Cleared when the id settles, its child exits, or it is replaced.
    */
   private readonly lostTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** When each in-flight request's own deadline falls, for a graceful drain. */
@@ -184,13 +185,15 @@ export class DriverChild {
   /**
    * When an accepted id's reply is presumed lost.
    *
-   * The id's OWN request deadline is the honest ceiling when it is still known:
-   * `call()` records it in `deadlines` and deletes it on settle, so a send made
-   * with a shorter per-call timeout is bounded by that timeout, not by the
-   * construction default. An accepted id with no live waiter (its request had
-   * already timed out when the page announced it) has no deadline left - that is
-   * the leak the live incident hung on - so it falls back to the construction
-   * timeout. The margin is added either way.
+   * The id's OWN request deadline is the ceiling: `call()` records it in
+   * `deadlines` before writing and only `finish()` removes it, and `finish()`
+   * removes the accepted entry too - and acceptance is recorded only while the
+   * id is pending. A recorded accepted id therefore ALWAYS has a deadline, and
+   * the construction-timeout fallback is a defensive floor that cannot be
+   * reached in the current lifecycle. The 21-minute bound in the live incident
+   * was the construction timeout itself; the ceiling that matters is the
+   * per-request deadline, which G-010 will shorten to the child's send ceiling.
+   * The margin is added either way.
    */
   private lostReplyBoundAt(id: string, acceptedAt: number): number {
     const deadline = this.deadlines.get(id)
@@ -224,10 +227,12 @@ export class DriverChild {
   /**
    * The bound passed with no reply, and no request had to time out to say so.
    *
-   * This is the QUIET shape: an accepted id that never settles is exactly the
-   * live incident, where nothing else was in flight for four minutes and the
-   * child would otherwise have gone unreplaced for its whole life. It takes the
-   * same distinct lost-reply replacement path as the timeout trigger.
+   * A defensive backstop: with acceptance recorded only for pending ids, the id
+   * settles at its own deadline (before the bound) and no timer survives, so
+   * this path is not reached on the current lifecycle. It keeps the distinct
+   * lost-reply replacement path wired so a future change to acceptance
+   * recording cannot leave an accepted id suppressing recovery for the child's
+   * whole life.
    *
    * The young-id rule still holds: a DIFFERENT accepted id that is still inside
    * its own bound is genuine work in flight, so this overdue reply does not get
@@ -352,10 +357,16 @@ export class DriverChild {
     const event = typeof message.event === 'string' ? message.event : ''
     if (event) {
       if (event === 'accepted') {
-        // Remember acceptance even without a callback: it is what the timeout
-        // recovery has to account for as accepted-but-unfinished work, and its
-        // age is what tells a slow turn from a lost reply.
-        if (id) {
+        // An acceptance only means something while the request is still pending.
+        // One whose request already settled is not work the host owes a reply
+        // to: recording it would let a dead id suppress recovery, and the bound
+        // would later kill a healthy idle child over a request the host had
+        // already abandoned. Live log evidence: `accepted for r194 has no live
+        // waiter; dropped`. Drop it and record nothing.
+        if (id && this.pending.has(id)) {
+          // Remember acceptance even without a callback: it is what the timeout
+          // recovery has to account for as accepted-but-unfinished work, and its
+          // age is what tells a slow turn from a lost reply.
           this.accepted.set(id, { generation, at: Date.now() })
           // The reply may never come and no later request may ever time out to
           // notice; the bound has to fire on its own.
@@ -379,6 +390,11 @@ export class DriverChild {
     }
     const waiter = this.pending.get(id)
     if (!waiter) {
+      // A reply proves nothing was lost, even when the host had already stopped
+      // waiting for it: forget any acceptance recorded for the id so no bound
+      // timer can later replace a child that did answer (G-008 defect 2).
+      this.accepted.delete(id)
+      this.clearLostReplyTimer(id)
       this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
       return
     }
