@@ -18,7 +18,7 @@
  */
 import { spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { lstat, open, readFile, readdir, unlink } from 'node:fs/promises'
+import { lstat, open, readFile, readdir, stat, unlink } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { join } from 'node:path'
 import { cleanLeafOwnerEnv } from './deepLink/terminalLauncher.js'
@@ -56,6 +56,22 @@ export type DurableIdentity = {
  * wins outright, which is what keeps a non-matriarch head from being made
  * durable by an alias the family no longer treats as its entry point.
  *
+ * The family record `leaf-families/<familyId>.json` is what makes an id a
+ * FAMILY at all, so it is required on both paths. That is the same definition
+ * the registry reaper uses, and the two must not disagree: a claim naming a
+ * family that does not exist cannot make a session the entry point of one,
+ * because the next listing would retire its registration as an entry point to
+ * nothing. Requiring it here is what stops a live session from publishing a
+ * durable claim the bus then acts on.
+ *
+ * Two things used to make that happen together. Every family member gets its
+ * own pointer copy at `index/<memberSessionId>.json`, and a copy carries the
+ * family's `patriarchSessionId` as it stood when it was written. Scanning the
+ * index for that field therefore matched a MEMBER's copy and returned the
+ * copy's own filename - a session id - as the family id. `rootSessionId` is
+ * the family, so a legacy alias counts only for the file that IS the family's
+ * root pointer (`rootSessionId === stem`), which excludes every member copy.
+ *
  * Exported for testing. Never throws: an unreadable index is "not durable",
  * the direction that cannot make an ordinary peer immortal.
  */
@@ -66,6 +82,9 @@ export async function resolveDurableIdentity(
   const index = join(configHome, 'leaf-families', 'index')
   let entries: string[]
   try { entries = await readdir(index) } catch { return { durable: false } }
+  const familyExists = async (familyId: string): Promise<boolean> => {
+    try { await stat(leafFamilyPaths(configHome, familyId).familyRecord); return true } catch { return false }
+  }
   const hostClaims = new Set<string>()
   for (const entry of entries) {
     if (!entry.endsWith('.host.json')) continue
@@ -74,7 +93,8 @@ export async function resolveDurableIdentity(
     hostClaims.add(familyId)
     try {
       const claim = JSON.parse(await readFile(join(index, entry), 'utf8')) as { matriarchSessionId?: unknown }
-      if (claim?.matriarchSessionId === sessionId) return { durable: true, familyId }
+      if (claim?.matriarchSessionId !== sessionId) continue
+      if (await familyExists(familyId)) return { durable: true, familyId }
     } catch { /* An unreadable claim is not a claim. */ }
   }
   // Legacy fallback. A family that HAS a host claim is not read here: its claim
@@ -84,8 +104,12 @@ export async function resolveDurableIdentity(
     const familyId = entry.slice(0, -'.json'.length)
     if (!familyId || hostClaims.has(familyId)) continue
     try {
-      const pointer = JSON.parse(await readFile(join(index, entry), 'utf8')) as { patriarchSessionId?: unknown }
-      if (pointer?.patriarchSessionId === sessionId) return { durable: true, familyId }
+      const pointer = JSON.parse(await readFile(join(index, entry), 'utf8')) as { rootSessionId?: unknown; patriarchSessionId?: unknown }
+      if (pointer?.patriarchSessionId !== sessionId) continue
+      // A member's copy is not the family's root pointer: it names the root in
+      // `rootSessionId` while living under the member's own session id.
+      if (pointer.rootSessionId !== familyId) continue
+      if (await familyExists(familyId)) return { durable: true, familyId }
     } catch { /* An unreadable pointer is not a pointer. */ }
   }
   return { durable: false }

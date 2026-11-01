@@ -182,6 +182,25 @@ test('the reaper keeps a durable entry whose pid and pipe are gone, and reaps it
   })
 })
 
+test('the reaper never retires a registration whose process is alive, whatever its durable claim says', async () => {
+  await withRegistry(async sessions => {
+    const sessionId = randomUUID()
+    // The live shape of the failure: a running process whose record advertises
+    // durable, with a family id that has no family record. The old reaper read
+    // the claim, skipped the pid, saw the family gone and tombstoned the record
+    // of a session that was answering on its pipe the whole time.
+    await writeRegistration(sessions, {
+      sessionId, pid: process.pid, durable: true, durableFamilyId: randomUUID(),
+    })
+
+    const listed = (await listGatewayPeers(sessions)).find(peer => peer.sessionId === sessionId)
+    assert.ok(listed, 'a live process is listed even when its durable claim points at no family')
+    assert.equal(listed!.durableState, 'closed', 'liveness comes from pid + endpoint, not from the claim')
+    assert.equal(await fileExists(join(sessions, `${sessionId}.json`)), true, 'its registration is not consumed by a listing')
+    assert.equal(await fileExists(join(sessions, `${sessionId}.dead.json`)), false, 'nothing is tombstoned')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // 3. Liveness is pid AND endpoint; unknown is not dead
 // ---------------------------------------------------------------------------
@@ -647,21 +666,63 @@ test('resolveDurableIdentity marks only the matriarch durable, and prefers a hos
   const aliasOnly = randomUUID()
   const index = join(configHome, 'leaf-families', 'index')
   await mkdir(index, { recursive: true })
+  await writeFamilyRecord(familyId)
   // A host claim names the matriarch.
   await writeFile(join(index, `${familyId}.host.json`), JSON.stringify({ matriarchSessionId: matriarch, pid: DEAD_PID, generation: 1 }))
   // A stale patriarch alias in the same family points at a different session;
   // the host claim must win, so that alias is NOT durable.
-  await writeFile(join(index, `${familyId}.json`), JSON.stringify({ rootSessionId: matriarch, patriarchSessionId: aliasOnly }))
+  await writeFile(join(index, `${familyId}.json`), JSON.stringify({ rootSessionId: familyId, patriarchSessionId: aliasOnly }))
 
   assert.deepEqual(await resolveDurableIdentity(matriarch, configHome), { durable: true, familyId })
   assert.deepEqual(await resolveDurableIdentity(aliasOnly, configHome), { durable: false }, 'the host claim wins over the legacy alias')
   assert.deepEqual(await resolveDurableIdentity(randomUUID(), configHome), { durable: false })
 
   // A legacy family with no host claim at all is still readable via the alias.
+  // It is written the way production writes it: the family file is the root's
+  // own pointer (`rootSessionId` is the family id) and the family record exists.
   const legacyId = randomUUID()
   const legacyMatriarch = randomUUID()
-  await writeFile(join(index, `${legacyId}.json`), JSON.stringify({ rootSessionId: legacyMatriarch, patriarchSessionId: legacyMatriarch }))
+  await writeFamilyRecord(legacyId)
+  await writeFile(join(index, `${legacyId}.json`), JSON.stringify({ rootSessionId: legacyId, patriarchSessionId: legacyMatriarch }))
   assert.deepEqual(await resolveDurableIdentity(legacyMatriarch, configHome), { durable: true, familyId: legacyId })
+})
+
+test('a member pointer copy never makes a member durable: the family root is the family', async () => {
+  const familyId = randomUUID()
+  const matriarch = randomUUID()
+  const member = randomUUID()
+  const index = join(configHome, 'leaf-families', 'index')
+  await mkdir(index, { recursive: true })
+  await writeFamilyRecord(familyId)
+  // The family's own pointer, as production writes it: the stem IS the root.
+  await writeFile(join(index, `${familyId}.json`), JSON.stringify({ rootSessionId: familyId, patriarchSessionId: member }))
+  // The host claim names the matriarch; the alias above is stale.
+  await writeHostClaim(familyId, { matriarchSessionId: matriarch, pid: DEAD_PID, generation: 3 })
+  // The member's own copy. It carries the family's stale alias and its own
+  // session id as its filename - the exact shape that used to hand back
+  // `member` as a FAMILY id, making the member claim durability for a family
+  // that does not exist and letting the next listing tombstone it while alive.
+  await writeFile(join(index, `${member}.json`), JSON.stringify({ rootSessionId: familyId, patriarchSessionId: member }))
+
+  assert.deepEqual(await resolveDurableIdentity(matriarch, configHome), { durable: true, familyId })
+  assert.deepEqual(await resolveDurableIdentity(member, configHome), { durable: false }, 'a member pointer copy is not the family')
+})
+
+test('a claim that names no existing family cannot make a session durable', async () => {
+  const familyId = randomUUID()
+  const matriarch = randomUUID()
+  const index = join(configHome, 'leaf-families', 'index')
+  await mkdir(index, { recursive: true })
+  await writeHostClaim(familyId, { matriarchSessionId: matriarch, pid: DEAD_PID, generation: 1 })
+  await writeFile(join(index, `${familyId}.json`), JSON.stringify({ rootSessionId: familyId, patriarchSessionId: matriarch }))
+
+  // The family record is what makes the id a family. Without it the resolution
+  // and the reaper would disagree - resolution says durable, the reaper says
+  // the family is gone - and the disagreement is what retired a live session.
+  assert.deepEqual(await resolveDurableIdentity(matriarch, configHome), { durable: false })
+
+  await writeFamilyRecord(familyId)
+  assert.deepEqual(await resolveDurableIdentity(matriarch, configHome), { durable: true, familyId })
 })
 
 // ---------------------------------------------------------------------------

@@ -790,13 +790,25 @@ async function readPriorIntent(directory: string, sessionId: string): Promise<{ 
  * let them go. Reaping is the bus's job, not the dead session's: a session that
  * was Ctrl-C'd or killed cannot deregister itself, and should not have to.
  *
- * Two independent signals are required before acting. The caller has already
- * established that the endpoint did not answer; this function additionally
- * requires that the recorded pid is gone. A busy peer can miss a ping, and a
- * recycled pid reads as alive, while reaping a live session's registration would
- * make it unreachable until it happened to write one again. Being wrong in the
- * other direction only leaves a stale file, which is what happens today anyway -
- * lingering is the safe failure.
+ * The live-process check comes FIRST, before anything the record CLAIMS about
+ * itself. A registration is a claim, and the one fact a listing can check for
+ * free is whether the process that wrote it still exists. If it does, nothing
+ * the file says about durability can retire it: the claim may be wrong, and a
+ * wrong claim must never make a running session unreachable. That is exactly
+ * what happened - a member's pointer copy handed its own session id to the
+ * durable resolver as a family id, the family record under that id never
+ * existed, and the first listing from any peer tombstoned a live session's
+ * registration. Liveness is decided from the process, never from the claim.
+ *
+ * For a peer whose process is gone, durability still decides: a durable entry
+ * survives liveness (that is `[closed]`, and the point of durability) and is
+ * retired only when the family it fronts no longer exists. An ordinary peer is
+ * retired once the caller has also established that its endpoint did not answer.
+ *
+ * Being wrong in the lingering direction only leaves a stale file, which the
+ * TTL sweep and a later listing handle; lingering is the safe failure. A
+ * recycled pid also reads as alive, which keeps a stale row rather than
+ * consuming a live one - the same deliberate asymmetry.
  *
  * The registration is re-read immediately before the move and must still carry
  * the same pid AND runtimeId that was listed. A session that rebound its own
@@ -804,6 +816,7 @@ async function readPriorIntent(directory: string, sessionId: string): Promise<{ 
  * must not have that record consumed; the reap is abandoned instead.
  */
 async function reapIfDead(directory: string, sessionId: string, peer: GatewayPeer): Promise<boolean> {
+  if (isProcessRunning(peer.pid)) return false
   if (peer.durable === true) {
     // A durable entry is never reaped for liveness: a dead pid or an absent
     // pipe is the `closed` state, which is exactly what durability exists to
@@ -819,7 +832,7 @@ async function reapIfDead(directory: string, sessionId: string, peer: GatewayPee
       else return false
     }
     if (!familyGone) return false
-  } else if (isProcessRunning(peer.pid)) return false
+  }
   const live = join(directory, `${sessionId}.json`)
   try {
     const current = await readRegistrationUnchecked(directory, sessionId)
@@ -930,14 +943,24 @@ export class GatewaySessionTransport {
   }
 
   /**
-   * Mark this registration durable before it is published.
+   * Set this registration's durability before it is published.
    *
    * The runtime computes the answer (it is the one place the session's own id
    * is authoritative) and applies it here; the transport itself never reads
-   * leaf-families. A no-op when not durable, so the fail-safe default stands.
+   * leaf-families.
+   *
+   * A not-durable answer CLEARS the fields. Absence is the fail-safe reading,
+   * so a session that is not the matriarch must not carry the marker, and a
+   * marker that was true earlier in the process's life (a succession moved the
+   * matriarch) must be removable without a relaunch. Clearing only ever
+   * removes a claim; it cannot make an ordinary peer immortal.
    */
   setDurable(identity: DurableIdentity): void {
-    if (!identity.durable) return
+    if (!identity.durable) {
+      delete this.peer.durable
+      delete this.peer.durableFamilyId
+      return
+    }
     this.peer.durable = true
     if (identity.familyId) this.peer.durableFamilyId = identity.familyId
   }

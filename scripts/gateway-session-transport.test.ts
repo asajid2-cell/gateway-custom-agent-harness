@@ -528,9 +528,13 @@ test('a listing lets go of registrations that are provably dead, and only those'
 
     assert.deepEqual(await listGatewayPeers(directory), [], 'no endpoint here is listening')
     await assert.rejects(readFile(abandoned), { code: 'ENOENT' })
-    // Its process is gone, but a restart is still plausible, so it keeps the
-    // intent it declared until the window closes.
-    assert.ok((await readFile(crashed, 'utf8')).includes(`"pid":${exited.pid}`))
+    // Its process is gone, but a restart is still plausible, so the intent it
+    // declared is preserved - in the tombstone, which `readPriorIntent` reads
+    // back, rather than in a live registration that would keep advertising a
+    // session that has exited. The join stays: a tombstoned record must still be
+    // readable as history, it just must not count as a claim of life.
+    await assert.rejects(readFile(crashed), { code: 'ENOENT' })
+    assert.ok((await readFile(join(directory, `${crashedId}.dead.json`), 'utf8')).includes(`"pid":${exited.pid}`))
     // Its pid answers a probe, so a silent endpoint is not proof of anything.
     assert.ok((await readFile(join(directory, `${aliveId}.json`), 'utf8')).includes(`"pid":${process.pid}`))
   } finally {
