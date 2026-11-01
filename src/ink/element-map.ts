@@ -223,7 +223,19 @@ export function stripElementMap(
       const partial = buffer.slice(open.index)
       if (partial.length > ELEMENT_MAP_MAX_CARRY_BYTES) {
         state.dropped += 1
-        return { text, frames }
+        // Resume inside this chunk rather than at the next one: a valid frame
+        // behind the garbage must not be lost with it. Everything between the
+        // overflow point and the next introducer is machine data and is
+        // discarded, never printed. With no further introducer the whole
+        // remainder goes, except a trailing partial introducer (rule 4a).
+        const rest = buffer.slice(open.index + 1)
+        const next = findIntroducer(rest)
+        if (!next) {
+          state.carry = partialIntroducer(rest) ?? ''
+          return { text, frames }
+        }
+        buffer = rest.slice(next.index)
+        continue
       }
       state.carry = partial
       return { text, frames }
@@ -280,11 +292,21 @@ function findTerminator(
  * on screen, and the next chunk completes the sequence.
  */
 function keepableTail(buffer: string, state: StripState): string {
-  // Hold a trailing suffix that could still become either introducer - the ESC
-  // form and the 8-bit C1 form both reach this path when a relay carries the
-  // stream in 8-bit mode. Holding only the ESC form would print a fragment and
-  // then print the next chunk's base64 as text: the exact failure this stripper
-  // exists to prevent, reachable on a seven-byte chunk boundary.
+  const suffix = partialIntroducer(buffer)
+  if (suffix === null) return buffer
+  state.carry = suffix
+  return buffer.slice(0, buffer.length - suffix.length)
+}
+
+/**
+ * The trailing bytes that could still become an introducer, or `null`.
+ *
+ * Both forms count: the ESC form and the 8-bit C1 form reach this path when a
+ * relay carries the stream in 8-bit mode. Holding only the ESC form would print
+ * a fragment and then print the next chunk's base64 as text: the exact failure
+ * this stripper exists to prevent, reachable on a seven-byte chunk boundary.
+ */
+function partialIntroducer(buffer: string): string | null {
   const hold = Math.max(ELEMENT_MAP_INTRODUCER.length, ELEMENT_MAP_INTRODUCER_C1.length) - 1
   // A buffer that is not a prefix at all is text and is printed whole - which
   // is why the length check is inside the loop rather than before it.
@@ -294,11 +316,10 @@ function keepableTail(buffer: string, state: StripState): string {
       ELEMENT_MAP_INTRODUCER.startsWith(suffix) ||
       ELEMENT_MAP_INTRODUCER_C1.startsWith(suffix)
     ) {
-      state.carry = suffix
-      return buffer.slice(0, buffer.length - keep)
+      return suffix
     }
   }
-  return buffer
+  return null
 }
 
 function decodePayload(payload: string): ElementMapFrame | null {

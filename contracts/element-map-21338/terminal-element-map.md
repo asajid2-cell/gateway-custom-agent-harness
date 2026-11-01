@@ -127,9 +127,18 @@ failure the stripper exists to prevent.
 `dropped` increments once per abandoned sequence: an undecodable body (not
 base64url, not JSON, wrong `v`, malformed element/action) including one cut
 short by an abort, or a carry that exceeds `ELEMENT_MAP_MAX_CARRY_BYTES`
-(64 KB). On carry
-overflow the remainder of that chunk is discarded and the stripper
-resynchronises at the next introducer.
+(64 KB).
+
+On carry overflow the open sequence is abandoned and scanning resumes **inside
+that same chunk** at the next legal introducer, so a valid frame behind the
+garbage is not lost with it. The bytes between the overflow point and that
+introducer are machine data: they are discarded, never printed. If the chunk
+carries no further introducer its remainder is discarded, except for a trailing
+partial introducer, which is held (rule 4a).
+
+An abort (ESC, CAN, SUB) is not the same path: an ESC is not a terminator here,
+so a frame that follows an unterminated body in one chunk is reached by the
+abort route before the cap is ever consulted, and the frame is delivered.
 
 An overflow cannot happen on a legal frame: 32 KB of JSON base64-encodes to
 about 43.7 KB, well under the 64 KB carry cap. The cap only bites on corruption

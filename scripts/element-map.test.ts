@@ -210,6 +210,28 @@ test('an unterminated sequence is held, then abandoned at the carry cap', () => 
   expect(recovered.frames.map(f => f.gen)).toEqual([11])
 })
 
+test('a carry overflow resumes at the next introducer inside the same chunk', () => {
+  // The cap fires only when the chunk holds no terminator at all - an ESC would
+  // abort the open sequence first, so the surviving introducer here has to be
+  // the C1 form, whose terminator is in the next chunk. If the overflow simply
+  // discarded the rest of the chunk, the frame would be lost and the terminator
+  // would print as text on the following chunk.
+  const state = createStripState()
+  const head = `A${INTRODUCER}${'B'.repeat(ELEMENT_MAP_MAX_CARRY_BYTES + 100)}`
+  const tail = `\u009d${ELEMENT_MAP_OSC};${payloadOf(encodeOk(frame(12)))}`
+
+  const first = stripElementMap(head + tail, state)
+  expect(first.text).toBe('A')
+  expect(first.frames).toHaveLength(0)
+  expect(state.dropped).toBe(1)
+  expect(state.carry).toBe(tail)
+
+  const second = stripElementMap('\u009c', state)
+  expect(second.text).toBe('')
+  expect(second.frames.map(f => f.gen)).toEqual([12])
+  expect(state.carry).toBe('')
+})
+
 test('a corrupt payload is dropped without taking the surrounding text down', () => {
   const state = createStripState()
   const out = stripElementMap(`left${INTRODUCER}not!base64!${ST}right`, state)

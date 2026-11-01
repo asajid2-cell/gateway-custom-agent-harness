@@ -308,6 +308,23 @@ const strip: StripCase[] = [
     'A' + overflowPayload,
     'B' + resyncSequence + 'C',
   ]),
+  // Harmonizer's requested shape: one chunk whose open body is longer than the
+  // cap, followed by a complete ESC frame. Note which path this takes - the
+  // frame's ESC aborts the open sequence before the cap is consulted, so this
+  // pins "an abort does not suppress a following frame", not the resync rule.
+  stripCase('unterminated-body-then-frame-same-chunk', [
+    'A' + overflowPayload + resyncSequence + 'C',
+  ]),
+  // The case that actually distinguishes the two overflow readings. No ESC
+  // anywhere in the chunk, so the cap really fires; the frame behind the
+  // garbage is the C1 form, whose 0x9C arrives in the next chunk. Resuming at
+  // the next introducer in this chunk carries that frame; discarding the rest
+  // of the chunk loses it and prints the 0x9C as text on the next one.
+  stripCase('carry-overflow-resumes-at-next-introducer-same-chunk', [
+    'A' + INTRODUCER + 'B'.repeat(ELEMENT_MAP_MAX_CARRY_BYTES + 100) +
+      `${INTRODUCER_C1}${Buffer.from(JSON.stringify(minimalFrame), 'utf8').toString('base64url')}`,
+    String.fromCharCode(0x9c),
+  ]),
   stripCase('corrupt-not-base64url', ['L' + corruptFrames[0]![1] + 'R']),
   stripCase('corrupt-v2', ['L' + corruptFrames[1]![1] + 'R']),
   stripCase('corrupt-malformed-action', ['L' + corruptFrames[2]![1] + 'R']),
