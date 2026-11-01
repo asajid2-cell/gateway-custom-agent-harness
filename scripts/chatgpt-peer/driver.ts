@@ -59,6 +59,24 @@ export function drainGraceMs(latestDeadline: number, nowMs: number = Date.now())
 export const DEFAULT_WEDGE_MS = 120_000
 
 /**
+ * How long PAST the send ceiling an accepted request may stay unanswered before
+ * its reply is presumed lost rather than still coming.
+ *
+ * The child accepts a send, works, and answers on the same request. A reply
+ * that never arrives while the child keeps answering LATER requests is not work
+ * in flight - it is a lost frame (the live incident: `r206` ran to completion
+ * and its reply never reached the host, which then suppressed replacement for
+ * 24 minutes because the accepted id counted as "busy"). Age separates the two:
+ * an accepted id older than the ceiling plus this margin cannot still be a
+ * legitimate turn, so it stops blocking recovery.
+ */
+export const DEFAULT_LOST_REPLY_MARGIN_MS = 60_000
+
+/** A log-friendly age: minutes for the live scale, tenths of a second in tests. */
+const humanAge = (ms: number): string =>
+  ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : `${Math.max(0, ms / 1000).toFixed(1)}s`
+
+/**
  * A reply that failed because the DRIVER failed - it timed out, was replaced,
  * or was closed - says nothing about the page. Callers must treat it as "no
  * evidence yet" and keep their own clock, never as a page refusal or a model
@@ -96,11 +114,13 @@ export class DriverChild {
    */
   private readonly acceptors = new Map<string, (id: string) => void>()
   /**
-   * Requests the page told us it took, by id and by the child generation that
-   * took them. Used to name the work a timeout recovery abandons; an id leaves
-   * this set when it is settled or its child exits.
+   * Requests the page told us it took, by id, the child generation that took
+   * them, and when. Used to name the work a timeout recovery abandons; the
+   * timestamp is what separates a long turn from a LOST REPLY - the live defect
+   * where one lost frame kept the accepted id "in flight" for the child's whole
+   * life. An id leaves this set when it is settled or its child exits.
    */
-  private readonly accepted = new Map<string, number>()
+  private readonly accepted = new Map<string, { generation: number; at: number }>()
   /** When each in-flight request's own deadline falls, for a graceful drain. */
   private readonly deadlines = new Map<string, number>()
   /**
@@ -122,6 +142,11 @@ export class DriverChild {
     timeoutMs?: number
     /** How long the child may be silent before a timeout is treated as a wedge. */
     wedgeMs?: number
+    /**
+     * How long past the send ceiling an accepted reply may be overdue before it
+     * is presumed lost and no longer suppresses replacement. Tests shorten it.
+     */
+    lostReplyMarginMs?: number
   }) {}
 
   /**
@@ -140,6 +165,17 @@ export class DriverChild {
   private get wedgeMs(): number {
     const configured = this.options.wedgeMs
     return typeof configured === 'number' && configured >= 0 ? configured : DEFAULT_WEDGE_MS
+  }
+
+  /**
+   * The longest a send may legitimately take (the construction timeout, which
+   * the host sets to the turn budget) plus the lost-reply margin.
+   */
+  private get acceptedAgeLimitMs(): number {
+    const ceiling = this.options.timeoutMs ?? 600_000
+    const configured = this.options.lostReplyMarginMs
+    const margin = typeof configured === 'number' && configured >= 0 ? configured : DEFAULT_LOST_REPLY_MARGIN_MS
+    return ceiling + margin
   }
 
   private ensure(): ChildProcessWithoutNullStreams {
@@ -172,8 +208,8 @@ export class DriverChild {
         waiter.finish({ ok: false, id, error: reason })
         this.acceptors.delete(id)
       }
-      for (const [id, acceptedGeneration] of [...this.accepted]) {
-        if (acceptedGeneration === generation) this.accepted.delete(id)
+      for (const [id, entry] of [...this.accepted]) {
+        if (entry.generation === generation) this.accepted.delete(id)
       }
     })
     child.stdin.on('error', () => {})
@@ -211,8 +247,9 @@ export class DriverChild {
     if (event) {
       if (event === 'accepted') {
         // Remember acceptance even without a callback: it is what the timeout
-        // recovery has to account for as accepted-but-unfinished work.
-        if (id) this.accepted.set(id, generation)
+        // recovery has to account for as accepted-but-unfinished work, and its
+        // age is what tells a slow turn from a lost reply.
+        if (id) this.accepted.set(id, { generation, at: Date.now() })
         const accept = id ? this.acceptors.get(id) : undefined
         if (!accept) {
           this.log(`driver: accepted for ${id || 'no id'} has no live waiter; dropped`)
@@ -291,22 +328,40 @@ export class DriverChild {
    * cannot be left in front of the queue, and R-LIVE-5 was right that a slow
    * read beside a working page is not that. The distinction is evidence:
    *
-   * - any OTHER accepted request of this generation means the child is busy
-   *   with real work, so one slow read is not a wedge - the live page keeps
-   *   generating and its turn must not be killed under it;
+   * - an accepted id that has outlived the send ceiling plus the margin is a
+   *   LOST reply (G-008): the child is answering later requests, so the frame
+   *   was not merely slow. It is replaced and named in a distinct log;
+   * - any OTHER young accepted request of this generation means the child is
+   *   busy with real work, so one slow read is not a wedge - the live page
+   *   keeps generating and its turn must not be killed under it;
    * - otherwise a request the child accepted and did not answer is exactly
    *   R2-F6's stuck head of the queue;
    * - otherwise the child is wedged only after emitting NOTHING for the
    *   explicit wedge interval. A child that answers nothing at all for the
    *   whole timeout is still replaced (R2-F6's "answers nothing" case).
    */
-  private wedged(generation: number, timedOutId: string, wasAccepted: boolean): { wedged: boolean; quietMs: number; otherAccepted: string[] } {
-    const quietMs = Date.now() - this.lastLineAt
-    const otherAccepted = [...this.accepted]
-      .filter(([id, at]) => at === generation && id !== timedOutId)
+  private wedged(generation: number, timedOutId: string, wasAccepted: boolean): {
+    wedged: boolean
+    quietMs: number
+    otherAccepted: string[]
+    /** Accepted ids far past the send ceiling: their replies never came. */
+    lostAccepted: { id: string; ageMs: number }[]
+  } {
+    const now = Date.now()
+    const quietMs = now - this.lastLineAt
+    const mine = [...this.accepted].filter(([id, entry]) => entry.generation === generation && id !== timedOutId)
+    // A slow turn is genuinely in flight only until its ceiling plus the
+    // margin. Past that the reply is not late, it is lost - and a lost reply
+    // must not disable recovery for the child's whole life.
+    const lostAccepted = mine
+      .filter(([, entry]) => now - entry.at > this.acceptedAgeLimitMs)
+      .map(([id, entry]) => ({ id, ageMs: now - entry.at }))
+    const otherAccepted = mine
+      .filter(([, entry]) => now - entry.at <= this.acceptedAgeLimitMs)
       .map(([id]) => id)
-    if (otherAccepted.length > 0) return { wedged: false, quietMs, otherAccepted }
-    return { wedged: wasAccepted || quietMs >= this.wedgeMs, quietMs, otherAccepted }
+    if (lostAccepted.length > 0) return { wedged: true, quietMs, otherAccepted, lostAccepted }
+    if (otherAccepted.length > 0) return { wedged: false, quietMs, otherAccepted, lostAccepted }
+    return { wedged: wasAccepted || quietMs >= this.wedgeMs, quietMs, otherAccepted, lostAccepted }
   }
 
   /**
@@ -337,8 +392,18 @@ export class DriverChild {
     const unfinished = [
       ...(wasAccepted ? [timedOutId] : []),
       ...decision.otherAccepted,
+      ...decision.lostAccepted.map(lost => lost.id),
     ]
-    this.log(`driver: ${timedOutId} timed out; replacing the child (accepted but unfinished: ${unfinished.join(', ') || 'none'})`)
+    if (decision.lostAccepted.length > 0) {
+      // Distinct from a plain timeout: the child is healthy enough to answer
+      // other requests, but one accepted id's reply never arrived. Name it and
+      // how long it has been outstanding, because that is the evidence a later
+      // reader needs to tell a lost frame from a slow turn.
+      const named = decision.lostAccepted.map(lost => `${lost.id} (accepted ${humanAge(lost.ageMs)} ago)`).join(', ')
+      this.log(`driver: no reply arrived for ${named}; the reply was lost, not a plain timeout - replacing the child`)
+    } else {
+      this.log(`driver: ${timedOutId} timed out; replacing the child (accepted but unfinished: ${unfinished.join(', ') || 'none'})`)
+    }
     this.child = undefined
     if (child && child.exitCode === null) { try { child.kill() } catch { /* already gone */ } }
     const reason = `driver was replaced after ${timedOutId} timed out`
@@ -346,7 +411,7 @@ export class DriverChild {
       if (waiter.generation !== generation) continue
       waiter.finish({ ok: false, id, error: reason })
     }
-    for (const [id, at] of [...this.accepted]) if (at === generation) this.accepted.delete(id)
+    for (const [id, entry] of [...this.accepted]) if (entry.generation === generation) this.accepted.delete(id)
   }
 
   /**
