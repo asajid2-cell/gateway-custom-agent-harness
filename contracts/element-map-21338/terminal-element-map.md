@@ -38,6 +38,16 @@ The payload is a JSON object:
   last-wins.
 - `r` is `[x, y, width, height]` in app-space cells, 0-based. An element may be
   outside the viewport (scrolled out) but is not emitted if it did not paint.
+  For a text element this is the **laid-out node's rect, not the glyph bounding
+  box**: a title text laid out across the row reports `[0,0,80,1]` even though
+  its glyphs occupy five cells, and a four-character label inside a 12-wide box
+  reports its own text node (four cells), not the box. Do not derive hit
+  boundaries from label length.
+- `id` is assigned the first time a node paints and is stable for that node's
+  lifetime. A node skipped on an early frame gets its id later, so a parent can
+  carry a higher id than a child; `els` order is paint order and id identity is
+  a separate guarantee. Consumers key overlays on `id`, not on position in the
+  array.
 - `label` is present only where the node renders text; 120 characters max,
   collapsed to one line, ending in `…` when cut.
 - `act` is one of:
@@ -72,29 +82,44 @@ every terminator, so the sequence boundary cannot be spoofed from inside the
 payload; and for a command we own, dropping an unrecognized body is the
 correct action, not printing it.
 
-**4. base64url is the law.** The body matches `[A-Za-z0-9_-]+` and carries no
-`=` padding. No body byte can therefore be ESC (`0x1b`), BEL (`0x07`), `0x9C`,
-CAN (`0x18`) or SUB (`0x1a`). If a future payload needs an escape byte, a
-payload escaping rule must be specified before emission changes.
+**4. base64url is the law.** A body is `[A-Za-z0-9_-]+` with at most two
+trailing `=` padding characters tolerated on input (this emitter never writes
+padding). Anything else is rejected before decoding. No body byte can
+therefore be ESC (`0x1b`), BEL (`0x07`), `0x9C`, CAN (`0x18`) or SUB (`0x1a`).
+If a future payload needs an escape byte, a payload escaping rule must be
+specified before emission changes.
+
+**4a. A trailing partial introducer is held, in both forms.** A chunk that
+ends in a suffix that could still become `ESC]21338;` **or** `0x9D 21338 ;` is
+not printed; it is carried and prepended to the next chunk. This is a chunk
+boundary, not a legal sequence: holding the ESC form only would print the
+fragment and then print the next chunk's base64 as text, which is the exact
+failure the stripper exists to prevent.
 
 ## Terminators and aborts
 
 - BEL (`0x07`), `ESC\` (`1b 5c`) and `0x9C` end the string. The terminator is
-  consumed.
+  consumed and never appears in the text.
 - ESC followed by anything other than `\` aborts the string **without
-  consuming the ESC**: the payload is discarded, and the ESC is the start of
-  the next real sequence, so it survives into the text stream. A payload that
-  is nonetheless valid base64url JSON is still decoded before the abort is
-  applied - a consumer must not assume an abort suppresses a well-formed body.
+  consuming the ESC**: the ESC is the start of the next real sequence, so it
+  survives into the text stream.
 - CAN (`0x18`) and SUB (`0x1A`) abort the string and **are consumed** by the
-  stripper (they do not appear in the output text). The payload is discarded.
+  stripper; they do not appear in the output text.
+- **An abort does not by itself discard a body that decodes.** The body before
+  the abort is processed exactly like a terminated body: if it is valid
+  base64url of a conforming frame the frame is delivered (`dropped` stays
+  put); if it does not decode it is discarded and `dropped` increments. The
+  rule "the aborted payload must not survive" therefore applies only to
+  payloads that do not decode. A consumer must not assume an abort suppresses
+  a well-formed body.
 - The emitter only ever writes ST.
 
 ## Dropping
 
 `dropped` increments once per abandoned sequence: an undecodable body (not
-base64url, not JSON, wrong `v`, malformed element/action), an aborted sequence,
-or a carry that exceeds `ELEMENT_MAP_MAX_CARRY_BYTES` (64 KB). On carry
+base64url, not JSON, wrong `v`, malformed element/action) including one cut
+short by an abort, or a carry that exceeds `ELEMENT_MAP_MAX_CARRY_BYTES`
+(64 KB). On carry
 overflow the remainder of that chunk is discarded and the stripper
 resynchronises at the next introducer.
 

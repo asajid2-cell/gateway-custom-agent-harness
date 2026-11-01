@@ -3512,21 +3512,29 @@
         ]
       },
       {
-        "name": "c1-partial-introducer-is-not-held",
+        "name": "c1-partial-introducer-held-then-completed",
         "chunks": [
           "789d323133",
           "33383b65794a32496a6f784c434a6e5a5734694f6a4573496d4e7662484d694f6a67774c434a796233647a496a6f794e4377695a57787a496a70625858309c"
         ],
         "expect": [
           {
-            "text_hex": "789d323133",
+            "text_hex": "78",
             "frames": [],
-            "carry_hex": "",
+            "carry_hex": "9d323133",
             "dropped": 0
           },
           {
-            "text_hex": "33383b65794a32496a6f784c434a6e5a5734694f6a4573496d4e7662484d694f6a67774c434a796233647a496a6f794e4377695a57787a496a70625858309c",
-            "frames": [],
+            "text_hex": "",
+            "frames": [
+              {
+                "v": 1,
+                "gen": 1,
+                "cols": 80,
+                "rows": 24,
+                "els": []
+              }
+            ],
             "carry_hex": "",
             "dropped": 0
           }

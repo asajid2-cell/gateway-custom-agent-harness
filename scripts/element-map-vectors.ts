@@ -278,7 +278,7 @@ const strip: StripCase[] = [
   stripCase('leading-zero-command-passes-through', [
     `${ESC}]00${ELEMENT_MAP_OSC};abc${BEL}tail`,
   ]),
-  stripCase('c1-partial-introducer-is-not-held', [
+  stripCase('c1-partial-introducer-held-then-completed', [
     'x' + `${String.fromCharCode(0x9d)}213`,
     '38;' + Buffer.from(JSON.stringify(minimalFrame), 'utf8').toString('base64url') +
       String.fromCharCode(0x9c),
