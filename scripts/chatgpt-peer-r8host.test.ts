@@ -2047,7 +2047,14 @@ describe('pending-watch: a posted turn is delivered within seconds, not at recon
       const extras = driver.conversationReads - readsBefore
       expect(extras).toBeGreaterThanOrEqual(1)
       expect(extras).toBeLessThanOrEqual(7)
-      // Settled: the watch is gone and no further observation runs.
+      // Settled: the watch is gone and no further observation runs. The disarm
+      // follows the delivery's awaited persist, so poll for it with a bounded
+      // deadline instead of racing that one microtask - a watch that genuinely
+      // never clears still fails here.
+      const clearedBy = Date.now() + 1_000
+      while (live.pendingWatch !== undefined && Date.now() < clearedBy) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
       expect(live.pendingWatch).toBeUndefined()
       const readsAfter = driver.conversationReads
       await new Promise(resolve => setTimeout(resolve, 1_500))

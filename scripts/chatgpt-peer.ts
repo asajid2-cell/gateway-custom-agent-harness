@@ -2980,13 +2980,17 @@ export class ChatGptHost {
   /**
    * Take the right to make ONE observation read: owed work, or a page event's
    * one-shot licence. A licence is spent only when the read is actually sent.
+   *
+   * A held licence is spent FIRST, even when work is owed: otherwise the owed
+   * read leaves the page event's licence alive, and it later buys one extra
+   * read of an otherwise idle bridge.
    */
   private takeObservationLicence(bridge: Bridge): boolean {
-    if (this.owesObservation(bridge)) return true
     if (bridge.reads.licence > 0) {
       bridge.reads.licence -= 1
       return true
     }
+    if (this.owesObservation(bridge)) return true
     bridge.reads.idleSkips += 1
     return false
   }
@@ -3667,10 +3671,22 @@ export class ChatGptHost {
     // happens for a bridge with nothing owed and no page event licensing one.
     if (!this.takeObservationLicence(bridge)) return
     const read = await this.readConversation(bridge, threadId, 'observation')
-    if (!read) return
+    if (!read) {
+      // No observation happened (the driver did not answer the read), so the
+      // licence was not spent: put it back. Losing a discovery licence here is
+      // the difference between a delayed human turn and a lost one, because the
+      // list walk has already advanced its update_time baseline and will never
+      // licence this change again.
+      bridge.reads.licence = Math.max(bridge.reads.licence, 1)
+      return
+    }
     if ('rateLimited' in read) {
-      // The page throttled the read. Keep every last known state and look again
-      // later; a 429 is not the thread's state and never a turn failure.
+      // The page throttled the read (or this bridge's own window refused it
+      // before the driver was asked). Keep every last known state and look
+      // again later; a 429 is not the thread's state and never a turn failure.
+      // The licence goes back for the same reason as above - the gate enforces
+      // the wait, so the retry is ONE read when the window ends, not a poll.
+      bridge.reads.licence = Math.max(bridge.reads.licence, 1)
       return
     }
     if ('missing' in read) {
@@ -4055,8 +4071,9 @@ export class ChatGptHost {
     const updatedBefore = this.threadUpdated
     this.threadUpdated = updatedNow
     // The relay's discovery step: a bound thread whose update_time MOVED since
-    // the last walk, or that has vanished from the list, licenses exactly one
-    // observation read of that bridge. Idle bridges otherwise stay unread.
+    // the last walk, that has vanished from the list, or that has COME BACK
+    // licenses exactly one observation read of that bridge. Idle bridges
+    // otherwise stay unread.
     if (!firstWalk) {
       for (const bridge of bound) {
         const threadId = bridge.state.threadId!.toLowerCase()
@@ -4068,7 +4085,15 @@ export class ChatGptHost {
           continue
         }
         const before = updatedBefore.get(threadId)
-        if (before !== undefined && fresh !== null && before !== fresh) this.triggerObserve('list-updated', { threadId })
+        if (before === undefined) {
+          // It was not in the previous walk's map. If the bridge was marked
+          // missing, this is the REAPPEARANCE: it is the successful read that
+          // clears `threadMissingAt`, so it must be licensed or the bridge stays
+          // wedged on a thread that is visible again.
+          if (bridge.state.threadMissingAt) this.triggerObserve('list-returned', { threadId })
+          continue
+        }
+        if (fresh !== null && before !== fresh) this.triggerObserve('list-updated', { threadId })
       }
     }
     for (const bridge of bound) {
