@@ -63,6 +63,7 @@ class FakeDriver {
   private current: string | null = null
   observable = false
   readonly deleted = new Set<string>()
+  conversationReads = 0
   private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
   private clock = Math.floor(Date.now() / 1000)
 
@@ -143,7 +144,11 @@ class FakeDriver {
       this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
       this.sentAtMs.push(Date.now())
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       this.readCalls++
@@ -151,6 +156,7 @@ class FakeDriver {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
     }
     if (op === 'conversation' && this.observable) {
+      this.conversationReads++
       const threadId = String(request.threadId ?? '')
       if (this.deleted.has(threadId)) return { ok: false, op, status: 404, error: 'conversation not found' }
       const tree = this.treeOf(threadId)
@@ -581,4 +587,73 @@ describe('R13 bus replies: one path out', () => {
       }
     }
   })
+
+  // Row 7 -------------------------------------------------------------------
+  test('7. a deferred turn that asks for a command posts the result lines back and delivers the round-2 prose', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primed('alpha', THREAD_A)
+    const sender = await busPeer(dir, 'sender')
+    const messageId = randomUUID()
+    // The page mints a fresh nonce per inbound; a deferred job carries it so
+    // its answer is parsed exactly like a direct one.
+    const nonce = randomUUID()
+    // The job arrived while the page was mid-turn: written down, never typed.
+    alpha.pendingTurns = [{
+      threadId: THREAD_A,
+      userNodeId: null,
+      ourText: 'count the peers',
+      text: 'count the peers',
+      senderSessionId: sender.peer.sessionId,
+      messageId,
+      kind: 'inquiry',
+      postedAt: null,
+      turnNonce: nonce,
+    } as any]
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.observable = true
+    driver.sendTextFor = request => {
+      const prompt = String(request.text ?? '')
+      // Round 1: the page asks for one permitted command.
+      if (!prompt.startsWith('BUS RESULT')) {
+        return `Sure, checking.\n\ngateway\n${JSON.stringify({ nonce, op: 'list' })}`
+      }
+      // Round 2: the result lines came back; the model continues in prose.
+      return 'Round two: the peer list is in, nothing else to do.'
+    }
+    const host = await startHost(dir, driver)
+    try {
+      const readsBefore = driver.conversationReads
+      const sendsBefore = driver.calls.length
+      await host.pollOnce()
+
+      const sends = sendsIn(driver, sendsBefore)
+      // Exactly one page turn for round 1 (the deferred job), and round 2 is a
+      // REAL new page turn carrying the command result lines - not a re-read of
+      // the round-1 answer, which the run loop would refuse as "already ran".
+      expect(sends.length).toBe(2)
+      expect(String(sends[0]!.text)).toBe('count the peers')
+      expect(String(sends[1]!.text)).toMatch(/^BUS RESULT/)
+      expect(String(sends[1]!.text)).toContain('sender')
+      // The seeded round costs NO extra conversation read: the synchronous
+      // send's answer was used as-is. Every page send pays one pre-send
+      // snapshot and one post-send attribution read, so the ceiling is the
+      // observation pass's own read plus two per send. A re-read of the seeded
+      // answer to feed round 2 would push this over (and the loop would burn to
+      // the budget), which the round-2 post above already rules out.
+      expect(driver.conversationReads - readsBefore).toBeLessThanOrEqual(1 + 2 * sends.length)
+
+      const reply = await waitFor(() => inboxMessages(sender).find(message => message.replyTo === messageId), 8_000)
+      // The sender gets the model's follow-up prose, not just receipts.
+      expect(reply.text).toContain('Round two')
+      expect(reply.text).toContain('(from the page')
+      await delay(200)
+      expect(inboxMessages(sender).filter(message => message.replyTo === messageId).length).toBe(1)
+      expect((await readBridge(dir, alpha.sessionId)).pendingTurns).toEqual([])
+    } finally {
+      await sender.close()
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
 })

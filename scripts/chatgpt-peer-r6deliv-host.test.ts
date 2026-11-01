@@ -160,7 +160,11 @@ class FakeDriver {
       this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
       this.sentAtMs.push(Date.now())
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }

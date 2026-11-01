@@ -51,6 +51,12 @@ rl.on('line', line => {
   if (request.op === 'send') {
     // Accepted at once, answered when the page finishes generating.
     emit({ event: 'accepted', id })
+    if (request.wait === true) {
+      // The page is still generating when the driver's own wait ends: report
+      // the state, never stale text. The host leaves the turn owed.
+      setTimeout(() => emit({ ok: false, op: 'send', id, reason: 'timeout', timedOut: true, state: 'generating', threadId: String(request.threadId ?? '') }), delay || 300)
+      return
+    }
     setTimeout(() => emit({ ok: true, op: 'send', id, text: 'answered:' + String(request.text ?? ''), threadId: String(request.threadId ?? '') }), delay || 1200)
     return
   }

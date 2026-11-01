@@ -191,7 +191,11 @@ class FakeDriver {
         return { ok: false, op, reason: 'timeout', error: 'driver timed out after 600s', threadId }
       }
       onAccepted?.(String(request.id ?? ''))
-      return { ok: true, op, text: this.sendText, threadId, model: 'GPT-6', effort: 'High' }
+      // `wait:true` promises the answer on this request. A turn that is still
+      // streaming has none: the real child reports `timedOut` instead of
+      // returning stale text, so the host must leave the turn owed.
+      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      return { ok: true, op, text: this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') return { ok: true, op, threadId: this.current, text: this.answer, evidence: 'state-complete' }
     if (op === 'conversation' && this.observable) {

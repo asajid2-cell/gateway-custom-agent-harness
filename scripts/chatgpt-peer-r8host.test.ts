@@ -198,6 +198,12 @@ class FakeDriver {
         this.wedgeAfterSend = false
         this.faultError = 'driver was replaced after r28 timed out'
       }
+      // `wait:true` promises the answer on this request. A page still
+      // generating has none: report the state, never stale text, so the host
+      // leaves the turn owed instead of settling it on a placeholder.
+      if (request.wait === true && this.noAnswer) {
+        return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+      }
       return { ok: true, op, text: this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') return { ok: true, op, threadId: this.current, text: this.answer, evidence: 'state-complete' }
@@ -386,7 +392,7 @@ type Internals = {
     includeOwned?: boolean, exclude?: ReadonlySet<string>, earliest?: boolean, afterId?: string | null,
     preservedAnchorId?: string | null,
   ) => string | null
-  postRecordedTurn: (bridge: LiveBridge, record: PendingRecord, locked?: boolean) => Promise<boolean>
+  postRecordedTurn: (bridge: LiveBridge, record: PendingRecord, locked?: boolean) => Promise<{ posted: boolean; text: string | null }>
   recordOurs: (bridge: LiveBridge, before: Set<string>, sent: string) => Promise<string[]>
   settlePostedTurn: (bridge: LiveBridge, job: PendingRecord, claimed: Set<string>) => Promise<'delivered' | 'present' | 'absent' | 'unreadable'>
   textMatchAnywhere: (conversation: unknown, text: string, ours: ReadonlySet<string>, exclude: ReadonlySet<string>, postedMs: number, preservedAnchorId?: string | null) => string | null
@@ -1621,7 +1627,7 @@ describe('R10-F3: an ambiguous send is never treated as "not posted"', () => {
           senderSessionId: senderId, messageId: randomUUID(), kind: 'inquiry', postedAt: new Date().toISOString(),
         }
         // Swallowed: the send MAY have landed, so the turn stays queued.
-        await expect(internals(host).postRecordedTurn(live, record)).resolves.toBe(false)
+        await expect(internals(host).postRecordedTurn(live, record)).resolves.toEqual({ posted: false, text: null })
         expect(sendCount(driver)).toBe(1)
         const posted = await readBridge(dir, alpha.sessionId)
         const turn = posted.pendingTurns.find(item => item.messageId === record.messageId)!
