@@ -1413,9 +1413,15 @@ export class ChatGptHost {
       // A live turn that outran the driver is not a host failure. The answer
       // is on the page; `status` observes it.
       if (error instanceof GeneratingTurn) {
+        // G-011: name WHO failed. `unobservedNote` owns the precedence (its
+        // childStated branch first), so a driver fault is not relabelled as a
+        // page state, and a healthy child that merely stopped waiting keeps
+        // the "still generating" wording. The fixed line is only for a turn
+        // with no fault at all (the genuinely slow page).
+        const note = unobservedNote(error)
         audit(this.hostState, {
           op: 'turn', target: error.threadId ?? bridge.state.threadId,
-          result: `still generating; the page turn is running, not refused [${bridge.state.name}]`,
+          result: note ? `${note} [${bridge.state.name}]` : `still generating; the page turn is running, not refused [${bridge.state.name}]`,
         })
         await this.persistHostState()
         return { status: 200, body: { ok: true, op: 'prompt', state: 'generating', timedOut: true, threadId: error.threadId ?? bridge.state.threadId } }
