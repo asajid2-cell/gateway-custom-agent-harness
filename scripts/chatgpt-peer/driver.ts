@@ -137,6 +137,14 @@ export class DriverChild {
    * talking child is that request's problem, not the child's.
    */
   private lastLineAt = 0
+  /**
+   * G-010: the total send ceiling the CURRENT child advertised on its `ready`
+   * event, in milliseconds from request write to reply. `null` means this child
+   * has not said - an old child, one that has just been spawned, or one that
+   * has gone. The claim belongs to the child, so it is never inherited by a
+   * replacement: a new child has its own ceiling.
+   */
+  private ceilingMs: number | null = null
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
@@ -211,6 +219,9 @@ export class DriverChild {
   private replaceChild(generation: number, reason: string): void {
     const child = this.child
     this.child = undefined
+    // G-010: a replacement has not advertised anything yet; the old claim dies
+    // with the old child.
+    this.ceilingMs = null
     if (child && child.exitCode === null) { try { child.kill() } catch { /* already gone */ } }
     for (const [id, waiter] of [...this.pending]) {
       if (waiter.generation !== generation) continue
@@ -223,6 +234,16 @@ export class DriverChild {
     }
   }
 
+  /**
+   * The send ceiling the current child advertised on its `ready` event, in
+   * milliseconds from request write to reply, or `null` while it has not
+   * advertised one. A caller that gets `null` has no number to shorten a
+   * send's deadline with and must keep its own fallback.
+   */
+  get sendCeilingMs(): number | null {
+    return this.ceilingMs
+  }
+
   private ensure(): ChildProcessWithoutNullStreams {
     // After kill() the driver is closed for good: a new child is reachable only
     // through an explicit reopen(), never as a side effect of a late call.
@@ -232,8 +253,10 @@ export class DriverChild {
     const env = { ...process.env, ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}) }
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     // A fresh child counts as having spoken at the moment it was spawned: the
-    // wedge clock measures silence, and launching is not silence.
+    // wedge clock measures silence, and launching is not silence. Its ceiling
+    // is unknown until it says so - the previous child's claim does not carry.
     this.lastLineAt = Date.now()
+    this.ceilingMs = null
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     createInterface({ input: child.stdout }).on('line', line => this.handleLine(line, generation))
@@ -246,7 +269,10 @@ export class DriverChild {
       // Only the current child may clear the current child. An old child that
       // exits after reopen()/timeout recovery left this.child pointing at its
       // replacement, and clearing it here would orphan that replacement.
-      if (this.child === child) this.child = undefined
+      if (this.child === child) {
+        this.child = undefined
+        this.ceilingMs = null
+      }
       // Settle this generation's waiters only; they carry the generation.
       for (const [id, waiter] of [...this.pending]) {
         if (waiter.generation !== generation) continue
@@ -292,6 +318,13 @@ export class DriverChild {
     const id = typeof message.id === 'string' ? message.id : ''
     const event = typeof message.event === 'string' ? message.event : ''
     if (event) {
+      if (event === 'ready') {
+        // G-010: every ready states (or omits) this child's own total send
+        // ceiling. An omitted or nonsensical value clears the claim rather
+        // than leaving a stale number from a different page state behind.
+        const advertised = message.sendCeilingMs
+        this.ceilingMs = typeof advertised === 'number' && Number.isFinite(advertised) && advertised > 0 ? advertised : null
+      }
       if (event === 'accepted') {
         // An acceptance only means something while the request is still pending.
         // One whose request already settled is not work the host owes a reply
@@ -482,6 +515,7 @@ export class DriverChild {
   async kill(): Promise<void> {
     const child = this.child
     this.child = undefined
+    this.ceilingMs = null
     this.closed = true
     if (!child || child.exitCode !== null) return
     const latest = [...this.deadlines.values()].reduce((max, at) => Math.max(max, at), 0)
@@ -499,6 +533,7 @@ export class DriverChild {
     this.closed = true
     const child = this.child
     this.child = undefined
+    this.ceilingMs = null
     if (!child || child.exitCode !== null) return
     await new Promise<void>(resolve => {
       child.once('exit', () => resolve())

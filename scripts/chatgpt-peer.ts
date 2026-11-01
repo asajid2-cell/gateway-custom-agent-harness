@@ -107,6 +107,20 @@ export function pollDelayMs(baseMs: number, failures: number): number {
 const TURN_TIMEOUT_MS = Number(process.env.CHATGPT_TURN_TIMEOUT_MS || 20 * 60_000)
 
 /**
+ * G-010: how long after the child's ADVERTISED send ceiling the host waits
+ * before calling that call lost.
+ *
+ * The child's ceiling is measured from its own write of the request to its own
+ * reply; the host starts its clock when it writes the line and must also cover
+ * the reply's trip back and its JSON parse on a possibly busy event loop. This
+ * margin is transport slack, not page time: it is far below any ceiling a
+ * working child advertises, so it cannot turn a legitimate slow answer into a
+ * timeout, and it keeps the failure path at ceiling + this instead of the
+ * twenty-minute turn timeout.
+ */
+const SEND_CEILING_MARGIN_MS = 15_000
+
+/**
  * The largest answer that travels inline. A long review or plan is bigger than
  * the bus's 64 KiB budget and can exceed one message, so the bus gets this much
  * text plus a path to the whole answer on disk.
@@ -295,6 +309,11 @@ type Config = {
   titlesEvery?: number
   /** How long one page turn may take. Overridden in tests; never widened. */
   turnTimeoutMs?: number
+  /**
+   * G-010: transport slack added to the child's advertised send ceiling before
+   * the host calls that call lost. Tests shorten it; never widened.
+   */
+  sendCeilingMarginMs?: number
   /** How often a status/answer wait looks at the pushed signal. Tests shorten it. */
   waitPollMs?: number
   /** How long one conversation read may take. Overridden in tests; never widened. */
@@ -661,6 +680,38 @@ export class ChatGptHost {
 
   /** How long one page turn may take (20 minutes unless a test says otherwise). */
   private get turnTimeout(): number { return this.config.turnTimeoutMs ?? TURN_TIMEOUT_MS }
+
+  /**
+   * G-010: how long the send CALL waits.
+   *
+   * The child advertises its own TOTAL send ceiling - compose/click/acceptance
+   * plus the reply budget - on `ready`, so the host waits that plus transport
+   * slack instead of the twenty-minute turn timeout. The child's reply budget
+   * alone is NOT the number to use: its clock starts after acceptance, so a
+   * deadline set to it would fire before the child's own reply on any turn that
+   * took time to accept.
+   *
+   * A child that has not advertised one (an older child, or one that has just
+   * been replaced and not yet spoken) leaves the fallback: without a number
+   * there is nothing to shorten.
+   *
+   * There is NO cap at turnTimeout. The advertisement and the turn timeout are
+   * independent numbers: a child whose ceiling is larger than the turn budget
+   * would have its own reply clipped by a cap, which is the very lost-reply
+   * defect this fixes. An over-budget advertisement is logged instead - it says
+   * the child has no overall deadline of its own.
+   */
+  private get sendCallTimeout(): number {
+    const ceiling = this.driver.sendCeilingMs
+    if (typeof ceiling === 'number' && Number.isFinite(ceiling) && ceiling > 0) {
+      const budget = ceiling + (this.config.sendCeilingMarginMs ?? SEND_CEILING_MARGIN_MS)
+      if (budget > this.turnTimeout) {
+        log(`the child advertises a ${(ceiling / 1000).toFixed(1)}s send ceiling; with the margin the call waits ${(budget / 1000).toFixed(1)}s, longer than the ${(this.turnTimeout / 1000).toFixed(1)}s turn timeout - the child has no overall deadline`)
+      }
+      return budget
+    }
+    return this.turnTimeout
+  }
 
   /** How often a wait looks at the pushed page signal. */
   private get waitPoll(): number { return this.config.waitPollMs ?? WAIT_POLL_MS }
@@ -3195,7 +3246,7 @@ export class ChatGptHost {
       // Only send `wait` when the caller asked for it (or explicitly refused it):
       // the plain synchronous `pageTurn` keeps the driver's own default.
       ...(options.wait === undefined ? {} : { wait: options.wait }),
-    }, { timeoutMs: this.turnTimeout, ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
+    }, { timeoutMs: this.sendCallTimeout, ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
     if (reply.ok !== true) return reply
     const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
     if (landed && options.landed) await options.landed(landed)
@@ -3667,9 +3718,18 @@ export class ChatGptHost {
   private onDriverEvent(event: DriverEvent): void {
     const threadId = typeof event.threadId === 'string' ? event.threadId.toLowerCase() : ''
     switch (event.event) {
-      case 'ready':
-        // The child announcing itself; the host has no use for the pid.
+      case 'ready': {
+        // G-010: the child also advertises its total send ceiling here. The
+        // authoritative record lives in DriverChild, which alone knows the
+        // child generation and therefore can drop the claim when that child is
+        // replaced, exits or is closed - a copy kept here would survive the
+        // child it described. So read it for the log, never cache it.
+        const ceiling = this.driver.sendCeilingMs
+        log(ceiling
+          ? `child ready; its send ceiling is ${Math.round(ceiling / 1000)}s`
+          : 'child ready; it advertised no send ceiling, the send call keeps the turn timeout')
         return
+      }
       case 'page-ready': {
         // A `document` ready is ONE thread's news: a cross-thread send
         // navigates the tab, and licensing every bridge there buys a read and a
