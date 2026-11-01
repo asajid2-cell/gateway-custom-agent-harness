@@ -6,12 +6,20 @@
  * accepted id as work in flight, so the host kept "leaving it running" through
  * `r207`-`r213` and only an out-of-band Stop-Process released the child 24
  * minutes later. The accepted map is now bounded by age: an accepted id older
- * than the send ceiling plus a margin is a LOST reply, not in-flight work.
+ * than ITS OWN request deadline plus a margin is a LOST reply, not in-flight
+ * work. The deadline is the one `call()` recorded in `deadlines`; an id whose
+ * request already timed out before the page announced acceptance keeps it
+ * (the incident's shape) and falls back to the construction ceiling.
+ *
+ * The bound also fires on its own timer. The incident had no later request for
+ * four minutes; with none at all, waiting for one to time out would never
+ * release the child. The QUIET row below accepts a send, never replies, issues
+ * NO further requests, and still expects the child replaced at the bound.
  *
  * The child here is a real OS process speaking the frozen line-JSON protocol:
- * it accepts the first request and withholds its reply forever, and it withholds
- * a reply for `hold` requests so they time out exactly like the incident's
- * status polls. All other requests are answered.
+ * a `send` announces acceptance after `acceptAfterMs` (after the host's own
+ * deadline when that is short) and never replies, and a `hold` never replies.
+ * Everything else is answered at once.
  */
 import { describe, expect, test } from 'bun:test'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -22,14 +30,13 @@ import { DriverChild } from './chatgpt-peer/driver.ts'
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 /**
- * A child that accepts the FIRST request and never replies to it, and never
- * replies to `hold`. Everything else is answered at once.
+ * `send` announces acceptance after `acceptAfterMs` and never replies; `hold`
+ * never replies; `quit` replies and exits; everything else is answered.
  */
 const CHILD = `
 const readline = require('node:readline')
 const emit = value => process.stdout.write(JSON.stringify(value) + '\\n')
 const rl = readline.createInterface({ input: process.stdin })
-let accepted = false
 emit({ event: 'ready', pid: process.pid })
 rl.on('line', line => {
   const trimmed = line.trim()
@@ -37,8 +44,12 @@ rl.on('line', line => {
   let request
   try { request = JSON.parse(trimmed) } catch { return }
   if (request.op === 'quit') { emit({ ok: true, op: 'quit', id: request.id }); process.exit(0) }
-  if (!accepted) { accepted = true; emit({ event: 'accepted', id: request.id }); return }
   if (request.op === 'hold') return
+  if (request.op === 'send') {
+    const after = Number(request.acceptAfterMs || 0)
+    setTimeout(() => emit({ event: 'accepted', id: request.id }), after)
+    return
+  }
   emit({ ok: true, op: request.op, id: request.id })
 })
 `
@@ -64,7 +75,7 @@ async function waitFor<T>(probe: () => T | undefined, timeoutMs = 5_000): Promis
   }
 }
 
-type Settled = { done: boolean; reply?: { ok: boolean; error?: string; id?: string } }
+type Settled = { done: boolean; reply?: { ok: boolean; reason?: string; error?: string; id?: string } }
 const track = (promise: Promise<any>): Settled => {
   const box: Settled = { done: false }
   void promise.then(reply => { box.done = true; box.reply = reply })
@@ -72,44 +83,27 @@ const track = (promise: Promise<any>): Settled => {
 }
 
 const lostLog = (logs: string[]): string[] => logs.filter(line => /the reply was lost, not a plain timeout/.test(line))
+const plainTimeoutLog = (logs: string[]): string[] => logs.filter(line => /timed out; replacing the child/.test(line))
+const deferredBoundLog = (logs: string[]): string[] => logs.filter(line => /no reply for .*accepted work is still in flight/.test(line))
 
 describe('G-008: a lost accepted reply is bounded by age', () => {
-  test('(i)-(iii) no replacement before the bound, then a distinct replacement naming the lost id and age', async () => {
+  test('(i) an accepted id still inside its own deadline suppresses replacement of another timeout', async () => {
     const { dir, cleanup } = await scratch()
     const logs: string[] = []
-    // The send ceiling is 600ms and the margin 100ms, so an accepted id is
-    // presumed lost after 700ms. The per-call timeout for the lost send stays
-    // long so its OWN timer cannot be what triggers recovery - only the age
-    // bound may.
+    // A 60 s per-call deadline: the accepted send is young by a wide margin, so
+    // a status-shaped request that misses its own 40 ms deadline says nothing
+    // about the child.
     const driver = new DriverChild({ script: await fakeChild(dir), timeoutMs: 600, wedgeMs: 600_000, lostReplyMarginMs: 100, log: line => logs.push(line) })
-    let lostId = ''
-    const send = track(driver.call({ op: 'send', text: 'the long turn' }, { timeoutMs: 60_000, onAccepted: id => { lostId = id } }))
+    let acceptedId = ''
+    const send = track(driver.call({ op: 'send', text: 'the long turn' }, { timeoutMs: 60_000, onAccepted: id => { acceptedId = id } }))
     try {
-      await waitFor(() => lostId || undefined)
-      expect(lostId).toMatch(/^r\d+$/)
-
-      // (i) A later request times out while the accepted id is still young:
-      // the child keeps running and no lost-reply verdict is logged.
+      await waitFor(() => acceptedId || undefined)
       const young = await driver.call({ op: 'hold' }, { timeoutMs: 40 })
       expect(young.reason).toBe('timeout')
       expect(send.done).toBe(false)
       expect(lostLog(logs)).toEqual([])
-      expect(logs.some(line => new RegExp(`accepted work in flight: ${lostId}`).test(line))).toBe(true)
-
-      // (ii)+(iii) Past the ceiling plus margin, the next timeout replaces the
-      // child with a DISTINCT line that names the id and how long it waited.
-      await delay(760)
-      const old = await driver.call({ op: 'hold' }, { timeoutMs: 40 })
-      expect(old.reason).toBe('timeout')
-      await waitFor(() => send.done || undefined)
-
-      const lost = lostLog(logs)
-      expect(lost.length).toBe(1)
-      expect(lost[0]!).toContain(lostId)
-      expect(lost[0]!).toMatch(/accepted \d+\.\d+s ago/)
-      // Distinct from a plain timeout replacement.
-      expect(logs.some(line => /timed out; replacing the child/.test(line))).toBe(false)
-      expect(String(send.reply?.error ?? '')).toContain('driver was replaced')
+      expect(plainTimeoutLog(logs)).toEqual([])
+      expect(logs.some(line => new RegExp(`accepted work in flight: ${acceptedId}`).test(line))).toBe(true)
     } finally {
       await driver.terminate()
       await delay(20)
@@ -117,23 +111,54 @@ describe('G-008: a lost accepted reply is bounded by age', () => {
     }
   }, 20_000)
 
-  test('(iv) a genuinely in-flight long turn still suppresses replacement within the bound', async () => {
+  test('(ii) QUIET shape: no reply, no further request - the bound timer replaces the child with the distinct line', async () => {
     const { dir, cleanup } = await scratch()
     const logs: string[] = []
-    // A five-second ceiling: the accepted turn below is young by that scale,
-    // and must be treated as real work, not a lost reply.
-    const driver = new DriverChild({ script: await fakeChild(dir), timeoutMs: 5_000, wedgeMs: 600_000, lostReplyMarginMs: 100, log: line => logs.push(line) })
-    let acceptedId = ''
-    const turn = track(driver.call({ op: 'send', text: 'a long but honest turn' }, { timeoutMs: 60_000, onAccepted: id => { acceptedId = id } }))
+    // The construction ceiling is 300 ms and the margin 100 ms, so an accepted
+    // id with no live waiter is presumed lost 400 ms after it is announced. The
+    // page announces acceptance AFTER the send's own 150 ms deadline: that is
+    // the incident's shape, an accepted id whose request already went away, and
+    // the bound that has to fire without any later request.
+    const driver = new DriverChild({ script: await fakeChild(dir), timeoutMs: 300, wedgeMs: 600_000, lostReplyMarginMs: 100, log: line => logs.push(line) })
+    const send = track(driver.call({ op: 'send', text: 'a reply that never comes', acceptAfterMs: 300 }, { timeoutMs: 150 }))
     try {
-      await waitFor(() => acceptedId || undefined)
-      await delay(300)
-
-      const missed = await driver.call({ op: 'hold' }, { timeoutMs: 40 })
-      expect(missed.reason).toBe('timeout')
-      expect(turn.done).toBe(false)
+      await waitFor(() => send.done || undefined)
+      expect(send.reply?.reason).toBe('timeout')
+      // Its own deadline passing is a plain timeout, not a lost reply: nothing
+      // has been announced yet, and no replacement may happen on that account.
       expect(lostLog(logs)).toEqual([])
-      expect(logs.some(line => new RegExp(`accepted work in flight: ${acceptedId}`).test(line))).toBe(true)
+      // From here NOTHING is sent. The bound alone must release the child.
+      await waitFor(() => lostLog(logs).length > 0 || undefined, 5_000)
+      const lost = lostLog(logs)
+      expect(lost.length).toBe(1)
+      expect(lost[0]!).toMatch(/r\d+/)
+      expect(lost[0]!).toMatch(/accepted \d+\.\d+s ago/)
+      expect(plainTimeoutLog(logs)).toEqual([])
+    } finally {
+      await driver.terminate()
+      await delay(20)
+      await cleanup()
+    }
+  }, 20_000)
+
+  test('(iii) the young-id rule holds in the timer path too: real accepted work is not killed under an overdue one', async () => {
+    const { dir, cleanup } = await scratch()
+    const logs: string[] = []
+    const driver = new DriverChild({ script: await fakeChild(dir), timeoutMs: 300, wedgeMs: 600_000, lostReplyMarginMs: 100, log: line => logs.push(line) })
+    // An honest, young turn: accepted at once, its own deadline 60 s away.
+    let honestId = ''
+    const honest = track(driver.call({ op: 'send', text: 'an honest long turn' }, { timeoutMs: 60_000, onAccepted: id => { honestId = id } }))
+    // A leaked accepted id: announced after its request already timed out, so
+    // its bound is the 300 ms construction ceiling plus the 100 ms margin.
+    track(driver.call({ op: 'send', text: 'a lost send', acceptAfterMs: 300 }, { timeoutMs: 150 }))
+    try {
+      await waitFor(() => honestId || undefined)
+      await waitFor(() => deferredBoundLog(logs).length > 0 || undefined, 5_000)
+      // The overdue id did NOT replace the child: the young turn is still work.
+      expect(lostLog(logs)).toEqual([])
+      expect(honest.done).toBe(false)
+      expect(deferredBoundLog(logs)[0]!).toContain(honestId)
+      expect(deferredBoundLog(logs)[0]!).toMatch(/no reply for r\d+ \(accepted \d+\.\d+s ago\)/)
     } finally {
       await driver.terminate()
       await delay(20)
