@@ -107,6 +107,20 @@ export function pollDelayMs(baseMs: number, failures: number): number {
 const TURN_TIMEOUT_MS = Number(process.env.CHATGPT_TURN_TIMEOUT_MS || 20 * 60_000)
 
 /**
+ * G-010: how long after the child's ADVERTISED send ceiling the host waits
+ * before calling that call lost.
+ *
+ * The child's ceiling is measured from its own write of the request to its own
+ * reply; the host starts its clock when it writes the line and must also cover
+ * the reply's trip back and its JSON parse on a possibly busy event loop. This
+ * margin is transport slack, not page time: it is far below any ceiling a
+ * working child advertises, so it cannot turn a legitimate slow answer into a
+ * timeout, and it keeps the failure path at ceiling + this instead of the
+ * twenty-minute turn timeout.
+ */
+const SEND_CEILING_MARGIN_MS = 15_000
+
+/**
  * The largest answer that travels inline. A long review or plan is bigger than
  * the bus's 64 KiB budget and can exceed one message, so the bus gets this much
  * text plus a path to the whole answer on disk.
@@ -163,9 +177,28 @@ const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'reco
  * of nothing.
  */
 class GeneratingTurn extends Error {
-  constructor(readonly threadId: string | null, readonly driverFault = false) {
+  constructor(readonly threadId: string | null, readonly driverFault = false, readonly childStated = false) {
     super(`the page was still generating${threadId ? ` in thread ${threadId}` : ''} when the host stopped watching; the turn was not refused and is not a model failure`)
   }
+}
+
+/**
+ * G-011: why a still-owed turn was not observed, in the host's own words.
+ *
+ * The child answering `{ timedOut: true, state: 'generating' }` after its own
+ * send budget is NOT a driver failure: the child is healthy and the host is
+ * merely blind, because every status read queues behind the running send on the
+ * child's single operation chain. Calling that "the driver failed" corrupted
+ * exactly the audit line these incidents are triaged from.
+ *
+ * A real driver fault - a replacement, a closed stdin, the driver's own
+ * deadline - keeps its own wording. Neither case changes behaviour: `driverFault`
+ * stays true, so the turn remains owed and no failure line is sent.
+ */
+const unobservedNote = (error: GeneratingTurn): string => {
+  if (error.childStated) return 'no observation: the child reported the page still generating and its status reads were queued behind that send'
+  if (error.driverFault) return 'no evidence: the driver failed, not the page'
+  return ''
 }
 
 /**
@@ -295,6 +328,11 @@ type Config = {
   titlesEvery?: number
   /** How long one page turn may take. Overridden in tests; never widened. */
   turnTimeoutMs?: number
+  /**
+   * G-010: transport slack added to the child's advertised send ceiling before
+   * the host calls that call lost. Tests shorten it; never widened.
+   */
+  sendCeilingMarginMs?: number
   /** How often a status/answer wait looks at the pushed signal. Tests shorten it. */
   waitPollMs?: number
   /** How long one conversation read may take. Overridden in tests; never widened. */
@@ -661,6 +699,52 @@ export class ChatGptHost {
 
   /** How long one page turn may take (20 minutes unless a test says otherwise). */
   private get turnTimeout(): number { return this.config.turnTimeoutMs ?? TURN_TIMEOUT_MS }
+
+  /**
+   * G-010: how long the send CALL waits.
+   *
+   * The child advertises its own TOTAL send ceiling - compose/click/acceptance
+   * plus the reply budget - on `ready`, so the host waits that plus transport
+   * slack instead of the twenty-minute turn timeout. The child's reply budget
+   * alone is NOT the number to use: its clock starts after acceptance, so a
+   * deadline set to it would fire before the child's own reply on any turn that
+   * took time to accept.
+   *
+   * A child that has not advertised one (an older child, or one that has just
+   * been replaced and not yet spoken) leaves the fallback: without a number
+   * there is nothing to shorten.
+   *
+   * An attachment is the exception the child itself measured: it credits the
+   * attach time back into its own deadline, so a send carrying a file may
+   * legitimately outlive the plain ceiling. The child advertises that credit
+   * per attachment (`sendAttachCreditMs`), and the call's budget adds it once
+   * per attachment carried - a count, not a flag, so a later multi-file send
+   * is not silently under-budgeted. A child that advertises no credit keeps
+   * the plain ceiling + margin: an old child is still bounded by what it said.
+   *
+   * There is NO cap at turnTimeout. The advertisement and the turn timeout are
+   * independent numbers: a child whose ceiling is larger than the turn budget
+   * would have its own reply clipped by a cap, which is the very lost-reply
+   * defect this fixes. An over-budget advertisement is logged instead - it says
+   * the child has no overall deadline of its own.
+   */
+  private sendCallTimeout(attachCount: number): number {
+    const ceiling = this.driver.sendCeilingMs
+    if (typeof ceiling === 'number' && Number.isFinite(ceiling) && ceiling > 0) {
+      // The driver records the claim per child generation; `0` is "none
+      // advertised" and adds nothing.
+      const perAttachment = this.driver.sendAttachCreditMs
+      const attached = perAttachment > 0 && attachCount > 0
+        ? ` and ${(perAttachment / 1000).toFixed(1)}s of attach credit per attachment (${attachCount} attached)`
+        : ''
+      const budget = ceiling + (this.config.sendCeilingMarginMs ?? SEND_CEILING_MARGIN_MS) + perAttachment * attachCount
+      if (budget > this.turnTimeout) {
+        log(`the child advertises a ${(ceiling / 1000).toFixed(1)}s send ceiling${attached}; with the margin the call waits ${(budget / 1000).toFixed(1)}s, longer than the ${(this.turnTimeout / 1000).toFixed(1)}s turn timeout - the child has no overall deadline`)
+      }
+      return budget
+    }
+    return this.turnTimeout
+  }
 
   /** How often a wait looks at the pushed page signal. */
   private get waitPoll(): number { return this.config.waitPollMs ?? WAIT_POLL_MS }
@@ -1602,7 +1686,9 @@ export class ChatGptHost {
       // The driver says the turn is still running. That is a state, not a
       // refusal: the answer exists on the page even though this call ended.
       if (reply.timedOut === true) {
-        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+        // G-011: the CHILD stopped waiting, not the driver. Keep the owed-turn
+        // behaviour, and record who said so so the audit can be honest.
+        throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true, true)
       }
       // R-LIVE-5: the DRIVER failed this send, not the page. The page may hold
       // the text, so its state is unproven: leave the turn running and let the
@@ -1650,7 +1736,8 @@ export class ChatGptHost {
       },
     })
     if (reply.ok !== true) {
-      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+      // G-011: the child's own wait expired; the driver did not fail.
+      if (reply.timedOut === true) throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true, true)
       // R10-F3: the driver refuses to re-click Send when it cannot prove the
       // post either way. The prompt may have landed, so this is the
       // "initiated, node unknown" state, never a refusal (see postRecordedTurn).
@@ -2936,7 +3023,7 @@ export class ChatGptHost {
       if (error instanceof GeneratingTurn) {
         // The page is still generating, or nothing could be asked: not a
         // verdict on the turn. A driver fault is no evidence about the page.
-        const line = `${error.message} [${error.driverFault ? 'no evidence: the driver failed, not the page; ' : ''}still owed]`
+        const line = `${error.message} [${error.driverFault ? `${unobservedNote(error)}; ` : ''}still owed]`
         audit(this.hostState, { op: 'turn', target: job.senderSessionId, result: `${line} [${bridge.state.name}]`, messageId: job.messageId })
         await this.persistHostState()
         return
@@ -3195,7 +3282,7 @@ export class ChatGptHost {
       // Only send `wait` when the caller asked for it (or explicitly refused it):
       // the plain synchronous `pageTurn` keeps the driver's own default.
       ...(options.wait === undefined ? {} : { wait: options.wait }),
-    }, { timeoutMs: this.turnTimeout, ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
+    }, { timeoutMs: this.sendCallTimeout(options.attach ? 1 : 0), ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
     if (reply.ok !== true) return reply
     const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
     if (landed && options.landed) await options.landed(landed)
@@ -3667,9 +3754,19 @@ export class ChatGptHost {
   private onDriverEvent(event: DriverEvent): void {
     const threadId = typeof event.threadId === 'string' ? event.threadId.toLowerCase() : ''
     switch (event.event) {
-      case 'ready':
-        // The child announcing itself; the host has no use for the pid.
+      case 'ready': {
+        // G-010: the child also advertises its total send ceiling here. The
+        // authoritative record lives in DriverChild, which alone knows the
+        // child generation and therefore can drop the claim when that child is
+        // replaced, exits or is closed - a copy kept here would survive the
+        // child it described. So read it for the log, never cache it.
+        const ceiling = this.driver.sendCeilingMs
+        const credit = this.driver.sendAttachCreditMs
+        log(ceiling
+          ? `child ready; its send ceiling is ${Math.round(ceiling / 1000)}s${credit ? ` plus ${Math.round(credit / 1000)}s per attachment` : ''}`
+          : 'child ready; it advertised no send ceiling, the send call keeps the turn timeout')
         return
+      }
       case 'page-ready': {
         // A `document` ready is ONE thread's news: a cross-thread send
         // navigates the tab, and licensing every bridge there buys a read and a
@@ -4618,7 +4715,7 @@ export class ChatGptHost {
         // as a driver-faulted send does; a failure line here told the sender
         // its question failed while the page went on to answer it.
         if (error.driverFault) {
-          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [no evidence: the driver failed, not the page; left for the observation pass]`, messageId: message.id })
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [${unobservedNote(error)}; left for the observation pass]`, messageId: message.id })
           await this.persistHostState()
           return
         }

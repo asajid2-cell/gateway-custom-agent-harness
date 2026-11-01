@@ -123,7 +123,10 @@ class FakeDriver {
         // test accepts but that carries no text yet.
         this.placeholder(threadId, userNode)
         this.signal = { phase: 'streaming', threadId, at: Date.now() }
-        return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+        // The DRIVER's own deadline, in the shape driver.ts actually produces
+        // (`reason: 'timeout'`, no `timedOut` flag). The flag means the CHILD
+        // stated the timeout instead - a different attribution (G-011).
+        return { ok: false, op, reason: 'timeout', error: 'driver timed out after 900ms', state: 'generating', threadId }
       }
       this.signal = { phase: 'complete', threadId, at: Date.now() }
       if (request.wait === true) {
