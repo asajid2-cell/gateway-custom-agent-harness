@@ -4,7 +4,7 @@ import { promisify } from 'node:util'
 import { lstat, mkdir, open, readdir, readFile, rename, rm, stat, unlink } from 'node:fs/promises'
 import { createConnection, createServer, type Server } from 'node:net'
 import { join } from 'node:path'
-import { isProcessRunning } from './genericProcessUtils.js'
+import { getProcessStartTime, isProcessRunning } from './genericProcessUtils.js'
 import { getSessionId } from '../bootstrap/state.js'
 import { lock } from './lockfile.js'
 import {
@@ -547,7 +547,7 @@ export type DurableLivenessProbe = (endpoint: string) => Promise<EndpointProbe>
  * and endpoint - never persisted as a claim, and never from a route-health
  * answer. Non-durable peers take the ordinary probe path unchanged.
  */
-export async function listGatewayPeers(directory: string, options: { probeEndpoint?: DurableLivenessProbe } = {}): Promise<GatewayPeer[]> {
+export async function listGatewayPeers(directory: string, options: { probeEndpoint?: DurableLivenessProbe; readProcessStartTime?: ProcessStartTimeReader } = {}): Promise<GatewayPeer[]> {
   let entries: string[]
   try { entries = await readdir(directory) }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error }
@@ -609,7 +609,7 @@ export async function listGatewayPeers(directory: string, options: { probeEndpoi
       // open, and a dead one is closed rather than a reap reason. Only a family
       // whose record is gone may reap it.
       if (peer.durable === true) {
-        if (await reapIfDead(directory, sessionId, peer)) return undefined
+        if (await reapIfDead(directory, sessionId, peer, options.readProcessStartTime)) return undefined
         const state = await durableLiveness(peer, options.probeEndpoint ?? probeEndpoint)
         return { ...peer, durableState: state }
       }
@@ -618,7 +618,7 @@ export async function listGatewayPeers(directory: string, options: { probeEndpoi
     } catch (error) {
       connected = (error as { peerConnected?: boolean }).peerConnected === true
     }
-    if (peer && !answered && !connected) await reapIfDead(directory, sessionId, peer)
+    if (peer && !answered && !connected) await reapIfDead(directory, sessionId, peer, options.readProcessStartTime)
     return answered || connected ? peer : undefined
   })
   const peers: GatewayPeer[] = []
@@ -807,22 +807,49 @@ async function readPriorIntent(directory: string, sessionId: string): Promise<{ 
  *
  * Being wrong in the lingering direction only leaves a stale file, which the
  * TTL sweep and a later listing handle; lingering is the safe failure. A
- * recycled pid also reads as alive, which keeps a stale row rather than
- * consuming a live one - the same deliberate asymmetry.
+ * recycled pid is the one exception that is worth the extra question: the
+ * record now carries `processStartedAt`, so when the platform can report the
+ * live pid's own start time the two are compared, and a disagreement is a
+ * different process wearing the number. When the platform cannot answer, the
+ * pid keeps its veto - unanswerable is not evidence. That question is asked
+ * LAZILY, because reading a start time is a platform probe (a PowerShell spawn
+ * on Windows): it is only reached where the pid is the sole evidence, so a
+ * listing whose endpoints answer pays nothing for it.
  *
  * The registration is re-read immediately before the move and must still carry
  * the same pid AND runtimeId that was listed. A session that rebound its own
  * record between the probe and the rename (same pid, new runtime) is alive and
  * must not have that record consumed; the reap is abandoned instead.
  */
-async function reapIfDead(directory: string, sessionId: string, peer: GatewayPeer): Promise<boolean> {
-  if (isProcessRunning(peer.pid)) return false
+type ProcessStartTimeReader = (pid: number) => Promise<number | undefined>
+/** A recorded and a reported start time may differ this much and still be one process. */
+const PROCESS_START_TOLERANCE_MS = 2_000
+
+async function reapIfDead(
+  directory: string,
+  sessionId: string,
+  peer: GatewayPeer,
+  readProcessStartTime: ProcessStartTimeReader = getProcessStartTime,
+): Promise<boolean> {
+  // Whether the live pid is the process that wrote the record. A live pid is
+  // taken as that process unless the record says when it began and the platform
+  // says the number now belongs to a later one; an unanswerable platform is not
+  // evidence, so the pid keeps its veto.
+  const pidIsRecordedProcess = async (): Promise<boolean> => {
+    if (!isProcessRunning(peer.pid)) return false
+    if (!peer.processStartedAt) return true
+    const recorded = Date.parse(peer.processStartedAt)
+    if (!Number.isFinite(recorded)) return true
+    const actual = await readProcessStartTime(peer.pid).catch(() => undefined)
+    return actual === undefined || Math.abs(actual - recorded) <= PROCESS_START_TOLERANCE_MS
+  }
   if (peer.durable === true) {
     // A durable entry is never reaped for liveness: a dead pid or an absent
     // pipe is the `closed` state, which is exactly what durability exists to
     // keep enumerable. The ONE answer that retires it is that the family it
     // belongs to no longer exists - there is then nothing it is the entry
-    // point of.
+    // point of. A live writer still keeps its record in that case; only a pid
+    // the platform says belongs to some other process does not.
     if (!peer.durableFamilyId) return false
     const familyRecord = leafFamilyPaths(getClaudeConfigHomeDir(), peer.durableFamilyId).familyRecord
     let familyGone = false
@@ -832,7 +859,8 @@ async function reapIfDead(directory: string, sessionId: string, peer: GatewayPee
       else return false
     }
     if (!familyGone) return false
-  }
+    if (await pidIsRecordedProcess()) return false
+  } else if (await pidIsRecordedProcess()) return false
   const live = join(directory, `${sessionId}.json`)
   try {
     const current = await readRegistrationUnchecked(directory, sessionId)
@@ -916,6 +944,17 @@ export class GatewaySessionTransport {
      * fallback in `send` always uses the real probe.
      */
     durableLivenessProbe?: DurableLivenessProbe
+    /**
+     * Recomputed wherever this registration is written, and again at close.
+     *
+     * A start-time answer is only as true as the lease at that moment: a
+     * succession can move the family to another window while this one keeps
+     * running, and a session that was ordinary can take it. Asking again at the
+     * write boundary is what keeps the durable marker a statement about now
+     * instead of about boot, without a relaunch. The runtime supplies it - the
+     * transport still never reads leaf-families.
+     */
+    durableIdentity?: () => Promise<DurableIdentity>
     onInboxChanged?: () => void
     /**
      * Called when a wake timer fires, in this process. The runtime turns it
@@ -934,6 +973,7 @@ export class GatewaySessionTransport {
       protocol: GATEWAY_SESSION_PROTOCOL, sessionId: options.sessionId, runtimeId,
       name: options.name, cwd: options.cwd, purpose: options.purpose ?? '',
       pid: process.pid, startedAt: new Date().toISOString(), status: 'idle',
+      processStartedAt: new Date(Date.now() - process.uptime() * 1000).toISOString(),
       endpoint: process.platform === 'win32' ? `\\\\.\\pipe\\gateway-${runtimeId}` : join(options.directory, `${runtimeId}.sock`),
       ...(buildId ? { buildId } : {}),
       ...(options.durable ? { durable: true } : {}),
@@ -1355,6 +1395,9 @@ export class GatewaySessionTransport {
       // the start instead of publishing a registration senders cannot read.
       const route = this.options.route === undefined ? await describeOwnRoute() : gatewayPeerRouteSchema.parse(this.options.route)
       if (route) this.peer.route = route
+      if (this.options.durableIdentity) {
+        try { this.setDurable(await this.options.durableIdentity()) } catch { /* Keep the last answer. */ }
+      }
       await atomicJson(this.registrationPath, { peer: this.peer, token: this.token })
     } catch (error) {
       this.server?.close()
@@ -1864,6 +1907,10 @@ export class GatewaySessionTransport {
     // re-describing it here is Claude-only and would clobber the host's route.
     const route = this.options.route === undefined ? await describeOwnRoute() : undefined
     const subscribers = await this.serial(async () => {
+      // Every write of this record is a chance for the family to have moved.
+      if (this.options.durableIdentity) {
+        try { this.setDurable(await this.options.durableIdentity()) } catch { /* Keep the last answer. */ }
+      }
       const next = gatewayPeerSchema.parse({ ...this.peer, ...(route ? { route } : {}), ...values })
       await atomicJson(this.registrationPath, { peer: next, token: this.token })
       const becameIdle = this.peer.status !== 'idle' && next.status === 'idle'
@@ -1902,6 +1949,12 @@ export class GatewaySessionTransport {
       await this.starting?.catch(() => {})
       await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
       await this.chain
+      // The last chance to learn the family moved: a displaced matriarch that
+      // closes must not leave a durable row behind, because a durable row is
+      // never reaped and would front the family forever.
+      if (this.options.durableIdentity) {
+        try { this.setDurable(await this.options.durableIdentity()) } catch { /* Keep the last answer. */ }
+      }
       try {
         const current = await readRegistration(this.options.directory, this.peer.sessionId)
         // A durable entry IS the family's addressable identity: it is how a

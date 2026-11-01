@@ -74,6 +74,10 @@ export class GatewaySessionRuntime {
   constructor(sessionId: string, cwd: string, name: string) {
     this.transport = new GatewaySessionTransport({
       directory: join(getClaudeConfigHomeDir(), 'gateway-sessions'), sessionId, cwd, name,
+      // Asked again at every write of the record, not only at start: a
+      // succession can move the family under a running session, and the marker
+      // has to follow it in both directions.
+      durableIdentity: () => resolveDurableIdentity(sessionId),
       onInboxChanged: () => { if (this.ready) this.delivery.drain() },
       // A timer wake is the session resuming itself, so it enters through the
       // same prompt queue an operator's typing does - not through the peer
@@ -134,9 +138,9 @@ export class GatewaySessionRuntime {
         }
         if (this.closing) return
         // Durability is computed from the leaf-family index, never inside the
-        // transport. This is the one place the answer can be decided, because
-        // the session's own id is already known here.
-        this.transport.setDurable(await resolveDurableIdentity(this.transport.peer.sessionId))
+        // transport. The transport asks the same question at every write (and
+        // at close), which is what keeps a succession truthful without a
+        // relaunch; nothing extra is needed here.
         await this.transport.start()
         if (this.closing) return
         this.unsubscribeCounts = subscribeSessionCompactionCounts((id, nextCounts) => {

@@ -550,6 +550,52 @@ test('open names each failed post-open check, with retry safety', async () => {
   })
 })
 
+test('open resolves the family from the index, not from the claim the row makes about itself', async () => {
+  await withRegistry(async sessions => {
+    // The row claims a family that has no record. Only the host claim, in the
+    // record's real family, names this session - and that is the family whose
+    // open lock the launcher must be handed, or two openers target two locks.
+    const realFamily = randomUUID()
+    const claimedFamily = randomUUID()
+    const sessionId = randomUUID()
+    await writeFamilyRecord(realFamily)
+    await writeRegistration(sessions, { sessionId, pid: DEAD_PID, durable: true, durableFamilyId: claimedFamily })
+    await writeHostClaim(realFamily, { matriarchSessionId: sessionId, pid: DEAD_PID, generation: 5 })
+
+    let launchedFamily: string | undefined
+    const outcome = await requestDurablePeerOpen(sessions, sessionId, {
+      configHome, probeEndpoint: async () => 'present', postOpenTimeoutMs: 40, pollMs: 5,
+      launcher: async ({ familyId }) => { launchedFamily = familyId; return { ok: true } },
+    })
+    assert.equal(launchedFamily, realFamily, 'the launcher is told the family the lease lives in')
+    assert.equal(outcome.state, 'failed')
+    assert.equal((outcome as { check: string }).check, 'generation-not-advanced')
+  })
+})
+
+test('open refuses a session its family lease no longer names, instead of resuming it', async () => {
+  await withRegistry(async sessions => {
+    // A succession moved the family to `current`. The old matriarch's row still
+    // says durable, but the lease is what makes it so: resuming it here would
+    // start a second writer for a family that already has one.
+    const familyId = randomUUID()
+    const former = randomUUID()
+    const current = randomUUID()
+    await writeFamilyRecord(familyId)
+    await writeRegistration(sessions, { sessionId: former, pid: DEAD_PID, durable: true, durableFamilyId: familyId })
+    await writeHostClaim(familyId, { matriarchSessionId: current, pid: DEAD_PID, generation: 5 })
+
+    let launched = 0
+    const outcome = await requestDurablePeerOpen(sessions, former, {
+      configHome, probeEndpoint: async () => 'present', postOpenTimeoutMs: 40, pollMs: 5,
+      launcher: async () => { launched += 1; return { ok: true } },
+    })
+    assert.equal(outcome.state, 'failed')
+    assert.equal((outcome as { check: string }).check, 'not-durable')
+    assert.equal(launched, 0, 'a displaced matriarch is never resumed')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // 7. The CAS: a live claim is already-open; a stale-claim race is safe-once
 // ---------------------------------------------------------------------------
@@ -660,7 +706,7 @@ test('the skill queues a send to a closed durable peer verbatim and refuses to o
 // 9. Durable identity resolution from the leaf-family index
 // ---------------------------------------------------------------------------
 
-test('resolveDurableIdentity marks only the matriarch durable, and prefers a host claim over the legacy alias', async () => {
+test('resolveDurableIdentity marks only the matriarch durable, and reads no head designation', async () => {
   const familyId = randomUUID()
   const matriarch = randomUUID()
   const aliasOnly = randomUUID()
@@ -674,17 +720,19 @@ test('resolveDurableIdentity marks only the matriarch durable, and prefers a hos
   await writeFile(join(index, `${familyId}.json`), JSON.stringify({ rootSessionId: familyId, patriarchSessionId: aliasOnly }))
 
   assert.deepEqual(await resolveDurableIdentity(matriarch, configHome), { durable: true, familyId })
-  assert.deepEqual(await resolveDurableIdentity(aliasOnly, configHome), { durable: false }, 'the host claim wins over the legacy alias')
+  assert.deepEqual(await resolveDurableIdentity(aliasOnly, configHome), { durable: false }, 'the host claim wins over the head designation')
   assert.deepEqual(await resolveDurableIdentity(randomUUID(), configHome), { durable: false })
 
-  // A legacy family with no host claim at all is still readable via the alias.
-  // It is written the way production writes it: the family file is the root's
-  // own pointer (`rootSessionId` is the family id) and the family record exists.
-  const legacyId = randomUUID()
-  const legacyMatriarch = randomUUID()
-  await writeFamilyRecord(legacyId)
-  await writeFile(join(index, `${legacyId}.json`), JSON.stringify({ rootSessionId: legacyId, patriarchSessionId: legacyMatriarch }))
-  assert.deepEqual(await resolveDurableIdentity(legacyMatriarch, configHome), { durable: true, familyId: legacyId })
+  // A family with NO host claim has no known matriarch. The root pointer's
+  // `patriarchSessionId` names the family's HEAD - since the rename it is often
+  // not the session holding the lease - so it must not make anyone durable even
+  // when the family record exists and the pointer is production-shaped. The
+  // session becomes durable when a lease names it, which is `writeHostClaim`.
+  const headOnlyId = randomUUID()
+  const designatedHead = randomUUID()
+  await writeFamilyRecord(headOnlyId)
+  await writeFile(join(index, `${headOnlyId}.json`), JSON.stringify({ rootSessionId: headOnlyId, patriarchSessionId: designatedHead }))
+  assert.deepEqual(await resolveDurableIdentity(designatedHead, configHome), { durable: false }, 'a head designation is not a lease')
 })
 
 test('a member pointer copy never makes a member durable: the family root is the family', async () => {

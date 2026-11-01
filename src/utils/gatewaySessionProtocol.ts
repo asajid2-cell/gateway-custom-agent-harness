@@ -93,6 +93,15 @@ export const gatewayPeerSchema = z.object({
   endpoint: z.string().min(1).max(4096),
   status: z.enum(['idle', 'running', 'awaiting-approval', 'shutting-down']),
   startedAt: z.string().datetime(),
+  // When THIS PROCESS began, which is not `startedAt`: a resumed session keeps
+  // its session id and its old `startedAt` while a new process takes over the
+  // same pid range. A pid is recycled by the operating system, so "pid N is
+  // running" is not evidence that it is the process that wrote this record. The
+  // reaper compares this with the process's own start time when the platform
+  // can be asked, and keeps the pid veto when it cannot - so a record from a
+  // build that did not write it (or a platform that cannot answer) is treated
+  // exactly as before.
+  processStartedAt: z.string().datetime().optional(),
   // What the session has been asked to do since it launched. The displayed
   // purpose is frozen at the opening prompt, so a session that pivots (the
   // platformer one started as a stack question) stayed advertised under its

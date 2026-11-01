@@ -118,6 +118,48 @@ test('closed transport cannot recreate registration or mutate inbox', { timeout:
   } finally { await peer.close(); await rm(root, { recursive: true, force: true }) }
 })
 
+test('durability follows the family at every write and at close, without a relaunch', { timeout: 30000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-durable-recompute-'))
+  const directory = join(root, 'private')
+  const sessionId = randomUUID()
+  const familyId = randomUUID()
+  // The runtime's answer, standing in for the leaf-family index. What matters
+  // here is the transport's contract: it asks again wherever the record is
+  // written, so a family that moves under a running session is reflected.
+  let answer: { durable: boolean; familyId?: string } = { durable: true, familyId }
+  const peer = new GatewaySessionTransport({
+    directory, sessionId, name: 'Recompute peer', cwd: root,
+    durableIdentity: async () => answer,
+  })
+  const record = async () => JSON.parse(await readFile(join(directory, `${sessionId}.json`), 'utf8')).peer
+  try {
+    await peer.start()
+    assert.equal((await record()).durable, true, 'published durable at start')
+    assert.equal((await record()).durableFamilyId, familyId)
+
+    // A succession moves the family to another window between two status
+    // writes: the first write must drop the marker from the record.
+    answer = { durable: false }
+    await peer.update({ status: 'running' })
+    const afterMove = await record()
+    assert.equal(afterMove.durable, undefined, 'the marker is gone from the record')
+    assert.equal(afterMove.durableFamilyId, undefined)
+    assert.equal(afterMove.status, 'running', 'the ordinary fields still land')
+
+    // ...and taking it back is the same recomputation in the other direction.
+    answer = { durable: true, familyId }
+    await peer.update({ status: 'idle' })
+    assert.equal((await record()).durable, true)
+
+    // The dangerous residual: a displaced matriarch that closes must not leave
+    // a durable row behind. A durable row is never reaped, so it would front
+    // the family forever as a `[closed]` entry that is not the entry point.
+    answer = { durable: false }
+    await peer.close()
+    await assert.rejects(readFile(join(directory, `${sessionId}.json`)), { code: 'ENOENT' })
+  } finally { await peer.close().catch(() => {}); await rm(root, { recursive: true, force: true }) }
+})
+
 test('concurrent start and close cannot leave a listening registration', { timeout: 30000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'gateway-peer-start-close-'))
   const directory = join(root, 'private')
@@ -539,6 +581,54 @@ test('a listing lets go of registrations that are provably dead, and only those'
     assert.ok((await readFile(join(directory, `${aliveId}.json`), 'utf8')).includes(`"pid":${process.pid}`))
   } finally {
     await seed.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a recycled pid is not the process that wrote the record', { timeout: 30000 }, async () => {
+  // The pid veto that keeps a busy peer's registration is also what let a dead
+  // row survive forever: Windows reissues pids, so an unrelated process wearing
+  // the number read as the writer. The record now carries the process's own
+  // start, and the reaper compares when the platform can be asked.
+  const root = await mkdtemp(join(tmpdir(), 'gateway-peer-recycled-pid-'))
+  const directory = join(root, 'private')
+  const seed = new GatewaySessionTransport({ directory, sessionId: randomUUID(), name: 'Seed', cwd: root })
+  const recordedStart = new Date('2020-01-01T00:00:00.000Z')
+  const write = async (sessionId: string) => {
+    const runtimeId = randomUUID()
+    const path = join(directory, `${sessionId}.json`)
+    await writeFile(path, JSON.stringify({
+      peer: {
+        protocol: 1, sessionId, runtimeId, name: 'Recycled', cwd: root, purpose: '',
+        pid: process.pid, startedAt: recordedStart.toISOString(),
+        processStartedAt: recordedStart.toISOString(), status: 'idle',
+        endpoint: `\\\\.\\pipe\\gateway-${runtimeId}`,
+      },
+      token: 'a'.repeat(64),
+    }))
+    return path
+  }
+  try {
+    await seed.start()
+    await seed.close()
+    // The pid is this test's own, so it IS running - but it began long after
+    // the record says its writer did. The seam supplies what the OS would say.
+    const recycled = await write(randomUUID())
+    assert.deepEqual(await listGatewayPeers(directory, { readProcessStartTime: async () => Date.now() }), [])
+    await assert.rejects(readFile(recycled), { code: 'ENOENT' }, 'the number belongs to another process')
+
+    // The control: the same row is kept when the process holding the pid is the
+    // one the record names. Its endpoint is silent, which is a busy peer, not a
+    // dead one - and the reaper must not consume it.
+    const held = await write(randomUUID())
+    assert.deepEqual(await listGatewayPeers(directory, { readProcessStartTime: async () => recordedStart.getTime() }), [])
+    assert.ok((await readFile(held, 'utf8')).includes(`"pid":${process.pid}`), 'a matching start keeps the registration')
+    // Unanswerable is not evidence either: no reader means the old veto holds.
+    assert.ok((await readFile(held, 'utf8')).includes(`"pid":${process.pid}`))
+    assert.deepEqual(await listGatewayPeers(directory, { readProcessStartTime: async () => undefined }), [])
+    assert.ok((await readFile(held, 'utf8')).includes(`"pid":${process.pid}`))
+  } finally {
+    await seed.close().catch(() => {})
     await rm(root, { recursive: true, force: true })
   }
 })

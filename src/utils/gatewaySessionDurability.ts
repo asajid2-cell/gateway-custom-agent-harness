@@ -49,68 +49,81 @@ export type DurableIdentity = {
 /**
  * Whether a session is a family's durable matriarch.
  *
- * The authority is `index/<familyId>.host.json`; only a `matriarchSessionId`
- * equal to this session id makes it durable. The deprecated
- * `index/<familyId>.json#patriarchSessionId` alias is read ONLY for a family
- * that has no host claim at all - a legacy family. If a host claim exists it
- * wins outright, which is what keeps a non-matriarch head from being made
- * durable by an alias the family no longer treats as its entry point.
+ * The authority is `index/<familyId>.host.json`, and ONLY a `matriarchSessionId`
+ * equal to this session id makes it durable. There is no second source.
+ *
+ * There used to be one: the deprecated `index/<familyId>.json#patriarchSessionId`
+ * alias, read for a family with no host claim. It cannot be read any more,
+ * because the field no longer means what this function needs. When it was
+ * introduced `patriarch` WAS the matriarch; after the head rename it names the
+ * family's HEAD, which is often not the session holding the lease. A reader
+ * cannot tell which meaning a given file was written with, and the two answers
+ * differ in the dangerous direction - it would make a head durable. So a family
+ * with no host claim has no known matriarch and is not durable until a session
+ * claims it, which every family gains the first time it is opened. Absence is
+ * the fail-safe reading.
  *
  * The family record `leaf-families/<familyId>.json` is what makes an id a
- * FAMILY at all, so it is required on both paths. That is the same definition
- * the registry reaper uses, and the two must not disagree: a claim naming a
- * family that does not exist cannot make a session the entry point of one,
- * because the next listing would retire its registration as an entry point to
- * nothing. Requiring it here is what stops a live session from publishing a
- * durable claim the bus then acts on.
+ * FAMILY at all, so it is required. That is the same definition the registry
+ * reaper uses, and the two must not disagree: a claim naming a family that does
+ * not exist cannot make a session the entry point of one, because the next
+ * listing would retire its registration as an entry point to nothing.
  *
- * Two things used to make that happen together. Every family member gets its
- * own pointer copy at `index/<memberSessionId>.json`, and a copy carries the
- * family's `patriarchSessionId` as it stood when it was written. Scanning the
- * index for that field therefore matched a MEMBER's copy and returned the
- * copy's own filename - a session id - as the family id. `rootSessionId` is
- * the family, so a legacy alias counts only for the file that IS the family's
- * root pointer (`rootSessionId === stem`), which excludes every member copy.
+ * The answer is memoised per config home against both directories' mtimes, so
+ * the routine can be called wherever the registration is written (the runtime
+ * recomputes it on every status change and at close, which is what keeps a
+ * succession truthful without a relaunch). A directory entry created, renamed
+ * or removed bumps the mtime and drops the whole answer set.
  *
  * Exported for testing. Never throws: an unreadable index is "not durable",
  * the direction that cannot make an ordinary peer immortal.
  */
+type ResolutionEpoch = { index: number; families: number }
+const resolutionCache = new Map<string, { epoch: ResolutionEpoch; answers: Map<string, DurableIdentity> }>()
+
+async function directoryEpoch(configHome: string): Promise<ResolutionEpoch | undefined> {
+  try {
+    const [index, families] = await Promise.all([
+      stat(join(configHome, 'leaf-families', 'index')),
+      stat(join(configHome, 'leaf-families')),
+    ])
+    return { index: index.mtimeMs, families: families.mtimeMs }
+  } catch { return undefined }
+}
+
 export async function resolveDurableIdentity(
   sessionId: string,
   configHome: string = getClaudeConfigHomeDir(),
 ): Promise<DurableIdentity> {
+  const epoch = await directoryEpoch(configHome)
+  const cached = resolutionCache.get(configHome)
+  if (epoch && cached && cached.epoch.index === epoch.index && cached.epoch.families === epoch.families) {
+    const answer = cached.answers.get(sessionId)
+    if (answer) return answer
+  } else if (epoch) {
+    resolutionCache.set(configHome, { epoch, answers: new Map() })
+  }
+  const answer = await readDurableIdentity(sessionId, configHome)
+  if (epoch) resolutionCache.get(configHome)!.answers.set(sessionId, answer)
+  return answer
+}
+
+async function readDurableIdentity(sessionId: string, configHome: string): Promise<DurableIdentity> {
   const index = join(configHome, 'leaf-families', 'index')
   let entries: string[]
   try { entries = await readdir(index) } catch { return { durable: false } }
   const familyExists = async (familyId: string): Promise<boolean> => {
     try { await stat(leafFamilyPaths(configHome, familyId).familyRecord); return true } catch { return false }
   }
-  const hostClaims = new Set<string>()
   for (const entry of entries) {
     if (!entry.endsWith('.host.json')) continue
     const familyId = entry.slice(0, -'.host.json'.length)
     if (!familyId) continue
-    hostClaims.add(familyId)
     try {
       const claim = JSON.parse(await readFile(join(index, entry), 'utf8')) as { matriarchSessionId?: unknown }
       if (claim?.matriarchSessionId !== sessionId) continue
       if (await familyExists(familyId)) return { durable: true, familyId }
     } catch { /* An unreadable claim is not a claim. */ }
-  }
-  // Legacy fallback. A family that HAS a host claim is not read here: its claim
-  // already answered, and a stale patriarchal alias must not contradict it.
-  for (const entry of entries) {
-    if (!entry.endsWith('.json') || entry.endsWith('.host.json')) continue
-    const familyId = entry.slice(0, -'.json'.length)
-    if (!familyId || hostClaims.has(familyId)) continue
-    try {
-      const pointer = JSON.parse(await readFile(join(index, entry), 'utf8')) as { rootSessionId?: unknown; patriarchSessionId?: unknown }
-      if (pointer?.patriarchSessionId !== sessionId) continue
-      // A member's copy is not the family's root pointer: it names the root in
-      // `rootSessionId` while living under the member's own session id.
-      if (pointer.rootSessionId !== familyId) continue
-      if (await familyExists(familyId)) return { durable: true, familyId }
-    } catch { /* An unreadable pointer is not a pointer. */ }
   }
   return { durable: false }
 }
@@ -261,11 +274,22 @@ export async function requestDurablePeerOpen(
   const failed = (check: OpenCheck): OpenOutcome => ({ state: 'failed', check })
 
   const peer = await readRegistrationPeer(directory, sessionId)
-  if (!peer || peer.durable !== true || !peer.durableFamilyId) return failed('not-durable')
-  const familyId = peer.durableFamilyId
+  if (!peer) return failed('not-durable')
+  // The family comes from the INDEX, not from what the row says about itself.
+  // A row is written once, at registration; a succession moves the lease under
+  // it, so a row can name a family that has already moved on (or, from a build
+  // that trusted a member copy, a family that never existed). The index is the
+  // authority the reaper and the registration both use, so the open targets the
+  // family it actually is rather than the one the record claims.
+  const identity = await resolveDurableIdentity(sessionId, configHome)
+  if (!identity.durable || !identity.familyId) return failed('not-durable')
+  const familyId = identity.familyId
   const paths = leafFamilyPaths(configHome, familyId)
   const hostBefore = await readHostClaim(paths.hostClaim)
-  if (!hostBefore) return failed('not-durable')
+  // The claim that made it durable names this session; if the family has moved
+  // between the two reads, this address is a former matriarch and opening it
+  // would resume the wrong session.
+  if (!hostBefore || hostBefore.matriarchSessionId !== sessionId) return failed('not-durable')
   const baseline = hostBefore.generation
 
   // (a) PRIMARY. The peer row alone is not evidence of open: a dead process
