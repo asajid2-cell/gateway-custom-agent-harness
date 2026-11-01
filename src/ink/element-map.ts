@@ -35,6 +35,16 @@
  * refused frame leaves the previous map in place, which is why the publisher
  * below only advances `gen` after a frame has actually been written.
  *
+ * Emit in one call. `encodeElementMap` returns the whole sequence as one
+ * string and the emitter hands it to a single `write()`; nothing in this tree
+ * writes a sequence in pieces or interleaves another write inside it. That is
+ * a constraint on the code path, not a property a test can prove: a process
+ * killed between the introducer and ST leaves the terminal inside an OSC
+ * string, and ConPTY/Windows Terminal then swallow output until some later ESC
+ * ends it - the failure is a dark screen, not a cosmetic glitch. One call per
+ * sequence bounds the exposure to a kill that lands inside that single write;
+ * splitting the sequence would create the same window on every frame.
+ *
  * The contract is shared with the relay half (harmonizer-suite) and with the
  * relay's stripper (relaycore). Fields: v, gen, cols, rows, els; per element
  * id, role, r, label, act. Emission is the full list every time - no deltas -
