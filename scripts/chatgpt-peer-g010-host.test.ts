@@ -45,10 +45,12 @@ type CallOptions = { timeoutMs?: number; onAccepted?: (id: string) => void }
  */
 const CHILD_SCRIPT = `
 const ceiling = process.env.G010_CEILING
+const credit = process.env.G010_ATTACH_CREDIT
 const delay = Number(process.env.G010_READY_DELAY_MS || 0)
 function ready() {
   const line = { event: 'ready' }
   if (ceiling !== undefined && ceiling !== '' && Number.isFinite(Number(ceiling))) line.sendCeilingMs = Number(ceiling)
+  if (credit !== undefined && credit !== '' && Number.isFinite(Number(credit))) line.sendAttachCreditMs = Number(credit)
   process.stdout.write(JSON.stringify(line) + '\\n')
 }
 if (delay > 0) setTimeout(ready, delay); else ready()
@@ -100,6 +102,7 @@ describe('G-010: the driver owns the child-advertised send ceiling', () => {
   test('a send with no reply settles at the deadline the caller set, not the construction timeout', async () => {
     const { dir, cleanup } = await scratch()
     process.env.G010_CEILING = '120'
+    process.env.G010_ATTACH_CREDIT = '30'
     delete process.env.G010_READY_DELAY_MS
     try {
       const driver = new DriverChild({ script: await childScript(dir), timeoutMs: 5_000 })
@@ -108,6 +111,8 @@ describe('G-010: the driver owns the child-advertised send ceiling', () => {
         // advertisement arrives on the `ready` line before the ping's reply.
         expect((await driver.call({ op: 'ping' })).ok).toBe(true)
         expect(await waitFor(() => driver.sendCeilingMs ?? undefined)).toBe(120)
+        // G-010 attach credit: the same ready line, the same generation claim.
+        expect(await waitFor(() => driver.sendAttachCreditMs ?? undefined)).toBe(30)
         const started = Date.now()
         const reply = await driver.call({ op: 'send', text: 'held open' }, 200)
         const elapsed = Date.now() - started
@@ -120,8 +125,10 @@ describe('G-010: the driver owns the child-advertised send ceiling', () => {
       }
       // Closed: the next child must advertise for itself.
       expect(driver.sendCeilingMs).toBeNull()
+      expect(driver.sendAttachCreditMs).toBe(0)
     } finally {
       delete process.env.G010_CEILING
+      delete process.env.G010_ATTACH_CREDIT
       await cleanup()
     }
   }, 20_000)
@@ -129,12 +136,14 @@ describe('G-010: the driver owns the child-advertised send ceiling', () => {
   test('a child that advertises nothing leaves the ceiling unknown', async () => {
     const { dir, cleanup } = await scratch()
     delete process.env.G010_CEILING
+    delete process.env.G010_ATTACH_CREDIT
     delete process.env.G010_READY_DELAY_MS
     try {
       const driver = new DriverChild({ script: await childScript(dir), timeoutMs: 5_000 })
       try {
         expect((await driver.call({ op: 'ping' })).ok).toBe(true)
         expect(driver.sendCeilingMs).toBeNull()
+        expect(driver.sendAttachCreditMs).toBe(0)
       } finally {
         await driver.kill()
       }
@@ -148,29 +157,39 @@ describe('G-010: the driver owns the child-advertised send ceiling', () => {
     // The old child advertises a LARGE number, so a stale claim would be easy
     // to notice; the replacement advertises a small one.
     process.env.G010_CEILING = '800'
+    process.env.G010_ATTACH_CREDIT = '200'
     delete process.env.G010_READY_DELAY_MS
     try {
       const driver = new DriverChild({ script: await childScript(dir), timeoutMs: 5_000 })
       try {
         expect((await driver.call({ op: 'ping' })).ok).toBe(true)
         expect(await waitFor(() => driver.sendCeilingMs ?? undefined)).toBe(800)
+        expect(await waitFor(() => driver.sendAttachCreditMs ?? undefined)).toBe(200)
         // Accepted and unanswered: the timeout replaces this child, and a
         // replacement owns no claim until it speaks.
         expect((await driver.call({ op: 'send', text: 'held open' }, 150)).reason).toBe('timeout')
         expect(driver.sendCeilingMs).toBeNull()
+        expect(driver.sendAttachCreditMs).toBe(0)
 
-        // The next spawn advertises late (a replacement still starting).
+        // The next spawn advertises late (a replacement still starting) and
+        // advertises a ceiling but NO credit: a ready that omits the field
+        // clears the old child's credit rather than inheriting it.
         process.env.G010_CEILING = '120'
+        delete process.env.G010_ATTACH_CREDIT
         process.env.G010_READY_DELAY_MS = '250'
         expect((await driver.call({ op: 'ping' })).ok).toBe(true)
         // It answered the ping but has not advertised yet: unknown, not 800.
         expect(driver.sendCeilingMs).toBeNull()
+        expect(driver.sendAttachCreditMs).toBe(0)
         expect(await waitFor(() => driver.sendCeilingMs ?? undefined)).toBe(120)
+        // The new ready has been read and it carried no credit.
+        expect(driver.sendAttachCreditMs).toBe(0)
       } finally {
         await driver.kill()
       }
     } finally {
       delete process.env.G010_CEILING
+      delete process.env.G010_ATTACH_CREDIT
       delete process.env.G010_READY_DELAY_MS
       await cleanup()
     }
@@ -182,8 +201,12 @@ class FakeDriver {
   readonly calls: Call[] = []
   /** What this "child" advertises on ready; null = nothing advertised. */
   sendCeilingMs: number | null = null
+  /** The per-attachment credit this "child" advertises; 0 = none. */
+  sendAttachCreditMs = 0
   /** The deadline the host asked this send call to use. */
   lastSendTimeoutMs: number | null = null
+  /** How many attachments the last send carried (one attach object = 1). */
+  lastSendAttachCount: number | null = null
   /**
    * How long an unanswered send actually waits. Defaults to the deadline it was
    * given; a row may shorten it so an over-budget advertisement stays fast.
@@ -195,6 +218,8 @@ class FakeDriver {
    * The child is healthy; the host was simply blind behind the running send.
    */
   childTimesOut = false
+  /** A send that lands at once (the upload path needs a success reply). */
+  sendAccepted = false
   threads = [{ id: THREAD_A, title: 'Existing work' }]
   private current: string | null = THREAD_A
   /** The page reports `generating` only while a send is actually in flight. */
@@ -229,10 +254,14 @@ class FakeDriver {
     if (op === 'send') {
       const budget = typeof options.timeoutMs === 'number' ? options.timeoutMs : null
       this.lastSendTimeoutMs = budget
+      this.lastSendAttachCount = request.attach ? 1 : 0
       this.sending = true
       try {
         if (options.onAccepted) options.onAccepted(String(request.id ?? ''))
         this.append(this.tree.current, 'user', String(request.text ?? ''))
+        if (this.sendAccepted) {
+          return { ok: true, op, threadId: this.current, attachment: { state: 'landed' } }
+        }
         if (this.childTimesOut) {
           // The child's own wait expired while the page was still generating.
           return { ok: false, op, timedOut: true, state: 'generating', threadId: this.current }
@@ -325,6 +354,29 @@ const repliesTo = (transport: GatewaySessionTransport, id: string): string[] =>
     .filter(record => (record.message as unknown as { replyTo?: string }).replyTo === id)
     .map(record => String((record.message as unknown as { text: string }).text))
 
+/** The host's own operator token, as `writeInstanceFile` laid it down. */
+async function credentials(dir: string): Promise<{ token: string }> {
+  const body = JSON.parse(await readFile(join(privateDir(dir), 'instances', 'test.json'), 'utf8')) as { token: string }
+  return { token: body.token }
+}
+
+/** One operator request against the host's own loopback port. */
+async function operatorCall(host: ChatGptHost, token: string, body: Record<string, unknown>): Promise<{ status: number; body: any }> {
+  const response = await fetch(`http://127.0.0.1:${host.port}/operator`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return { status: response.status, body: await response.json() }
+}
+
+/** The deadline the host actually asked the last send to use. */
+function recordedBudget(driver: FakeDriver): number {
+  const budget = driver.lastSendTimeoutMs
+  if (typeof budget !== 'number') throw new Error('the send recorded no deadline')
+  return budget
+}
+
 describe('G-010: the host send call follows ceiling + margin, else the turn timeout', () => {
   test('an advertised ceiling sets the call deadline to ceiling + margin', async () => {
     const { dir, cleanup } = await scratch()
@@ -410,6 +462,66 @@ describe('G-010: the host send call follows ceiling + margin, else the turn time
       budgets.push(driver.lastSendTimeoutMs)
 
       expect(budgets).toEqual([160, 600, 290])
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('the same send with one attachment is budgeted exactly the advertised credit longer than with none', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    // The child measured that an attach send outlives its plain ceiling and
+    // credits the difference back, per attachment.
+    driver.sendCeilingMs = 150
+    driver.sendAttachCreditMs = 100
+    driver.sendAccepted = true
+    const host = await startHost(dir, driver, { turnTimeoutMs: 3_000, sendCeilingMarginMs: 50 })
+    try {
+      const file = join(dir, 'note.txt')
+      await writeFile(file, 'hello')
+      const { token } = await credentials(dir)
+
+      // No attachment: 150 ceiling + 50 margin, no credit.
+      await host.promptForTest(alpha.sessionId, { text: 'the same send, no file' })
+      expect(driver.lastSendAttachCount).toBe(0)
+      const withoutAttach = recordedBudget(driver)
+      expect(withoutAttach).toBe(200)
+
+      // One attachment: the same numbers plus the credit, exactly.
+      const uploaded = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(uploaded.status).toBe(200)
+      expect(driver.lastSendAttachCount).toBe(1)
+      const withAttach = recordedBudget(driver)
+      expect(withAttach - withoutAttach).toBe(100)
+      expect(withAttach).toBe(300)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('a child that advertises a ceiling but no credit keeps ceiling + margin for an attachment', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge()
+    await seedHost(dir, [alpha])
+    const driver = new FakeDriver()
+    driver.sendCeilingMs = 150
+    // Absent/omitted credit: the fallback is the ceiling + margin, never the
+    // turn timeout.
+    driver.sendAttachCreditMs = 0
+    driver.sendAccepted = true
+    const host = await startHost(dir, driver, { turnTimeoutMs: 3_000, sendCeilingMarginMs: 50 })
+    try {
+      const file = join(dir, 'note.txt')
+      await writeFile(file, 'hello')
+      const { token } = await credentials(dir)
+      const uploaded = await operatorCall(host, token, { op: 'attachFile', bridge: alpha.sessionId, path: file })
+      expect(uploaded.status).toBe(200)
+      expect(driver.lastSendAttachCount).toBe(1)
+      expect(recordedBudget(driver)).toBe(200)
     } finally {
       await host.stop()
       await cleanup()

@@ -714,18 +714,32 @@ export class ChatGptHost {
    * been replaced and not yet spoken) leaves the fallback: without a number
    * there is nothing to shorten.
    *
+   * An attachment is the exception the child itself measured: it credits the
+   * attach time back into its own deadline, so a send carrying a file may
+   * legitimately outlive the plain ceiling. The child advertises that credit
+   * per attachment (`sendAttachCreditMs`), and the call's budget adds it once
+   * per attachment carried - a count, not a flag, so a later multi-file send
+   * is not silently under-budgeted. A child that advertises no credit keeps
+   * the plain ceiling + margin: an old child is still bounded by what it said.
+   *
    * There is NO cap at turnTimeout. The advertisement and the turn timeout are
    * independent numbers: a child whose ceiling is larger than the turn budget
    * would have its own reply clipped by a cap, which is the very lost-reply
    * defect this fixes. An over-budget advertisement is logged instead - it says
    * the child has no overall deadline of its own.
    */
-  private get sendCallTimeout(): number {
+  private sendCallTimeout(attachCount: number): number {
     const ceiling = this.driver.sendCeilingMs
     if (typeof ceiling === 'number' && Number.isFinite(ceiling) && ceiling > 0) {
-      const budget = ceiling + (this.config.sendCeilingMarginMs ?? SEND_CEILING_MARGIN_MS)
+      // The driver records the claim per child generation; `0` is "none
+      // advertised" and adds nothing.
+      const perAttachment = this.driver.sendAttachCreditMs
+      const attached = perAttachment > 0 && attachCount > 0
+        ? ` and ${(perAttachment / 1000).toFixed(1)}s of attach credit per attachment (${attachCount} attached)`
+        : ''
+      const budget = ceiling + (this.config.sendCeilingMarginMs ?? SEND_CEILING_MARGIN_MS) + perAttachment * attachCount
       if (budget > this.turnTimeout) {
-        log(`the child advertises a ${(ceiling / 1000).toFixed(1)}s send ceiling; with the margin the call waits ${(budget / 1000).toFixed(1)}s, longer than the ${(this.turnTimeout / 1000).toFixed(1)}s turn timeout - the child has no overall deadline`)
+        log(`the child advertises a ${(ceiling / 1000).toFixed(1)}s send ceiling${attached}; with the margin the call waits ${(budget / 1000).toFixed(1)}s, longer than the ${(this.turnTimeout / 1000).toFixed(1)}s turn timeout - the child has no overall deadline`)
       }
       return budget
     }
@@ -3268,7 +3282,7 @@ export class ChatGptHost {
       // Only send `wait` when the caller asked for it (or explicitly refused it):
       // the plain synchronous `pageTurn` keeps the driver's own default.
       ...(options.wait === undefined ? {} : { wait: options.wait }),
-    }, { timeoutMs: this.sendCallTimeout, ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
+    }, { timeoutMs: this.sendCallTimeout(options.attach ? 1 : 0), ...(options.onAccepted ? { onAccepted: options.onAccepted } : {}) })
     if (reply.ok !== true) return reply
     const landed = typeof reply.threadId === 'string' ? reply.threadId : ''
     if (landed && options.landed) await options.landed(landed)
@@ -3747,8 +3761,9 @@ export class ChatGptHost {
         // replaced, exits or is closed - a copy kept here would survive the
         // child it described. So read it for the log, never cache it.
         const ceiling = this.driver.sendCeilingMs
+        const credit = this.driver.sendAttachCreditMs
         log(ceiling
-          ? `child ready; its send ceiling is ${Math.round(ceiling / 1000)}s`
+          ? `child ready; its send ceiling is ${Math.round(ceiling / 1000)}s${credit ? ` plus ${Math.round(credit / 1000)}s per attachment` : ''}`
           : 'child ready; it advertised no send ceiling, the send call keeps the turn timeout')
         return
       }

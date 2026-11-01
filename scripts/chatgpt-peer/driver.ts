@@ -145,6 +145,13 @@ export class DriverChild {
    * replacement: a new child has its own ceiling.
    */
   private ceilingMs: number | null = null
+  /**
+   * G-010 attach credit: the milliseconds the CURRENT child credits back per
+   * attachment, so a send carrying a file may legitimately outlive its plain
+   * send ceiling. A claim of the same child and cleared everywhere the ceiling
+   * is: a replacement has neither.
+   */
+  private attachCreditMs = 0
   private readonly listeners = new Set<(event: DriverEvent) => void>()
   private closed = false
   private sequence = 0
@@ -222,6 +229,7 @@ export class DriverChild {
     // G-010: a replacement has not advertised anything yet; the old claim dies
     // with the old child.
     this.ceilingMs = null
+    this.attachCreditMs = 0
     if (child && child.exitCode === null) { try { child.kill() } catch { /* already gone */ } }
     for (const [id, waiter] of [...this.pending]) {
       if (waiter.generation !== generation) continue
@@ -244,6 +252,17 @@ export class DriverChild {
     return this.ceilingMs
   }
 
+  /**
+   * G-010 attach credit: milliseconds per attachment the current child credits
+   * back into its own send deadline. `0` means none advertised; an absent,
+   * non-finite or `<= 0` field all mean the same `0`, so a child that says
+   * nothing and one that says zero are indistinguishable. Same generation rule
+   * as the ceiling - an old child's credit is not a new child's.
+   */
+  get sendAttachCreditMs(): number {
+    return this.attachCreditMs
+  }
+
   private ensure(): ChildProcessWithoutNullStreams {
     // After kill() the driver is closed for good: a new child is reachable only
     // through an explicit reopen(), never as a side effect of a late call.
@@ -257,6 +276,7 @@ export class DriverChild {
     // is unknown until it says so - the previous child's claim does not carry.
     this.lastLineAt = Date.now()
     this.ceilingMs = null
+    this.attachCreditMs = 0
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     createInterface({ input: child.stdout }).on('line', line => this.handleLine(line, generation))
@@ -272,6 +292,7 @@ export class DriverChild {
       if (this.child === child) {
         this.child = undefined
         this.ceilingMs = null
+        this.attachCreditMs = 0
       }
       // Settle this generation's waiters only; they carry the generation.
       for (const [id, waiter] of [...this.pending]) {
@@ -324,6 +345,10 @@ export class DriverChild {
         // than leaving a stale number from a different page state behind.
         const advertised = message.sendCeilingMs
         this.ceilingMs = typeof advertised === 'number' && Number.isFinite(advertised) && advertised > 0 ? advertised : null
+        // G-010 attach credit: the same generation claim, cleared the same way
+        // by a ready that omits or disowns it.
+        const credit = message.sendAttachCreditMs
+        this.attachCreditMs = typeof credit === 'number' && Number.isFinite(credit) && credit > 0 ? credit : 0
       }
       if (event === 'accepted') {
         // An acceptance only means something while the request is still pending.
@@ -516,6 +541,7 @@ export class DriverChild {
     const child = this.child
     this.child = undefined
     this.ceilingMs = null
+    this.attachCreditMs = 0
     this.closed = true
     if (!child || child.exitCode !== null) return
     const latest = [...this.deadlines.values()].reduce((max, at) => Math.max(max, at), 0)
@@ -534,6 +560,7 @@ export class DriverChild {
     const child = this.child
     this.child = undefined
     this.ceilingMs = null
+    this.attachCreditMs = 0
     if (!child || child.exitCode !== null) return
     await new Promise<void>(resolve => {
       child.once('exit', () => resolve())
