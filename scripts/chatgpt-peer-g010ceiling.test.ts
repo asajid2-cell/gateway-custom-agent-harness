@@ -31,10 +31,28 @@
  * settle to be strictly before the alternative whenever the two are
  * distinguishable.
  *
- * Measured at base `782b646` (see the report): rows 1, 4, 5, 6, 7 are RED and
- * rows 2, 3 are GREEN. Rows 2/3 pass at base because the fallback really is the
- * turn timeout at both layers; they are here so the fallback cannot silently
- * become "no deadline at all" once the ceiling path lands.
+ * MEASURED, same command both sides (`bun test
+ * scripts/chatgpt-peer-g010ceiling.test.ts`, the file run alone):
+ *
+ *  - base `782b646`: 2 pass / 5 fail, 31.43 s, 33.35 s and 33.53 s (three
+ *    identical runs). RED rows 1, 4, 5, 6 and 7 - the whole deadline, the
+ *    driver claim row 4 starts with, the no-cap rule, the replacement bound,
+ *    and every attach clause; rows 2 and 3 GREEN, because the fallback really
+ *    is the turn timeout at both layers. Rows 2/3 are here so that fallback
+ *    cannot silently become "no deadline at all" once the ceiling path lands.
+ *  - `2f56920` (#46's host half on top of the child's advertised credit):
+ *    7 pass / 0 fail, 49 `expect()` calls, 42.15 s and 42.59 s from two
+ *    independently produced runs in this lane (the head's own worktree at the
+ *    same sha reports 7/0 in 39.63 s). Per-row wall time: 1 2.84 s, 2 2.29 s,
+ *    3 14.13 s (six hosts), 4 7.25 s, 5 7.71 s, 6 2.45 s, 7 4.73 s. Observed
+ *    deadlines: row 1 armed 500 / settled 502 ms; row 2 200 / 200; row 3 all
+ *    200 / 200-202; row 4 phase A 500 / 501 and phase B 3 000 / 3 002;
+ *    row 5 5 200 / 5 201; row 6 500 / 501 with `replacing the child (accepted
+ *    but unfinished: r4)`; row 7 500 vs 300 500 with the credit, 500 / 500
+ *    without it.
+ *
+ * This is the acceptance gate for G-010. It is not the fixture that produced
+ * the original driver-level measurement (`chatgpt-g010ceiling` @ `fc5663d`).
  */
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
