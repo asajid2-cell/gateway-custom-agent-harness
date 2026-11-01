@@ -280,12 +280,20 @@ function findTerminator(
  * on screen, and the next chunk completes the sequence.
  */
 function keepableTail(buffer: string, state: StripState): string {
-  const hold = ELEMENT_MAP_INTRODUCER.length - 1
+  // Hold a trailing suffix that could still become either introducer - the ESC
+  // form and the 8-bit C1 form both reach this path when a relay carries the
+  // stream in 8-bit mode. Holding only the ESC form would print a fragment and
+  // then print the next chunk's base64 as text: the exact failure this stripper
+  // exists to prevent, reachable on a seven-byte chunk boundary.
+  const hold = Math.max(ELEMENT_MAP_INTRODUCER.length, ELEMENT_MAP_INTRODUCER_C1.length) - 1
   // A buffer that is not a prefix at all is text and is printed whole - which
   // is why the length check is inside the loop rather than before it.
   for (let keep = Math.min(hold, buffer.length); keep > 0; keep--) {
     const suffix = buffer.slice(buffer.length - keep)
-    if (ELEMENT_MAP_INTRODUCER.startsWith(suffix)) {
+    if (
+      ELEMENT_MAP_INTRODUCER.startsWith(suffix) ||
+      ELEMENT_MAP_INTRODUCER_C1.startsWith(suffix)
+    ) {
       state.carry = suffix
       return buffer.slice(0, buffer.length - keep)
     }
@@ -294,6 +302,12 @@ function keepableTail(buffer: string, state: StripState): string {
 }
 
 function decodePayload(payload: string): ElementMapFrame | null {
+  // The alphabet is contract, so it is enforced here rather than assumed:
+  // Buffer.from ignores bytes outside base64url, which would leave "an invalid
+  // body is dropped" depending on JSON.parse happening to reject the garbage.
+  // Optional padding is tolerated for an encoder outside this tree; this one
+  // never emits it.
+  if (!/^[A-Za-z0-9_-]+={0,2}$/.test(payload)) return null
   let parsed: unknown
   try {
     parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))

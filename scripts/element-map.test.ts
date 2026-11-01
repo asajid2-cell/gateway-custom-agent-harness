@@ -175,6 +175,23 @@ test('a partial introducer at a chunk edge is held, not printed as ^[', () => {
   expect(second.frames).toHaveLength(1)
 })
 
+test('a partial C1 introducer at a chunk edge is held too', () => {
+  // A relay carrying the stream in 8-bit mode sends 0x9D instead of ESC ].
+  // Holding only the ESC form printed this fragment and then the next chunk's
+  // base64 - the leak this stripper exists to prevent.
+  const state = createStripState()
+  const first = stripElementMap('text\u009d213', state)
+  expect(first.text).toBe('text')
+  expect(state.carry).toBe('\u009d213')
+
+  const sequence = encodeOk(frame(6, [{ id: 'c', role: 'text', r: [0, 0, 1, 1], label: 'c1' }]))
+  const c1 = `\u009d${ELEMENT_MAP_OSC};${payloadOf(sequence)}\u009c`
+  const second = stripElementMap(c1.slice('\u009d213'.length) + 'after', state)
+  expect(second.text).toBe('after')
+  expect(second.frames.map(f => f.gen)).toEqual([6])
+  expect(state.carry).toBe('')
+})
+
 // --- strip: corruption ----------------------------------------------------
 
 test('an unterminated sequence is held, then abandoned at the carry cap', () => {
@@ -199,6 +216,22 @@ test('a corrupt payload is dropped without taking the surrounding text down', ()
   expect(out.text).toBe('leftright')
   expect(out.frames).toHaveLength(0)
   expect(state.dropped).toBe(1)
+})
+
+test('the body alphabet is enforced, not left to Buffer.from to skip', () => {
+  // Buffer.from ignores bytes outside base64url, so a body with a stray space
+  // would decode to a perfectly valid frame if the alphabet were not checked.
+  // That would make "an invalid body is dropped" true only by luck.
+  const valid = payloadOf(encodeOk(frame(3, [{ id: 's', role: 'text', r: [0, 0, 1, 1] }])))
+  const state = createStripState()
+  const out = stripElementMap(`a${INTRODUCER}${valid.slice(0, 10)} ${valid.slice(10)}${ST}b`, state)
+  expect(out.text).toBe('ab')
+  expect(out.frames).toHaveLength(0)
+  expect(state.dropped).toBe(1)
+
+  // Optional trailing padding is tolerated for an encoder outside this tree.
+  const padded = stripElementMap(`${INTRODUCER}${valid}=${ST}`, createStripState())
+  expect(padded.frames.map(f => f.gen)).toEqual([3])
 })
 
 test('a well-formed base64 payload of the wrong shape is dropped', () => {
