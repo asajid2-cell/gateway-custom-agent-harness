@@ -9,8 +9,10 @@
  * line `accepted for r194 has no live waiter; dropped` is that shape - and the
  * dead id then suppressed recovery for the child's life. Acceptance is now
  * recorded only while its request is pending, so an accepted id cannot outlive
- * its own deadline. The age bound (`deadline` plus a margin) remains as the
- * backstop that names a lost frame if the lifecycle ever regresses.
+ * its own deadline and the next timeout beside it classifies it against that
+ * deadline. There is no bound timer: `finish()` settles the id at its own
+ * deadline and clears the acceptance in the same breath, so a timer could
+ * never be the thing that ends an accepted id's life.
  *
  * The child here is a real OS process speaking the frozen line-JSON protocol.
  * A `send` announces acceptance after `acceptAfterMs` and, only when
@@ -109,7 +111,7 @@ describe('G-008: an accepted id is bounded by its own request', () => {
     }
   }, 20_000)
 
-  test('(ii) an acceptance for an already-settled id is recorded nowhere: its late reply and the bound cost the same healthy child', async () => {
+  test('(ii) an acceptance for an already-settled id is recorded nowhere: its late reply cannot cost the same healthy child', async () => {
     const { dir, cleanup } = await scratch()
     const logs: string[] = []
     // The construction ceiling is 300 ms and the margin 100 ms; the send's own

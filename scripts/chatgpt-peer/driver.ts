@@ -59,16 +59,15 @@ export function drainGraceMs(latestDeadline: number, nowMs: number = Date.now())
 export const DEFAULT_WEDGE_MS = 120_000
 
 /**
- * How long PAST the send ceiling an accepted request may stay unanswered before
- * its reply is presumed lost rather than still coming.
+ * How long PAST its own request deadline an accepted id may stay unanswered
+ * before its reply is presumed lost rather than still coming.
  *
- * The child accepts a send, works, and answers on the same request. A reply
- * that never arrives while the child keeps answering LATER requests is not work
- * in flight - it is a lost frame (the live incident: `r206` ran to completion
- * and its reply never reached the host, which then suppressed replacement for
- * 24 minutes because the accepted id counted as "busy"). Age separates the two:
- * an accepted id older than the ceiling plus this margin cannot still be a
- * legitimate turn, so it stops blocking recovery.
+ * This is read only when a request times out and `wedged()` decides what to do.
+ * An accepted id that has outlived its deadline plus this margin cannot still be
+ * a legitimate turn, so it stops suppressing replacement and the next timeout
+ * replaces the child with the distinct "reply was lost" line instead of
+ * "accepted work in flight". That partition is what fixes the live incident,
+ * where the accepted id counted as "busy" and blocked recovery for 24 minutes.
  */
 export const DEFAULT_LOST_REPLY_MARGIN_MS = 60_000
 
@@ -119,18 +118,11 @@ export class DriverChild {
    * live `accepted for r194 has no live waiter; dropped` line showed the old
    * code recording settled ids, which is what disabled recovery for the child's
    * life). An id leaves this set when it is settled, its child exits, or its
-   * child is replaced.
+   * child is replaced. Its age, read against its own request deadline, decides
+   * in `wedged()` whether a timeout beside it is that request's problem or a
+   * lost reply.
    */
   private readonly accepted = new Map<string, { generation: number; at: number }>()
-  /**
-   * The bound timer for each accepted id: the backstop that would replace the
-   * child if an accepted id ever outlived its request deadline plus the margin
-   * with no reply. In the current lifecycle it cannot fire - the request's own
-   * deadline settles the id first, and a settled id is never recorded - but it
-   * is kept so a future change to acceptance recording cannot reintroduce the
-   * wedge. Cleared when the id settles, its child exits, or it is replaced.
-   */
-  private readonly lostTimers = new Map<string, ReturnType<typeof setTimeout>>()
   /** When each in-flight request's own deadline falls, for a graceful drain. */
   private readonly deadlines = new Map<string, number>()
   /**
@@ -153,8 +145,9 @@ export class DriverChild {
     /** How long the child may be silent before a timeout is treated as a wedge. */
     wedgeMs?: number
     /**
-     * How long past the send ceiling an accepted reply may be overdue before it
-     * is presumed lost and no longer suppresses replacement. Tests shorten it.
+     * How long past its own request deadline an accepted id may be overdue
+     * before it is presumed lost and no longer suppresses replacement. Tests
+     * shorten it.
      */
     lostReplyMarginMs?: number
   }) {}
@@ -201,77 +194,13 @@ export class DriverChild {
     return ceilingAt + this.lostReplyMargin()
   }
 
-  /** Arm (or re-arm) the timer that presumes `id` lost at its own bound. */
-  private armLostReplyTimer(id: string, generation: number, delayMs?: number): void {
-    const entry = this.accepted.get(id)
-    if (!entry || entry.generation !== generation) return
-    const delay = delayMs ?? this.lostReplyBoundAt(id, entry.at) - Date.now()
-    this.clearLostReplyTimer(id)
-    const timer = setTimeout(() => this.lostReplyTimerFired(id, generation), Math.max(0, delay))
-    const unref = (timer as unknown as { unref?: () => void }).unref
-    if (unref) unref.call(timer)
-    this.lostTimers.set(id, timer)
-  }
-
-  private clearLostReplyTimer(id: string): void {
-    const timer = this.lostTimers.get(id)
-    if (!timer) return
-    clearTimeout(timer)
-    this.lostTimers.delete(id)
-  }
-
-  private clearLostReplyTimers(): void {
-    for (const id of [...this.lostTimers.keys()]) this.clearLostReplyTimer(id)
-  }
-
-  /**
-   * The bound passed with no reply, and no request had to time out to say so.
-   *
-   * A defensive backstop: with acceptance recorded only for pending ids, the id
-   * settles at its own deadline (before the bound) and no timer survives, so
-   * this path is not reached on the current lifecycle. It keeps the distinct
-   * lost-reply replacement path wired so a future change to acceptance
-   * recording cannot leave an accepted id suppressing recovery for the child's
-   * whole life.
-   *
-   * The young-id rule still holds: a DIFFERENT accepted id that is still inside
-   * its own bound is genuine work in flight, so this overdue reply does not get
-   * to kill the child under it. The timer looks again when that id's own bound
-   * falls.
-   */
-  private lostReplyTimerFired(id: string, generation: number): void {
-    this.lostTimers.delete(id)
-    if (generation !== this.generation) return
-    const entry = this.accepted.get(id)
-    if (!entry || entry.generation !== generation) return
-    const now = Date.now()
-    const young = [...this.accepted]
-      .filter(([other, otherEntry]) => otherEntry.generation === generation && other !== id && now <= this.lostReplyBoundAt(other, otherEntry.at))
-      .map(([other, otherEntry]) => ({ id: other, boundAt: this.lostReplyBoundAt(other, otherEntry.at) }))
-    if (young.length > 0) {
-      const next = Math.min(...young.map(one => one.boundAt))
-      this.log(`driver: no reply for ${id} (accepted ${humanAge(now - entry.at)} ago), but accepted work is still in flight: ${young.map(one => one.id).join(', ')}; leaving it running`)
-      this.armLostReplyTimer(id, generation, Math.max(25, next - now + 25))
-      return
-    }
-    const lost = [...this.accepted]
-      .filter(([other, otherEntry]) => otherEntry.generation === generation && (other === id || now > this.lostReplyBoundAt(other, otherEntry.at)))
-      .map(([other, otherEntry]) => ({ id: other, ageMs: now - otherEntry.at }))
-    this.logLost(lost)
-    this.replaceChild(generation, `driver was replaced after the reply to ${id} was lost`)
-  }
-
-  /** The one distinct line a lost reply is reported with, from either trigger. */
+  /** The one distinct line a lost reply is reported with. */
   private logLost(lost: { id: string; ageMs: number }[]): void {
     const named = lost.map(one => `${one.id} (accepted ${humanAge(one.ageMs)} ago)`).join(', ')
     this.log(`driver: no reply arrived for ${named}; the reply was lost, not a plain timeout - replacing the child`)
   }
 
-  /**
-   * Kill the generation's child, fail its waiters, and forget its accepted ids
-   * and their bound timers. Shared by both replacement triggers so a lost reply
-   * and a wedged timeout leave the bus in the same state.
-   */
+  /** Kill the generation's child, fail its waiters, and forget its accepted ids. */
   private replaceChild(generation: number, reason: string): void {
     const child = this.child
     this.child = undefined
@@ -281,9 +210,7 @@ export class DriverChild {
       waiter.finish({ ok: false, id, error: reason })
     }
     for (const [id, entry] of [...this.accepted]) {
-      if (entry.generation !== generation) continue
-      this.accepted.delete(id)
-      this.clearLostReplyTimer(id)
+      if (entry.generation === generation) this.accepted.delete(id)
     }
   }
 
@@ -318,9 +245,7 @@ export class DriverChild {
         this.acceptors.delete(id)
       }
       for (const [id, entry] of [...this.accepted]) {
-        if (entry.generation !== generation) continue
-        this.accepted.delete(id)
-        this.clearLostReplyTimer(id)
+        if (entry.generation === generation) this.accepted.delete(id)
       }
     })
     child.stdin.on('error', () => {})
@@ -359,18 +284,14 @@ export class DriverChild {
       if (event === 'accepted') {
         // An acceptance only means something while the request is still pending.
         // One whose request already settled is not work the host owes a reply
-        // to: recording it would let a dead id suppress recovery, and the bound
-        // would later kill a healthy idle child over a request the host had
-        // already abandoned. Live log evidence: `accepted for r194 has no live
-        // waiter; dropped`. Drop it and record nothing.
+        // to: recording it would let a dead id suppress recovery for the child's
+        // whole life. Live log evidence: `accepted for r194 has no live waiter;
+        // dropped`. Drop it and record nothing.
         if (id && this.pending.has(id)) {
           // Remember acceptance even without a callback: it is what the timeout
           // recovery has to account for as accepted-but-unfinished work, and its
           // age is what tells a slow turn from a lost reply.
           this.accepted.set(id, { generation, at: Date.now() })
-          // The reply may never come and no later request may ever time out to
-          // notice; the bound has to fire on its own.
-          this.armLostReplyTimer(id, generation)
         }
         const accept = id ? this.acceptors.get(id) : undefined
         if (!accept) {
@@ -391,10 +312,9 @@ export class DriverChild {
     const waiter = this.pending.get(id)
     if (!waiter) {
       // A reply proves nothing was lost, even when the host had already stopped
-      // waiting for it: forget any acceptance recorded for the id so no bound
-      // timer can later replace a child that did answer (G-008 defect 2).
+      // waiting for it: forget any acceptance recorded for the id so a later
+      // timeout cannot read it as in-flight work (G-008 defect 2).
       this.accepted.delete(id)
-      this.clearLostReplyTimer(id)
       this.log(`driver: late reply for ${id} dropped (that request already timed out)`)
       return
     }
@@ -426,7 +346,6 @@ export class DriverChild {
         if (!this.pending.delete(id)) return
         this.acceptors.delete(id)
         this.accepted.delete(id)
-        this.clearLostReplyTimer(id)
         this.deadlines.delete(id)
         resolve(reply)
       }
@@ -539,9 +458,6 @@ export class DriverChild {
    * forced kill used to cut a page turn short mid-operation.
    */
   async kill(): Promise<void> {
-    // A shutting-down driver must not have its drain cut short by a bound
-    // timer replacing the child mid-operation.
-    this.clearLostReplyTimers()
     const child = this.child
     this.child = undefined
     this.closed = true
@@ -558,7 +474,6 @@ export class DriverChild {
 
   /** Forced shutdown: kill now, ignoring any operation's deadline. */
   async terminate(): Promise<void> {
-    this.clearLostReplyTimers()
     this.closed = true
     const child = this.child
     this.child = undefined
