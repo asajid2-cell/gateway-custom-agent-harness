@@ -62,6 +62,14 @@ The payload is a JSON object:
 - `role` is free-form; consumers must tolerate roles they do not know. The
   emitter publishes `box`, `text`, `link`, `progress` and `raw`.
 
+A consumer presses the published `(x,y)` verbatim and never recomputes it: it
+is not promised to be the rect's centre, and is not required to be. The current
+emitter uses `floor(rect.x + rect.width/2)` clamped to the viewport, which is
+the right-hand of the two middle cells on an even width, so a consumer that
+derived `(x + w - 1) / 2` instead would press a different cell on every
+even-width control. A consumer that has to synthesise a press (no `act`) uses
+`floor(x + w/2)`.
+
 ## Introducers
 
 **1. Legal introducers are exactly `ESC]21338;` and `0x9D 21338 ;`.** Anything
