@@ -11,6 +11,11 @@ VT stream, and the exact rules a consumer's stripper must follow to separate
 that map from text and from every other escape sequence. The consumer owns
 nothing in this stream except the right to read it.
 
+Emission is on by default. `CLAUDE_CODE_TERMINAL_ELEMENT_MAP=0` is the opt-out,
+for a terminal that does something unexpected with an unknown OSC number; any
+other value, including unset, leaves it on. The flag is read once, when the
+renderer is constructed, so it cannot be changed inside a running process.
+
 ## Wire format
 
 An emitted sequence is exactly:

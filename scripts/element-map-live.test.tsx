@@ -347,8 +347,8 @@ test('each OSC 21338 sequence sits wholly inside one write() call', async () => 
 
 // --- 2: the default path ---------------------------------------------------
 
-test('with the gate off the default path emits no map at all', async () => {
-  await withEnv(undefined, async () => {
+test('with the gate explicitly off the default path emits no map at all', async () => {
+  await withEnv('0', async () => {
     const h = harness()
     const { app } = await mount(h, 'alpha')
     try {

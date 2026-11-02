@@ -47,10 +47,10 @@ function rootOf(children: DOMElement[]): DOMElement {
   return root
 }
 
-test('the flag is off unless the env var is exactly 1', () => {
-  expect(isElementMapEnabled({})).toBe(false)
+test('the flag is on by default and only an explicit 0 turns it off', () => {
+  expect(isElementMapEnabled({})).toBe(true)
   expect(isElementMapEnabled({ [ELEMENT_MAP_ENV]: '0' })).toBe(false)
-  expect(isElementMapEnabled({ [ELEMENT_MAP_ENV]: 'true' })).toBe(false)
+  expect(isElementMapEnabled({ [ELEMENT_MAP_ENV]: 'false' })).toBe(true)
   expect(isElementMapEnabled({ [ELEMENT_MAP_ENV]: '1' })).toBe(true)
 })
 

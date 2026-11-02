@@ -71,6 +71,15 @@ class ReplayScreen {
     for (let i = 0; i < data.length; i++) {
       const ch = data[i]!
       if (ch === '\x1b') {
+        if (data[i + 1] === ']') {
+          // OSC. A real terminal consumes the string and paints nothing; the
+          // element map rides this way by default. Terminated by BEL or ST.
+          let j = i + 2
+          while (j < data.length && data[j] !== '\x07' && !(data[j] === '\x1b' && data[j + 1] === '\\')) j++
+          assert.ok(j < data.length, `replay does not understand unterminated OSC at index ${i}`)
+          i = data[j] === '\x07' ? j : j + 1
+          continue
+        }
         const match = /^\x1b\[([?<>]?)(\d*)(?:;(\d+))?([A-Za-z@])/.exec(data.slice(i))
         assert.ok(match, `replay does not understand escape at index ${i}`)
         const [whole, priv, first, , final] = match

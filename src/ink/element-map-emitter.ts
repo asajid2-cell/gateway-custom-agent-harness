@@ -25,13 +25,18 @@ import type { DOMElement } from './dom.js'
 import { nodeCache } from './node-cache.js'
 import squashTextNodes from './squash-text-nodes.js'
 
-/** Opt-in. Default off: the sequence is invisible to terminals and costs bytes. */
+/**
+ * On by default: the sequence is invisible to a conforming terminal, and the
+ * map is what lets a remote viewer paint the same controls the tab shows. Set
+ * the variable to `0` to switch it off for a terminal that does something
+ * unexpected with an unknown OSC number.
+ */
 export const ELEMENT_MAP_ENV = 'CLAUDE_CODE_TERMINAL_ELEMENT_MAP'
 
 export function isElementMapEnabled(
   env: Record<string, string | undefined> = process.env,
 ): boolean {
-  return env[ELEMENT_MAP_ENV] === '1'
+  return env[ELEMENT_MAP_ENV] !== '0'
 }
 
 /**
