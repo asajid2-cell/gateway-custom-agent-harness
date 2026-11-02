@@ -39,6 +39,12 @@ The payload is a JSON object:
 - `gen` advances only when the map changes; a heartbeat re-sends the same `gen`.
   `0` means nothing has ever been sent.
 - `cols`/`rows` are the frame geometry the rects were computed against.
+- `oy` (optional) is the number of terminal rows above the rendered block's
+  row 0: `0` on the alternate screen, and the inline probe's origin on the
+  normal screen - the same offset the renderer subtracts from every mouse row.
+  Absent means the origin is not yet known. A consumer must place an inline map
+  at `oy + y`, and must place **nothing** for a normal-screen frame without
+  `oy`: assuming `0` puts every box `oy` rows too high.
 - `els` is the full list every frame - never a delta. Duplicate ids resolve
   last-wins.
 - `r` is `[x, y, width, height]` in app-space cells, 0-based. An element may be

@@ -350,6 +350,28 @@ test('gen advances on change only, and an unchanged frame puts nothing on the wi
   expect(gens).toEqual([1, 2, 3])
 })
 
+test('the inline block origin is part of the map identity', () => {
+  const { emitted, emit } = recorder()
+  const publisher = new ElementMapPublisher({ emit, schedule: manualSchedule().schedule })
+  const sent = () =>
+    JSON.parse(Buffer.from(payloadOf(emitted[emitted.length - 1]!), 'base64url').toString('utf8')) as ElementMapFrame
+
+  // Alt screen: the app starts at the terminal's row 0, and says so explicitly.
+  expect(publisher.publish(BUTTON, 80, 24, 0)).toBe('emitted')
+  expect(sent().oy).toBe(0)
+
+  // Same elements against the same grid, but the inline probe has now measured
+  // where the block starts: that is a different map, not a heartbeat.
+  expect(publisher.publish(BUTTON, 80, 24, 2)).toBe('emitted')
+  expect(publisher.generation).toBe(2)
+  expect(sent().oy).toBe(2)
+
+  // Uncalibrated: the origin is left out rather than guessed, so an inline
+  // consumer draws nothing instead of a box that is one row out.
+  expect(publisher.publish(BUTTON, 80, 24)).toBe('emitted')
+  expect('oy' in sent()).toBe(false)
+})
+
 test('the heartbeat re-sends the last frame with the same gen', () => {
   const { emitted, emit } = recorder()
   const scheduler = manualSchedule()

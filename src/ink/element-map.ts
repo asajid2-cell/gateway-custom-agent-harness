@@ -46,9 +46,10 @@
  * splitting the sequence would create the same window on every frame.
  *
  * The contract is shared with the relay half (harmonizer-suite) and with the
- * relay's stripper (relaycore). Fields: v, gen, cols, rows, els; per element
- * id, role, r, label, act. Emission is the full list every time - no deltas -
- * and the consumer resolves duplicates last-wins by id.
+ * relay's stripper (relaycore). Fields: v, gen, cols, rows, els, and an
+ * optional `oy`; per element id, role, r, label, act. Emission is the full
+ * list every time - no deltas - and the consumer resolves duplicates last-wins
+ * by id.
  */
 
 import { Buffer } from 'buffer'
@@ -121,6 +122,17 @@ export type ElementMapFrame = {
   /** Frame geometry, so a consumer can sanity-check rects against its terminal. */
   cols: number
   rows: number
+  /**
+   * Terminal rows above the rendered block's row 0. `0` on the alternate
+   * screen; on the normal screen it is the inline probe's origin, i.e. the
+   * same offset the mouse lane subtracts (ink.tsx `getMouseRowOffset`).
+   *
+   * Without it a consumer can place an alt-screen map but not an inline one:
+   * the app's row 0 is not the terminal's row 0. Absent means "origin not
+   * known yet" (the probe has not answered), and an inline consumer must not
+   * guess - a box one row out is worse than no box.
+   */
+  oy?: number
   els: MapElement[]
 }
 
@@ -343,6 +355,7 @@ function isElementMapFrame(value: unknown): value is ElementMapFrame {
   const frame = value as Partial<ElementMapFrame>
   if (frame.v !== 1) return false
   if (!isCount(frame.gen) || !isCount(frame.cols) || !isCount(frame.rows)) return false
+  if (frame.oy !== undefined && !isCount(frame.oy)) return false
   if (!Array.isArray(frame.els)) return false
   return frame.els.every(isMapElement)
 }
@@ -453,14 +466,17 @@ export class ElementMapPublisher {
     return this.gen
   }
 
-  publish(els: MapElement[], cols: number, rows: number): PublishResult {
+  publish(els: MapElement[], cols: number, rows: number, oy?: number): PublishResult {
     if (this.stopped) return 'unchanged'
-    const key = `${cols}x${rows}|${JSON.stringify(els)}`
+    // `oy` is part of the identity: the same elements against the same grid but
+    // a freshly measured origin are a different map, and must be re-emitted.
+    const key = `${cols}x${rows}|${oy === undefined ? '' : oy}|${JSON.stringify(els)}`
     if (this.last && this.last.key === key) {
       this.armHeartbeat()
       return 'unchanged'
     }
     const frame: ElementMapFrame = { v: 1, gen: this.gen + 1, cols, rows, els }
+    if (oy !== undefined) frame.oy = oy
     const encoded = encodeElementMap(frame)
     if (!encoded.ok) {
       // Whole frame refused, previous map retained: a truncated sequence would
