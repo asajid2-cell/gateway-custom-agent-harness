@@ -45,8 +45,15 @@ async function mountQuota(provider: ProviderName, model: string, value: Provider
   await wait(100)
   return {
     // The renderer writes changed cells and cursor moves, so assertions are made
-    // against the characters that reached the terminal with escapes taken out.
-    rendered: () => output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''),
+    // against the characters that reached the terminal with escapes taken out. A
+    // run of unchanged cells is emitted as a cursor-forward for that many
+    // columns, not as literal spaces, so those are expanded first - otherwise
+    // every space in a label disappears and the assertion reads as a product
+    // defect.
+    rendered: () =>
+      output
+        .replace(/\x1b\[(\d*)C/g, (_match, count: string) => ' '.repeat(count === '' ? 1 : Number(count)))
+        .replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''),
     // The raw bytes, escapes kept, for assertions about the styling the renderer
     // emitted (an underline is an SGR sequence, not a character).
     raw: () => output,
