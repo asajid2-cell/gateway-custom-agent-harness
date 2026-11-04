@@ -45,6 +45,15 @@ import {
   commandCodeHeaders,
 } from './commandcode.mjs'
 import {
+  MISTRAL_MODEL_IDS,
+  MISTRAL_ROUTES,
+  mistralEffortLevels,
+  mistralEndpoint,
+  mistralGatewayId,
+  mistralHeaders,
+  anthropicToMistralChat,
+} from './mistral.mjs'
+import {
   gatewayCatalogDrift,
   ANTHROPIC_EFFORT_LEVELS_BY_MODEL,
   ASTRA_EFFORT_LEVELS,
@@ -355,6 +364,21 @@ const DEFAULT_MODELS = {
       },
     ]),
   ),
+  // Mistral AI. Its public API is OpenAI-compatible chat completions behind one
+  // Bearer key, and it also hosts third-party open-weight models. `upstream`
+  // carries the provider-native id (`deepseek-v4-1-flash-1017`), which is not
+  // derivable from the friendly Gateway name.
+  ...Object.fromEntries(
+    MISTRAL_MODEL_IDS.map(model => [
+      mistralGatewayId(model),
+      {
+        backend: 'mistral',
+        upstream: model,
+        protocol: MISTRAL_ROUTES[model],
+        effortLevels: mistralEffortLevels(model),
+      },
+    ]),
+  ),
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -427,7 +451,8 @@ function loadModels() {
       value.backend !== 'anthropic' &&
       value.backend !== 'opencode-go' &&
       value.backend !== 'opencode-zen' &&
-      value.backend !== 'commandcode'
+      value.backend !== 'commandcode' &&
+      value.backend !== 'mistral'
     ) {
       throw new Error(`MODEL_GATEWAY_MODELS entry ${name} has an invalid backend`)
     }
@@ -454,12 +479,13 @@ function loadModels() {
         : value.backend === 'codex' ||
             value.backend === 'opencode-go' ||
             value.backend === 'opencode-zen' ||
-            value.backend === 'commandcode'
+            value.backend === 'commandcode' ||
+            value.backend === 'mistral'
           ? { upstream: name }
           : {}),
       ...(value.backend === 'opencode-go' || value.backend === 'opencode-zen'
         ? { protocol: value.protocol }
-        : value.backend === 'commandcode'
+        : value.backend === 'commandcode' || value.backend === 'mistral'
           ? { protocol: 'chat-completions' }
           : {}),
       ...(Array.isArray(value.effortLevels)
@@ -2311,7 +2337,7 @@ function retryableStatus(status) {
 // still surfaced rather than retried.
 function providerHasRotatingBodyMarkers(provider) {
   const name = String(provider).toLowerCase()
-  return name.includes('opencode') || name.includes('commandcode') || name.includes('command code')
+  return name.includes('opencode') || name.includes('commandcode') || name.includes('command code') || name.includes('mistral')
 }
 
 // Wording that means the key cannot serve, not that the request is wrong. Kept
@@ -2784,6 +2810,85 @@ async function sessionOpenCodeCredentials(sessionId) {
   return entry.pool
 }
 
+// Mistral's pool mirrors CommandCode's: MISTRAL_API_KEY, __KEY2, __KEY3 ...,
+// one process-wide pool plus per-session pins, a promotion broadcast to the
+// sibling pools and written to a preference file so a respawn re-applies it.
+const mistralPreferencePath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'mistral-account.json')
+
+async function persistMistralPromotion(record) {
+  const temp = `${mistralPreferencePath}.${randomUUID()}.tmp`
+  try {
+    let saved = {}
+    try { saved = JSON.parse(await fs.readFile(mistralPreferencePath, 'utf8')) } catch {}
+    const next = {}
+    if (Number.isSafeInteger(saved?.number) && saved.number > 0) next.number = saved.number
+    if (record && Number.isSafeInteger(record.number)) next.pendingNew = { number: record.number }
+    await fs.mkdir(path.dirname(mistralPreferencePath), { recursive: true })
+    await fs.writeFile(temp, JSON.stringify(next))
+    await fs.rename(temp, mistralPreferencePath)
+  } catch {
+    await fs.unlink(temp).catch(() => {})
+  }
+}
+
+let mistralGlobalNumber = 1
+const mistralSessionCredentials = new Map()
+
+function mistralPoolList() {
+  return [mistralCredentials, ...[...mistralSessionCredentials.values()].map(entry => entry.pool)]
+}
+
+function mistralPromotion(record) {
+  if (record) {
+    for (const pool of mistralPoolList()) {
+      if (pool.pending?.number !== record.number) pool.adoptPending(record)
+    }
+  }
+  void persistMistralPromotion(record)
+}
+
+export function mistralCredentialPool(env = process.env, overlay = null, onPromote = null) {
+  return credentialPool({ env, prefix: 'MISTRAL_API_KEY', overlay, onPromote })
+}
+
+const mistralCredentials = mistralCredentialPool(process.env, gatewayKeyOverlay, mistralPromotion)
+
+async function sessionMistralCredentials(sessionId) {
+  let number = 1
+  let saved = null
+  try {
+    saved = JSON.parse(await fs.readFile(mistralPreferencePath, 'utf8'))
+    if (Number.isSafeInteger(saved.number) && saved.number > 0) number = saved.number
+  } catch {}
+  if (number !== mistralGlobalNumber) {
+    mistralGlobalNumber = number
+    mistralCredentials.select(number)
+    for (const entry of mistralSessionCredentials.values()) {
+      if (!entry.explicit) entry.pool.select(number)
+    }
+  }
+  const carried = saved?.pendingNew
+  if (carried && Number.isSafeInteger(carried.number) && number !== carried.number) {
+    for (const pool of mistralPoolList()) {
+      if (pool.pending?.number !== carried.number && pool.numbers.includes(carried.number)) {
+        pool.adoptPending(carried)
+      }
+    }
+  }
+  if (!sessionId) return mistralCredentials
+  let entry = mistralSessionCredentials.get(sessionId)
+  if (!entry) {
+    entry = { pool: mistralCredentialPool(process.env, gatewayKeyOverlay, mistralPromotion), explicit: false }
+    entry.pool.select(mistralGlobalNumber)
+    mistralSessionCredentials.set(sessionId, entry)
+  }
+  return entry.pool
+}
+
+async function ensureMistralPreference(sessionId) {
+  return sessionMistralCredentials(sessionId)
+}
+
 // A key just landed in the overlay: touch the owning pool so the new number is
 // detected and promoted now, rather than on whichever request reads it next.
 function noteGatewayKeyInjected(name) {
@@ -2791,6 +2896,8 @@ function noteGatewayKeyInjected(name) {
     for (const pool of openCodePoolList()) void pool.numbers
   } else if (name.startsWith('COMMANDCODE_API_KEY')) {
     for (const pool of commandCodePoolList()) void pool.numbers
+  } else if (name.startsWith('MISTRAL_API_KEY')) {
+    for (const pool of mistralPoolList()) void pool.numbers
   }
 }
 
@@ -2814,6 +2921,7 @@ const ROUTE_HEALTH = new Map()
 const ROUTE_HEALTH_PROVIDERS = new Map([
   ['command code', 'commandcode'],
   ['commandcode', 'commandcode'],
+  ['mistral', 'mistral'],
   ['opencode go', 'opencode-go'],
   ['opencode-go', 'opencode-go'],
   ['opencode zen', 'opencode-zen'],
@@ -2884,6 +2992,7 @@ export function resetRouteHealth() {
 /** The credential number a session's pool would select for a provider. */
 async function sessionRouteNumber(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).number
+  if (providerId === 'mistral') return (await sessionMistralCredentials(sessionId)).number
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).number
   return 1
 }
@@ -2901,6 +3010,7 @@ async function sessionRouteNumber(providerId, sessionId) {
  */
 async function providerRouteNumbers(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).numbers
+  if (providerId === 'mistral') return (await sessionMistralCredentials(sessionId)).numbers
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).numbers
   return [1]
 }
@@ -2939,7 +3049,7 @@ export function fleetRouteHealth(providerId, numbers) {
 
 // Only the numbered pools consult the overlay, so only their variables can be
 // live-injected. A single-key provider (DeepSeek, AMD) would be a silent no-op.
-const POOLED_KEY_PATTERN = /^(?:OPENCODE|COMMANDCODE)_API_KEY(?:[2-9]|[1-9][0-9]+)?$/
+const POOLED_KEY_PATTERN = /^(?:OPENCODE|COMMANDCODE|MISTRAL)_API_KEY(?:[2-9]|[1-9][0-9]+)?$/
 
 function isPooledKeyEnvVar(name) {
   return typeof name === 'string' && POOLED_KEY_PATTERN.test(name)
@@ -4111,6 +4221,139 @@ async function handleCommandCode(body, req, res, modelName, route) {
   }
 }
 
+async function handleMistral(body, req, res, modelName, route) {
+  const wantsStream = body.stream === true
+  const sessionId = upstreamSessionId(req, body)
+  const trace = createGatewayTrace({ model: modelName, backend: 'mistral', protocol: route.protocol })
+  const control = createRequestControl(req, res, trace)
+  const querySource = gatewayQuerySource(req)
+  const credentials = await ensureMistralPreference(sessionId)
+  let apiKey = credentials.key
+  if (!apiKey) {
+    anthropicError(res, 401, 'Mistral API key is not configured')
+    trace.finish('auth-error', null, 401)
+    control.cleanup()
+    return
+  }
+
+  let request
+  try {
+    const toolSafeBody = stripUnsupportedOpenCodeToolChoice(
+      stripUnsupportedOpenCodeTools(body, route),
+      route,
+    )
+    const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
+    request = anthropicToMistralChat(normalizedBody, route.upstream, querySource)
+    logRequestShape({
+      body: normalizedBody,
+      providerRequest: request,
+      model: modelName,
+      backend: 'mistral',
+      protocol: route.protocol,
+      querySource,
+    })
+  } catch (error) {
+    anthropicError(res, 400, error instanceof Error ? error.message : 'Unsupported request')
+    trace.finish('invalid-request', error, 400)
+    control.cleanup()
+    return
+  }
+
+  try {
+    let relayAttempt = 0
+    while (true) {
+      let upstream
+      control.startUpstream()
+      try {
+        upstream = await fetchWithRetry({
+          provider: 'Mistral',
+          url: mistralEndpoint(),
+          options: () => {
+            apiKey = credentials.key
+            return {
+              method: 'POST',
+              headers: mistralHeaders(apiKey, wantsStream),
+              body: JSON.stringify(request),
+              signal: control.signal,
+            }
+          },
+          control,
+          trace,
+          credentials,
+        })
+      } catch (error) {
+        trace.markError(error)
+        const status = control.signal.aborted ? control.statusFor(error) : 502
+        anthropicError(res, status, control.signal.aborted ? 'Mistral upstream request timed out' : 'Mistral connection failed')
+        trace.finish('upstream-error', error, status)
+        return
+      }
+
+      if (!upstream.ok) {
+        const detail = await safeUpstreamResponseError(
+          upstream,
+          'Mistral',
+          apiKey,
+          {
+            signal: control.signal,
+            timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+            onTimeout: error => control.abortUpstream(error),
+          },
+        )
+        await upstream.body?.cancel().catch(() => {})
+        const status = upstream.status >= 500 ? 502 : upstream.status
+        anthropicError(res, status, detail)
+        trace.finish('upstream-http-error', null, status)
+        return
+      }
+
+      try {
+        const relayOptions = { signal: control.signal, throwPreOutput: true }
+        if (wantsStream) {
+          await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
+        } else {
+          await relayOpenCodeResponseByProtocol(res, upstream, modelName, route.protocol, trace, relayOptions)
+        }
+        break
+      } catch (error) {
+        if (
+          !res.headersSent &&
+          !control.signal.aborted &&
+          retryablePreOutputRelayError(error) &&
+          relayAttempt < UPSTREAM_RETRIES
+        ) {
+          relayAttempt += 1
+          credentials.advance()
+          const delay = retryDelayMs(relayAttempt, null)
+          trace.clearError?.()
+          process.stderr.write(
+            `model-gateway retry provider=Mistral error=pre-output-${safeLogValue(classifyGatewayError(error))} attempt=${relayAttempt} delay_ms=${delay}\n`,
+          )
+          await waitForRetry(delay, control.signal)
+          continue
+        }
+        if (!res.headersSent) {
+          anthropicError(res, 502, credentials.redact(errorMessage(error)))
+        } else if (wantsStream) {
+          finishAnthropicStreamWithError(res, error)
+        }
+        break
+      }
+    }
+    trace.finish(res.headersSent && res.statusCode === 200 ? 'success' : 'error', null, res.statusCode)
+  } catch (error) {
+    trace.markError(error)
+    if (!res.headersSent) {
+      anthropicError(res, 502, credentials.redact(error instanceof Error ? error.message : 'Mistral request failed'))
+    } else if (wantsStream) {
+      finishAnthropicStreamWithError(res, error)
+    }
+    trace.finish('request-error', error, res.statusCode)
+  } finally {
+    control.cleanup()
+  }
+}
+
 async function handleOpenCodeZen(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
   const sessionId = upstreamSessionId(req, body)
@@ -5039,7 +5282,9 @@ export function modelsResponse() {
                 ? 'anthropic'
                 : backend === 'commandcode'
                   ? 'commandcode'
-                  : backend === 'opencode-zen'
+                  : backend === 'mistral'
+                    ? 'mistral'
+                    : backend === 'opencode-zen'
                     ? 'opencode-zen'
                     : 'opencode-go',
       display_name: upstream,          // Claude Code's gateway discovery labels entries by this
@@ -5165,6 +5410,53 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/mistral-account') {
+    let selection
+    try { selection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid account selection' })
+      return
+    }
+    const { number, sessionId, scope } = selection ?? {}
+    if (!Number.isSafeInteger(number) || number < 1 || !['session', 'global'].includes(scope) || typeof sessionId !== 'string' || !sessionId.trim()) {
+      json(res, 400, { error: 'Use a positive account number and session or global scope' })
+      return
+    }
+    const pool = await sessionMistralCredentials(sessionId)
+    if (!pool.numbers.includes(number)) {
+      json(res, 400, { error: `Account ${number} is not loaded. Available: ${pool.numbers.join(', ')}. Run /refreshlogin after adding a key.` })
+      return
+    }
+    if (scope === 'global') {
+      const temp = `${mistralPreferencePath}.${randomUUID()}.tmp`
+      try {
+        await fs.mkdir(path.dirname(mistralPreferencePath), { recursive: true })
+        await fs.writeFile(temp, JSON.stringify({ number }))
+        await fs.rename(temp, mistralPreferencePath)
+      } catch {
+        await fs.unlink(temp).catch(() => {})
+        json(res, 500, { error: 'Could not save the global Mistral account' })
+        return
+      }
+      await sessionMistralCredentials(sessionId)
+      mistralCredentials.select(number)
+      for (const entry of mistralSessionCredentials.values()) {
+        if (!entry.explicit) entry.pool.select(number)
+      }
+      mistralSessionCredentials.get(sessionId).explicit = false
+    } else {
+      mistralSessionCredentials.get(sessionId).explicit = true
+    }
+    pool.select(number)
+    json(res, 200, { number, scope })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/mistral-account') {
+    const pool = await sessionMistralCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, { number: pool.number, global: mistralGlobalNumber, available: pool.numbers })
+    return
+  }
+
   // Reload the credential set from Keysafe. The gateway cannot re-read the vault
   // itself (it only ever reads env), so it answers the caller, flushes, and exits
   // with a code the supervisor recognizes as a deliberate restart; the supervisor
@@ -5174,6 +5466,7 @@ const server = http.createServer(async (req, res) => {
     const sessionId = requestUrl.searchParams.get('sessionId')
     const pool = await sessionOpenCodeCredentials(sessionId)
     const commandCodePool = await sessionCommandCodeCredentials(sessionId)
+    const mistralPool = await sessionMistralCredentials(sessionId)
     // `available` stays the OpenCode list: the opencode CLI reads it as its own
     // accounts. CommandCode numbers travel separately and its CLI re-reads GET
     // /gateway/commandcode-account, which already returns its own `available`.
@@ -5183,6 +5476,7 @@ const server = http.createServer(async (req, res) => {
       reloading: true,
       available: pool.numbers,
       commandcodeAvailable: commandCodePool.numbers,
+      mistralAvailable: mistralPool.numbers,
     }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })
@@ -5227,7 +5521,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/route-health') {
     const providerId = routeHealthProviderId(requestUrl.searchParams.get('provider'))
     if (!providerId) {
-      json(res, 400, { error: 'Use provider=commandcode|opencode-go|opencode-zen|deepseek|amd-radeon|anthropic|codex' })
+      json(res, 400, { error: 'Use provider=commandcode|mistral|opencode-go|opencode-zen|deepseek|amd-radeon|anthropic|codex' })
       return
     }
     const sessionId = requestUrl.searchParams.get('sessionId')
@@ -5379,6 +5673,10 @@ async function dispatchRoute({ body, rawBody, req, res, requestUrl, modelName, r
   }
   if (route.backend === 'commandcode') {
     await handleCommandCode(body, req, res, modelName, route)
+    return
+  }
+  if (route.backend === 'mistral') {
+    await handleMistral(body, req, res, modelName, route)
     return
   }
   if (route.backend === 'amd-radeon') {

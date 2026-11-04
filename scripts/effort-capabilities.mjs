@@ -112,6 +112,20 @@ export function effortLevelsForCommandCodeModel(model) {
   return levels ? [...levels] : []
 }
 
+// Mistral validates reasoning_effort against one closed enum for every model
+// (probed live 2026-11-04: 422 naming none|minimal|low|medium|high|xhigh|max),
+// so a route there can offer the whole ladder. Kept per model anyway: a future
+// non-reasoning Mistral route declares an empty ladder rather than advertising
+// a knob the model cannot use.
+export const MISTRAL_EFFORT_LEVELS = Object.fromEntries(
+  Object.entries(CATALOG.mistral || {}).map(([model, levels]) => [model, [...levels]]),
+)
+
+export function effortLevelsForMistralModel(model) {
+  const levels = MISTRAL_EFFORT_LEVELS[model]
+  return levels ? [...levels] : []
+}
+
 export function effortWireMapForOpenCodeModel(model) {
   if (model === 'hy3') return { none: 'no_think' }
   return {}

@@ -335,6 +335,11 @@ function chatContent(blocks) {
       result.push({ type: 'image_url', image_url: { url: imageUrl(block) } })
     } else if (block?.type === 'document') {
       result.push({ type: 'text', text: blockText(block) })
+    } else if (block?.type === 'thinking' && Array.isArray(block.thinking)) {
+      // A provider that takes reasoning back as content (Mistral) gets the
+      // already-shaped block; the default reasoning_content path never puts a
+      // thinking block in this array.
+      result.push(block)
     }
   }
   return result
@@ -361,6 +366,39 @@ function reasoningText(blocks) {
 }
 
 /**
+ * Thinking text from either provider spelling.
+ *
+ * OpenCode/DeepSeek carry it as a flat string; Mistral returns a content block
+ * whose own `thinking` is a list of `{type:"text",text}` parts, both on the way
+ * out and when it is echoed back on the next assistant turn.
+ */
+function thinkingBlockText(block) {
+  const value = block?.thinking
+  if (typeof value === 'string') return value
+  if (!Array.isArray(value)) return ''
+  return value
+    .map(part => typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : '')
+    .join('')
+}
+
+/**
+ * Text and reasoning out of a Chat Completions `message.content`, which a
+ * provider may send as a plain string or as an array of content blocks.
+ */
+function chatContentParts(content) {
+  if (typeof content === 'string') return { text: content, thinking: '' }
+  if (!Array.isArray(content)) return { text: '', thinking: '' }
+  let text = ''
+  let thinking = ''
+  for (const block of content) {
+    if (typeof block === 'string') text += block
+    else if (block?.type === 'text' && typeof block.text === 'string') text += block.text
+    else if (block?.type === 'thinking') thinking += thinkingBlockText(block)
+  }
+  return { text, thinking }
+}
+
+/**
  * Reasoning is owed on every tool-call turn, not just the one that carried
  * text.
  *
@@ -377,7 +415,8 @@ function owesReasoning(role, toolCalls) {
   return role === 'assistant' && toolCalls.length > 0
 }
 
-function appendChatMessage(messages, message) {
+function appendChatMessage(messages, message, options = {}) {
+  const reasoningBlocks = options.assistantReasoning === 'content-blocks'
   const role = message?.role === 'assistant' ? 'assistant' : 'user'
   const sanitizedContent = role === 'assistant'
     ? sanitizeStaleToolCapabilityContent(message?.content)
@@ -391,6 +430,16 @@ function appendChatMessage(messages, message) {
   const toolImages = []
 
   for (const block of blocks) {
+    // Mistral refuses `reasoning_content` as an extra input but accepts the
+    // reasoning back as a content block, so the two providers need the same
+    // text in different places on the assistant turn.
+    if (reasoningBlocks && block?.type === 'thinking') {
+      const thinking = thinkingBlockText(block)
+      if (thinking) {
+        content.push({ type: 'thinking', thinking: [{ type: 'text', text: thinking }], closed: true })
+      }
+      continue
+    }
     if (block?.type === 'tool_use') {
       toolCalls.push({
         id: block.id || `call_${randomUUID().replaceAll('-', '')}`,
@@ -434,9 +483,9 @@ function appendChatMessage(messages, message) {
   // else in it) would invent a message the provider never sent. A tool-call
   // turn with no thinking left to echo still sends the field, empty: the
   // provider requires its presence there.
-  const reasoning = role === 'assistant' ? reasoningText(blocks) : ''
+  const reasoning = role === 'assistant' && !reasoningBlocks ? reasoningText(blocks) : ''
   if (converted && reasoning) converted.reasoning_content = reasoning
-  else if (converted && owesReasoning(role, toolCalls)) {
+  else if (converted && !reasoningBlocks && owesReasoning(role, toolCalls)) {
     converted.reasoning_content = ''
   }
   // Images that came out of tool results. They follow the tool messages they
@@ -463,11 +512,11 @@ function chatToolChoice(choice) {
   return undefined
 }
 
-export function anthropicToOpenCodeChat(body, upstreamModel, querySource, effortWireMap = openCodeGoEffortWireMap(upstreamModel)) {
+export function anthropicToOpenCodeChat(body, upstreamModel, querySource, effortWireMap = openCodeGoEffortWireMap(upstreamModel), options = {}) {
   const messages = []
   const system = rewriteGatewaySystemPrompt(body.system, '', querySource)
   messages.push({ role: 'system', content: system })
-  for (const message of body.messages || []) appendChatMessage(messages, message)
+  for (const message of body.messages || []) appendChatMessage(messages, message, options)
   const request = { model: upstreamModel, stream: body.stream === true, messages }
   if (body.max_tokens != null) request.max_tokens = body.max_tokens
   if (body.temperature != null) request.temperature = body.temperature
@@ -821,13 +870,14 @@ export async function relayOpenCodeChatResponse(res, upstream, model, trace = nu
       throw new Error(detail ? String(detail) : 'OpenCode Chat Completions request failed')
     }
     const choice = response.choices?.[0]
-    const messageContent = choice?.message?.content
-    const content = typeof messageContent === 'string' && messageContent
-      ? [{ type: 'text', text: messageContent }]
+    const parts = chatContentParts(choice?.message?.content)
+    const content = parts.text
+      ? [{ type: 'text', text: parts.text }]
       : []
     const reasoningContent = choice?.message?.reasoning_content ?? choice?.message?.reasoning
-    if (typeof reasoningContent === 'string' && reasoningContent) {
-      content.unshift({ type: 'thinking', thinking: reasoningContent })
+    const reasoning = parts.thinking || (typeof reasoningContent === 'string' ? reasoningContent : '')
+    if (reasoning) {
+      content.unshift({ type: 'thinking', thinking: reasoning })
     }
     for (const call of choice?.message?.tool_calls || []) {
       content.push({ type: 'tool_use', id: call.id || `call_${randomUUID().replaceAll('-', '')}`, name: call.function?.name || 'tool', input: parseFunctionArguments(call.function?.arguments) })
@@ -1178,7 +1228,16 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
       if (chunk?.usage) usage = chunk.usage
       for (const choice of chunk.choices || []) {
         const delta = choice.delta || {}
+        // A provider may stream `content` as a string or as content blocks. The
+        // block spelling is what Mistral uses for reasoning: each thinking block
+        // carries the next slice of thinking text, not the whole text again.
         if (typeof delta.content === 'string') text(delta.content)
+        else if (Array.isArray(delta.content)) {
+          for (const block of delta.content) {
+            if (block?.type === 'text' && typeof block.text === 'string') text(block.text)
+            else if (block?.type === 'thinking') thinking(thinkingBlockText(block))
+          }
+        }
         if (typeof delta.reasoning === 'string') thinking(delta.reasoning)
         if (typeof delta.reasoning_content === 'string') thinking(delta.reasoning_content)
         if (Array.isArray(delta.tool_calls)) for (const call of delta.tool_calls) tool(call)

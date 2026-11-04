@@ -12,7 +12,7 @@
  *   <vault>/master.*      the per-machine master key, held by a platform backend
  *
  * Record names are the external keysafe's names (opencode-go, opencode-go2,
- * ds, amd-ds, commandcode, commandcode2, openrouter), so GATEWAY_CREDENTIALS_MODE
+ * ds, amd-ds, commandcode, commandcode2, mistral, mistral2, openrouter), so GATEWAY_CREDENTIALS_MODE
  * changes where a credential lives, never what a consumer asks for.
  *
  * Provider records are never plaintext. Secrets move on stdin to platform
@@ -35,6 +35,7 @@ const SERVICE = 'gateway-keysafe'
 
 const OPENCODE = /^opencode-go([2-9]|[1-9][0-9]+)?$/
 const COMMANDCODE = /^commandcode([2-9]|[1-9][0-9]+)?$/
+const MISTRAL = /^mistral([2-9]|[1-9][0-9]+)?$/
 
 const masterKeyCache = new Map()
 
@@ -45,6 +46,7 @@ export function envVarForRecord(name) {
   // would let a future provider name collide with an existing record.
   if (OPENCODE.test(name)) return `OPENCODE_API_KEY${name.slice('opencode-go'.length)}`
   if (COMMANDCODE.test(name)) return `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}`
+  if (MISTRAL.test(name)) return `MISTRAL_API_KEY${name.slice('mistral'.length)}`
   switch (name) {
     case 'ds':
       return 'DEEPSEEK_API_KEY'

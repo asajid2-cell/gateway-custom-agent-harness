@@ -22,6 +22,7 @@ export type ModelBackend =
   | 'opencode-go'
   | 'opencode-zen'
   | 'commandcode'
+  | 'mistral'
   | 'amd-radeon'
   | 'unknown'
 
@@ -60,6 +61,7 @@ export function resolveModelBackend(model: string): ModelBackend {
   }
 
   if (lower.startsWith('gateway-commandcode-')) return 'commandcode'
+  if (lower.startsWith('gateway-mistral-')) return 'mistral'
   if (lower.startsWith('gateway-amd-')) return 'amd-radeon'
   if (lower.startsWith('gateway-ds-')) return 'deepseek'
   if (lower.startsWith('gateway-gpt-')) return 'codex'

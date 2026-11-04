@@ -1146,7 +1146,15 @@ try {
       $suffix = $_.BaseName.Substring('opencode-go'.Length)
       @{ Credential = $_.BaseName; EnvVar = ('OPENCODE_API_KEY' + $suffix) }
     })
-  $OptionalKeyProviders = $OpenCodeProviders + @(
+  # Mistral is a numbered pool too, so every stored slot is injected.
+  $MistralProviders = @(Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.keysafe') -Filter 'mistral*.cred' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match '^mistral([2-9]|[1-9][0-9]+)?$' } |
+    Sort-Object { if ($_.BaseName -eq 'mistral') { 1 } else { [int]$_.BaseName.Substring('mistral'.Length) } } |
+    ForEach-Object {
+      $suffix = $_.BaseName.Substring('mistral'.Length)
+      @{ Credential = $_.BaseName; EnvVar = ('MISTRAL_API_KEY' + $suffix) }
+    })
+  $OptionalKeyProviders = $OpenCodeProviders + $MistralProviders + @(
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
     @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )

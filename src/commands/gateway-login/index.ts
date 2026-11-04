@@ -6,7 +6,7 @@ const command = (name: string, description: string, keyName: string) =>
     name,
     description,
     argumentHint:
-      keyName === 'opencode-go' || keyName === 'commandcode'
+      keyName === 'opencode-go' || keyName === 'commandcode' || keyName === 'mistral'
         ? '[new|switch <number> [session|global]|status|remove]'
         : '[status|remove]',
     load: async () => {
@@ -53,6 +53,12 @@ export const commandCodeLogin = command(
   'commandcodelogin',
   'Add, replace, inspect, or remove the Command Code API key',
   'commandcode',
+)
+
+export const mistralLogin = command(
+  'mistrallogin',
+  'Add, replace, inspect, or remove the Mistral API key',
+  'mistral',
 )
 
 // Compatibility aliases for the original command registry names.

@@ -422,6 +422,7 @@ export function describePeerRoute(route: GatewayPeerRoute | undefined): string |
 /** The preference file a provider's account selection is read from, when it has one. */
 const ROUTE_PREFERENCE_FILES: Record<string, string> = {
   commandcode: 'commandcode-account.json',
+  mistral: 'mistral-account.json',
   'opencode-go': 'opencode-account.json',
   'opencode-zen': 'opencode-account.json',
 }
