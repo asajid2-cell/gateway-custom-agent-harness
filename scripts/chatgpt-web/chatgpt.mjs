@@ -1247,6 +1247,210 @@ async function treeSendEvidence(page, text, baseline, timeoutMs = TREE_PROBE_REA
 }
 
 /**
+ * Does this SSE frame say the assistant turn is over?
+ *
+ * G-018: the send POST's body carries a `delta` patch whose `v` array both
+ * replaces `/message/status` with `finished_successfully` and `/message/end_turn`
+ * with `true`. That pair is the source's own statement that the message is
+ * complete, and it arrives 2.2-2.8 s before this page cancels its reader (live,
+ * 2026-11-01, four turns).
+ *
+ * The predicate is deliberately narrow. `finished_successfully` also appears on
+ * messages that are CREATED already finished (system, tool and reasoning
+ * messages), and `is_complete:true` / `finish_details` / stop_tokens appear on
+ * an empty assistant shell (live: `stop_tokens:[200012]`). None of those is a
+ * patch on this turn's message, so requiring two patch operations in ONE delta
+ * excludes them.
+ */
+function parseTurnMarker(eventName, data) {
+  if (eventName !== 'delta') return null
+  let payload = null
+  try { payload = JSON.parse(data) } catch { return null }
+  const ops = Array.isArray(payload?.v) ? payload.v : null
+  if (!ops) return null
+  let statusDone = false
+  let endTurn = false
+  for (const op of ops) {
+    if (!op || typeof op !== 'object') continue
+    if (op.p === '/message/status' && op.o === 'replace' && op.v === 'finished_successfully') statusDone = true
+    else if (op.p === '/message/end_turn' && op.o === 'replace' && op.v === true) endTurn = true
+  }
+  return statusDone && endTurn ? { status: 'finished_successfully', endTurn: true } : null
+}
+
+/**
+ * The answer message's id, from the marker frames that carry it. The completion
+ * patch itself names no message, so this is how the marker is anchored to the
+ * message it belongs to: `user_visible_token`/`first` announces the id,
+ * `last_token`/`last` corroborates it. Corroboration is logged, never required.
+ */
+function parseMessageMarker(eventName, data) {
+  let payload = null
+  try { payload = JSON.parse(data) } catch { return null }
+  if (payload?.type !== 'message_marker') return null
+  return {
+    messageId: typeof payload.message_id === 'string' ? payload.message_id : null,
+    marker: typeof payload.marker === 'string' ? payload.marker : '',
+    event: typeof payload.event === 'string' ? payload.event : '',
+  }
+}
+
+/**
+ * The content-part operations this frame carries, in order. The body writes
+ * them three ways, all live on 2026-11-01:
+ *   {v:[{p:"/message/content/parts/0",o:"append",v:"..."}]}   array of ops
+ *   {p:"",o:"patch",v:[{p:"/message/content/parts/0",...}]}   one op, ops in v
+ *   {p:"/message/content/parts/0",o:"append",v:"..."}         one op
+ * Only part ops with a string value are content; everything else is skipped.
+ */
+function contentPartOps(payload) {
+  const ops = []
+  const take = op => {
+    if (!op || typeof op !== 'object') return
+    if (typeof op.p !== 'string' || typeof op.v !== 'string') return
+    if (!/^\/message\/content\/parts\/\d+$/.test(op.p)) return
+    ops.push(op)
+  }
+  if (Array.isArray(payload?.v)) {
+    for (const op of payload.v) take(op)
+  } else {
+    take(payload)
+  }
+  return ops
+}
+
+/**
+ * How many characters of answer text this frame carries, or null. Used only to
+ * detect a content delta arriving AFTER the completion patch: the answer is
+ * then being edited after the source said it was over, which changes what the
+ * confirm window has to cover.
+ */
+function framePartOps(eventName, data) {
+  if (eventName !== 'delta') return []
+  let payload = null
+  try { payload = JSON.parse(data) } catch { return [] }
+  return contentPartOps(payload)
+}
+
+function parseContentDelta(eventName, data) {
+  const ops = framePartOps(eventName, data)
+  if (!ops.length) return null
+  let chars = 0
+  for (const op of ops) chars += op.v.length
+  return chars > 0 ? chars : null
+}
+
+/**
+ * The message id a frame names, or null. Content-append frames name no message,
+ * so this is the only way to attribute them: a message object inside the frame
+ * (creation snapshots) or the message id carried by a `message_marker` frame.
+ */
+function frameMessageId(eventName, data) {
+  let payload = null
+  try { payload = JSON.parse(data) } catch { return null }
+  if (!payload || typeof payload !== 'object') return null
+  const direct = payload?.message?.id
+  if (typeof direct === 'string' && direct) return direct
+  const inside = payload?.v
+  if (inside && typeof inside === 'object' && !Array.isArray(inside)) {
+    const id = inside.message?.id
+    if (typeof id === 'string' && id) return id
+  }
+  if (Array.isArray(inside)) {
+    for (const op of inside) {
+      const id = op?.v && typeof op.v === 'object' ? op.v.message?.id : null
+      if (typeof id === 'string' && id) return id
+    }
+  }
+  return null
+}
+
+/**
+ * Render markdown-ish payload text the way the page's innerText shows prose:
+ * cite/HTML tags gone, links reduced to their text, emphasis/fence/heading/
+ * quote marks gone, table pipes gone, rule lines gone, whitespace collapsed.
+ * This is the comparison surface for the payload tail check; it is deliberately
+ * blind to formatting, because the DOM has no markdown.
+ */
+function normalizeAnswerText(text) {
+  return String(text ?? '')
+    // Fence lines (``` and ```python) are chrome: the page renders the code
+    // without them, and its own "Python / Run" header sits where the label was.
+    .replace(/^[ \t]*```[^\n]*$/gm, '')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[`*_#>]/g, ' ')
+    .replace(/\|/g, ' ')
+    .replace(/-{2,}/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * The suffix the DOM must show before the marker path may deliver, or null when
+ * the payload is too small to make a claim.
+ *
+ * It is built from the LAST BLOCK of the payload, not from the last N words of
+ * everything: the page renders a fence's language label and a "Run" control
+ * between a prose line and its code, so a suffix that spans that boundary can
+ * never close even on a correct DOM. Whole words inside one block survive
+ * rendering (the DOM shows tabs where markdown had pipes, spaces where it had
+ * newlines), so the rule is: take the last block; walk back only if it holds
+ * fewer than TAIL_MIN_WORDS; then keep its last TAIL_WORDS words.
+ */
+function tailSuffix(rawText, words = TAIL_WORDS) {
+  const blocks = String(rawText ?? '').split(/\n[ \t]*\n+/).map(normalizeAnswerText).filter(Boolean)
+  if (!blocks.length) return null
+  let suffix = blocks[blocks.length - 1]
+  let index = blocks.length - 2
+  const count = value => value.split(' ').filter(Boolean).length
+  while (count(suffix) < TAIL_MIN_WORDS && index >= 0) {
+    suffix = `${blocks[index]} ${suffix}`.trim()
+    index -= 1
+  }
+  const parts = suffix.split(' ').filter(Boolean)
+  if (parts.length < TAIL_MIN_WORDS) return null
+  return parts.slice(-Math.min(words, parts.length)).join(' ')
+}
+
+/**
+ * Split decoded SSE text into frames. `push` takes base64 bytes as CDP delivers
+ * them and calls `onFrame(name, data, at)` per complete frame; a frame split
+ * across chunks is held until its blank-line terminator arrives.
+ */
+function createSseFrames(onFrame) {
+  const decoder = new TextDecoder('utf-8')
+  let buffer = ''
+  return {
+    push(base64, at) {
+      let bytes = null
+      try { bytes = Buffer.from(String(base64), 'base64') } catch { return }
+      buffer += decoder.decode(bytes, { stream: true })
+      for (;;) {
+        const match = /\r?\n\r?\n/.exec(buffer)
+        if (!match) return
+        const raw = buffer.slice(0, match.index)
+        buffer = buffer.slice(match.index + match[0].length)
+        let name = ''
+        const data = []
+        for (const line of raw.split(/\r?\n/)) {
+          if (!line || line.startsWith(':')) continue
+          const colon = line.indexOf(':')
+          const field = colon === -1 ? line : line.slice(0, colon)
+          let value = colon === -1 ? '' : line.slice(colon + 1)
+          if (value.startsWith(' ')) value = value.slice(1)
+          if (field === 'event') name = value
+          else if (field === 'data') data.push(value)
+        }
+        if (!name && !data.length) continue
+        try { onFrame(name, data.join('\n'), at) } catch {}
+      }
+    },
+  }
+}
+
+/**
  * A started/stopped observer for the page's own requests, built on the CDP
  * Network domain instead of page request events.
  *
@@ -1322,6 +1526,94 @@ async function startNetworkWatch(page) {
     const entry = finished.get(acceptedResponse.requestId)
     if (entry) resolveCompletion(entry)
   }
+  // G-018: the answer's own completion patch, read from the send POST's body.
+  // `Network.streamResourceContent` asks Chrome to hand the CDP session the
+  // bytes it is already reading; it is an observer, never a proxy - the page's
+  // reader is not paused, redirected or re-created. The promise resolves once,
+  // to `{ at, requestId, messageId, lastTokenAt }` at the first qualifying
+  // patch, or null when this observer can no longer say anything (stopped,
+  // superseded, or the tap could not be started).
+  let settleMarker = null
+  const marker = new Promise(resolve => { settleMarker = resolve })
+  const resolveMarker = value => {
+    const resolve = settleMarker
+    if (!resolve) return
+    settleMarker = null
+    resolve(value)
+  }
+  let tapId = null
+  let answerMessageId = null
+  let lastTokenAt = null
+  let tapping = false
+  let markerResolvedAt = null
+  let postMarkerDeltas = 0
+  // The answer's own stream text, kept per message id. Content-append frames
+  // name no message, so a frame that names a different message resets the
+  // buffer; the tail check only speaks when that id is the answer id the marker
+  // named, and is unavailable otherwise.
+  let answerBuffer = { id: null, parts: [], at: null }
+  const resetAnswer = id => { answerBuffer = { id, parts: [], at: Date.now() } }
+  const reader = createSseFrames((eventName, data, at) => {
+    const namedId = frameMessageId(eventName, data)
+    if (namedId && namedId !== answerBuffer.id) resetAnswer(namedId)
+    // Contents next: a frame that both edits the answer and closes the message
+    // must not be lost to the early return below.
+    const ops = framePartOps(eventName, data)
+    if (ops.length) {
+      if (markerResolvedAt !== null) {
+        postMarkerDeltas += 1
+        log(`reply marker: post-marker content delta at +${at - markerResolvedAt}ms, ${ops.reduce((sum, op) => sum + op.v.length, 0)} chars, ${postMarkerDeltas} since the marker`)
+      }
+      for (const op of ops) {
+        const index = Number(op.p.slice(op.p.lastIndexOf('/') + 1))
+        const held = answerBuffer.parts[index] || ''
+        answerBuffer.parts[index] = op.o === 'replace' ? op.v : held + op.v
+      }
+      answerBuffer.at = at
+    }
+    const named = parseMessageMarker(eventName, data)
+    if (named) {
+      if (named.marker === 'user_visible_token' && named.event === 'first' && named.messageId) {
+        answerMessageId = named.messageId
+        if (answerBuffer.id !== named.messageId) resetAnswer(named.messageId)
+      } else if (named.marker === 'last_token' && named.event === 'last') lastTokenAt = at
+      return
+    }
+    if (!parseTurnMarker(eventName, data)) return
+    // Only the accepted request's own body can speak for this turn, and only
+    // while it is still the newest send: a marker for a superseded requestId is
+    // not evidence about the turn the caller is waiting for.
+    if (!acceptedResponse || tapId !== acceptedResponse.requestId) return
+    if (latestSendId !== null && latestSendId !== acceptedResponse.requestId) return
+    markerResolvedAt = at
+    resolveMarker({ at, requestId: acceptedResponse.requestId, messageId: answerMessageId, lastTokenAt })
+  })
+  // One tap per turn, started at the response header. The call fails while the
+  // response is not yet streaming, so it is retried; every failure is bounded
+  // and swallowed - a tap that cannot start costs the marker path, never the
+  // turn.
+  const startTap = requestId => {
+    if (tapping || session === null) return
+    tapping = true
+    tapId = requestId
+    const deadline = Date.now() + MARKER_TAP_DEADLINE_MS
+    ;(async () => {
+      for (;;) {
+        const held = session
+        if (!held) return
+        try {
+          const result = await ceiling(held.send('Network.streamResourceContent', { requestId }), 'Network.streamResourceContent')
+          const buffered = typeof result?.bufferedData === 'string' ? result.bufferedData : ''
+          if (buffered) reader.push(buffered, Date.now())
+          return
+        } catch {
+          // Give up quietly: the turn keeps its guard and shortener.
+          if (Date.now() >= deadline) return
+          await new Promise(resolve => setTimeout(resolve, MARKER_TAP_RETRY_MS))
+        }
+      }
+    })().catch(() => {})
+  }
   let session = null
   let reason = null
   try {
@@ -1344,7 +1636,7 @@ async function startNetworkWatch(page) {
               // A second send POST while we hold an acceptance means the request
               // that was accepted is not the last word: nothing it emits can be
               // attributed to the turn the caller waits for.
-              if (acceptedResponse && requestId !== acceptedResponse.requestId) resolveCompletion(null)
+              if (acceptedResponse && requestId !== acceptedResponse.requestId) { resolveCompletion(null); resolveMarker(null) }
             }
           }
         } catch {}
@@ -1363,6 +1655,17 @@ async function startNetworkWatch(page) {
           acceptedResponse = { at: Date.now(), status, pathname, requestId }
           resolveAccepted(acceptedResponse)
           considerCompletion()
+          startTap(requestId)
+        } catch {}
+      })
+      // Bytes Chrome is already reading from the send POST, once the tap asked
+      // for them. `data` is base64 of the ALREADY-DECODED body even when the
+      // response header says `content-encoding: gzip` (live, 2026-11-01), which
+      // is why the frames are parsed as text and not gunzipped.
+      session.on('Network.dataReceived', event => {
+        try {
+          if (!tapId || event?.requestId !== tapId) return
+          if (typeof event?.data === 'string' && event.data) reader.push(event.data, Date.now())
         } catch {}
       })
       // The body ending is the only claim this makes: the request is done. A
@@ -1424,6 +1727,17 @@ async function startNetworkWatch(page) {
     // some other way, and null when this observer can no longer say anything
     // (stopped, superseded). Never rejects.
     completion,
+    // Resolves `{ at, requestId, messageId, lastTokenAt }` at the first
+    // `/message/status finished_successfully` + `/message/end_turn true` patch
+    // in the accepted send POST's body, or null when the observer is stopped,
+    // superseded, or the tap could not be started. Never rejects.
+    marker,
+    // The answer text the tap has received so far, as `{ id, text, at }`, or
+    // `{ id: null, text: '' }` when no content has been attributed yet. It is a
+    // live read, not a snapshot: a post-marker delta shows here too. The marker
+    // path uses `text` to check that the DOM has caught up to the source; when
+    // `id` is not the answer id the marker named, the check is unavailable.
+    answerText: () => ({ id: answerBuffer.id, text: answerBuffer.parts.join(''), at: answerBuffer.at }),
     stop: async () => {
       const held = session
       session = null
@@ -1435,10 +1749,12 @@ async function startNetworkWatch(page) {
           ceiling(held.detach(), 'detach'),
         ])
       }
-      // Release anyone racing on acceptance or completion: the observer is gone,
-      // so neither can arrive for it now.
+      // Release anyone racing on acceptance, completion or the marker: the
+      // observer is gone, so none of them can arrive for it now.
+      if (postMarkerDeltas) await log(`reply marker: ${postMarkerDeltas} content delta(s) after the marker`)
       if (!acceptedResponse) resolveAccepted(null)
       resolveCompletion(null)
+      resolveMarker(null)
       return { available: held !== null, reason, seen }
     },
   }
@@ -1881,6 +2197,39 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
       () => { completion = null; completionKnown = true; return null },
     )
     : null
+  // The source's own completion patch, when the caller has one. It buys a
+  // bounded confirm rather than an immediate delivery: live T2 read 877 chars
+  // at the marker and the final 974 thirty-one milliseconds later, so the
+  // source can lead the paint. Absent, unavailable or null, the two paths below
+  // are exactly what they were.
+  const markerSignal = typeof watch?.marker?.then === 'function' ? watch.marker : null
+  let marker = null
+  let markerKnown = false
+  // One attempt per turn: a marker whose confirm does not settle is not retried
+  // at the shorter cadence, it hands the turn back to the guard.
+  let markerTried = false
+  let markerArrivedAt = null
+  let markerDeliveredAt = null
+  let markerSamples = 0
+  let markerSettleMs = 0
+  let markerEntryLag = 0
+  // The answer text the tap holds, when it can be attributed to the same message
+  // the completion patch named. Null means "no claim": the DOM equality rule is
+  // then exactly what it was.
+  const answerTail = () => {
+    if (typeof watch?.answerText !== 'function') return null
+    let state = null
+    try { state = watch.answerText() } catch { return null }
+    if (!state || !state.text) return null
+    if (!marker?.messageId || state.id !== marker.messageId) return null
+    return tailSuffix(state.text)
+  }
+  const markerSettled = markerSignal
+    ? markerSignal.then(
+      value => { marker = value; markerKnown = true; return value },
+      () => { marker = null; markerKnown = true; return null },
+    )
+    : null
   // Only a finished body counts: `loadingFinished`, or the page's own client
   // cancellation of its SSE reader. A transport fault, a supersession (`null`)
   // and a stop all land in `completion` without `at`, and are not evidence of an
@@ -1890,17 +2239,23 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
   // not busy - so this changes when the partial answer comes back, not what.
   const cleanEnd = () => (completion && typeof completion.at === 'number' ? completion : null)
   const sleepOrCompletion = async ms => {
-    if (!settled || completionKnown) return sleep(ms)
+    // Only a signal this loop has not seen yet may cut the interval short. Once
+    // a signal is known, the interval is the guard's again, exactly as before.
+    const fresh = []
+    if (settled && !completionKnown) fresh.push(settled)
+    if (markerSettled && !markerKnown) fresh.push(markerSettled)
+    if (!fresh.length) return sleep(ms)
     const at = Date.now()
-    await Promise.race([sleep(ms), settled])
-    // A failed/superseded/stopped watch says "the observer is done", not "the
-    // answer is in": the guard's own interval is still served in full. Only a
-    // clean end may end a sleep early, because that is the read the shortener
-    // wants.
-    if (completionKnown && !cleanEnd()) {
-      const rest = ms - (Date.now() - at)
-      if (rest > 0) await sleep(rest)
-    }
+    await Promise.race([sleep(ms), ...fresh])
+    const rest = ms - (Date.now() - at)
+    if (rest <= 0) return
+    // A clean stream end or a live marker may end the interval early: both are
+    // reads this loop wants now. Anything else - a failed/superseded/stopped
+    // watch - says "the observer is done", not "the answer is in", so the
+    // guard's own interval is still served in full.
+    if (completionKnown && cleanEnd()) return
+    if (markerKnown && marker && typeof marker.at === 'number') return
+    await sleep(rest)
   }
   const refuseProblems = async () => {
     const body = await page.evaluate(() => (document.body?.innerText || '').slice(-4000)).catch(() => '')
@@ -1920,9 +2275,96 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
     if (how === 'stream') {
       await log(`reply stream: ended at ${completion.at - startedAt}ms (${completion.end}), first stable sample at ${firstStableAt - startedAt}ms (shortener)`)
     }
+    if (how === 'marker') {
+      const named = marker.messageId ? ` (message ${marker.messageId})` : ''
+      // The corroborating marker usually arrives in the same batch but after
+      // the patch frame, so a null here means "not yet seen", not "absent".
+      const corroborated = marker.lastTokenAt ? `, last_token at ${marker.lastTokenAt - startedAt}ms` : ''
+      await log(`reply marker: /message/status finished at ${markerArrivedAt - startedAt}ms${named}, entered +${markerEntryLag}ms, confirm settled at ${markerDeliveredAt - startedAt}ms after ${markerSamples} samples (${markerSettleMs}ms), delivered ${reply.length} chars${corroborated}`)
+      // Counterfactual for the same turn, stated for exactly one path: the
+      // 3 x 900 ms guard, projected from the same stable read. The existing
+      // stream-end shortener is a different (usually earlier) counterfactual
+      // and is measured from the stream end, not from here. A LOWER BOUND, not
+      // a prediction: a guard sample taken while the stop control is still
+      // visible resets agreement, and the page's busy flag has been measured
+      // clearing up to 1.4 s after the patch, so the guard can lose one or two
+      // 900 ms steps that this arithmetic does not charge it.
+      const guardAt = stableSince === null ? null : stableSince - startedAt + (ANSWER_AGREE_SAMPLES - 1) * 900
+      await log(`reply marker: guard (3 x 900ms from the same stable read) would have said at least ~${guardAt === null ? 'unknown' : `${guardAt}ms`} (lower bound; busy can reset a cadence step)`)
+    }
     return { reply }
   }
+  // The bounded confirm after the source's marker. Two consecutive equal
+  // non-empty samples inside MARKER_CONFIRM_MS deliver; the cap falling first
+  // is the DOM not having caught up, and the turn goes back to the guard.
+  const confirmAfterMarker = async () => {
+    // The window starts when the loop can actually look, not when the frame
+    // landed: a big table sample can hold the loop past the marker's own 400 ms
+    // (live 2026-11-01, shape 4: the confirm arrived with the window already
+    // spent and took 0 samples). The entry lag is logged, so a late entry is
+    // visible rather than hidden.
+    const enteredAt = Date.now()
+    const entryLag = enteredAt - markerArrivedAt
+    markerEntryLag = entryLag
+    const capAt = enteredAt + MARKER_CONFIRM_MS
+    let previous = ''
+    let previousAt = 0
+    let samples = 0
+    const trace = []
+    const firstReadAt = enteredAt + MARKER_SETTLE_MS
+    while (Date.now() <= capAt) {
+      // Spend the render budget before the first read: the source leads the
+      // paint, and a pair taken before the paint lands would agree on the
+      // short text.
+      const wait = firstReadAt - Date.now()
+      if (wait > 0) await sleep(Math.min(wait, capAt - Date.now()))
+      if (Date.now() > capAt) break
+      const snapshot = await sampleTurn(page).catch(() => null)
+      const at = Date.now()
+      samples += 1
+      const busy = await busyState(page)
+      const got = Boolean(snapshot?.found && snapshot.text) && (snapshot.candidates > beforeCount || snapshot.text !== beforeText)
+      // The payload tail check. Equality alone cannot tell a finished answer
+      // from a stable prefix of one: live 2026-11-01 a 37-char prefix held for
+      // 423 ms while the source had the full 253 chars. When the tap can name
+      // the answer's text, its last words must already be in this read.
+      const suffix = answerTail()
+      const closed = suffix === null ? null : got ? normalizeAnswerText(snapshot.text).includes(suffix) : false
+      if (trace.length < 12) trace.push(`${at - enteredAt}ms:${got ? (snapshot.text.length ?? 0) : 'none'}${busy.busy ? '+busy' : ''}${suffix === null ? '+no-tail' : closed ? '+tail' : '+tail-miss'}`)
+      // The busy flag is deliberately NOT a condition here. It is the page's
+      // streaming/thinking marker and it LAGS the source: live 2026-11-01 the
+      // answer was already final (418 chars, unchanged) at +215/+277/+340/+402 ms
+      // while the page still reported busy at every one of those reads. The
+      // source's patch is the stronger statement; requiring the lagging DOM flag
+      // as well makes the path unreachable. It is logged, never gating.
+      if (got && previous && snapshot.text === previous && (suffix === null || closed)) {
+        agree = 2
+        stableSince = previousAt
+        markerDeliveredAt = at
+        markerSamples = samples
+        markerSettleMs = at - previousAt
+        await refuseProblems()
+        return await finish('marker', snapshot.text)
+      }
+      previous = got ? snapshot.text : ''
+      previousAt = at
+      const left = capAt - Date.now()
+      if (left <= 0) break
+      await sleep(Math.min(MARKER_SAMPLE_MS, left))
+    }
+    const named = marker.messageId ? ` (message ${marker.messageId})` : ''
+    await log(`reply marker: /message/status finished at ${markerArrivedAt - startedAt}ms${named}, entered +${entryLag}ms, confirm did not settle within ${MARKER_CONFIRM_MS}ms (${samples} samples: ${trace.join(', ')}); falling back to the guard`)
+    return null
+  }
   while (Date.now() < deadline) {
+    // The source says the turn is over. Confirm the DOM once, bounded, and
+    // deliver as soon as it settles.
+    if (!markerTried && markerKnown && marker && typeof marker.at === 'number') {
+      markerTried = true
+      markerArrivedAt = marker.at
+      const delivered = await confirmAfterMarker()
+      if (delivered) return delivered
+    }
     // A clean end with a reply already on the page buys exactly one confirming
     // read, taken after the settle. The sample the guard already holds is the
     // reference - no fresh read is taken at the stream end, so the whole turn
@@ -2018,6 +2460,55 @@ const ANSWER_AGREE_SAMPLES = 3
  * render. Bounded to 150-250 ms.
  */
 const STREAM_SETTLE_MS = 200
+
+/**
+ * How long the marker path confirms the DOM once the loop can look at it (the
+ * entry lag is logged; a slow sample can hold the loop past the frame). The
+ * source can lead the paint: live T2 read 877 chars at the marker and 974
+ * (final) 31 ms later. Two consecutive equal non-empty samples inside the
+ * window deliver; the cap falling first means the DOM has not caught up, and
+ * the turn falls back to the guard unchanged rather than being delivered on a
+ * truncated read.
+ */
+const MARKER_CONFIRM_MS = 400
+
+/** Sampling interval inside the marker confirm window. */
+const MARKER_SAMPLE_MS = 50
+
+/**
+ * How long after the marker the first confirming read is taken. The source
+ * leads the paint: live T2 read 877 chars at the marker and the final 974 at
+ * +112 ms (a render of ~150 ms). Two equal reads taken at 50 ms spacing from
+ * the marker itself would both land inside that lag and deliver the short
+ * text, so the pair is taken only after one render budget has passed. The cap
+ * is unchanged; this spends 200 of its 400 ms on the lag it is there to cover.
+ */
+const MARKER_SETTLE_MS = 200
+
+/**
+ * How long `Network.streamResourceContent` is retried after the response
+ * header. It fails while the body has not started, so the first call is
+ * normally too early; the retry is cheap and never blocks the send path.
+ */
+const MARKER_TAP_RETRY_MS = 120
+
+/** When to give up on starting the tap for this turn. */
+const MARKER_TAP_DEADLINE_MS = 5000
+
+/**
+ * The payload tail check: how many whole words of the answer's own stream text
+ * must be present in the DOM read before the marker path may deliver.
+ *
+ * Live 2026-11-01, 12:57 turn: the source had all 253 chars of the answer before
+ * the patch, the DOM showed a stable 37-char prefix 266 ms after it, and the
+ * marker path delivered 37 of 253. Equality alone cannot see that: the prefix
+ * was unchanged between two probes. The last 8 words of the payload were not in
+ * the DOM read, would not be until the paint landed 423 ms after the patch, and
+ * that is the check this constant sets. Below TAIL_MIN_WORDS the answer is too
+ * short to make a claim, and the check is unavailable rather than wrong.
+ */
+const TAIL_WORDS = 8
+const TAIL_MIN_WORDS = 3
 
 /**
  * Read the newest ANSWER without touching the composer.
@@ -4151,6 +4642,8 @@ export {
   SEND_ATTACH_CREDIT_MS, ATTACH_INPUT_TIMEOUT_MS, ATTACH_CHIP_TIMEOUT_MS,
   composeExactlyOnce, clearComposer, composerTextOf, readUserTreeOnPage, recoverComposer,
   readUserNodesInPage, readUserNodesOn, waitForReply, STREAM_SETTLE_MS, ANSWER_AGREE_SAMPLES,
+  parseTurnMarker, parseMessageMarker, parseContentDelta, createSseFrames, MARKER_CONFIRM_MS, MARKER_SAMPLE_MS,
+  framePartOps, frameMessageId, contentPartOps, normalizeAnswerText, tailSuffix, TAIL_WORDS, TAIL_MIN_WORDS,
   commandLineTokens, portOwner,
   exhaustedLaunchWhy,
   // G-010: the enforced deadline and the advertised ceiling are exported so a
