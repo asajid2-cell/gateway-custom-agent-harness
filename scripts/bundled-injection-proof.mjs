@@ -47,10 +47,12 @@ const GATEWAY_SCRIPT = path.join(ROOT, 'scripts', 'model-gateway.mjs')
 
 // Supervisor log contract (see gateway-supervisor.mjs). Line-anchored on the
 // stderr pipe the supervisor writes to; the gateway's own lines share it.
-const SUP_PREFIX = 'model-gateway supervisor '
 const RELOAD_LINE = /^model-gateway supervisor reload-keys requested; restarting with a fresh (\S+) credential chain$/m
 const CHILD_EXIT_LINE = /^model-gateway supervisor child-exit code=(\S+) signal=(\S+) restart=(\d+)\/(\d+) delay_ms=(\d+)$/gm
 const LIMIT_LINE = /^model-gateway supervisor restart-limit-exhausted/m
+// matchAll needs its own global copy; a global RegExp reused with .test() keeps
+// lastIndex state and silently skips matches.
+const RELOAD_LINE_ALL = new RegExp(RELOAD_LINE.source, 'gm')
 const STALE = 'STALE_SENTINEL_MUST_NOT_SURVIVE'
 const WATCHED = ['DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'AMD_API_KEY', 'COMMANDCODE_API_KEY']
 
@@ -178,7 +180,7 @@ function childExitLines(log) {
  * crash again (restart must be 1, not 2). Line-anchored on the supervisor's
  * own stderr contract; no prose heuristics.
  */
-async function reloadPhase(env) {
+async function reloadPhase(env, { vault, vaultDir } = {}) {
   if (!existsSync(SUPERVISOR_SCRIPT) || !existsSync(GATEWAY_SCRIPT)) {
     record('supervisor reload accounting', 'SKIP', 'supervisor/model-gateway not present in this tree')
     return
@@ -224,6 +226,22 @@ async function reloadPhase(env) {
       return pid
     }
 
+    // Slot 1 of opencode lives in the vault for the whole run; slot 2 is saved
+    // mid-run to prove the reload response reflects a fresh vault read.
+    const slot1 = `probe-${createHash('sha256').update(`oc1-${Date.now()}`).digest('hex').slice(0, 32)}`
+    await vault.captureSecret('opencode-go', slot1, { vaultDir })
+
+    const reload = async label => {
+      const before = log.length
+      const response = await httpRequest('POST', `http://127.0.0.1:${port}/gateway/reload-keys`)
+      let body = null
+      try {
+        body = JSON.parse(response.body)
+      } catch {}
+      await waitFor(() => log.slice(before).match(RELOAD_LINE), 25000, `${label} reload line`)
+      return { status: response.status, body, segment: log.slice(before) }
+    }
+
     // One deliberate crash before the reload, so the reset is meaningful.
     await crash('pre-reload')
     if (!(await waitFor(() => childExitLines(log).length >= 1, 20000, 'first child-exit line'))) {
@@ -235,24 +253,50 @@ async function reloadPhase(env) {
     }
     await waitFor(healthy, 45000, '/health after first restart')
 
-    const beforeReload = log.length
-    const response = await httpRequest('POST', `http://127.0.0.1:${port}/gateway/reload-keys`)
-    record('reload route answers 200', response.status === 200 ? 'PASS' : 'FAIL',
-      `HTTP ${response.status} ${String(response.body).slice(0, 80)}`)
+    const firstReload = await reload('first')
+    record('reload route answers 200', firstReload.status === 200 ? 'PASS' : 'FAIL',
+      `HTTP ${firstReload.status} ${JSON.stringify(firstReload.body ?? {}).slice(0, 100)}`)
+    const firstMode = firstReload.segment.match(RELOAD_LINE)?.[1]
+    record('reload line names the bundled chain', firstMode === 'bundled' ? 'PASS' : 'FAIL',
+      firstMode ? `mode=${firstMode}` : `no reload line; got ${firstReload.segment.slice(-200)}`)
+    record('reload reports the saved opencode slot',
+      Array.isArray(firstReload.body?.available) && firstReload.body.available.includes(1) &&
+      !firstReload.body.available.includes(2) ? 'PASS' : 'FAIL',
+      `available=${JSON.stringify(firstReload.body?.available ?? null)} (expected [1])`)
 
-    const reloadSeen = await waitFor(() => RELOAD_LINE.test(log), 25000, 'reload line')
-    const reloadMatch = log.match(RELOAD_LINE)
-    record('reload line names the bundled chain', reloadSeen && reloadMatch?.[1] === 'bundled' ? 'PASS' : 'FAIL',
-      reloadSeen ? reloadMatch[0] : `no reload line; log=${log.slice(beforeReload).slice(-300)}`)
+    await waitFor(healthy, 45000, '/health after first reload')
 
-    const reloadIndex = reloadSeen ? log.search(RELOAD_LINE) : -1
-    const tail = reloadIndex >= 0 ? log.slice(reloadIndex) : ''
+    // Mid-run save. `available` is built from process.env + the in-process
+    // overlay (sessionOpenCodeCredentials), not by re-reading the vault, so the
+    // process that answers the NEXT reload still has the old chain: the new slot
+    // appears one generation later, when that reload's respawn has run. Assert
+    // the real behaviour and make the lag explicit rather than papering over it.
+    const slot2 = `probe-${createHash('sha256').update(`oc2-${Date.now()}`).digest('hex').slice(0, 32)}`
+    await vault.captureSecret('opencode-go2', slot2, { vaultDir })
+    const secondReload = await reload('second')
+    record('reload reports the running chain',
+      Array.isArray(secondReload.body?.available) && secondReload.body.available.includes(1) &&
+      !secondReload.body.available.includes(2) ? 'PASS' : 'FAIL',
+      `available=${JSON.stringify(secondReload.body?.available ?? null)} (the answering process ` +
+      'started before the save, so the new slot is not in its env yet)')
+
+    await waitFor(healthy, 45000, '/health after second reload')
+    const thirdReload = await reload('third')
+    record('mid-run save lands on the next generation',
+      Array.isArray(thirdReload.body?.available) && thirdReload.body.available.includes(1) &&
+      thirdReload.body.available.includes(2) ? 'PASS' : 'FAIL',
+      `available=${JSON.stringify(thirdReload.body?.available ?? null)} (expected [1,2])`)
+
+    const reloadMatches = [...log.matchAll(RELOAD_LINE_ALL)]
+    const lastReloadIndex = reloadMatches.length ? reloadMatches[reloadMatches.length - 1].index : -1
+    const tail = lastReloadIndex >= 0 ? log.slice(lastReloadIndex) : ''
     record('reload does not log a crash', tail && !/^model-gateway supervisor child-exit /m.test(tail) ? 'PASS' : 'FAIL',
-      `child-exit lines after reload=${(tail.match(/^model-gateway supervisor child-exit /gm) ?? []).length}`)
+      `reloads=${reloadMatches.length}, child-exit lines after the last one=` +
+      `${(tail.match(/^model-gateway supervisor child-exit /gm) ?? []).length}`)
     record('reload never exhausts the restart limit', !LIMIT_LINE.test(log) ? 'PASS' : 'FAIL',
       `restart-limit-exhausted lines=${(log.match(/^model-gateway supervisor restart-limit-exhausted /gm) ?? []).length}`)
 
-    await waitFor(healthy, 45000, '/health after reload')
+    await waitFor(healthy, 45000, '/health after second reload')
     await crash('post-reload')
     const exits = childExitLines(log)
     const afterReload = exits[exits.length - 1]
@@ -402,7 +446,7 @@ async function main() {
     record('reload exit code propagates', code === 75 ? 'PASS' : 'FAIL',
       `launcher exit=${code} (expected 75)`)
 
-    await reloadPhase(env)
+    await reloadPhase(env, { vault, vaultDir })
   } finally {
     try {
       if (launcher && launcher.exitCode === null) launcher.kill()
