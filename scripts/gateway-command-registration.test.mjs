@@ -25,7 +25,7 @@ test('gateway login command objects expose the expected interactive names', () =
 test('commandcodelogin advertises the account selection argument hint', () => {
   assert.match(
     loginSource,
-    /keyName === 'opencode-go' \|\| keyName === 'commandcode'\s*\n\s*\?\s*'\[new\|switch <number> \[session\|global\]\|status\|remove\]'/,
+    /keyName === 'opencode-go' \|\| keyName === 'commandcode' \|\| keyName === 'mistral'\s*\n\s*\?\s*'\[new\|switch <number> \[session\|global\]\|status\|remove\]'/,
   )
   assert.match(loginSource, /command\(\s*'commandcodelogin'/)
 })
@@ -38,7 +38,10 @@ test('commandcode keys are labelled and routed as Command Code slots', () => {
 test('commandcode login supports new, switch, and status against the gateway', () => {
   assert.match(loginImplementationSource, /'\/gateway\/commandcode-account'/)
   assert.match(loginImplementationSource, /nextKeySlot\(accountKeyPrefix\)/)
-  assert.match(loginImplementationSource, /accountKeyPrefix === 'commandcode' \? 'Command Code' : 'OpenCode'/)
+  assert.match(
+    loginImplementationSource,
+    /accountKeyPrefix === 'commandcode' \? 'Command Code' : accountKeyPrefix === 'mistral' \? 'Mistral' : 'OpenCode'/,
+  )
   assert.match(loginImplementationSource, /`\$\{label\} account \$\{result\.number\} selected /)
   assert.match(loginImplementationSource, /`\$\{label\} active account: \$\{result\.number\}; global default:/)
   assert.match(loginImplementationSource, /Automatic fallback remains enabled\.`/)
@@ -50,15 +53,16 @@ test('gateway login commands are included in the built-in command registry', () 
   assert.match(commandsSource, /\bopenCodeLoginCommand,\s*[\r\n]\s*commandCodeLogin/)
 })
 
-test('gateway mode registers the provider-key login, off-gateway keeps OAuth login', () => {
+test('gateway mode registers the credential login, off-gateway keeps OAuth login', () => {
   // Exactly one `login` in either mode: the OAuth command off gateway, the
-  // provider-key command under gateway/3P. Never both, never none.
+  // gateway credential command under gateway/3P. Never both, never none.
   assert.match(
     commandsSource,
     /isUsing3PServices\(\)\s*\?\s*\[gatewayLogin\]\s*:\s*\[logout, login\(\)\]/,
   )
   assert.match(loginSource, /name: 'login'/)
-  assert.match(loginSource, /gateway provider key \(opencode, commandcode, deepseek, openrouter\)/)
+  assert.match(loginSource, /Claude Code or Codex/)
+  assert.match(loginSource, /mistral, mistralvibe/)
 })
 
 test('the gateway login command reaches the picker and the per-provider UI', async () => {
@@ -74,6 +78,28 @@ test('the gateway login command reaches the picker and the per-provider UI', asy
   // existing per-provider dialog with the bound credential name.
   assert.match(unifiedSource, /<ProviderPicker action=\{plan\.action\}/)
   assert.match(unifiedSource, /import \{ call as providerLogin \} from '\.\/login\.js'/)
-  assert.match(unifiedSource, /PROVIDER_CREDENTIALS\[props\.provider\]/)
-  assert.match(planSource, /opencode: 'opencode-go',\s*\n\s*commandcode: 'commandcode',\s*\n\s*deepseek: 'ds',\s*\n\s*openrouter: 'openrouter'/)
+  assert.match(unifiedSource, /PROVIDER_CREDENTIALS\[provider\]/)
+  assert.match(
+    planSource,
+    /opencode: 'opencode-go',\s*\n\s*commandcode: 'commandcode',\s*\n\s*mistral: 'mistral',\s*\n\s*mistralvibe: 'mistralvibe',\s*\n\s*deepseek: 'ds',\s*\n\s*openrouter: 'openrouter'/,
+  )
+})
+
+test('the gateway picker reaches the host sign-ins, not only vault keys', async () => {
+  const unifiedSource = await readFile(
+    new URL('../src/commands/gateway-login/unified.tsx', import.meta.url),
+    'utf8',
+  )
+  const planSource = await readFile(
+    new URL('../src/commands/gateway-login/unified-plan.ts', import.meta.url),
+    'utf8',
+  )
+  // Claude Code keeps Anthropic's own OAuth flow, Codex keeps its device-auth
+  // login, and neither is turned into a vault key.
+  assert.match(unifiedSource, /import \{ call as anthropicLogin \} from '\.\.\/login\/anthropic\.js'/)
+  assert.match(unifiedSource, /import \{[\s\S]*ChatGptLogin[\s\S]*\} from '\.\.\/login\/login\.js'/)
+  assert.match(unifiedSource, /performLogout/)
+  assert.match(planSource, /export const PROVIDERS: ProviderName\[\] = \['claude', 'codex', \.\.\.KEY_PROVIDERS\]/)
+  assert.match(planSource, /anthropic: 'claude'/)
+  assert.match(planSource, /chatgpt: 'codex'/)
 })

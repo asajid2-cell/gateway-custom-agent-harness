@@ -40,8 +40,8 @@ export const gatewayLogin: Command = {
   type: 'local-jsx',
   name: 'login',
   description:
-    'Add, replace, inspect, or remove a gateway provider key (opencode, commandcode, deepseek, openrouter)',
-  argumentHint: '[provider|status|remove]',
+    'Sign in to Claude Code or Codex, or add, replace, inspect, or remove a gateway provider key (opencode, commandcode, mistral, mistralvibe, deepseek, openrouter)',
+  argumentHint: '[claude|codex|provider|status|remove]',
   load: async () => {
     const module = await import('./unified.js')
     return {
