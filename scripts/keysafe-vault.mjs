@@ -25,6 +25,7 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
+import os from 'node:os'
 import path from 'node:path'
 
 const ALGORITHM = 'aes-256-gcm'
@@ -210,9 +211,48 @@ function requireSuccess(result, what) {
   return String(result.stdout).trim()
 }
 
+const hardenedDirs = new Set()
+
+/**
+ * A protected DACL on the vault directory: no inherited ACEs, then explicit
+ * full control for the current user, SYSTEM and Administrators, propagating to
+ * descendants. This is what removes an inherited CodexSandboxUsers grant.
+ * New files created inside inherit these ACEs; chmod(0600) is not enough here.
+ */
+async function hardenWindowsAcl(dir) {
+  if (process.platform !== 'win32' || hardenedDirs.has(dir) || process.env.KEYSAFE_SKIP_ACL === '1') {
+    return
+  }
+  const user = process.env.USERNAME || os.userInfo().username
+  const domain = process.env.USERDOMAIN
+  const principal = domain && domain.toLowerCase() !== user.toLowerCase() ? `${domain}\\${user}` : user
+  const result = await defaultRun(
+    'icacls',
+    [
+      dir,
+      '/inheritance:r',
+      '/grant:r',
+      `${principal}:(OI)(CI)F`,
+      '/grant:r',
+      'SYSTEM:(OI)(CI)F',
+      '/grant:r',
+      'BUILTIN\\Administrators:(OI)(CI)F',
+    ],
+    '',
+  )
+  if (result.code !== 0) {
+    throw new Error(
+      `keysafe: could not protect the vault directory ACL (exit ${result.code}): ` +
+        `${String(result.stderr).trim().slice(0, 240)}`,
+    )
+  }
+  hardenedDirs.add(dir)
+}
+
 async function ensureDir(dir) {
   await mkdir(dir, { recursive: true, mode: 0o700 })
   if (process.platform !== 'win32') await chmod(dir, 0o700).catch(() => {})
+  await hardenWindowsAcl(dir)
 }
 
 async function writePrivate(file, contents) {
