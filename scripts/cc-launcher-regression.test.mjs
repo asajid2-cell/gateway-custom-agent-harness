@@ -280,7 +280,11 @@ test('launcher names the two gateway-unhealthy modes instead of one timeout', as
   assert.match(script, /errorType = 'exited'/)
   assert.match(script, /errorType = 'timeout'/)
   assert.match(script, /\$gatewayExitCode = \$GatewayProcess\.ExitCode/)
-  assert.match(script, /backend exited \(code \$gatewayExitCode\) after \$\{elapsedMs\}ms/)
+  assert.match(script, /backend exited \(code \$codeText\) after \$\{elapsedMs\}ms/)
+  // The missing-record hint emits only the validated name from keysafe's own
+  // message, never raw stderr.
+  assert.match(script, /no key named '\(\[A-Za-z0-9\._-\]\{1,64\}\)'/)
+  assert.match(script, /credential is missing from the legacy keysafe store/)
   assert.match(script, /did not become healthy within 15 seconds \(waited \$\{elapsedMs\}ms\)/)
   assert.match(script, /\$PreserveGatewayLogs = \$true/)
   assert.match(script, /if \(\$KeepGatewayLogs -or \$PreserveGatewayLogs\)/)
@@ -725,6 +729,51 @@ test('cc login forwards the credential subcommand without session flags', { skip
     let events = []
     try { events = (await readFile(path.join(root, 'Gateway', 'launcher.jsonl'), 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse) } catch {}
     assert.equal(events.some(event => event.event === 'gateway-spawn-start'), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a gateway that dies on a missing keysafe record names that record', { skip: process.platform !== 'win32', timeout: 120000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'gateway-missing-key-'))
+  try {
+    const home = path.join(root, 'home')
+    const keysafeDir = path.join(home, '.claude', 'skills', 'keysafe', 'scripts')
+    await mkdir(keysafeDir, { recursive: true })
+    await mkdir(path.join(root, 'scripts'))
+    await mkdir(path.join(root, 'src'))
+    await mkdir(path.join(root, 'dist'))
+    await mkdir(path.join(root, 'tmp'))
+    await copyFile(new URL('./cc.ps1', import.meta.url), path.join(root, 'scripts', 'cc.ps1'))
+    await copyFile(new URL('./owned-gateway-process.ps1', import.meta.url), path.join(root, 'scripts', 'owned-gateway-process.ps1'))
+    await copyFile(new URL('./effort-capabilities.json', import.meta.url), path.join(root, 'scripts', 'effort-capabilities.json'))
+    await writeFile(path.join(root, 'scripts', 'model-gateway.mjs'), 'export {}')
+    await writeFile(path.join(root, 'scripts', 'gateway-supervisor.mjs'), 'export {}')
+    await writeFile(path.join(root, 'scripts', 'build.ts'), 'export {}')
+    await writeFile(path.join(root, 'src', 'input.ts'), 'export {}')
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'bun scripts/build.ts' } }))
+    await writeFile(path.join(root, 'dist', 'cli.js'), 'throw new Error("the harness must not start")')
+    await writeFile(path.join(keysafeDir, 'keysafe.ps1'), [
+      'param([string]$Action, [string]$Inject, [string]$Command)',
+      '[Console]::Error.WriteLine("no key named \'ds\' - capture it first")',
+      'exit 1',
+    ].join('\r\n'))
+
+    const env = { ...process.env, GATEWAY_CREDENTIALS_MODE: 'external', CC_RAW_ARGS: 'hello',
+      CC_CLAUDE_RUNNER_OVERRIDE: process.execPath, LOCALAPPDATA: root, USERPROFILE: home,
+      TEMP: path.join(root, 'tmp'), TMP: path.join(root, 'tmp') }
+    delete env.CC_CLAUDE_SCRIPT_OVERRIDE
+    delete env.TANDEM_GATEWAY_CODEX_HOME
+
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'scripts', 'cc.ps1')], {
+      env, encoding: 'utf8', timeout: 60000,
+    })
+    assert.notEqual(result.status, 0)
+    const noise = `${result.stdout}\n${result.stderr}`
+    // The owned-process wrapper cannot always replay ExitCode; the point is
+    // that the code is named rather than rendered as an empty parenthesis.
+    assert.match(noise, /exited \(code (?:1|unknown)\)/, noise)
+    assert.match(noise, /the 'ds' credential is missing from the legacy keysafe\s+store/, noise)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

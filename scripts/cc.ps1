@@ -1255,12 +1255,32 @@ try {
       $elapsedMs = [int]([DateTime]::UtcNow - $healthStarted).TotalMilliseconds
       if ($GatewayProcess.HasExited) {
         $gatewayExitCode = $null
-        try { $gatewayExitCode = $GatewayProcess.ExitCode } catch {}
+        try {
+          [void]$GatewayProcess.WaitForExit(2000)
+          $gatewayExitCode = $GatewayProcess.ExitCode
+        } catch {}
+        $codeText = if ($null -ne $gatewayExitCode) { [string]$gatewayExitCode } else { 'unknown' }
         $failureFields = @{ port = $Port; errorType = 'exited' }
         if ($null -ne $gatewayExitCode) { $failureFields.exitCode = $gatewayExitCode }
         Write-LaunchDiagnostic 'gateway-unhealthy' $failureFields
         $PreserveGatewayLogs = $true
-        throw "Model gateway backend exited (code $gatewayExitCode) after ${elapsedMs}ms without becoming healthy. Safe diagnostics: $DiagnosticPath"
+        # keysafe refuses to inject a record it does not have, and the wrapper
+        # exits in about a second. Name the missing record so the operator does
+        # not have to open the log: emit only the validated name from keysafe's
+        # own message, never raw stderr (it could carry provider payloads).
+        $missingCredential = $null
+        try {
+          foreach ($line in @(Get-Content -LiteralPath $StderrLog -Tail 40 -ErrorAction Stop)) {
+            if ([string]$line -match "no key named '([A-Za-z0-9._-]{1,64})'") {
+              $missingCredential = $Matches[1]
+              break
+            }
+          }
+        } catch {}
+        if ($missingCredential) {
+          throw "Model gateway backend exited (code $codeText) after ${elapsedMs}ms: the '$missingCredential' credential is missing from the legacy keysafe store. Capture it with /login inside a gateway session or with cc login, then launch again. Safe diagnostics: $DiagnosticPath"
+        }
+        throw "Model gateway backend exited (code $codeText) after ${elapsedMs}ms without becoming healthy. Safe diagnostics: $DiagnosticPath"
       }
       Write-LaunchDiagnostic 'gateway-unhealthy' @{ port = $Port; errorType = 'timeout' }
       throw "Model gateway did not become healthy within 15 seconds (waited ${elapsedMs}ms). Safe diagnostics: $DiagnosticPath"
