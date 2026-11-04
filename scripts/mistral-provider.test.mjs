@@ -7,6 +7,7 @@ import {
   mistralEndpoint,
   mistralGatewayId,
   mistralHeaders,
+  mistralRouteVariants,
 } from './mistral.mjs'
 import {
   MISTRAL_EFFORT_LEVELS,
@@ -75,12 +76,34 @@ test('Mistral advertises the closed reasoning_effort enum it validates', () => {
   ])
 })
 
-test('the Mistral route is a first-class picker entry with aliases', () => {
-  const id = 'gateway-mistral-deepseek-v4.1-flash'
-  assert.ok(GATEWAY_MODEL_OPTIONS.some(option => option.value === id))
-  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral/deepseek-v4-1-flash-1017'], id)
-  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral-deepseek-v4-1-flash-1017'], id)
-  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral-deepseek-v4.1-flash'], id)
+test('Mistral Vibe and Studio are separate picker entries', () => {
+  const vibe = 'gateway-mistral-vibe-deepseek-v4.1-flash'
+  const api = 'gateway-mistral-api-deepseek-v4.1-flash'
+  assert.ok(GATEWAY_MODEL_OPTIONS.some(option => option.value === vibe))
+  assert.ok(GATEWAY_MODEL_OPTIONS.some(option => option.value === api))
+  // The unsuffixed id is a legacy alias of the Vibe route, not a second picker
+  // entry; existing transcripts spend the same budget they did before.
+  assert.equal(
+    GATEWAY_MODEL_OPTIONS.some(
+      option => option.value === 'gateway-mistral-deepseek-v4.1-flash',
+    ),
+    false,
+  )
+  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral/deepseek-v4-1-flash-1017'], vibe)
+  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral-deepseek-v4-1-flash-1017'], vibe)
+  assert.deepEqual(GATEWAY_MODEL_ALIAS_MAP['mistral-deepseek-v4.1-flash'], vibe)
+  assert.deepEqual(
+    GATEWAY_MODEL_ALIAS_MAP['mistral-api/deepseek-v4-1-flash-1017'],
+    api,
+  )
+})
+
+test('one provider model yields Vibe, API and legacy routes', () => {
+  assert.deepEqual(mistralRouteVariants('deepseek-v4-1-flash-1017'), [
+    { id: 'gateway-mistral-vibe-deepseek-v4.1-flash', credential: 'vibe' },
+    { id: 'gateway-mistral-api-deepseek-v4.1-flash', credential: 'api' },
+    { id: 'gateway-mistral-deepseek-v4.1-flash', credential: 'auto' },
+  ])
 })
 
 test('assistant reasoning is echoed as a thinking block, never reasoning_content', () => {

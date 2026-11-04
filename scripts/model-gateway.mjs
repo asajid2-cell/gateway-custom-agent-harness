@@ -50,6 +50,7 @@ import {
   mistralEffortLevels,
   mistralEndpoint,
   mistralGatewayId,
+  mistralRouteVariants,
   mistralHeaders,
   anthropicToMistralChat,
 } from './mistral.mjs'
@@ -369,15 +370,19 @@ const DEFAULT_MODELS = {
   // carries the provider-native id (`deepseek-v4-1-flash-1017`), which is not
   // derivable from the friendly Gateway name.
   ...Object.fromEntries(
-    MISTRAL_MODEL_IDS.map(model => [
-      mistralGatewayId(model),
-      {
-        backend: 'mistral',
-        upstream: model,
-        protocol: MISTRAL_ROUTES[model],
-        effortLevels: mistralEffortLevels(model),
-      },
-    ]),
+    MISTRAL_MODEL_IDS.flatMap(model =>
+      mistralRouteVariants(model).map(({ id, credential }) => [
+        id,
+        {
+          backend: 'mistral',
+          upstream: model,
+          protocol: MISTRAL_ROUTES[model],
+          effortLevels: mistralEffortLevels(model),
+          mistralCredential: credential,
+          ...(credential === 'auto' ? { hidden: true } : {}),
+        },
+      ]),
+    ),
   ),
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
@@ -487,6 +492,12 @@ function loadModels() {
         ? { protocol: value.protocol }
         : value.backend === 'commandcode' || value.backend === 'mistral'
           ? { protocol: 'chat-completions' }
+          : {}),
+      ...(value.backend === 'mistral' &&
+      ['vibe', 'api', 'auto'].includes(value.mistralCredential)
+        ? { mistralCredential: value.mistralCredential }
+        : typeof previous?.mistralCredential === 'string'
+          ? { mistralCredential: previous.mistralCredential }
           : {}),
       ...(Array.isArray(value.effortLevels)
         ? { effortLevels: value.effortLevels.filter(level => NATIVE_EFFORT_LEVELS.includes(level)) }
@@ -3018,6 +3029,8 @@ const ROUTE_HEALTH_PROVIDERS = new Map([
   ['command code', 'commandcode'],
   ['commandcode', 'commandcode'],
   ['mistral', 'mistral'],
+  ['mistral api', 'mistral-api'],
+  ['mistral-api', 'mistral-api'],
   ['mistral vibe', 'mistral-vibe'],
   ['mistral-vibe', 'mistral-vibe'],
   ['opencode go', 'opencode-go'],
@@ -3091,6 +3104,7 @@ export function resetRouteHealth() {
 async function sessionRouteNumber(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).number
   if (providerId === 'mistral') return mistralRouteCredentials(await sessionMistralCredentials(sessionId)).number
+  if (providerId === 'mistral-api') return (await sessionMistralCredentials(sessionId)).number
   if (providerId === 'mistral-vibe') return mistralVibeCredentials.number
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).number
   return 1
@@ -3110,6 +3124,7 @@ async function sessionRouteNumber(providerId, sessionId) {
 async function providerRouteNumbers(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).numbers
   if (providerId === 'mistral') return mistralRouteCredentials(await sessionMistralCredentials(sessionId)).numbers
+  if (providerId === 'mistral-api') return (await sessionMistralCredentials(sessionId)).numbers
   if (providerId === 'mistral-vibe') return mistralVibeCredentials.numbers
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).numbers
   return [1]
@@ -4328,7 +4343,14 @@ async function handleMistral(body, req, res, modelName, route) {
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
   const apiPool = await ensureMistralPreference(sessionId)
-  const credentials = mistralRouteCredentials(apiPool)
+  // The route names the budget: `vibe` spends only Vibe plan keys, `api` only
+  // Studio API keys. The unsuffixed legacy route keeps Vibe-first fallback.
+  const credentials =
+    route.mistralCredential === 'api'
+      ? apiPool
+      : route.mistralCredential === 'vibe'
+        ? mistralVibeCredentials
+        : mistralRouteCredentials(apiPool)
   let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'Mistral API key is not configured')

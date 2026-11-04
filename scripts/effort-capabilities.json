@@ -119,7 +119,10 @@
     "gateway-commandcode-deepseek-v4.1-flash": {
       "contextWindow": 450000
     },
-    "gateway-mistral-deepseek-v4.1-flash": {
+    "gateway-mistral-vibe-deepseek-v4.1-flash": {
+      "contextWindow": 1048576
+    },
+    "gateway-mistral-api-deepseek-v4.1-flash": {
       "contextWindow": 1048576
     }
   },
@@ -219,7 +222,8 @@
     "gateway-commandcode-longcat-2.0-free": ["low", "medium", "high", "xhigh", "max"],
     "gateway-commandcode-laguna-s-2.1-free": ["low", "medium", "high", "xhigh", "max"],
     "gateway-commandcode-ling-3.0-flash-sante-free": ["low", "medium", "high", "xhigh", "max"],
-    "gateway-mistral-deepseek-v4.1-flash": ["none", "low", "high", "xhigh", "max"],
+    "gateway-mistral-vibe-deepseek-v4.1-flash": ["none", "low", "high", "xhigh", "max"],
+    "gateway-mistral-api-deepseek-v4.1-flash": ["none", "low", "high", "xhigh", "max"],
     "gateway-opencode-gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-mimo-v2.5": ["none", "low", "medium", "high", "xhigh", "max"],
     "gateway-opencode-glm-5.3-flash": ["low", "high", "max"],
@@ -410,9 +414,14 @@
       "description": "Command Code - Ling 3.0 Flash Sante, free"
     },
     {
-      "value": "gateway-mistral-deepseek-v4.1-flash",
-      "label": "Mistral DeepSeek v4.1 Flash",
-      "description": "Mistral - DeepSeek v4.1 Flash 1017 (1M context)"
+      "value": "gateway-mistral-vibe-deepseek-v4.1-flash",
+      "label": "Mistral Vibe DeepSeek v4.1 Flash",
+      "description": "Mistral Vibe - DeepSeek v4.1 Flash (Vibe plan key, 1M context)"
+    },
+    {
+      "value": "gateway-mistral-api-deepseek-v4.1-flash",
+      "label": "Mistral API DeepSeek v4.1 Flash",
+      "description": "Mistral API - DeepSeek v4.1 Flash (Studio API key, 1M context)"
     },
     {
       "value": "gateway-opencode-gpt-5.6-luna",
@@ -678,10 +687,19 @@
       "commandcode-ling-3.0-flash-sante-free",
       "commandcode/inclusionai/ling-3.0-flash-sante:free"
     ],
-    "gateway-mistral-deepseek-v4.1-flash": [
+    "gateway-mistral-vibe-deepseek-v4.1-flash": [
+      "gateway-mistral-deepseek-v4.1-flash",
+      "mistral-vibe-deepseek-v4.1-flash",
+      "mistral-vibe/deepseek-v4-1-flash-1017",
+      "mistral-vibe-deepseek-v4-1-flash-1017",
       "mistral-deepseek-v4.1-flash",
       "mistral/deepseek-v4-1-flash-1017",
       "mistral-deepseek-v4-1-flash-1017"
+    ],
+    "gateway-mistral-api-deepseek-v4.1-flash": [
+      "mistral-api-deepseek-v4.1-flash",
+      "mistral-api/deepseek-v4-1-flash-1017",
+      "mistral-api-deepseek-v4-1-flash-1017"
     ],
     "gateway-gpt-luna": ["gpt-5.6-luna", "claude-gpt-luna"],
     "gateway-gpt-6-luna": ["gpt-6-luna"],
