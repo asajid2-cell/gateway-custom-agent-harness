@@ -86,7 +86,7 @@ test('a clean machine launches bundled and does not require the legacy store', a
 
 test('launcher diagnostics use an explicit safe-field allowlist', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
-  assert.match(script, /@\('exitCode', 'attempt', 'port', 'errorType'\)/)
+  assert.match(script, /@\('exitCode', 'attempt', 'port', 'errorType', 'elapsedMs'\)/)
   assert.match(script, /Write-LaunchDiagnostic 'harness-exit'/)
   assert.match(script, /Write-LaunchDiagnostic 'build-exit'/)
   assert.doesNotMatch(script, /throw[^\n]*\$detail/)
@@ -359,9 +359,12 @@ test('interactive cc avoids the Defender-blocked nested encoded launcher', async
     script,
     /\$KeysafeCommand\s*=\s*['"]& powershell\.exe[\s\S]*-EncodedCommand/,
   )
+  // Bundled mode spawns the supervisor plain. The external branch injects
+  // through one keysafe run-many child, named as argv -File items rather than
+  // a nested -EncodedCommand.
   assert.match(
     script,
-    /\$KeysafeCommand\s*=\s*'& '\s*\+[\s\S]*\$Keysafe\.Replace/,
+    /'-File'\s*\r?\n\s*\$Keysafe\s*\r?\n\s*'run-many'/,
     'each optional credential should be injected by invoking keysafe directly in the existing child',
   )
   // Every optional provider must be wrapped the same way, and the env-var name
