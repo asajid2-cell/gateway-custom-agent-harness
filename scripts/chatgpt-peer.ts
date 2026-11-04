@@ -845,6 +845,8 @@ export class ChatGptHost {
           maxLanes: config.laneMax,
           idleMs: config.laneIdleMs,
           syncCookies: config.laneSyncCookies,
+          sharedBrowser: this.provider.laneSharedBrowser === true,
+          sourceProfile: config.profile,
           maxTurns: config.laneMaxTurns,
           maxAgeMs: config.laneMaxAgeMs,
           backoffBaseMs: config.laneBackoffBaseMs,

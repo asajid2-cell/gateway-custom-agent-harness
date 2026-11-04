@@ -32,6 +32,8 @@ export type Provider = {
   masterPort: number
   /** The first lane's CDP port. */
   laneBasePort: number
+  /** Lanes are tabs in the master browser (the login cannot be copied). */
+  laneSharedBrowser?: boolean
   /** Driver filename, resolved under `home` unless overridden. */
   driver: string
   /** Primer filename under `scripts/chatgpt-peer/`. */
@@ -78,8 +80,9 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     profile: join(homedir(), '.gemini-web', 'profile'),
     masterPort: 9223,
     laneBasePort: 9400,
+    laneSharedBrowser: true,
     driver: 'gemini.mjs',
-    primer: 'primer.md',
+    primer: 'primer-gemini.md',
     site: 'https://gemini.google.com/app',
     threadId: value => GEMINI_THREAD.test(value),
   },

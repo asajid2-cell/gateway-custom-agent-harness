@@ -59,6 +59,13 @@ export type LaneOptions = {
   idleMs?: number
   /** Write a lane's rotated cookies back to the master on close. */
   syncCookies?: boolean
+  /**
+   * A provider whose session cannot be copied into a fresh profile gives each
+   * lane a TAB in the master browser instead of its own Chrome window.
+   */
+  sharedBrowser?: boolean
+  /** The master's Chrome profile, so a shared lane can reopen a closed browser. */
+  sourceProfile?: string
   /** Rotate a lane after this many acquired turns (0 disables). */
   maxTurns?: number
   /** Rotate a lane this long after it opened (0 disables). */
@@ -427,6 +434,13 @@ export class LaneManager {
         CHATGPT_LANE_ID: laneId,
         CHATGPT_LANE_SOURCE_PORT: String(this.sourcePort),
         CHATGPT_LANE_SYNC_COOKIES: this.options.syncCookies === false ? '0' : '1',
+        ...(this.options.sharedBrowser
+          ? {
+              CHATGPT_LANE_SHARED: '1',
+              CHATGPT_LANE_SHARED_DIR: this.options.root,
+              ...(this.options.sourceProfile ? { CHATGPT_LANE_SOURCE_PROFILE: this.options.sourceProfile } : {}),
+            }
+          : {}),
       }
       const driver = this.options.spawnLane
         ? this.options.spawnLane({ laneId, port, profile, stateDir, env })
