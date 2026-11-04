@@ -33,11 +33,29 @@ if (!PROFILE) {
   throw new Error('CHATGPT_PROFILE is required: the host owns the Chrome profile path and this driver has no default profile')
 }
 const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
-const PID_FILE = path.join(BASE, 'chrome.pid')
-const LOG = path.join(BASE, 'driver.log')
+/**
+ * Where this child writes its PID and log.
+ *
+ * The default is the one-window driver's historic home. A lane gets its own
+ * directory from the host, because many lane children run at once and must not
+ * overwrite one `chrome.pid` or interleave one `driver.log`.
+ */
+const STATE_DIR = process.env.CHATGPT_STATE_DIR || BASE
+const PID_FILE = path.join(STATE_DIR, 'chrome.pid')
+const LOG = path.join(STATE_DIR, 'driver.log')
 const PORT = Number(process.env.CHATGPT_CDP_PORT || 9222)
 const CHAT_URL = 'https://chatgpt.com/'
 const MAX_REPLY = 63_000 // bus messages cap at 64 KiB
+/**
+ * Lane mode: this child owns one disposable window that branches the master
+ * login instead of owning the human's Chrome. A source port of 0 means the
+ * original one-window driver, and every lane behaviour is off.
+ */
+const LANE_ID = process.env.CHATGPT_LANE_ID || ''
+const LANE_SOURCE_PORT = Number(process.env.CHATGPT_LANE_SOURCE_PORT || 0)
+const LANE_SYNC_COOKIES = process.env.CHATGPT_LANE_SYNC_COOKIES !== '0'
+/** Only the account's own cookies cross between the master and a lane. */
+const COOKIE_ORIGIN = /(^|\.)(chatgpt\.com|openai\.com)$/i
 
 /**
  * Is this page ChatGPT, by origin rather than by substring?
@@ -392,7 +410,7 @@ async function writeLogChunk(chunk) {
 function drainLog() {
   if (!logDrain) {
     logDrain = (async () => {
-      await fs.mkdir(BASE, { recursive: true }).catch(() => {})
+      await fs.mkdir(STATE_DIR, { recursive: true }).catch(() => {})
       while (LOG_QUEUE.length) {
         const chunk = LOG_QUEUE.join('')
         LOG_QUEUE.length = 0
@@ -527,6 +545,89 @@ function exhaustedLaunchWhy({ port, served, owner, waitedMs }) {
   return `port ${port} ${seen}, but ${who} could not be proven to be this install's browser within ${waited} s; no browser of this install has answered yet, so nothing was adopted`
 }
 
+/**
+ * The master's account cookies, read through CDP and nothing else.
+ *
+ * The master Chrome is a credential source, not a page this driver works in.
+ * This connects, reads, and disconnects: it never navigates, types, or closes
+ * the human's window. `connectOverCDP`'s close() is a disconnect.
+ */
+async function masterCookies(port) {
+  const { chromium } = loadPlaywright()
+  const source = await chromium.connectOverCDP(`http://127.0.0.1:${port}`)
+  try {
+    const context = source.contexts()[0]
+    if (!context) throw new Error(`master Chrome on port ${port} has no browser context`)
+    const kept = (await context.cookies()).filter(cookie => COOKIE_ORIGIN.test(cookie.domain || ''))
+    if (kept.length === 0) throw new Error(`master Chrome on port ${port} holds no chatgpt.com/openai.com cookies; is it signed in?`)
+    return kept
+  } finally {
+    await source.close().catch(() => {})
+  }
+}
+
+/** Put account cookies into a browser this child owns, then prove the login. */
+async function injectCookies(port, cookies) {
+  const { chromium } = loadPlaywright()
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`)
+  try {
+    const context = browser.contexts()[0] ?? await browser.newContext()
+    await context.addCookies(cookies)
+    const page = context.pages().find(candidate => isChatGPTUrl(candidate.url()))
+      ?? context.pages()[0]
+      ?? await context.newPage()
+    if (!isChatGPTUrl(page.url())) {
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+    }
+    const state = await waitForLogin(page, LOGIN_WAIT_MS)
+    if (!state?.loggedIn) throw new Error(`the lane did not accept the master login (${state?.url ?? 'page unavailable'})`)
+    return state
+  } finally {
+    await browser.close().catch(() => {})
+  }
+}
+
+/** Branch this lane's login from the master before its first page turn. */
+async function branchMasterLogin() {
+  const cookies = await masterCookies(LANE_SOURCE_PORT)
+  await log(`lane ${LANE_ID || '(unnamed)'}: read ${cookies.length} cookies from master port ${LANE_SOURCE_PORT}`)
+  const state = await injectCookies(PORT, cookies)
+  await log(`lane ${LANE_ID || '(unnamed)'}: signed in (plan ${state.plan ?? 'unknown'})`)
+  return state
+}
+
+/**
+ * Write this lane's rotated account cookies back to the master.
+ *
+ * ChatGPT rotates session tokens; without write-back a lane's refresh would
+ * leave the master holding a dead token, and the next lane would branch a dead
+ * login. Failures are logged and never block the lane from closing.
+ */
+async function syncLaneCookies() {
+  if (!LANE_SOURCE_PORT) return { ok: false, reason: 'not a lane' }
+  if (!LANE_SYNC_COOKIES) return { ok: false, reason: 'write-back disabled' }
+  const lane = await connectOwned()
+  let cookies
+  try {
+    const context = lane.contexts()[0]
+    if (!context) throw new Error('the lane has no browser context')
+    cookies = (await context.cookies()).filter(cookie => COOKIE_ORIGIN.test(cookie.domain || ''))
+  } finally {
+    await lane.close().catch(() => {})
+  }
+  if (cookies.length === 0) throw new Error('the lane holds no account cookies')
+  const { chromium } = loadPlaywright()
+  const master = await chromium.connectOverCDP(`http://127.0.0.1:${LANE_SOURCE_PORT}`)
+  try {
+    const context = master.contexts()[0]
+    if (!context) throw new Error(`master Chrome on port ${LANE_SOURCE_PORT} has no browser context`)
+    await context.addCookies(cookies)
+  } finally {
+    await master.close().catch(() => {})
+  }
+  return { ok: true, cookies: cookies.length }
+}
+
 async function ensureChrome({ visible = true } = {}) {
   const owned = await ownedDebugger()
   if (owned) return { spawned: false, pid: owned.pid }
@@ -549,7 +650,10 @@ async function ensureChrome({ visible = true } = {}) {
     '--metrics-recording-only',
     '--disable-features=Translate,MediaRouter,OptimizationHints,AcceptCHFrame,InterestFeedContentSuggestions,CalculateNativeWinOcclusion',
     '--window-size=900,760',
-    '--window-position=80,60',
+    // A lane is headful (Cloudflare challenges headless) but parked off-screen:
+    // the writer gets a window of its own without a stack of windows on the
+    // desktop. The one-window driver keeps its old position.
+    `--window-position=${LANE_SOURCE_PORT ? '-2000,0' : '80,60'}`,
     CHAT_URL,
   ]
   if (!visible) args.unshift('--headless=new')
@@ -583,6 +687,13 @@ async function ensureChrome({ visible = true } = {}) {
       if (verdict.ok) {
         await writeLaunchMarker(verdict.pid ?? child.pid, served)
         await writeInstallRecord(verdict.pid ?? child.pid, served)
+        // A lane is not usable until the branched login is proven. A failure
+        // here fails the launch, so the host closes the lane instead of typing
+        // into a signed-out page.
+        if (LANE_SOURCE_PORT) {
+          const state = await branchMasterLogin()
+          return { spawned: true, pid: child.pid, lane: true, signedIn: state.loggedIn, plan: state.plan ?? null }
+        }
         return { spawned: true, pid: child.pid }
       }
       if (!verdict.retry) throw new Error(verdict.why)
@@ -4556,10 +4667,44 @@ async function serve() {
       const items = (read.body?.items ?? []).map(item => ({ id: item.id, title: item.title ?? '', update_time: item.update_time ?? null }))
       return { ok: true, op, offset, limit, items }
     }
+    if (op === 'warm') {
+      // Start (or adopt) this child's browser and prove the login BEFORE the
+      // host hands it a turn. In lane mode this is where the master branch is
+      // injected and verified; the host treats a refusal as a failed lane open.
+      await ensureChrome({ visible: true })
+      const { browser, page } = await connect()
+      try {
+        let state = await pageState(page)
+        if (!state.loggedIn) {
+          await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+          state = await waitForLogin(page, LOGIN_WAIT_MS)
+        }
+        return { ok: true, op, lane: LANE_ID || null, signedIn: state.loggedIn, plan: state.plan ?? null, url: state.url }
+      } finally {
+        await browser.close().catch(() => {})
+      }
+    }
     if (op === 'unload') {
+      let cookiesSynced = 0
+      let cookieSync = 'not a lane'
+      if (LANE_SOURCE_PORT) {
+        // A lane's cookies are newer than the master's: write them back first,
+        // so the next lane branches from a live token. Notification only; the
+        // close itself must not depend on it. The result travels in the reply
+        // because this child's log directory is deleted with the lane.
+        try {
+          const synced = await syncLaneCookies()
+          cookieSync = synced.ok ? 'ok' : (synced.reason || 'skipped')
+          cookiesSynced = synced.ok ? synced.cookies : 0
+        } catch (error) {
+          cookieSync = `failed: ${error.message}`
+        }
+        await log(`lane ${LANE_ID || '(unnamed)'}: cookie write-back ${cookieSync} (${cookiesSynced} cookies) to master port ${LANE_SOURCE_PORT}`)
+        process.stderr.write(`[lane] cookie write-back ${cookieSync} (${cookiesSynced} cookies) to master port ${LANE_SOURCE_PORT}\n`)
+      }
       await doQuit()
       ACTIVE_THREAD = null
-      return { ok: true, op, state: 'unloaded' }
+      return { ok: true, op, state: 'unloaded', cookiesSynced, cookieSync }
     }
     return { ok: false, op, error: `unknown op ${op ?? '(missing)'}` }
   }

@@ -14,6 +14,7 @@
  *
  * Run it with bun: `bun run scripts/chatgpt-peer.ts`.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
@@ -26,6 +27,7 @@ import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewayS
 import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
+import { LaneManager, type LaneEvent, type LaneHandle } from './chatgpt-peer/lanes.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, PROMPT_PREFIX_MIN, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
@@ -41,6 +43,8 @@ const execFileAsync = promisify(execFile)
 
 const NAME = 'chatgpt-web'
 const PROVIDER = 'chatgpt-web'
+/** The lane host-initiated work runs in: scheduled wakes, operator requests. */
+const HOST_LANE = '__host__'
 const PURPOSE = 'A signed-in ChatGPT web thread on this machine\'s account, addressed like any other live session.'
 
 /**
@@ -342,6 +346,24 @@ type Config = {
   pendingWatchGapsMs?: number[]
   /** The first 429 backoff before doubling. Tests shorten it; never widened. */
   readBackoffBaseMs?: number
+  /**
+   * One disposable Chrome window per writer. Off by default in code, on by
+   * default when the CLI resolves a config; the injected-driver test path stays
+   * on the one-window model unless it says otherwise.
+   */
+  lanes?: boolean
+  /** Live lane windows at once. */
+  laneMax?: number
+  /** How long an idle lane survives before its process is killed. */
+  laneIdleMs?: number
+  /** The first lane debugging port. */
+  laneBasePort?: number
+  /** The master Chrome port lanes branch their login from. */
+  laneSourcePort?: number
+  /** Write a lane's rotated cookies back into the master on close. */
+  laneSyncCookies?: boolean
+  /** Test seam: a lane manager built by the test. */
+  laneManager?: LaneManager
 }
 
 /**
@@ -444,6 +466,13 @@ function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
     else if (arg === '--poll-seconds') { config.pollSeconds = Number(take(index++)); config.observeEvery = config.pollSeconds }
     else if (arg === '--observe-every') config.observeEvery = Number(take(index++))
     else if (arg === '--titles-every') config.titlesEvery = Number(take(index++))
+    else if (arg === '--lanes') config.lanes = true
+    else if (arg === '--no-lanes') config.lanes = false
+    else if (arg === '--lane-max') config.laneMax = Number(take(index++))
+    else if (arg === '--lane-idle-ms') config.laneIdleMs = Number(take(index++))
+    else if (arg === '--lane-base-port') config.laneBasePort = Number(take(index++))
+    else if (arg === '--lane-source-port') config.laneSourcePort = Number(take(index++))
+    else if (arg === '--lane-sync-cookies') config.laneSyncCookies = take(index++) !== '0'
   }
   return config
 }
@@ -471,6 +500,15 @@ export function resolveConfig(partial: Partial<Config>): Config {
       ? Number(partial.titlesEvery)
       : Number(process.env.CHATGPT_WEB_TITLES_EVERY ?? 120),
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
+    // Production (the CLI path) runs lanes unless told not to. Tests build a
+    // Config directly and therefore stay on the injected one-window driver.
+    lanes: partial.lanes ?? (process.env.CHATGPT_WEB_LANES !== '0'),
+    laneMax: Number.isFinite(partial.laneMax) ? Number(partial.laneMax) : Number(process.env.CHATGPT_WEB_LANE_MAX ?? 8),
+    laneIdleMs: Number.isFinite(partial.laneIdleMs) ? Number(partial.laneIdleMs) : Number(process.env.CHATGPT_WEB_LANE_IDLE_MS ?? 30_000),
+    laneBasePort: Number.isFinite(partial.laneBasePort) ? Number(partial.laneBasePort) : Number(process.env.CHATGPT_WEB_LANE_BASE_PORT ?? 9300),
+    laneSourcePort: Number.isFinite(partial.laneSourcePort) ? Number(partial.laneSourcePort) : Number(process.env.CHATGPT_WEB_LANE_SOURCE_PORT ?? process.env.CHATGPT_CDP_PORT ?? 9222),
+    laneSyncCookies: partial.laneSyncCookies ?? (process.env.CHATGPT_WEB_LANE_SYNC_COOKIES !== '0'),
+    laneManager: partial.laneManager,
   }
 }
 
@@ -595,7 +633,15 @@ export class ChatGptHost {
   private readonly files: { stat: typeof stat; readFile: typeof readFile }
   private readonly maxAttachmentBytes: number
   private hostState!: HostState
-  private readonly driver: DriverChild
+  /**
+   * The human's Chrome. In lane mode it is only the credential source and the
+   * observation page; bridge turns run on a lane. `driver` resolves to the lane
+   * inside a turn and to this outside one, so every existing call site keeps
+   * working without threading a second argument through the turn code.
+   */
+  private readonly masterDriver: DriverChild
+  private readonly lanes: LaneManager | null
+  private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean }>()
   private readonly bridges = new Map<string, Bridge>()
   /**
    * One delivery lock per bridge. Collecting a file and writing down that it
@@ -706,7 +752,30 @@ export class ChatGptHost {
     this.primer = { text: '', sha: '' }
     this.files = config.files ?? { stat, readFile }
     this.maxAttachmentBytes = config.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES
-    this.driver = driver ?? new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
+    this.masterDriver = driver ?? new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
+    // A test that injects its driver is never silently given real lane Chrome
+    // processes; it opts in with `lanes: true` or its own manager.
+    this.lanes = config.laneManager ?? (config.lanes === true
+      ? new LaneManager({
+          driverScript: config.driverPath,
+          root: join(config.home, 'lanes'),
+          sourcePort: config.laneSourcePort,
+          basePort: config.laneBasePort,
+          maxLanes: config.laneMax,
+          idleMs: config.laneIdleMs,
+          syncCookies: config.laneSyncCookies,
+          log: line => log(`lanes: ${line}`),
+          onEvent: (event, laneId, detail) => this.onLaneEvent(event, laneId, detail),
+        })
+      : null)
+  }
+
+  /**
+   * The driver for the work in flight: the turn's lane inside a lane turn, the
+   * master everywhere else.
+   */
+  private get driver(): DriverChild {
+    return this.laneContext.getStore()?.driver ?? this.masterDriver
   }
 
   /** The loopback port the host bound. Valid after start(). */
@@ -957,6 +1026,10 @@ export class ChatGptHost {
     if (!samePath(this.hostState.profile, this.config.profile)) {
       throw new Error(`peer.json was created with profile "${this.hostState.profile}" but --profile is "${this.config.profile}"; use the same profile or a different --state file`)
     }
+    // A crashed earlier host leaves lane browsers behind. Each is killed only
+    // when its own profile proof matches; its directory is discarded either
+    // way, because a new host cannot adopt it.
+    if (this.lanes) await this.lanes.reapOrphans().catch(error => log(`lane reap failed: ${(error as Error).message}`))
 
     const loadedPrimer = await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8').catch(() => '')
     this.primer.text = loadedPrimer
@@ -1328,6 +1401,10 @@ export class ChatGptHost {
         state: this.health.state,
         ...(this.health.reason ? { reason: this.health.reason } : {}),
       }],
+      // Answer from memory only: the route gate must never wake a browser.
+      lanes: this.lanes
+        ? { max: this.lanes.max, queued: this.lanes.queued, active: this.lanes.status() }
+        : null,
     })
   }
 
@@ -1918,13 +1995,21 @@ export class ChatGptHost {
     this.absorbPage(bridge, reply)
     this.health = { state: 'serving', at: now() }
     const landed = typeof reply.threadId === 'string' && reply.threadId ? reply.threadId : bridge.state.threadId
+    const answerText = wait && typeof reply.text === 'string' ? reply.text : null
+    // A completed turn with no text is the random empty answer. It keeps the
+    // existing no-answer line (G-009), but it also marks this lane bad: the
+    // turn's owner recycles the window once the delivery has been made.
+    if (answerText !== null && answerText.trim() === '') {
+      const context = this.laneContext.getStore()
+      if (context) context.empty = true
+    }
     return {
       threadId: landed ?? null,
       userNodeId: typeof reply.ownNodeId === 'string' && reply.ownNodeId ? reply.ownNodeId : null,
       // The synchronous send returns the completed answer on the same request.
       // When `wait` was not asked for (or the driver reports no text), there is
       // no answer here and the caller falls back to the observation path.
-      text: wait && typeof reply.text === 'string' ? reply.text : null,
+      text: answerText,
     }
   }
 
@@ -2984,7 +3069,9 @@ export class ChatGptHost {
         // is a command block runs (one round is this post, the next is a page
         // turn), so the follow-up rounds must not queue on that lock again.
         const message = this.inboundMessageOf(bridge, record)
-        await this.settleTurnAnswer(bridge, record, message, nodeTextOf(answer), true)
+        // Settling can run command follow-up rounds, which type into a page:
+        // they belong on the sender's lane, never in the master window.
+        await this.laneWork(this.laneIdOf({ fromSessionId: record.senderSessionId }), () => this.settleTurnAnswer(bridge, record, message, nodeTextOf(answer), true))
         // R8-C: ownership was persisted above, and that alone stops the next
         // pass re-handling this delivery - `pendingHumanTurns` skips `ours`, and
         // `newPageAnswers` excludes a governing user node in `ourNodeIds`. The
@@ -3011,15 +3098,16 @@ export class ChatGptHost {
     if (!threadId) return
     const gate = await this.cheapStatus(threadId)
     if (gate.state === 'generating') return
-    const posted = await this.postPendingTurn(bridge, deferred, 0, true)
+    const laneId = this.laneIdOf({ fromSessionId: deferred.senderSessionId })
+    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, deferred, 0, true))
     if (posted.posted) {
       audit(this.hostState, { op: 'turn', target: deferred.senderSessionId, result: `deferred job posted after the turn ended [${bridge.state.name}]`, messageId: deferred.messageId })
       await this.persistHostState()
       // A deferred turn is a COMMAND turn like any other: with the synchronous
-      // answer in hand, settle it here (this pass holds the page lock). With no
-      // text the first round reads the thread, exactly as the direct path does.
+      // answer in hand, settle it here. With no text the first round reads the
+      // thread, exactly as the direct path does.
       const message = this.inboundMessageOf(bridge, deferred)
-      await this.settleTurnAnswer(bridge, deferred, message, posted.text, true)
+      await this.laneWork(laneId, () => this.settleTurnAnswer(bridge, deferred, message, posted.text, true))
     }
   }
 
@@ -4540,7 +4628,7 @@ export class ChatGptHost {
       // never produce evidence either, so it keeps the old behaviour.
       const job = bridge.state.pendingTurns.find(item => item.messageId === entry.toMessageId)
       if (job && job.postedAt !== null && this.observes !== false) {
-        const evidence = await this.settlePostedTurn(bridge, job, claimed)
+        const evidence = await this.laneWork(this.laneIdOf({ fromSessionId: job.senderSessionId }), () => this.settlePostedTurn(bridge, job, claimed))
         if (evidence === 'delivered') {
           bridge.handled.add(entry.toMessageId)
           continue
@@ -4740,186 +4828,193 @@ export class ChatGptHost {
     const kind: 'inquiry' | 'directive' = message.kind === 'directive' ? 'directive' : 'inquiry'
     let job: PendingTurn | null = null
     const alive = (): void => { if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`) }
-    try {
-      const name = await this.nameOf(message.fromSessionId)
-      const text = sanitizePeerText(message.text)
-      const turnNonce = nonce()
-      const prompt = this.inboundPrompt({ ...message, fromName: name, text }, turnNonce)
-      // The job is written BEFORE anything is posted, and the job IS the prompt
-      // (never the raw peer text): from here on the answer is owed, and a
-      // crash, a restart or a page that stays busy is finished by the
-      // observation pass, never silently dropped.
-      job = {
-        threadId: bridge.state.threadId,
-        userNodeId: null,
-        ourText: prompt.slice(0, 4096),
-        text: prompt,
-        senderSessionId: message.fromSessionId,
-        messageId: message.id,
-        kind,
-        postedAt: null,
-        // Persisted with the job, so a deferred or recovered answer is parsed
-        // against the SAME nonce this inbound was prompted with.
-        turnNonce,
-      }
-      await this.notePendingTurn(bridge, job)
-      // The observation pass must leave this job alone while this turn is alive.
-      this.attachedTurns.add(message.id)
-      // R7-F2: and while its answer is being settled, the reply may be in
-      // flight - the durable record still names the turn until it is sent.
-      this.settling.add(message.id)
-      // Only a turn with no transcript on disk may execute commands: a replay
-      // of one that already ran is refused by `executeCommand` (R1-F9).
-      if (!bridge.state.inboundRuns.some(entry => entry.messageId === message.id)) this.freshTurns.add(message.id)
-      // The ack is per-request and idempotent: the page names the send it
-      // accepted, so a primer posting its own node can never acknowledge this
-      // inbound, and rounds 2..n do not acknowledge it twice.
-      let acknowledged = false
-      const acknowledge = (): void => {
-        if (acknowledged) return
-        acknowledged = true
-        void bridge.transport?.acknowledge(message.id).catch(() => {})
-      }
-      // The primer (and the attachments) go first, under the lock and briefly:
-      // a primer's own turn means the page is busy, and the inbound must then
-      // wait rather than be typed into it.
-      await this.pageWork(async () => {
-        if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
-        await this.ensurePrimerAndThread(bridge)
-        await this.injectAttachment(bridge, text, message.fromSessionId, message.id)
-      })
-      alive()
-      const seeded = await this.postPendingTurn(bridge, job, 30_000)
-      if (!seeded.posted) {
-        // Deferred, never refused: nothing was typed, and the next idle
-        // transition posts the job (this pass or the observation pass).
-        acknowledge()
-        const line = 'queued: the page is mid-turn; it will be posted when the turn ends'
-        audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
-        log(`turn ${shortId(message.id)}: ${line}`)
-        return
-      }
-      // The seed WAS round 1's page turn, and with `wait:true` the driver
-      // returned the answer on that same request. That text IS round 1: no
-      // post-turn observation read is needed to deliver it (the page throttles
-      // those reads, and they were the roundtrip this path paid for).
-      alive()
-      acknowledge()
-      let seededAnswer = true
-      let seededText = seeded.text
-      // The command's ordinal within the turn. Two identical commands differ by
-      // position, so the durable receipt key cannot collapse them; a restart
-      // replay re-runs the same sequence from zero and lands on the same keys.
-      let ordinal = 0
-      const outcome = await runCommandTurn(prompt, turnNonce, {
-        generate: async subject => {
-          try {
-            alive()
-            if (seededAnswer) {
-              seededAnswer = false
-              if (seededText !== null) {
-                const text = seededText
-                seededText = null
-                return { ok: true, text }
-              }
-              const answer = await this.awaitAnswer(bridge, job!.userNodeId, {
-                acceptedAt: job!.postedAt ? Date.parse(job!.postedAt) : undefined,
-                sentText: job!.text,
-              })
-              return { ok: true, text: answer.text }
-            }
-            alive()
-            return { ok: true, text: await this.generateRound(bridge, job!, subject, acknowledge) }
-          } catch (error) {
-            // "Still generating" is a state, never a failed generation: let it
-            // out so the turn loop leaves the job pending instead of reporting
-            // a model failure the page never produced (R-LIVE-4).
-            if (error instanceof GeneratingTurn || error instanceof PageUnproven) throw error
-            return { ok: false, error: (error as Error).message }
-          }
-        },
-        execute: command => {
-          alive()
-          return this.executeCommand(bridge, command, 'model', message.id, ordinal++)
-        },
-      })
-      // The delivery decision is written BEFORE the reply leaves, so a crash
-      // between here and the receipt loses one reply rather than sending two.
-      alive()
-      await this.markAnswered(bridge, job)
-      alive()
-      await this.settleReply(bridge, message, expects, outcome, job?.userNodeId ?? null)
-      // R7-F2: only now, and only when the debt is actually settled, does the
-      // job leave the ledger. `settleReply` catches a failed `transport.send`
-      // and returns normally, so retiring on the strength of reaching here
-      // would delete the record while the sender is still owed - the restart
-      // would then re-post the prompt. A message that expected no reply settles
-      // at `settleReply`'s early return and is retired here (otherwise the
-      // observation pass would deliver an answer nobody asked for); anything
-      // else needs the bus's own sent entry. An explicit command reply also
-      // carries `replyTo = message.id`, so `replySent` covers it.
-      if (!expects || this.replySent(bridge, message.id)) await this.retirePendingTurn(bridge, job.messageId)
-    } catch (error) {
-      // R-LIVE-4: the page's signal stopped advancing while it still said it
-      // was generating. This is NOT a model failure and must not be worded as
-      // one - the line says the page was still generating when watching
-      // stopped. Nothing is refused. A live-generating page never reaches here
-      // (its signal keeps moving, which extends the wait), so this is only the
-      // genuinely stuck page, and giving up on it is the honest outcome.
-      if (error instanceof GeneratingTurn) {
-        const line = error.message
-        log(`turn ${shortId(message.id)}: ${line}; left for the observation pass`)
-        if (this.stopping || bridge.stopping) {
-          // Shutting down: nothing is sent, the persisted job is finished by
-          // the next host.
+    // Everything that touches the page runs inside THIS sender's lane, from the
+    // primer through the last command round. The lane is exclusive for the
+    // duration, so two writers never interleave on one window, and writers on
+    // different lanes never wait for each other.
+    const runTurn = async (): Promise<void> => {
+      try {
+        const name = await this.nameOf(message.fromSessionId)
+        const text = sanitizePeerText(message.text)
+        const turnNonce = nonce()
+        const prompt = this.inboundPrompt({ ...message, fromName: name, text }, turnNonce)
+        // The job is written BEFORE anything is posted, and the job IS the prompt
+        // (never the raw peer text): from here on the answer is owed, and a
+        // crash, a restart or a page that stays busy is finished by the
+        // observation pass, never silently dropped.
+        job = {
+          threadId: bridge.state.threadId,
+          userNodeId: null,
+          ourText: prompt.slice(0, 4096),
+          text: prompt,
+          senderSessionId: message.fromSessionId,
+          messageId: message.id,
+          kind,
+          postedAt: null,
+          // Persisted with the job, so a deferred or recovered answer is parsed
+          // against the SAME nonce this inbound was prompted with.
+          turnNonce,
+        }
+        await this.notePendingTurn(bridge, job)
+        // The observation pass must leave this job alone while this turn is alive.
+        this.attachedTurns.add(message.id)
+        // R7-F2: and while its answer is being settled, the reply may be in
+        // flight - the durable record still names the turn until it is sent.
+        this.settling.add(message.id)
+        // Only a turn with no transcript on disk may execute commands: a replay
+        // of one that already ran is refused by `executeCommand` (R1-F9).
+        if (!bridge.state.inboundRuns.some(entry => entry.messageId === message.id)) this.freshTurns.add(message.id)
+        // The ack is per-request and idempotent: the page names the send it
+        // accepted, so a primer posting its own node can never acknowledge this
+        // inbound, and rounds 2..n do not acknowledge it twice.
+        let acknowledged = false
+        const acknowledge = (): void => {
+          if (acknowledged) return
+          acknowledged = true
+          void bridge.transport?.acknowledge(message.id).catch(() => {})
+        }
+        // The primer (and the attachments) go first, under the lock and briefly:
+        // a primer's own turn means the page is busy, and the inbound must then
+        // wait rather than be typed into it.
+        await this.pageWork(async () => {
+          if (bridge.removed || bridge.stopping) throw new Error(`bridge "${bridge.state.name}" was removed`)
+          await this.ensurePrimerAndThread(bridge)
+          await this.injectAttachment(bridge, text, message.fromSessionId, message.id)
+        })
+        alive()
+        const seeded = await this.postPendingTurn(bridge, job, 30_000)
+        if (!seeded.posted) {
+          // Deferred, never refused: nothing was typed, and the next idle
+          // transition posts the job (this pass or the observation pass).
+          acknowledge()
+          const line = 'queued: the page is mid-turn; it will be posted when the turn ends'
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
+          log(`turn ${shortId(message.id)}: ${line}`)
           return
         }
-        // R-LIVE-8: when the DRIVER failed, the page is unproven, not slow. No
-        // line is sent and the job stays owed for the observation pass, exactly
-        // as a driver-faulted send does; a failure line here told the sender
-        // its question failed while the page went on to answer it.
-        if (error.driverFault) {
-          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [${unobservedNote(error)}; left for the observation pass]`, messageId: message.id })
+        // The seed WAS round 1's page turn, and with `wait:true` the driver
+        // returned the answer on that same request. That text IS round 1: no
+        // post-turn observation read is needed to deliver it (the page throttles
+        // those reads, and they were the roundtrip this path paid for).
+        alive()
+        acknowledge()
+        let seededAnswer = true
+        let seededText = seeded.text
+        // The command's ordinal within the turn. Two identical commands differ by
+        // position, so the durable receipt key cannot collapse them; a restart
+        // replay re-runs the same sequence from zero and lands on the same keys.
+        let ordinal = 0
+        const outcome = await runCommandTurn(prompt, turnNonce, {
+          generate: async subject => {
+            try {
+              alive()
+              if (seededAnswer) {
+                seededAnswer = false
+                if (seededText !== null) {
+                  const text = seededText
+                  seededText = null
+                  return { ok: true, text }
+                }
+                const answer = await this.awaitAnswer(bridge, job!.userNodeId, {
+                  acceptedAt: job!.postedAt ? Date.parse(job!.postedAt) : undefined,
+                  sentText: job!.text,
+                })
+                return { ok: true, text: answer.text }
+              }
+              alive()
+              return { ok: true, text: await this.generateRound(bridge, job!, subject, acknowledge) }
+            } catch (error) {
+              // "Still generating" is a state, never a failed generation: let it
+              // out so the turn loop leaves the job pending instead of reporting
+              // a model failure the page never produced (R-LIVE-4).
+              if (error instanceof GeneratingTurn || error instanceof PageUnproven) throw error
+              return { ok: false, error: (error as Error).message }
+            }
+          },
+          execute: command => {
+            alive()
+            return this.executeCommand(bridge, command, 'model', message.id, ordinal++)
+          },
+        })
+        // The delivery decision is written BEFORE the reply leaves, so a crash
+        // between here and the receipt loses one reply rather than sending two.
+        alive()
+        await this.markAnswered(bridge, job)
+        alive()
+        await this.settleReply(bridge, message, expects, outcome, job?.userNodeId ?? null)
+        // R7-F2: only now, and only when the debt is actually settled, does the
+        // job leave the ledger. `settleReply` catches a failed `transport.send`
+        // and returns normally, so retiring on the strength of reaching here
+        // would delete the record while the sender is still owed - the restart
+        // would then re-post the prompt. A message that expected no reply settles
+        // at `settleReply`'s early return and is retired here (otherwise the
+        // observation pass would deliver an answer nobody asked for); anything
+        // else needs the bus's own sent entry. An explicit command reply also
+        // carries `replyTo = message.id`, so `replySent` covers it.
+        if (!expects || this.replySent(bridge, message.id)) await this.retirePendingTurn(bridge, job.messageId)
+      } catch (error) {
+        // R-LIVE-4: the page's signal stopped advancing while it still said it
+        // was generating. This is NOT a model failure and must not be worded as
+        // one - the line says the page was still generating when watching
+        // stopped. Nothing is refused. A live-generating page never reaches here
+        // (its signal keeps moving, which extends the wait), so this is only the
+        // genuinely stuck page, and giving up on it is the honest outcome.
+        if (error instanceof GeneratingTurn) {
+          const line = error.message
+          log(`turn ${shortId(message.id)}: ${line}; left for the observation pass`)
+          if (this.stopping || bridge.stopping) {
+            // Shutting down: nothing is sent, the persisted job is finished by
+            // the next host.
+            return
+          }
+          // R-LIVE-8: when the DRIVER failed, the page is unproven, not slow. No
+          // line is sent and the job stays owed for the observation pass, exactly
+          // as a driver-faulted send does; a failure line here told the sender
+          // its question failed while the page went on to answer it.
+          if (error.driverFault) {
+            audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: `${line} [${unobservedNote(error)}; left for the observation pass]`, messageId: message.id })
+            await this.persistHostState()
+            return
+          }
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
+          if (job) await this.deliverSolicitedFailure(bridge, job, line)
+          else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not answer: ${line}`)
           await this.persistHostState()
           return
         }
-        audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
-        if (job) await this.deliverSolicitedFailure(bridge, job, line)
-        else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not answer: ${line}`)
+        if (this.stopping || bridge.stopping) {
+          // Shutting down: the persisted job is finished by the next host.
+          log(`turn ${shortId(message.id)}: host stopping; the job stays pending`)
+          return
+        }
+        const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
+        // R-LIVE-8: a driver fault (including one that wrapped a page read) is no
+        // evidence about the page. Leave the turn owed; sending a failure line
+        // settled the debt as a definite negative the page never produced.
+        const driverFault = (error instanceof PageUnproven && error.driverFault) || isDriverFault(reason)
+        log(`turn for ${message.id} failed: ${reason}`)
+        audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: driverFault ? `no evidence (the driver failed, not the page): ${reason}` : `failed: ${reason}`, messageId: message.id })
+        // A removed or stopping bridge is cancelled: it types nothing more into
+        // the page and tells nobody about a turn it is no longer running.
+        if (bridge.removed || bridge.stopping) return
+        if (driverFault) {
+          await this.persistHostState()
+          return
+        }
+        if (job) await this.deliverSolicitedFailure(bridge, job, reason)
+        else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
+      } finally {
+        this.attachedTurns.delete(message.id)
+        this.freshTurns.delete(message.id)
+        this.settling.delete(message.id)
+        await bridge.transport?.update({ status: 'idle' }).catch(() => {})
+        if (!bridge.removed) this.refreshOwed(bridge)
+        await this.persistBridgeState(bridge)
         await this.persistHostState()
-        return
+        this.scheduleIdleUnload()
       }
-      if (this.stopping || bridge.stopping) {
-        // Shutting down: the persisted job is finished by the next host.
-        log(`turn ${shortId(message.id)}: host stopping; the job stays pending`)
-        return
-      }
-      const reason = one((error as Error).message, 200) || 'the page could not complete a turn'
-      // R-LIVE-8: a driver fault (including one that wrapped a page read) is no
-      // evidence about the page. Leave the turn owed; sending a failure line
-      // settled the debt as a definite negative the page never produced.
-      const driverFault = (error instanceof PageUnproven && error.driverFault) || isDriverFault(reason)
-      log(`turn for ${message.id} failed: ${reason}`)
-      audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: driverFault ? `no evidence (the driver failed, not the page): ${reason}` : `failed: ${reason}`, messageId: message.id })
-      // A removed or stopping bridge is cancelled: it types nothing more into
-      // the page and tells nobody about a turn it is no longer running.
-      if (bridge.removed || bridge.stopping) return
-      if (driverFault) {
-        await this.persistHostState()
-        return
-      }
-      if (job) await this.deliverSolicitedFailure(bridge, job, reason)
-      else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
-    } finally {
-      this.attachedTurns.delete(message.id)
-      this.freshTurns.delete(message.id)
-      this.settling.delete(message.id)
-      await bridge.transport?.update({ status: 'idle' }).catch(() => {})
-      if (!bridge.removed) this.refreshOwed(bridge)
-      await this.persistBridgeState(bridge)
-      await this.persistHostState()
-      this.scheduleIdleUnload()
     }
+    await this.laneWork(this.laneIdOf(message), runTurn)
   }
 
   /**
@@ -4981,6 +5076,21 @@ export class ChatGptHost {
    * pass still owns the answer this turn owed.
    */
   private async readCompletedAnswer(bridge: Bridge): Promise<string> {
+    try {
+      return await this.readCompletedAnswerOnce(bridge)
+    } catch (error) {
+      // The empty read is the fault the lane cycle exists for. A read changes
+      // nothing, so one retry on a fresh window is safe: the turn is on the
+      // page and reading it again cannot type anything.
+      const laneId = this.laneContext.getStore()?.laneId
+      if (!this.lanes || !laneId) throw error
+      if (!(error instanceof PageUnproven) || error.pageState !== 'not-read' || error.driverFault) throw error
+      await this.lanes.recycle(laneId, `empty read: ${one(error.message, 160)}`)
+      return await this.laneWork(laneId, () => this.readCompletedAnswerOnce(bridge))
+    }
+  }
+
+  private async readCompletedAnswerOnce(bridge: Bridge): Promise<string> {
     const threadId = bridge.state.threadId
     if (!threadId) throw new Error('the page posted nothing into a thread')
     const reply = await this.driver.call({ op: 'read' }, this.turnTimeout)
@@ -5613,7 +5723,9 @@ export class ChatGptHost {
     this.cancelIdleUnload()
     const turnNonce = nonce()
     try {
-      await this.pageLock.run(async () => {
+      // A wake is host-initiated work: it gets the host lane, not the master
+      // window and not some writer's lane.
+      await this.laneWork(HOST_LANE, async () => {
         if (bridge.removed || bridge.stopping) return
         await this.ensurePrimerAndThread(bridge)
         const prompt = [
@@ -5649,12 +5761,74 @@ export class ChatGptHost {
     }
   }
 
+  // ------------------------------------------------------------------ lanes
+
+  /**
+   * The lane one bus message belongs to.
+   *
+   * A local session's id is the key: every bridge that session writes to
+   * bounces inside that one window. Host-initiated work (a scheduled wake, an
+   * operator request) uses the host lane, a single window of its own.
+   */
+  private laneIdOf(message: { fromSessionId?: string }): string {
+    return message.fromSessionId && message.fromSessionId.trim() ? message.fromSessionId : HOST_LANE
+  }
+
+  /**
+   * Run `work` on one lane's driver.
+   *
+   * The lane is held for the whole turn, so two turns on one lane cannot
+   * interleave even though the driver itself would accept a second line. The
+   * async-local store is what makes every `this.driver` inside `work` resolve to
+   * this lane, including code many calls deep that never learned about lanes.
+   */
+  private async laneWork<T>(laneId: string, work: (lane: LaneHandle) => Promise<T>): Promise<T> {
+    if (!this.lanes) return work({ laneId: HOST_LANE, driver: this.masterDriver, port: 0, profile: this.config.profile, stateDir: this.config.home })
+    const lane = await this.lanes.acquire(laneId, () => {
+      const line = `queued for a lane (cap ${this.lanes!.max})`
+      audit(this.hostState, { op: 'lane_queue', target: laneId, result: line })
+      log(`lane "${laneId}": ${line}`)
+      void this.persistHostState()
+    })
+    const context: { driver: DriverChild; laneId: string; empty?: boolean } = { driver: lane.driver, laneId }
+    try {
+      return await this.laneContext.run(context, () => work(lane))
+    } finally {
+      // A turn that completed with no text is the random empty answer. The
+      // answer path has already told the sender in the existing words; the
+      // window that produced it is recycled so the next turn starts clean.
+      if (context.empty) await this.lanes.recycle(laneId, 'empty answer')
+      this.lanes.release(laneId)
+    }
+  }
+
+  /** One line per lane lifecycle event, in the audit the host already keeps. */
+  private onLaneEvent(event: LaneEvent, laneId: string, detail: string): void {
+    if (!this.hostState) return
+    audit(this.hostState, {
+      op: `lane_${event}`,
+      target: laneId.slice(0, 200),
+      result: detail.slice(0, 300),
+    })
+    void this.persistHostState()
+  }
+
   // ------------------------------------------------------------------- idle
 
-  /** Any page work: serialized, and each turn restarts the idle countdown. */
+  /**
+   * Any page work: serialized, and each turn restarts the idle countdown.
+   *
+   * Inside a lane turn the lane is already exclusive to that turn, so queueing
+   * on the host-wide lock would serialize the writers the lanes exist to
+   * unblock. Outside one, the work belongs to a lane too (the host lane), so a
+   * bridge turn never types into the master window. The old single page lock
+   * survives only for the no-lanes configuration and for observation.
+   */
   private pageWork<T>(work: () => Promise<T>): Promise<T> {
     this.lastWorkAt = Date.now()
     this.cancelIdleUnload()
+    if (this.laneContext.getStore()) return work().finally(() => this.scheduleIdleUnload())
+    if (this.lanes) return this.laneWork(HOST_LANE, () => work()).finally(() => this.scheduleIdleUnload())
     return this.pageLock.run(work).finally(() => this.scheduleIdleUnload())
   }
 
@@ -5673,6 +5847,10 @@ export class ChatGptHost {
 
   private scheduleIdleUnload(): void {
     this.cancelIdleUnload()
+    // Lane mode: idle windows are the lane manager's business, and the master
+    // Chrome is never a window this host is allowed to close. It is the
+    // credential source every lane branches from.
+    if (this.lanes) return
     if (!(this.hostState.idleUnloadMinutes > 0)) return
     // The callback remembers when it was armed. Clearing the timer cannot stop
     // a callback that has already started, so the callback itself checks for
@@ -5690,6 +5868,7 @@ export class ChatGptHost {
 
   /** Chrome is disposable; the registrations and the state files are not. */
   private async unloadChrome(reason: string, armedAt = 0): Promise<void> {
+    if (this.lanes) return
     // Work that arrived after this unload was scheduled cancels it, even if the
     // timer could not be cleared in time.
     if (armedAt && this.lastWorkAt > armedAt) return
@@ -5784,7 +5963,10 @@ export class ChatGptHost {
       await this.persistBridgeState(bridge)
     }
     await this.persistHostState()
-    await this.driver.kill().catch(() => {})
+    // Lanes first: each one writes its cookies back and then kills its own
+    // Chrome. The master driver is then killed as before.
+    await this.lanes?.shutdown().catch(error => log(`lane shutdown failed: ${(error as Error).message}`))
+    await this.masterDriver.kill().catch(() => {})
     await this.removeInstanceFile()
     await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
     for (const bridge of this.bridges.values()) {
@@ -5816,6 +5998,12 @@ async function main(): Promise<void> {
       '  --observe-every <n> seconds between reconcile passes (default 300; 0 = never).',
       '  --poll-seconds <n>  the old name for --observe-every; both set the reconcile interval',
       '  --titles-every <n>  seconds between title walks (default 120; 0 = never)',
+      '  --lanes / --no-lanes  one disposable Chrome window per writer (default on)',
+      '  --lane-max <n>      live lane windows at once (default 8; extra writers queue)',
+      '  --lane-idle-ms <n>  kill an idle lane after this long (default 30000)',
+      '  --lane-base-port <n> first lane debugging port (default 9300)',
+      '  --lane-source-port <n> master Chrome port lanes branch login from (default 9222)',
+      '  --lane-sync-cookies <0|1> write a closing lane\'s cookies back to the master (default 1)',
       '',
       'The instance file (~/.chatgpt-web/instances/<slug>.json) holds a bearer token.',
       'It is the control surface, and /operator is NOT a messaging path: peer work',

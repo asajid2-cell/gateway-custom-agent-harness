@@ -171,6 +171,11 @@ export class DriverChild {
      * shorten it.
      */
     lostReplyMarginMs?: number
+    /**
+     * Extra environment for this child. A lane needs its own CDP port, profile
+     * and state directory; the parent's environment is still inherited.
+     */
+    env?: Record<string, string>
   }) {}
 
   /**
@@ -269,7 +274,11 @@ export class DriverChild {
     if (this.closed) throw new Error('driver is closed')
     if (this.child && this.child.exitCode === null) return this.child
     const generation = ++this.generation
-    const env = { ...process.env, ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}) }
+    const env = {
+      ...process.env,
+      ...(this.options.profile ? { CHATGPT_PROFILE: this.options.profile } : {}),
+      ...(this.options.env ?? {}),
+    }
     const child = spawn(process.execPath, [this.options.script, 'serve'], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env })
     // A fresh child counts as having spoken at the moment it was spawned: the
     // wedge clock measures silence, and launching is not silence. Its ceiling

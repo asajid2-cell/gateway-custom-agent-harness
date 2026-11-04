@@ -1,0 +1,506 @@
+/**
+ * One disposable Chrome window per writer.
+ *
+ * A lane is a driver child of its own: its own Chrome process, its own temporary
+ * profile, its own debugging port, its own serial page chain. A local session
+ * that sends gets one lane and keeps it while it is working; the lane branches
+ * its login from the master Chrome's cookies (read over CDP, never typed in)
+ * and is killed after it has been idle for a moment. Nothing about one writer's
+ * page can then collide with another's, which is the whole point.
+ *
+ * The master Chrome (the human's window) is a credential source only. It is
+ * never unloaded, never navigated and never typed into by this manager.
+ *
+ * Cap and queue are deliberate: at most `maxLanes` windows exist, and a writer
+ * beyond the cap waits for one instead of failing. Order is FIFO.
+ */
+import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { connect as netConnect, createServer } from 'node:net'
+import { join } from 'node:path'
+import { DriverChild } from './driver.ts'
+
+export type LaneHandle = {
+  laneId: string
+  driver: DriverChild
+  port: number
+  profile: string
+  stateDir: string
+}
+
+export type LaneState = 'opening' | 'active' | 'idle' | 'closing'
+
+export type LaneStatus = {
+  laneId: string
+  port: number
+  state: LaneState
+  users: number
+  since: string
+  lastUsedAt: string
+}
+
+export type LaneEvent = 'open' | 'ready' | 'close' | 'recycle' | 'queue' | 'failed'
+
+export type LaneOptions = {
+  /** The driver entry point this repo ships (`chatgpt.mjs`). */
+  driverScript: string
+  /** Where lane state directories live. */
+  root: string
+  /** The master Chrome's debugging port; cookies branch from it. */
+  sourcePort?: number
+  /** The first lane port; 0 picks 9300. */
+  basePort?: number
+  /** Live lanes at once; 8 by default. */
+  maxLanes?: number
+  /** How long an idle lane survives; 30 s by default. */
+  idleMs?: number
+  /** Write a lane's rotated cookies back to the master on close. */
+  syncCookies?: boolean
+  log?: (line: string) => void
+  /** Every open/close/recycle, for the host's audit trail. */
+  onEvent?: (event: LaneEvent, laneId: string, detail: string) => void
+  /** Test seam: build the child for one lane. */
+  spawnLane?: (lane: { laneId: string; port: number; profile: string; stateDir: string; env: Record<string, string> }) => DriverChild
+  /** Test seam: the clock. */
+  now?: () => number
+  /** Test seam: timers. Returns a cancel function. */
+  schedule?: (work: () => void, ms: number) => () => void
+  /** How long one lane open (Chrome + branched login) may take. */
+  openTimeoutMs?: number
+  /** How long a lane close may wait for the driver to drain. */
+  closeTimeoutMs?: number
+}
+
+type Lane = {
+  laneId: string
+  port: number
+  profile: string
+  stateDir: string
+  driver: DriverChild
+  users: number
+  ready: boolean
+  state: LaneState
+  since: number
+  lastUsedAt: number
+  cancelIdle?: () => void
+  closePromise?: Promise<void>
+  closing: boolean
+}
+
+type Waiter = {
+  laneId: string
+  resolve: (handle: LaneHandle) => void
+  reject: (error: Error) => void
+  onQueued?: () => void
+}
+
+const DEFAULT_BASE_PORT = 9300
+const DEFAULT_MAX_LANES = 8
+const DEFAULT_IDLE_MS = 30_000
+const DEFAULT_OPEN_TIMEOUT_MS = 120_000
+const DEFAULT_CLOSE_TIMEOUT_MS = 90_000
+
+/** A lane id is a bus session id; the directory only needs it to be safe. */
+const safeName = (value: string): string => String(value || 'lane').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'lane'
+
+/** Is anything listening on this loopback port right now? */
+function portFree(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const server = createServer()
+    server.once('error', () => resolve(false))
+    server.once('listening', () => server.close(() => resolve(true)))
+    server.listen(port, '127.0.0.1')
+  })
+}
+
+/** A live pid, treating EPERM as alive (it is a process we may not signal). */
+function alive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+/**
+ * One process's command line, or null when it cannot be read.
+ *
+ * Windows only, and only ever used to prove a pid really is a lane before it is
+ * killed. A null answer means "cannot prove", which means "do not kill".
+ */
+function commandLineOf(pid: number): Promise<string | null> {
+  if (process.platform !== 'win32') return Promise.resolve(null)
+  return new Promise(resolve => {
+    const script = `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    let text = ''
+    let settled = false
+    const finish = (value: string | null) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value) } }
+    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } finish(null) }, 5_000)
+    child.stdout.on('data', chunk => { text += chunk; if (text.length > 32_000) { try { child.kill() } catch { /* gone */ } finish(null) } })
+    child.on('error', () => finish(null))
+    child.on('close', () => finish(text.trim() ? text.trim() : null))
+  })
+}
+
+/** Kill a proved lane's whole process tree. */
+function killTree(pid: number): Promise<void> {
+  if (process.platform === 'win32') {
+    return new Promise(resolve => {
+      const child = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      child.on('error', () => resolve())
+      child.on('exit', () => resolve())
+    })
+  }
+  try { process.kill(-pid, 'SIGKILL') } catch { try { process.kill(pid, 'SIGKILL') } catch { /* gone */ } }
+  return Promise.resolve()
+}
+
+export class LaneManager {
+  private readonly options: LaneOptions
+  private readonly lanes = new Map<string, Lane>()
+  private readonly waiters: Waiter[] = []
+  private readonly registryPath: string
+  private readonly maxLanes: number
+  private readonly basePort: number
+  private readonly idleMs: number
+  private readonly sourcePort: number
+  private readonly openTimeoutMs: number
+  private readonly closeTimeoutMs: number
+  private opening = 0
+  private closed = false
+
+  constructor(options: LaneOptions) {
+    this.options = options
+    this.maxLanes = Math.max(1, Math.floor(options.maxLanes ?? DEFAULT_MAX_LANES))
+    this.basePort = Math.max(1, Math.floor(options.basePort ?? DEFAULT_BASE_PORT))
+    this.idleMs = Math.max(0, Math.floor(options.idleMs ?? DEFAULT_IDLE_MS))
+    this.sourcePort = Math.max(1, Math.floor(options.sourcePort ?? 9222))
+    this.openTimeoutMs = Math.max(1_000, Math.floor(options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS))
+    this.closeTimeoutMs = Math.max(1_000, Math.floor(options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS))
+    this.registryPath = join(options.root, 'lanes.json')
+  }
+
+  /** The cap, so the host can say why a turn is queued. */
+  get max(): number { return this.maxLanes }
+  /** Live lanes, including ones still opening. */
+  get size(): number { return this.lanes.size }
+  /** Writers waiting for a lane. */
+  get queued(): number { return this.waiters.length }
+
+  private get now(): number { return this.options.now ? this.options.now() : Date.now() }
+
+  private log(line: string): void { this.options.log?.(line) }
+
+  private emit(event: LaneEvent, laneId: string, detail: string): void {
+    try { this.options.onEvent?.(event, laneId, detail) } catch { /* an audit sink must not break a lane */ }
+  }
+
+  private schedule(work: () => void, ms: number): () => void {
+    if (this.options.schedule) return this.options.schedule(work, ms)
+    const handle = setTimeout(work, ms)
+    handle.unref?.()
+    return () => clearTimeout(handle)
+  }
+
+  private handle(lane: Lane): LaneHandle {
+    return { laneId: lane.laneId, driver: lane.driver, port: lane.port, profile: lane.profile, stateDir: lane.stateDir }
+  }
+
+  /**
+   * Take a lane for one writer.
+   *
+   * Returns at once when the lane (or a free slot) exists, and otherwise waits
+   * in FIFO order. `onQueued` is called once, exactly when this caller could
+   * not start now, so the host can say "queued for a lane" instead of failing.
+   */
+  async acquire(laneId: string, onQueued?: () => void): Promise<LaneHandle> {
+    if (this.closed) throw new Error('lane manager is closed')
+    const lane = this.lanes.get(laneId)
+    if (lane && !lane.closing) {
+      if (lane.ready && lane.users === 0) {
+        this.use(lane)
+        return this.handle(lane)
+      }
+      return this.wait(laneId, onQueued)
+    }
+    if (this.lanes.size + this.opening < this.maxLanes) return this.open(laneId, onQueued)
+    return this.wait(laneId, onQueued)
+  }
+
+  /** Give a lane back. The idle timer starts only when nobody else is waiting. */
+  release(laneId: string): void {
+    const lane = this.lanes.get(laneId)
+    if (!lane || lane.closing) return
+    lane.users = Math.max(0, lane.users - 1)
+    lane.lastUsedAt = this.now
+    if (lane.users === 0 && lane.ready) {
+      lane.state = 'idle'
+      lane.cancelIdle?.()
+      lane.cancelIdle = undefined
+    }
+    // A waiter for THIS lane gets the window first; only then is an unused
+    // window offered to a different writer by closing it.
+    this.pump()
+    if (lane.closing || this.lanes.get(laneId) !== lane || lane.users > 0) return
+    if (this.waiters.length > 0) {
+      // A queued writer must not wait out a window nobody is using.
+      void this.close(laneId, 'released for a queued writer')
+      return
+    }
+    if (lane.ready) {
+      lane.cancelIdle = this.schedule(() => { void this.close(laneId, 'idle') }, this.idleMs)
+    }
+  }
+
+  /** Close one lane now. The slot is free for the queue as soon as it is called. */
+  async close(laneId: string, reason = 'idle'): Promise<void> {
+    const lane = this.lanes.get(laneId)
+    if (!lane) return
+    if (lane.closePromise) return lane.closePromise
+    lane.closing = true
+    lane.state = 'closing'
+    lane.cancelIdle?.()
+    lane.cancelIdle = undefined
+    this.lanes.delete(laneId)
+    this.log(`lane "${laneId}": closing (${reason}); port ${lane.port}`)
+    lane.closePromise = this.destroy(lane).then(detail => { this.emit('close', laneId, `${reason}${detail}`) })
+    void this.writeRegistry()
+    this.pump()
+    await lane.closePromise
+  }
+
+  /** Close a lane whose page went bad, so the next acquire opens a clean one. */
+  async recycle(laneId: string, reason: string): Promise<void> {
+    this.emit('recycle', laneId, reason)
+    await this.close(laneId, `recycled: ${reason}`)
+  }
+
+  status(): LaneStatus[] {
+    return [...this.lanes.values()].map(lane => ({
+      laneId: lane.laneId,
+      port: lane.port,
+      state: lane.state,
+      users: lane.users,
+      since: new Date(lane.since).toISOString(),
+      lastUsedAt: new Date(lane.lastUsedAt).toISOString(),
+    }))
+  }
+
+  /** Close every lane; the host is stopping. */
+  async shutdown(): Promise<void> {
+    this.closed = true
+    for (const waiter of this.waiters.splice(0)) waiter.reject(new Error('lane manager is closing'))
+    await Promise.allSettled([...this.lanes.keys()].map(laneId => this.close(laneId, 'shutdown')))
+  }
+
+  /**
+   * Kill lanes a crashed earlier host left behind.
+   *
+   * A lane is only killed when its own `chrome.pid` names a live process AND
+   * that process's command line carries this lane's exact profile: the same
+   * proof-of-ownership rule the driver uses before attaching. Anything that
+   * cannot be proved is left alone; its directory is still removed, because it
+   * cannot be adopted by a new host anyway.
+   */
+  async reapOrphans(): Promise<number> {
+    let rows: { laneId?: string; profile?: string; stateDir?: string }[] = []
+    try {
+      const parsed = JSON.parse(await readFile(this.registryPath, 'utf8')) as { rows?: typeof rows }
+      rows = Array.isArray(parsed?.rows) ? parsed.rows : []
+    } catch { return 0 }
+    let killed = 0
+    for (const row of rows) {
+      if (!row?.stateDir || !row?.profile) continue
+      try {
+        const pid = Number((await readFile(join(row.stateDir, 'chrome.pid'), 'utf8')).trim())
+        if (alive(pid)) {
+          const commandLine = await commandLineOf(pid)
+          if (commandLine && commandLine.toLowerCase().includes(String(row.profile).toLowerCase())) {
+            await killTree(pid)
+            killed += 1
+          }
+        }
+      } catch { /* no pid file, or unreadable: nothing provable */ }
+      await rm(row.stateDir, { recursive: true, force: true }).catch(() => {})
+    }
+    await rm(this.registryPath, { force: true }).catch(() => {})
+    if (killed > 0) this.log(`reaped ${killed} orphan lane browser(s) from an earlier host`)
+    return killed
+  }
+
+  // --------------------------------------------------------------- internals
+
+  private use(lane: Lane): void {
+    lane.cancelIdle?.()
+    lane.cancelIdle = undefined
+    lane.users += 1
+    lane.state = 'active'
+    lane.lastUsedAt = this.now
+  }
+
+  private wait(laneId: string, onQueued?: () => void): Promise<LaneHandle> {
+    return new Promise<LaneHandle>((resolve, reject) => {
+      this.waiters.push({ laneId, resolve, reject, onQueued })
+      onQueued?.()
+      this.pump()
+    })
+  }
+
+  /** A new lane: reserve capacity now, then open Chrome and branch the login. */
+  private async open(laneId: string, onQueued?: () => void): Promise<LaneHandle> {
+    if (this.closed) throw new Error('lane manager is closed')
+    if (this.lanes.size + this.opening >= this.maxLanes) {
+      if (onQueued) onQueued()
+      return this.wait(laneId, onQueued)
+    }
+    this.opening += 1
+    let lane: Lane | undefined
+    try {
+      const port = await this.nextPort()
+      const stateDir = join(this.options.root, `${safeName(laneId)}-${randomUUID().slice(0, 8)}`)
+      const profile = join(stateDir, 'profile')
+      await mkdir(profile, { recursive: true })
+      const env: Record<string, string> = {
+        CHATGPT_CDP_PORT: String(port),
+        CHATGPT_PROFILE: profile,
+        CHATGPT_STATE_DIR: stateDir,
+        CHATGPT_LANE_ID: laneId,
+        CHATGPT_LANE_SOURCE_PORT: String(this.sourcePort),
+        CHATGPT_LANE_SYNC_COOKIES: this.options.syncCookies === false ? '0' : '1',
+      }
+      const driver = this.options.spawnLane
+        ? this.options.spawnLane({ laneId, port, profile, stateDir, env })
+        : new DriverChild({
+            script: this.options.driverScript,
+            profile,
+            log: this.log.bind(this),
+            timeoutMs: 20 * 60_000,
+            env,
+          })
+      lane = {
+        laneId,
+        port,
+        profile,
+        stateDir,
+        driver,
+        users: 0,
+        ready: false,
+        state: 'opening',
+        since: this.now,
+        lastUsedAt: this.now,
+        closing: false,
+      }
+      this.lanes.set(laneId, lane)
+      void this.writeRegistry()
+      this.emit('open', laneId, `port ${port}`)
+      this.log(`lane "${laneId}": opening on port ${port}`)
+      const warm = await driver.call({ op: 'warm' }, { timeoutMs: this.openTimeoutMs })
+      if (warm.ok !== true) throw new Error(`lane "${laneId}" did not warm: ${String(warm.error ?? 'no reason')}`)
+      lane.ready = true
+      lane.state = 'active'
+      lane.users = 1
+      lane.lastUsedAt = this.now
+      this.emit('ready', laneId, `signedIn=${warm.signedIn === true} plan=${String(warm.plan ?? 'unknown')}`)
+      this.log(`lane "${laneId}": ready on port ${port} (plan ${String(warm.plan ?? 'unknown')})`)
+      return this.handle(lane)
+    } catch (error) {
+      if (lane) {
+        this.lanes.delete(laneId)
+        await this.destroy(lane)
+      }
+      this.emit('failed', laneId, (error as Error).message)
+      this.log(`lane "${laneId}": open failed: ${(error as Error).message}`)
+      throw error
+    } finally {
+      this.opening = Math.max(0, this.opening - 1)
+      this.pump()
+    }
+  }
+
+  private pump(): void {
+    if (this.closed) return
+    let index = 0
+    while (index < this.waiters.length) {
+      const waiter = this.waiters[index]!
+      const lane = this.lanes.get(waiter.laneId)
+      if (lane && !lane.closing) {
+        if (lane.ready && lane.users === 0) {
+          this.waiters.splice(index, 1)
+          this.use(lane)
+          waiter.resolve(this.handle(lane))
+          continue
+        }
+        // Busy or still opening: stay queued behind this lane.
+        index += 1
+        continue
+      }
+      if (this.lanes.size + this.opening < this.maxLanes) {
+        this.waiters.splice(index, 1)
+        void this.open(waiter.laneId).then(waiter.resolve, waiter.reject)
+        continue
+      }
+      index += 1
+    }
+  }
+
+  /** Unload (which writes cookies back), terminate, and remove the profile. */
+  private async destroy(lane: Lane): Promise<string> {
+    let detail = ''
+    try {
+      const reply = await lane.driver.call({ op: 'unload' }, { timeoutMs: this.closeTimeoutMs })
+      const synced = Number((reply as { cookiesSynced?: unknown }).cookiesSynced)
+      if (Number.isFinite(synced) && synced > 0) detail = `; cookies written back: ${synced}`
+      else if (typeof (reply as { cookieSync?: unknown }).cookieSync === 'string') {
+        detail = `; cookie sync ${String((reply as { cookieSync?: unknown }).cookieSync)}`
+      }
+    } catch (error) {
+      this.log(`lane "${lane.laneId}": unload failed: ${(error as Error).message}`)
+    }
+    try { await lane.driver.terminate() } catch { /* already gone */ }
+    await rm(lane.stateDir, { recursive: true, force: true }).catch(() => {})
+    return detail
+  }
+
+  /** The first free lane port at or above the base, skipping live lanes. */
+  private async nextPort(): Promise<number> {
+    const used = new Set([...this.lanes.values()].map(lane => lane.port))
+    const limit = this.basePort + this.maxLanes * 4 + 16
+    for (let port = this.basePort; port < limit; port++) {
+      if (used.has(port)) continue
+      if (await portFree(port)) return port
+    }
+    throw new Error(`no free lane port between ${this.basePort} and ${limit}`)
+  }
+
+  private async writeRegistry(): Promise<void> {
+    const rows = [...this.lanes.values()].map(lane => ({
+      laneId: lane.laneId,
+      port: lane.port,
+      profile: lane.profile,
+      stateDir: lane.stateDir,
+      since: new Date(lane.since).toISOString(),
+    }))
+    try {
+      await mkdir(this.options.root, { recursive: true })
+      await writeFile(this.registryPath, JSON.stringify({ rows }, null, 2))
+    } catch (error) {
+      this.log(`lane registry write failed: ${(error as Error).message}`)
+    }
+  }
+}
+
+/** Is `port` listening? Exported for tests and the host's health report. */
+export function portListening(port: number, timeoutMs = 1_000): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = netConnect({ host: '127.0.0.1', port })
+    let settled = false
+    const finish = (value: boolean) => { if (!settled) { settled = true; clearTimeout(timer); socket.destroy(); resolve(value) } }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
+}
