@@ -207,14 +207,19 @@ const LOCKED_HINT =
 const NOT_FOUND_HINT =
   /errSecItemNotFound|-25300|The specified item could not be found|could not be found|No such secret|no such object/i
 
-function lockedError(what, detail) {
+function lockedError(what, detail, code = 'KEYSAFE_LOCKED') {
   const error = new Error(
     `keysafe: [KEYSAFE_LOCKED] ${what} could not be read; the credential store is locked ` +
       `or unavailable. Unlock it in the user's GUI session and retry. ${String(detail).trim().slice(0, 240)}`,
   )
-  error.code = 'KEYSAFE_LOCKED'
+  error.code = code
   return error
 }
+
+// Only this one failure permits a fresh-vault fallback: the store exists but
+// this process is outside the session allowed to use it (ssh, no GUI session).
+const INTERACTION_HINT =
+  /errSecInteractionNotAllowed|-25308|interaction not allowed|could not switch to audit session/i
 
 async function vaultHasRecords(vaultDir) {
   try {
@@ -236,13 +241,13 @@ async function readVaultMeta(vaultDir) {
   return null
 }
 
-async function writeVaultMeta(vaultDir, backend) {
+async function writeVaultMeta(vaultDir, backend, extra = {}) {
   // aclVersion records that the files passed the DACL pass in this process, so
   // the next process does not repeat one icacls spawn per record.
   const aclVersion = process.platform === 'win32' && hardenedFiles.has(vaultDir) ? 1 : 0
   await writePrivate(
     path.join(vaultDir, 'vault.meta'),
-    `${JSON.stringify({ version: 1, backend, aclVersion })}\n`,
+    `${JSON.stringify({ version: 1, backend, aclVersion, ...extra })}\n`,
   )
 }
 
@@ -508,6 +513,12 @@ async function keychainMasterKey(vaultDir, run, { create = true } = {}) {
     return key
   }
   const detail = `${lookup.stderr}\n${lookup.stdout}`
+  // An interaction failure outranks "not found": macOS reports both in the same
+  // message, and minting a key the GUI session can never reach would orphan the
+  // vault. This is the one failure a fresh vault may fall back from.
+  if (INTERACTION_HINT.test(detail)) {
+    throw lockedError('the Keychain master key', detail, 'KEYSAFE_LOCKED_INTERACTION')
+  }
   // A failed lookup is NOT "no key": generating a replacement here would
   // orphan every record encrypted under the real one.
   if (!NOT_FOUND_HINT.test(detail) || !create) {
@@ -607,7 +618,24 @@ export async function resolveMasterKey(options = {}) {
   if (backend === 'dpapi') {
     resolved = { key: await dpapiMasterKey(vaultDir, run, opts), backend }
   } else if (backend === 'keychain') {
-    resolved = { key: await keychainMasterKey(vaultDir, run, opts), backend }
+    try {
+      resolved = { key: await keychainMasterKey(vaultDir, run, opts), backend }
+    } catch (error) {
+      // Existing records mean a master key exists somewhere. Never mint a
+      // second one: it would orphan every record encrypted under the first.
+      // Only an interaction failure permits this, and only on a fresh vault.
+      if (!allowCreate || error?.code !== 'KEYSAFE_LOCKED_INTERACTION') throw error
+      const warning =
+        'keysafe: the Keychain is not usable from this session ' +
+        '(no GUI security session, or it is locked); ' +
+        'using a 0600 master-key file in the config directory'
+      resolved = {
+        key: await fileMasterKey(vaultDir, opts),
+        backend: 'file',
+        warning,
+        reason: 'keychain-unavailable',
+      }
+    }
   } else if (backend === 'libsecret') {
     try {
       resolved = { key: await libsecretMasterKey(vaultDir, run, opts), backend }
@@ -620,12 +648,24 @@ export async function resolveMasterKey(options = {}) {
       const warning =
         `keysafe: libsecret is unavailable (${String(error?.message ?? error).slice(0, 160)}); ` +
         'using a 0600 master-key file in the config directory'
-      resolved = { key: await fileMasterKey(vaultDir, opts), backend: 'file', warning }
+      resolved = {
+        key: await fileMasterKey(vaultDir, opts),
+        backend: 'file',
+        warning,
+        reason: 'libsecret-unavailable',
+      }
     }
   } else {
     resolved = { key: await fileMasterKey(vaultDir, opts), backend: 'file' }
   }
-  if (!meta) await writeVaultMeta(vaultDir, resolved.backend)
+  if (!meta) {
+    // A fallback records why, so the choice is auditable on the next open.
+    await writeVaultMeta(
+      vaultDir,
+      resolved.backend,
+      resolved.reason ? { reason: resolved.reason } : {},
+    )
+  }
   masterKeyCache.set(vaultDir, resolved)
   return resolved
 }
@@ -693,7 +733,7 @@ export async function captureSecret(name, secret, options = {}) {
   if (!value) throw new Error(`keysafe: refusing to store an empty secret for "${name}"`)
   const vaultDir = options.vaultDir ?? defaultVaultDir()
   await ensureDir(vaultDir, options.run ?? defaultRun)
-  const { key } = await resolveMasterKey({ ...options, vaultDir })
+  const { key, backend, warning } = await resolveMasterKey({ ...options, vaultDir })
   const envVar = envVarForRecord(name)
   const existing = await readRecordFile(vaultDir, name)
   const now = new Date().toISOString()
@@ -706,6 +746,9 @@ export async function captureSecret(name, secret, options = {}) {
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   })
+  // The caller needs to say which store the key actually landed in. A silent
+  // fallback is a security-relevant surprise, not an implementation detail.
+  return { name, envVar, backend, ...(warning ? { warning } : {}) }
 }
 
 /** @param {string} name */

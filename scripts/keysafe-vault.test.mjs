@@ -237,7 +237,95 @@ test('a fresh vault falls back to file and records the backend', async () => {
   }
 })
 
-test('a locked keychain is not "no record" and does not mint a key', async () => {
+const INTERACTION_FAILURE = {
+  code: 1,
+  stdout: '',
+  stderr: 'security: SecKeychainSearchCopyNext: The specified item could not be found.\n' +
+    'errSecInteractionNotAllowed -25308',
+}
+
+// A Keychain that works: the lookup misses, the store succeeds.
+const keychainWorks = async (_file, args, stdin) =>
+  String(stdin).startsWith('find-generic-password')
+    ? { code: 1, stdout: '', stderr: 'The specified item could not be found.' }
+    : { code: 0, stdout: '', stderr: '' }
+
+test('a fresh vault outside a GUI session falls back to file and says so', async () => {
+  const { dir } = await scratch()
+  try {
+    const { resolveMasterKey } = await import('./keysafe-vault.mjs')
+    const resolved = await resolveMasterKey({
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      run: async () => INTERACTION_FAILURE,
+    })
+    assert.equal(resolved.backend, 'file')
+    assert.match(resolved.warning, /Keychain is not usable from this session/)
+    const meta = JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8'))
+    assert.equal(meta.backend, 'file')
+    assert.equal(meta.reason, 'keychain-unavailable')
+    // The fallback is usable immediately, and the choice is sticky.
+    clearMasterKeyCache()
+    const reopened = await resolveMasterKey({ vaultDir: dir, platform: 'darwin', run: keychainWorks })
+    assert.equal(reopened.backend, 'file')
+    assert.equal(reopened.warning, undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('captureSecret reports the backend it actually used', async () => {
+  const { dir } = await scratch()
+  try {
+    const stored = await captureSecret('ds', 'fallback-sentinel', {
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      run: async () => INTERACTION_FAILURE,
+    })
+    assert.equal(stored.backend, 'file')
+    assert.match(stored.warning, /master-key file/)
+    // A plain file vault is the normal case and must not warn.
+    const { dir: other } = await scratch()
+    try {
+      const quiet = await captureSecret('ds', 'quiet-sentinel', { vaultDir: other, backend: 'file' })
+      assert.equal(quiet.backend, 'file')
+      assert.equal('warning' in quiet, false)
+    } finally {
+      await rm(other, { recursive: true, force: true })
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a populated vault never falls back when the keychain is unreachable', async () => {
+  const { dir } = await scratch()
+  try {
+    const { resolveMasterKey } = await import('./keysafe-vault.mjs')
+    await captureSecret('ds', 'populated-sentinel', {
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      run: keychainWorks,
+    })
+    clearMasterKeyCache()
+    await assert.rejects(
+      () => resolveMasterKey({ vaultDir: dir, platform: 'darwin', run: async () => INTERACTION_FAILURE }),
+      /KEYSAFE_LOCKED/,
+    )
+    const { readdir } = await import('node:fs/promises')
+    const entries = await readdir(dir)
+    // No second master key was minted beside the records.
+    assert.equal(entries.includes('master.key'), false)
+    assert.equal(JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8')).backend, 'keychain')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a locked keychain for another reason does not fall back', async () => {
   const { dir } = await scratch()
   try {
     const { resolveMasterKey } = await import('./keysafe-vault.mjs')
@@ -247,12 +335,12 @@ test('a locked keychain is not "no record" and does not mint a key', async () =>
           vaultDir: dir,
           backend: 'keychain',
           platform: 'darwin',
-          run: async () => ({ code: 1, stdout: '', stderr: 'errSecInteractionNotAllowed -25308' }),
+          run: async () => ({ code: 1, stdout: '', stderr: 'errSecAuthFailed -25293' }),
         }),
       /KEYSAFE_LOCKED/,
     )
-    const entries = await (await import('node:fs/promises')).readdir(dir)
-    assert.equal(entries.some(entry => entry === 'master.key'), false)
+    const { readdir } = await import('node:fs/promises')
+    assert.equal((await readdir(dir)).includes('master.key'), false)
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

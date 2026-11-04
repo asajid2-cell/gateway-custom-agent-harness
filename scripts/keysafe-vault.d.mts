@@ -47,7 +47,12 @@ export function resolveMasterKey(options?: KeysafeOptions): Promise<{
   warning?: string
 }>
 
-export function captureSecret(name: string, secret: string, options?: KeysafeOptions): Promise<void>
+export function captureSecret(name: string, secret: string, options?: KeysafeOptions): Promise<{
+  name: string
+  envVar: string
+  backend: MasterKeyBackend
+  warning?: string
+}>
 export function readSecret(name: string, options?: KeysafeOptions): Promise<string | null>
 export function hasSecret(name: string, options?: KeysafeOptions): Promise<boolean>
 export function removeSecret(name: string, options?: KeysafeOptions): Promise<boolean>

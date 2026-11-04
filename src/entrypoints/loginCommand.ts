@@ -133,6 +133,8 @@ export async function runLoginCommand(args: string[], io: LoginIO = {}): Promise
           2,
         ),
       )
+      // A degraded backend belongs on stderr so stdout stays machine-readable.
+      if ('warning' in store && store.warning) console.error(store.warning)
       return 0
     } catch (error) {
       console.error(`Credential store error: ${(error as Error).message}`)
@@ -157,7 +159,12 @@ export async function runLoginCommand(args: string[], io: LoginIO = {}): Promise
       console.error(`Could not remove ${name}: ${result.reason ?? 'not present'}`)
       return 1
     }
-    console.log(`removed ${name} from the ${result.source}`)
+    console.log(
+      result.backend
+        ? `removed ${name} from the ${result.source} (backend ${result.backend})`
+        : `removed ${name} from the ${result.source}`,
+    )
+    if (result.warning) console.error(result.warning)
     return 0
   }
 
@@ -182,6 +189,12 @@ export async function runLoginCommand(args: string[], io: LoginIO = {}): Promise
     console.error(`Could not save ${name} (${result.source}): ${result.reason ?? 'unknown error'}`)
     return 1
   }
-  console.log(`saved ${name} in the ${result.source}`)
+  console.log(
+    result.backend
+      ? `saved ${name} in the ${result.source} (backend ${result.backend})`
+      : `saved ${name} in the ${result.source}`,
+  )
+  // The key is stored, but the operator must know if the vault degraded.
+  if (result.warning) console.error(result.warning)
   return 0
 }

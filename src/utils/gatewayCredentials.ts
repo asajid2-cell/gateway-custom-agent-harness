@@ -10,6 +10,7 @@ import {
   peekVault,
   removeSecret,
   type CredentialMode,
+  type MasterKeyBackend,
 } from './keysafe/index.js'
 
 export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode' | 'openrouter'
@@ -19,6 +20,10 @@ export type CredentialResult = {
   mode: CredentialMode
   /** Where the credential was found or written, named for the operator. */
   source: string
+  /** Which master-key backend the bundled vault actually used. */
+  backend?: MasterKeyBackend
+  /** A fallback or degradation the operator must be told about. */
+  warning?: string
   reason?: string
 }
 
@@ -102,8 +107,14 @@ export async function saveGatewayCredential(
   }
   if (mode === 'bundled') {
     try {
-      await captureSecret(name, value)
-      return { ok: true, mode, source: sourceFor(mode) }
+      const stored = await captureSecret(name, value)
+      return {
+        ok: true,
+        mode,
+        source: sourceFor(mode),
+        backend: stored.backend,
+        warning: stored.warning,
+      }
     } catch (error) {
       return {
         ok: false,
@@ -141,7 +152,15 @@ export async function removeGatewayCredential(
   if (mode === 'bundled') {
     try {
       const removed = await removeSecret(name)
-      return { ok: removed, mode, source: sourceFor(mode), reason: removed ? undefined : 'not present' }
+      // Report the backend the vault is on, so a fallback stays visible.
+      const backend = await peekVault().then(peek => peek.backend ?? undefined).catch(() => undefined)
+      return {
+        ok: removed,
+        mode,
+        source: sourceFor(mode),
+        backend: backend as MasterKeyBackend | undefined,
+        reason: removed ? undefined : 'not present',
+      }
     } catch (error) {
       return { ok: false, mode, source: sourceFor(mode), reason: (error as Error).message.slice(0, 300) }
     }

@@ -17,9 +17,13 @@ import {
   hasSecret,
   keysafeMode,
   listSecrets,
+  peekVault,
   removeSecret,
 } from '../../utils/keysafe/index.js'
-import { externalGatewayEnvPath } from '../../utils/gatewayCredentials.js'
+import {
+  describeCredentialStore,
+  externalGatewayEnvPath,
+} from '../../utils/gatewayCredentials.js'
 
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
 
@@ -79,11 +83,11 @@ async function storeHas(name: string): Promise<boolean> {
 async function storeCapture(
   name: string,
   value: string,
-): Promise<{ ok: boolean; source: string; reason?: string }> {
+): Promise<{ ok: boolean; source: string; reason?: string; backend?: string; warning?: string }> {
   if (keysafeMode() === 'bundled') {
     try {
-      await captureSecret(name, value)
-      return { ok: true, source: 'bundled vault' }
+      const stored = await captureSecret(name, value)
+      return { ok: true, source: 'bundled vault', backend: stored.backend, warning: stored.warning }
     } catch (error) {
       return { ok: false, source: 'bundled vault', reason: (error as Error).message.slice(0, 300) }
     }
@@ -101,11 +105,19 @@ async function storeCapture(
 
 async function storeRemove(
   name: string,
-): Promise<{ ok: boolean; source: string; reason?: string }> {
+): Promise<{ ok: boolean; source: string; reason?: string; backend?: string }> {
   if (keysafeMode() === 'bundled') {
     try {
       const removed = await removeSecret(name)
-      return { ok: removed, source: 'bundled vault', reason: removed ? undefined : 'not present' }
+      const backend = await peekVault()
+        .then(peek => peek.backend ?? undefined)
+        .catch(() => undefined)
+      return {
+        ok: removed,
+        source: 'bundled vault',
+        backend: backend ?? undefined,
+        reason: removed ? undefined : 'not present',
+      }
     } catch (error) {
       return { ok: false, source: 'bundled vault', reason: (error as Error).message.slice(0, 300) }
     }
@@ -281,21 +293,28 @@ export const call: LocalJSXCommandCall = async (
 
   if (action === 'status') {
     const stored = await storeHas(keyName)
+    if (!stored) {
+      onDone(`${keyLabel(keyName)} key is not configured. Run /${keyCommand(keyName)} to add it.`)
+      return null
+    }
+    // Name the master-key backend: a fallback must not look like the default.
+    const store = await describeCredentialStore().catch(() => null)
+    const backend = store?.backend ? ` (backend ${store.backend})` : ''
+    const warning = store && 'warning' in store && store.warning ? `\n${store.warning}` : ''
     onDone(
-      stored
-        ? `${keyLabel(keyName)} key is stored in the ${keysafeMode()} credential store. Run /refreshlogin after changing it.`
-        : `${keyLabel(keyName)} key is not configured. Run /${keyCommand(keyName)} to add it.`,
+      `${keyLabel(keyName)} key is stored in the ${keysafeMode()} credential store${backend}. Run /refreshlogin after changing it.${warning}`,
     )
     return null
   }
 
   if (action === 'remove') {
     const result = await storeRemove(keyName)
-    onDone(
-      result.ok
-        ? `${keyLabel(keyName)} key removed from the ${result.source}.`
-        : `Could not remove the ${keyLabel(keyName)} key (${result.source}): ${result.reason || 'unknown error'}`,
-    )
+    if (!result.ok) {
+      onDone(`Could not remove the ${keyLabel(keyName)} key (${result.source}): ${result.reason || 'unknown error'}`)
+      return null
+    }
+    const backend = result.backend ? ` (backend ${result.backend})` : ''
+    onDone(`${keyLabel(keyName)} key removed from the ${result.source}${backend}.`)
     return null
   }
 
@@ -332,14 +351,18 @@ function GatewayLoginDialog(props: {
       return
     }
     setValue('')
+    // The vault may have fallen back to a weaker master-key backend; say which
+    // one actually holds the key, and repeat any warning the store returned.
+    const backendNote = result.backend ? ` (backend ${result.backend})` : ''
+    const warningNote = result.warning ? `\n${result.warning}` : ''
     if (props.reload) {
       const reload = await reloadGatewayKeys()
       const accounts = reload.ok ? await waitForAccounts(accountsPath) : null
       setBusy(false)
       props.onDone(
         reload.ok
-          ? `${label} key saved in the ${result.source}. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
-          : `${label} key saved in the ${result.source}, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.`,
+          ? `${label} key saved in the ${result.source}${backendNote}. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.${warningNote}`
+          : `${label} key saved in the ${result.source}${backendNote}, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.${warningNote}`,
       )
       return
     }
@@ -350,7 +373,7 @@ function GatewayLoginDialog(props: {
       ? ' The gateway has no OpenRouter route yet; the key is stored for when it does.'
       : ''
     props.onDone(
-      `${label} key saved in the ${result.source}. Run /refreshlogin to load it without restarting cc.${routeNote}`,
+      `${label} key saved in the ${result.source}${backendNote}. Run /refreshlogin to load it without restarting cc.${routeNote}${warningNote}`,
     )
   }
 

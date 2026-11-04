@@ -38,9 +38,14 @@ async function withScratch(fn: (dir: string) => Promise<void>): Promise<void> {
 test('--key-stdin saves through the bundled vault without printing the key', async () => {
   await withScratch(async dir => {
     const output: string[] = []
+    const warnings: string[] = []
     const original = console.log
+    const originalError = console.error
     console.log = (line: unknown) => {
       output.push(String(line))
+    }
+    console.error = (line: unknown) => {
+      warnings.push(String(line))
     }
     try {
       const code = await runLoginCommand(['--provider', 'opencode', '--key-stdin'], {
@@ -49,7 +54,15 @@ test('--key-stdin saves through the bundled vault without printing the key', asy
       assert.equal(code, 0)
     } finally {
       console.log = original
+      console.error = originalError
     }
+    // The operator is told which master-key backend actually holds the key.
+    assert.match(
+      output.join('\n'),
+      /^saved opencode-go in the bundled vault \(backend (dpapi|keychain|libsecret|file)\)$/m,
+    )
+    // Nothing about the key may reach either stream.
+    assert.equal(warnings.join('\n').includes('sk-sentinel-opencode'), false)
     assert.equal(output.join('\n').includes('sk-sentinel-opencode'), false)
 
     const vault = path.join(dir, 'keysafe')
@@ -150,9 +163,23 @@ test('--status sees numbered slots, and a slot-only save reads as configured', a
     const deepseek = (await statusJson()).providers.find(entry => entry.provider === 'deepseek')
     assert.equal(deepseek?.present, false)
 
-    assert.equal(
-      await runLoginCommand(['--provider', 'commandcode', '--slot', '2', '--remove']),
-      0,
+    const lines: string[] = []
+    const original = console.log
+    console.log = (line: unknown) => {
+      lines.push(String(line))
+    }
+    try {
+      assert.equal(
+        await runLoginCommand(['--provider', 'commandcode', '--slot', '2', '--remove']),
+        0,
+      )
+    } finally {
+      console.log = original
+    }
+    // Removal names the backend the vault is still on.
+    assert.match(
+      lines.join('\n'),
+      /^removed commandcode2 from the bundled vault \(backend (dpapi|keychain|libsecret|file)\)$/m,
     )
     const removed = (await statusJson()).providers.find(entry => entry.provider === 'commandcode')
     assert.equal(removed?.present, false)
