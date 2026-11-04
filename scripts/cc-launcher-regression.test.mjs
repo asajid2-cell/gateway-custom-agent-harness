@@ -390,7 +390,7 @@ test('interactive cc avoids the Defender-blocked nested encoded launcher', async
   // so adding a provider cannot silently skip its key injection.
   assert.match(
     script,
-    /\$OptionalKeyProviders\s*=\s*\$OpenCodeProviders\s*\+\s*@\([\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
+    /\$OptionalKeyProviders\s*=\s*\$OpenCodeProviders\s*\+\s*(?:\$[A-Za-z]+Providers\s*\+\s*)*@\([\s\S]*Credential\s*=\s*'amd-ds'[\s\S]*\)/,
     'optional providers should be declared in one table',
   )
 })
