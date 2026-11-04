@@ -64,10 +64,10 @@ export const QUOTA_CYCLE: Record<ProviderName, QuotaWindowKind[]> = {
  */
 export const QUOTA_WINDOW_LABEL: Record<QuotaWindowKind, string> = {
   H: '5hr',
-  W: 'weekly',
-  M: 'monthly',
-  V: 'vibe',
-  A: 'api',
+  W: 'Weekly',
+  M: 'Monthly',
+  V: 'Vibe',
+  A: 'API',
 }
 
 /**
@@ -218,7 +218,7 @@ export function formatProviderQuota(
   const window = quota.windows[kind]
   if (!window) return null
   const remaining = Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)))
-  return `${QUOTA_WINDOW_LABEL[kind]} usage ${remaining}% left${quota.stale ? ' (stale)' : ''}`
+  return `${QUOTA_WINDOW_LABEL[kind]} usage: ${remaining}% left${quota.stale ? ' (stale)' : ''}`
 }
 
 /**
