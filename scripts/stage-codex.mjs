@@ -20,10 +20,10 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 
 const ASSETS = {
   'win32-x64': { asset: 'codex-x86_64-pc-windows-msvc.exe.zip', binary: 'codex.exe' },
-  'darwin-arm64': { asset: 'codex-aarch64-apple-darwin.tar.gz', binary: 'codex' },
-  'darwin-x64': { asset: 'codex-x86_64-apple-darwin.tar.gz', binary: 'codex' },
-  'linux-x64': { asset: 'codex-x86_64-unknown-linux-gnu.tar.gz', binary: 'codex' },
-  'linux-arm64': { asset: 'codex-aarch64-unknown-linux-gnu.tar.gz', binary: 'codex' },
+  'darwin-arm64': { asset: 'codex-package-aarch64-apple-darwin.tar.gz', binary: 'codex' },
+  'darwin-x64': { asset: 'codex-package-x86_64-apple-darwin.tar.gz', binary: 'codex' },
+  'linux-x64': { asset: 'codex-package-x86_64-unknown-linux-musl.tar.gz', binary: 'codex', libc: 'musl' },
+  'linux-arm64': { asset: 'codex-package-aarch64-unknown-linux-musl.tar.gz', binary: 'codex', libc: 'musl' },
 }
 
 function arg(name, fallback) {
@@ -78,10 +78,17 @@ if (extracted.status !== 0) {
 // The release is a directory: codex-package.json names the entrypoint and the
 // exec-server/resources/path directories that must travel with it. Stage the
 // whole tree; a release without that manifest still works as a single binary.
-const packageFile = path.join(extractDir, 'codex-package.json')
+// A tarball may keep the tree under one top-level directory.
+let packageRoot = extractDir
+if (!existsSync(path.join(packageRoot, 'codex-package.json'))) {
+  const tops = (await readdir(packageRoot, { withFileTypes: true })).filter(entry => entry.isDirectory())
+  if (tops.length === 1 && existsSync(path.join(packageRoot, tops[0].name, 'codex-package.json'))) {
+    packageRoot = path.join(packageRoot, tops[0].name)
+  }
+}
 let entrypoint = spec.binary
-if (existsSync(packageFile)) {
-  const manifest = JSON.parse(await readFile(packageFile, 'utf8'))
+if (existsSync(path.join(packageRoot, 'codex-package.json'))) {
+  const manifest = JSON.parse(await readFile(path.join(packageRoot, 'codex-package.json'), 'utf8'))
   if (typeof manifest.entrypoint === 'string' && !manifest.entrypoint.includes('..')) {
     entrypoint = manifest.entrypoint
   }
@@ -89,8 +96,8 @@ if (existsSync(packageFile)) {
 
 await rm(dir, { recursive: true, force: true })
 await mkdir(dir, { recursive: true })
-for (const entry of await readdir(extractDir, { withFileTypes: true })) {
-  await cp(path.join(extractDir, entry.name), path.join(dir, entry.name), { recursive: true })
+for (const entry of await readdir(packageRoot, { withFileTypes: true })) {
+  await cp(path.join(packageRoot, entry.name), path.join(dir, entry.name), { recursive: true })
 }
 
 const target = path.join(dir, entrypoint)
@@ -145,6 +152,7 @@ manifest.entries[key] = {
   sha256,
   treeSha256,
   entrypoint,
+  ...(spec.libc ? { libc: spec.libc } : {}),
 }
 await mkdir(path.dirname(manifestPath), { recursive: true })
 await writeFile(manifestPath, `${JSON.stringify({ version, entries: manifest.entries }, null, 2)}\n`)

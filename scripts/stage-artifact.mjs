@@ -197,6 +197,7 @@ await cp(codexSource, path.join(out, 'resources', 'codex', entry.version, key), 
 await cp(codexManifestPath, path.join(out, 'resources', 'codex', 'manifest.json'))
 report.sha256.codexArchive = entry.sha256
 report.sha256.codexTree = codexDigest
+report.codex = { version: entry.version, asset: entry.asset, ...(entry.libc ? { libc: entry.libc } : {}) }
 
 if (platform === 'darwin') {
   const helper = path.join(ROOT, 'scripts', 'macos', 'bin', 'keysafe-keychain')
@@ -247,10 +248,29 @@ async function run(command, args, options = {}) {
   return spawnSync(command, args, { cwd: out, encoding: 'utf8', timeout: 120_000, ...options })
 }
 
-async function healthSmoke(port) {
+/**
+ * A clean machine, as far as this process can imitate one. The artifact smoke
+ * must exercise the mode it ships: a legacy ~/.keysafe on the build host would
+ * otherwise resolve external, because mode lookup reads the real home.
+ */
+function isolatedEnv(home) {
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: home, USERPROFILE: home, HOME: home }
+  for (const name of [
+    'GATEWAY_CREDENTIALS_MODE',
+    'GATEWAY_KEYSAFE_MODE',
+    'GATEWAY_OAUTH_MODE',
+    'MODEL_GATEWAY_ENV_FILE',
+    'MODEL_GATEWAY_KEYSAFE_HOME',
+  ]) {
+    delete env[name]
+  }
+  return env
+}
+
+async function healthSmoke(port, home) {
   const child = spawn(process.execPath, [path.join(out, 'scripts', 'gateway-supervisor.mjs'), '--port', String(port)], {
     cwd: out,
-    env: { ...process.env, CLAUDE_CONFIG_DIR: path.join(out, '.scratch-config') },
+    env: isolatedEnv(home),
     stdio: 'ignore',
     detached: platform !== 'win32',
   })
@@ -290,22 +310,37 @@ if (smoke) {
   const scratchConfig = path.join(out, '.scratch-config')
   await mkdir(scratchConfig, { recursive: true })
   const status = await run('bun', ['--no-install', 'dist/cli.js', 'login', '--status'], {
-    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+    env: isolatedEnv(scratchConfig),
   })
   if (status.status !== 0) fail(`staged CLI failed login --status: ${status.stderr || status.stdout}`)
-  report.smoke.loginStatus = JSON.parse(status.stdout).mode
+  const mode = JSON.parse(status.stdout).mode
+  if (mode !== 'bundled') fail(`clean-home login --status reported "${mode}", expected bundled`)
+  report.smoke.loginStatus = mode
+
+  // sharp is the only native package in the artifact, and a staged copy that
+  // cannot dlopen its prebuilt has not been proved by file counts.
+  const sharp = await run('bun', ['--no-install', '-e', 'const s = require("sharp"); process.stdout.write(JSON.stringify({ sharp: s.versions.sharp, vips: s.versions.vips }))'])
+  if (sharp.status !== 0) fail(`staged sharp failed to load: ${sharp.stderr || sharp.stdout}`)
+  report.smoke.sharp = JSON.parse(sharp.stdout)
 
   const port = 41000 + Math.floor(Math.random() * 2000)
-  if (!await healthSmoke(port)) fail(`staged supervisor did not serve /health on ${port}`)
+  if (!await healthSmoke(port, scratchConfig)) fail(`staged supervisor did not serve /health on ${port}`)
   report.smoke.health = port
 
-  // Negative 1: manifests newer than dist must not trigger a rebuild.
+  // Negative 1: manifests newer than dist must not trigger a rebuild. Run it in
+  // a copy so the shipped artifact keeps dist newer than the manifests.
+  const mtimeCopy = path.join(os.tmpdir(), `stage-mtime-${process.pid}`)
+  await rm(mtimeCopy, { recursive: true, force: true })
+  await cp(out, mtimeCopy, { recursive: true })
   const now = new Date()
-  for (const name of ['package.json', 'bun.lock']) await utimes(path.join(out, name), now, now)
-  const prewarm = await run(process.execPath, ['scripts/cc-launcher.mjs', '--prewarm'], {
-    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+  for (const name of ['package.json', 'bun.lock']) await utimes(path.join(mtimeCopy, name), now, now)
+  const prewarm = spawnSync(process.execPath, ['scripts/cc-launcher.mjs', '--prewarm'], {
+    cwd: mtimeCopy,
+    encoding: 'utf8',
     timeout: 60_000,
+    env: isolatedEnv(scratchConfig),
   })
+  await rm(mtimeCopy, { recursive: true, force: true })
   if (prewarm.status !== 0) fail(`mtime-inverted prewarm failed: ${prewarm.stderr || prewarm.stdout}`)
   const noise = `${prewarm.stdout}${prewarm.stderr}`
   if (/compiled harness is stale|rebuilding before launch/i.test(noise)) fail('mtime-inverted prewarm attempted a rebuild')
@@ -320,7 +355,7 @@ if (smoke) {
     cwd: copy,
     encoding: 'utf8',
     timeout: 60_000,
-    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+    env: isolatedEnv(scratchConfig),
   })
   await rm(copy, { recursive: true, force: true })
   if (missing.status === 0) fail('missing dist/cli.js did not fail the launch')
@@ -334,12 +369,23 @@ if (smoke) {
       cwd: out,
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+      env: isolatedEnv(scratchConfig),
     })
     if (ps.status !== 0) fail(`staged cc.ps1 --prewarm failed: ${ps.stderr || ps.stdout}`)
     report.smoke.ccPrewarm = 'ok'
   }
 }
+
+// Whatever the smoke rows did in copies, the shipped tree must end with dist
+// newer than the manifests. A fresh-check that fires on the artifact is the
+// failure this ordering exists to prevent, and the guard must not be the only
+// thing standing between the artifact and a rebuild attempt.
+const cliTime = await stat(path.join(out, 'dist', 'cli.js'))
+const olderForShip = new Date(cliTime.mtimeMs - 60_000)
+for (const name of ['package.json', 'bun.lock']) await utimes(path.join(out, name), olderForShip, olderForShip)
+const manifestTime = (await stat(path.join(out, 'package.json'))).mtimeMs
+report.invariants = { distNewerThanManifests: cliTime.mtimeMs > manifestTime }
+if (!report.invariants.distNewerThanManifests) fail('artifact ordering: dist/cli.js is not newer than package.json')
 
 await rm(path.join(out, '.scratch-config'), { recursive: true, force: true })
 await measure()
