@@ -521,8 +521,13 @@ const { env: gatewayEnvBase, loaded: keysLoaded } = loadGatewayEnv()
  * the legacy external store must keep using it, so the launcher sets the
  * explicit external flag itself when it finds one. This is the "our cc sets the
  * flag" half of the rule: nothing changes for an existing setup, and a fresh
- * machine - which has neither gateway.env keys nor ~/.keysafe records - stays
- * on the bundled default.
+ * machine stays on the bundled default.
+ *
+ * The legacy store is platform-specific: gateway.env keys on POSIX (the file
+ * this launcher already loads) and ~/.keysafe/*.cred on Windows. A POSIX
+ * ~/.keysafe directory is deliberately NOT consulted - keysafe.ps1 is
+ * Windows-only, so a copy of that directory cannot be the external provider on
+ * Linux or macOS.
  */
 function legacyExternalStorePresent() {
   if (keysLoaded > 0) return true
