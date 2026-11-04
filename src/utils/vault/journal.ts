@@ -40,6 +40,14 @@ export function contentHash(body: Record<string, unknown>): string {
   return `sha256:${createHash('sha256').update(canonicalJson(rest), 'utf8').digest('hex')}`
 }
 
+/**
+ * The writer's identity on every committed line. A constant rather than a pid:
+ * it names the authority that validated the event, which is what the record
+ * needs to prove the scribe did not author its own verdict. It can never equal
+ * a `proposed_by` session id.
+ */
+export const WRITER_IDENTITY = 'writer:gateway-vault/1'
+
 export type JournalEvent = {
   schema_version: number
   sequence: number
@@ -442,6 +450,12 @@ export async function appendEventsLocked(
         rejected.push({ event_id: eventId, reason: 'content_hash is writer-owned and must not be proposed' })
         continue
       }
+      if ('status' in proposal) {
+        // Validation is the writer's verdict, not the scribe's claim: an event
+        // is 'validated' because the writer checked it, never because it said so.
+        rejected.push({ event_id: eventId, reason: 'status is writer-owned and must not be proposed' })
+        continue
+      }
       const generation = proposal.generation_id
       if (typeof generation !== 'string' || generation.trim() === '') {
         // Absent is a refusal, never a default: a retired scribe with stale
@@ -460,11 +474,13 @@ export async function appendEventsLocked(
       sequence += 1
       const body: Record<string, unknown> = {
         ...proposal,
-        // Writer-owned fields come last so a proposal cannot claim a family or
-        // a position it was not given.
+        // Writer-owned fields come last so a proposal cannot claim a family, a
+        // position, or its own validation.
         schema_version: options.schemaVersion ?? 1,
         family_id: familyId,
         sequence,
+        status: 'validated',
+        committed_by: WRITER_IDENTITY,
       }
       const event = { ...body, content_hash: contentHash(body) } as JournalEvent
       committed.push(event)

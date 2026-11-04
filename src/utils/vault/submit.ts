@@ -100,6 +100,11 @@ export function validateProposal(proposal: Proposal): string[] {
   }
   if (!isText(proposal.summary)) reasons.push('summary is required')
   if (!isText(proposal.recorded_at)) reasons.push('recorded_at is required')
+  // Provenance of the capture itself. These are the scribe's facts, not the
+  // writer's: which extractor version produced the proposal, and which session
+  // proposed it. `committed_by` and `status` are the writer's, and are stamped.
+  if (!isText(proposal.capture_version)) reasons.push('capture_version is required')
+  if (!isText(proposal.proposed_by)) reasons.push('proposed_by is required')
   return reasons
 }
 

@@ -18,6 +18,8 @@ function proposal(overrides: Partial<Proposal> = {}): Proposal {
     evidence_status: 'direct',
     summary: 'ship it',
     recorded_at: '2026-11-05T00:00:00.000Z',
+    capture_version: 'scribe-0.1.0',
+    proposed_by: 'sess-scribe-1',
     ...overrides,
   } as Proposal
 }
@@ -44,6 +46,11 @@ test('a valid proposal commits with the generation stamped and a writer hash', a
     assert.equal(event.sequence, 1)
     assert.equal(event.family_id, FAMILY)
     assert.match(String(event.content_hash), /^sha256:[0-9a-f]{64}$/)
+    // The verdict and the identity are the writer's, and can never be the
+    // proposer's own word.
+    assert.equal(event.status, 'validated')
+    assert.equal(event.committed_by, 'writer:gateway-vault/1')
+    assert.notEqual(event.committed_by, event.proposed_by)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -94,6 +101,27 @@ test('structural validation names what is missing', () => {
   assert.ok(topicMerge.some(reason => /merge needs merged_into/.test(reason)))
   const topicSplit = validateProposal(proposal({ kind: 'topic', topic_op: 'split' }))
   assert.ok(topicSplit.some(reason => /split needs split_into/.test(reason)))
+  const noCapture = validateProposal(proposal({ capture_version: '' }))
+  assert.ok(noCapture.some(reason => /capture_version is required/.test(reason)))
+  const noProposer = validateProposal(proposal({ proposed_by: '' }))
+  assert.ok(noProposer.some(reason => /proposed_by is required/.test(reason)))
+})
+
+test('a proposal that declares its own status is refused; the writer stamps it', async () => {
+  const root = await seeded()
+  try {
+    const result = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [proposal({ status: 'validated' } as never)],
+    })
+    assert.equal(result.committed.length, 0)
+    assert.match(result.rejected[0]?.reason ?? '', /status is writer-owned/)
+    assert.equal((await readJournal(root, FAMILY)).events.length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('the idempotency key makes a retried batch a replay, not a second commit', async () => {
