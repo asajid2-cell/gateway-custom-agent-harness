@@ -17,15 +17,17 @@
  * with 78 (EX_CONFIG) and a diagnostic instead of starting a gateway that would
  * fail every provider request.
  *
- * Usage: node gateway-vault-launch.mjs -- <gateway> [args...]
+ * Usage: node gateway-vault-launch.mjs <runner> <gateway> [args...]
+ *
+ * Positional, with no `--` separator: bun strips a bare `--` from a script's
+ * argv, so the separator form silently produced an empty command under bun.
  */
 import { spawn } from 'node:child_process'
 import { defaultVaultDir, peekVault, secretsEnv } from './keysafe-vault.mjs'
 import { stripGatewayKeys } from './gateway-keysafe.mjs'
 
-const separator = process.argv.indexOf('--')
-const command = separator >= 0 ? process.argv.slice(separator + 1) : []
-if (command.length === 0) {
+const [file, ...args] = process.argv.slice(2)
+if (!file) {
   process.stderr.write('gateway-vault-launch: missing gateway command\n')
   process.exit(64)
 }
@@ -50,7 +52,6 @@ try {
 }
 
 const env = { ...stripGatewayKeys(process.env), ...overlay }
-const [file, ...args] = command
 const child = spawn(file, args, { env, stdio: 'inherit', windowsHide: true })
 
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {

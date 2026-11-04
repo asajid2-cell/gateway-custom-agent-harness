@@ -97,6 +97,8 @@ test('gateway supervisor restarts a crashed local gateway and keeps the same por
       // Point the vault at the fixture root so the supervisor spawns the fake
       // gateway directly instead of wrapping it in a real keysafe chain.
       MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      // Hermetic: these rows must not read the developer's real bundled vault.
+      GATEWAY_CREDENTIALS_MODE: 'external',
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
@@ -238,6 +240,8 @@ test('consumer recovers across a supervised child restart with the follow-up too
       TEST_GATEWAY_EVENTS: events,
       TEST_GATEWAY_REQUESTS: requests,
       MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      // Hermetic: these rows must not read the developer's real bundled vault.
+      GATEWAY_CREDENTIALS_MODE: 'external',
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '250',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '250',
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '2',
@@ -362,6 +366,8 @@ test('gateway supervisor does not abandon a session after repeated child crashes
       ...process.env,
       TEST_GATEWAY_STARTS: counter,
       MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      // Hermetic: these rows must not read the developer's real bundled vault.
+      GATEWAY_CREDENTIALS_MODE: 'external',
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '5',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '5',
       MODEL_GATEWAY_SUPERVISOR_WINDOW_MS: '1000',
@@ -426,6 +432,8 @@ test('gateway supervisor treats the reload exit code as a deliberate restart, no
       ...process.env,
       TEST_GATEWAY_STARTS: counter,
       MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      // Hermetic: these rows must not read the developer's real bundled vault.
+      GATEWAY_CREDENTIALS_MODE: 'external',
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS: '1',
@@ -452,7 +460,7 @@ test('gateway supervisor treats the reload exit code as a deliberate restart, no
       (await readFile(counter, 'utf8')).trim().split(/\r?\n/).filter(Boolean),
       ['start', 'start'],
     )
-    assert.match(stderr, /reload-keys requested; restarting with a fresh keysafe chain/)
+    assert.match(stderr, /reload-keys requested; restarting with a fresh external credential chain/)
     // A reload must not be logged or counted as a crash restart.
     assert.doesNotMatch(stderr, /child-exit code=75/)
     assert.doesNotMatch(stderr, /restart-limit-exhausted/)
@@ -544,7 +552,75 @@ exit 1
       await wait(100)
     }
     assert.deepEqual(available, [1, 2])
-    assert.match(stderr, /reload-keys requested; restarting with a fresh keysafe chain/)
+    assert.match(stderr, /reload-keys requested; restarting with a fresh external credential chain/)
+  } finally {
+    await stopTree(child)
+    await rm(temp, { recursive: true, force: true })
+  }
+})
+
+test('bundled mode injects the vault and a reload picks up a saved key', { timeout: 60_000 }, async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'gateway-supervisor-bundled-'))
+  const configHome = path.join(temp, 'config')
+  const vaultDir = path.join(configHome, 'keysafe')
+  await mkdir(configHome, { recursive: true })
+  // File backend keeps the vault host-independent; the gateway child runs as
+  // the same user either way.
+  const { captureSecret, clearMasterKeyCache } = await import('./keysafe-vault.mjs')
+  clearMasterKeyCache()
+  await captureSecret('opencode-go', 'bundled-sentinel-one', { vaultDir, backend: 'file' })
+  await captureSecret('ds', 'bundled-sentinel-ds', { vaultDir, backend: 'file' })
+
+  const port = await findPort()
+  const child = spawn(process.execPath, [supervisor, '--port', String(port)], {
+    cwd: root,
+    env: {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: configHome,
+      GATEWAY_CREDENTIALS_MODE: 'bundled',
+      MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
+      MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
+    },
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true,
+  })
+  let stderr = ''
+  child.stderr.setEncoding('utf8')
+  child.stderr.on('data', chunk => { stderr += chunk })
+
+  const readAccounts = async () => {
+    const deadline = Date.now() + 20_000
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/gateway/opencode-account?sessionId=test`, { signal: AbortSignal.timeout(1000) })
+        if (response.ok) return (await response.json()).available
+      } catch {}
+      await wait(100)
+    }
+    throw new Error(`gateway never became ready: ${stderr}`)
+  }
+
+  try {
+    assert.deepEqual(await readAccounts(), [1])
+
+    await captureSecret('opencode-go2', 'bundled-sentinel-two', { vaultDir, backend: 'file' })
+    const reload = await fetch(`http://127.0.0.1:${port}/gateway/reload-keys`, { method: 'POST', signal: AbortSignal.timeout(5000) })
+    assert.equal(reload.status, 200)
+
+    const deadline = Date.now() + 20_000
+    let available = null
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/gateway/opencode-account?sessionId=test`, { signal: AbortSignal.timeout(1000) })
+        if (response.ok) {
+          available = (await response.json()).available
+          if (available.includes(2)) break
+        }
+      } catch {}
+      await wait(100)
+    }
+    assert.deepEqual(available, [1, 2], stderr)
+    assert.match(stderr, /reload-keys requested; restarting with a fresh bundled credential chain/)
   } finally {
     await stopTree(child)
     await rm(temp, { recursive: true, force: true })

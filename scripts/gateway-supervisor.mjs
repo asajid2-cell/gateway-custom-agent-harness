@@ -94,9 +94,10 @@ if (process.platform !== 'win32') {
 
 function startChild() {
   childStartedAt = Date.now()
-  // Rebuild the keysafe chain from the vault on every spawn, so a key added or
-  // removed since the last start is picked up by the next one. See
-  // gateway-keysafe.mjs for why the gateway still only ever reads env.
+  // Rebuild the credential chain on every spawn, so a key added or removed
+  // since the last start is picked up by the next one: the bundled vault is
+  // re-decrypted, the external store re-read. See gateway-keysafe.mjs for why
+  // the gateway still only ever reads env.
   const launch = buildGatewayLaunch({ gatewayPath, gatewayArgs: args, mode: credentialMode })
   child = spawn(launch.file, launch.args, {
     cwd: process.cwd(),
@@ -121,7 +122,7 @@ function startChild() {
     // A requested key reload is a deliberate restart, not a failure: respawn at
     // once with a fresh chain and do not let it count against the restart limit.
     if (code === GATEWAY_RELOAD_EXIT_CODE) {
-      log('reload-keys requested; restarting with a fresh keysafe chain')
+      log(`reload-keys requested; restarting with a fresh ${credentialMode} credential chain`)
       restartTimes = []
       restartNumber = 0
       restartTimer = setTimeout(() => {

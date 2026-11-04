@@ -156,7 +156,7 @@ test('bundled mode routes through the vault launcher and strips inherited keys',
     assert.equal(launch.args[0], vaultLaunchScriptPath())
     // The vault helper receives the full node command, so it can spawn the
     // gateway exactly as the supervisor would have.
-    assert.deepEqual(launch.args.slice(1), ['--', 'node', '/gw.mjs', '--port', '1'])
+    assert.deepEqual(launch.args.slice(1), ['node', '/gw.mjs', '--port', '1'])
     // The gateway is reached only through the vault helper, never the legacy
     // keysafe chain, and a stale inherited key cannot survive.
     assert.equal('DEEPSEEK_API_KEY' in launch.env, false)

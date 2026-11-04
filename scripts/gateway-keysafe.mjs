@@ -143,7 +143,7 @@ export function buildGatewayLaunch({
   if (effectiveMode === 'bundled') {
     return {
       file: nodePath,
-      args: [vaultLaunchScriptPath(), '--', nodePath, gatewayPath, ...gatewayArgs],
+      args: [vaultLaunchScriptPath(), nodePath, gatewayPath, ...gatewayArgs],
       env: stripGatewayKeys(env),
     }
   }
