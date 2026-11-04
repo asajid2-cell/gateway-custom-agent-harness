@@ -11,6 +11,7 @@ import {
   keysafeScriptPath,
   listKeysafeProviders,
   stripGatewayKeys,
+  vaultLaunchScriptPath,
 } from './gateway-keysafe.mjs'
 
 async function fixtureVault(records) {
@@ -89,7 +90,7 @@ test('an empty vault spawns the gateway directly with the inherited environment'
   const home = await fixtureVault([])
   const env = { ...process.env, OPENCODE_API_KEY: 'kept' }
   try {
-    const launch = buildGatewayLaunch({ gatewayPath: '/gw.mjs', gatewayArgs: ['--port', '1'], home, env, platform: 'win32' })
+    const launch = buildGatewayLaunch({ gatewayPath: '/gw.mjs', gatewayArgs: ['--port', '1'], home, env, platform: 'win32', mode: 'external' })
     assert.equal(launch.file, process.execPath)
     assert.deepEqual(launch.args, ['/gw.mjs', '--port', '1'])
     assert.equal(launch.env, env)
@@ -103,7 +104,7 @@ test('a populated vault injects every key through one keysafe run-many call and 
   const home = await fixtureVault(['opencode-go', 'opencode-go3', 'amd-ds', 'commandcode', 'ds'])
   const env = { ...process.env, OPENCODE_API_KEY: 'stale', DEEPSEEK_API_KEY: 'stale', KEEP_ME: 'yes' }
   try {
-    const launch = buildGatewayLaunch({ gatewayPath: 'C:\\gw\\model-gateway.mjs', gatewayArgs: ['--port', '4011'], home, env, platform: 'win32' })
+    const launch = buildGatewayLaunch({ gatewayPath: 'C:\\gw\\model-gateway.mjs', gatewayArgs: ['--port', '4011'], home, env, platform: 'win32', mode: 'external' })
     assert.equal(launch.file, 'powershell.exe')
     assert.deepEqual(launch.args.slice(0, 6), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', keysafeScriptPath(home), 'run-many'])
     assert.equal(launch.args[6], '-Inject')
@@ -130,12 +131,58 @@ test('off Windows the chain is skipped and the environment is untouched', async 
   const home = await fixtureVault(['ds'])
   const env = { ...process.env, DEEPSEEK_API_KEY: 'kept' }
   try {
-    const launch = buildGatewayLaunch({ gatewayPath: '/gw.mjs', home, env, platform: 'linux' })
+    const launch = buildGatewayLaunch({ gatewayPath: '/gw.mjs', home, env, platform: 'linux', mode: 'external' })
     assert.equal(launch.file, process.execPath)
     assert.equal(launch.env, env)
   } finally {
     await rm(home, { recursive: true, force: true })
   }
+})
+
+test('bundled mode routes through the vault launcher and strips inherited keys', async () => {
+  const home = await fixtureVault(['ds'])
+  const env = { ...process.env, DEEPSEEK_API_KEY: 'stale', KEEP_ME: 'yes' }
+  try {
+    const launch = buildGatewayLaunch({
+      gatewayPath: '/gw.mjs',
+      gatewayArgs: ['--port', '1'],
+      home,
+      env,
+      platform: 'win32',
+      nodePath: 'node',
+      mode: 'bundled',
+    })
+    assert.equal(launch.file, 'node')
+    assert.equal(launch.args[0], vaultLaunchScriptPath())
+    // The vault helper receives the full node command, so it can spawn the
+    // gateway exactly as the supervisor would have.
+    assert.deepEqual(launch.args.slice(1), ['--', 'node', '/gw.mjs', '--port', '1'])
+    // The gateway is reached only through the vault helper, never the legacy
+    // keysafe chain, and a stale inherited key cannot survive.
+    assert.equal('DEEPSEEK_API_KEY' in launch.env, false)
+    assert.equal(launch.env.KEEP_ME, 'yes')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('the shared resolver chooses the launch path when no mode is passed', () => {
+  const bundled = buildGatewayLaunch({
+    gatewayPath: '/gw.mjs',
+    env: { GATEWAY_CREDENTIALS_MODE: 'bundled' },
+    platform: 'linux',
+    nodePath: 'node',
+  })
+  assert.equal(bundled.args[0], vaultLaunchScriptPath())
+
+  const external = buildGatewayLaunch({
+    gatewayPath: '/gw.mjs',
+    env: { GATEWAY_CREDENTIALS_MODE: 'external' },
+    platform: 'linux',
+    nodePath: 'node',
+  })
+  assert.equal(external.file, 'node')
+  assert.deepEqual(external.args, ['/gw.mjs'])
 })
 
 test('stripGatewayKeys removes only gateway key variables', () => {

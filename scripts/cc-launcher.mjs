@@ -515,7 +515,35 @@ const stdoutLog = join(logDir, 'gateway.out.log')
 const stderrLog = join(logDir, 'gateway.err.log')
 
 const { env: gatewayEnvBase, loaded: keysLoaded } = loadGatewayEnv()
+
+/**
+ * The code default is the cleanroom bundled vault. A machine that already has
+ * the legacy external store must keep using it, so the launcher sets the
+ * explicit external flag itself when it finds one. This is the "our cc sets the
+ * flag" half of the rule: nothing changes for an existing setup, and a fresh
+ * machine - which has neither gateway.env keys nor ~/.keysafe records - stays
+ * on the bundled default.
+ */
+function legacyExternalStorePresent() {
+  if (keysLoaded > 0) return true
+  if (process.platform !== 'win32') return false
+  try {
+    return readdirSync(join(Home, '.keysafe')).some(entry => entry.endsWith('.cred'))
+  } catch {
+    return false
+  }
+}
+
+if (!process.env.GATEWAY_CREDENTIALS_MODE && legacyExternalStorePresent()) {
+  // Inherited by both the supervisor and the harness, so the gateway and the
+  // /login UI cannot disagree about which store holds the keys.
+  process.env.GATEWAY_CREDENTIALS_MODE = 'external'
+}
+
 const gatewayEnv = { ...gatewayEnvBase, CLAUDE_CODE_GATEWAY_PORT: String(port) }
+if (process.env.GATEWAY_CREDENTIALS_MODE) {
+  gatewayEnv.GATEWAY_CREDENTIALS_MODE = process.env.GATEWAY_CREDENTIALS_MODE
+}
 
 let gatewayProcess = null
 let exitCode = 1

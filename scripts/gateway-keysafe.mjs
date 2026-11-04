@@ -23,6 +23,7 @@ import { existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { keysafeMode } from './keysafe-vault.mjs'
 
 // A deliberate reload is not a crash. The gateway answers the reload request and
 // then exits with this code; the supervisor treats it as an immediate restart
@@ -109,11 +110,15 @@ const psQuote = value => `'${String(value).replace(/'/g, "''")}'`
 /**
  * Resolve how the supervisor should spawn the gateway.
  *
- * Returns { file, args, env }. With no vault records (or off Windows, or a
- * missing keysafe script) it is a plain `node <gateway>` spawn with the
- * inherited environment untouched, so development and the supervisor tests do
- * not need a vault. With records it is a powershell.exe invocation of one
- * keysafe layer (run-many) that injects every record into the gateway; the
+ * `mode` is the credential mode resolved once by the supervisor and frozen for
+ * that generation: `bundled` routes the spawn through gateway-vault-launch.mjs
+ * (the encrypted vault), `external` through the legacy keysafe chain.
+ *
+ * Returns { file, args, env }. In external mode with no vault records (or off
+ * Windows, or a missing keysafe script) it is a plain `node <gateway>` spawn
+ * with the inherited environment untouched, so development and the supervisor
+ * tests do not need a vault. With records it is a powershell.exe invocation of
+ * one keysafe layer (run-many) that injects every record into the gateway; the
  * environment handed to it has the inherited gateway key variables removed so
  * the fresh injection is the only source.
  */
@@ -124,8 +129,25 @@ export function buildGatewayLaunch({
   home = keysafeHome(),
   env = process.env,
   platform = process.platform,
+  mode,
 } = {}) {
   if (!gatewayPath) throw new Error('buildGatewayLaunch requires gatewayPath')
+  // The supervisor resolves this once per generation and passes it in; a direct
+  // caller falls back to the same mode resolution the rest of the code uses.
+  const effectiveMode = mode ?? keysafeMode(env)
+
+  // Bundled mode: the vault is the only source. A short-lived helper decrypts it
+  // and spawns the gateway, so the gateway still reads env only and no key ever
+  // becomes an argument or a file. The inherited key variables are stripped even
+  // when the vault is empty, so a stale inherited key cannot impersonate one.
+  if (effectiveMode === 'bundled') {
+    return {
+      file: nodePath,
+      args: [vaultLaunchScriptPath(), '--', nodePath, gatewayPath, ...gatewayArgs],
+      env: stripGatewayKeys(env),
+    }
+  }
+
   const providers = listKeysafeProviders(home)
   const keysafe = keysafeScriptPath(home)
   if (platform !== 'win32' || providers.length === 0 || !existsSync(keysafe)) {
@@ -160,6 +182,11 @@ export function buildGatewayLaunch({
 export function gatewayKeyInjectScriptPath() {
   return process.env.MODEL_GATEWAY_KEY_INJECT_SCRIPT ||
     fileURLToPath(new URL('./gateway-key-inject.mjs', import.meta.url))
+}
+
+export function vaultLaunchScriptPath() {
+  return process.env.MODEL_GATEWAY_VAULT_LAUNCH_SCRIPT ||
+    fileURLToPath(new URL('./gateway-vault-launch.mjs', import.meta.url))
 }
 
 /**

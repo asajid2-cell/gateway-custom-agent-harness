@@ -497,6 +497,9 @@ exit 1
     env: {
       ...process.env,
       MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      // This row exercises the legacy external chain; the code default is now
+      // the bundled vault, so name the mode explicitly.
+      GATEWAY_CREDENTIALS_MODE: 'external',
       MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
       MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS: '10',
     },

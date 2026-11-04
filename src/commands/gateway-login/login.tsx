@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { access, readFile, readdir } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
@@ -19,12 +19,9 @@ import {
   listSecrets,
   removeSecret,
 } from '../../utils/keysafe/index.js'
+import { externalGatewayEnvPath } from '../../utils/gatewayCredentials.js'
 
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
-
-function keyPath(keyName: string): string {
-  return join(homedir(), '.keysafe', `${keyName}.cred`)
-}
 
 function keyLabel(keyName: string): string {
   if (keyName === 'ds') return 'DeepSeek'
@@ -45,7 +42,7 @@ async function storedNames(): Promise<string[]> {
   if (keysafeMode() === 'bundled') return (await listSecrets()).map(entry => entry.name)
   if (process.platform !== 'win32') {
     try {
-      const raw = await readFile(join(homedir(), '.claude', 'gateway.env'), 'utf8')
+      const raw = await readFile(externalGatewayEnvPath(), 'utf8')
       const names: string[] = []
       for (const line of raw.split(/\r?\n/)) {
         const match = /^\s*(?:export\s+)?([A-Z0-9_]+)=/.exec(line)
@@ -220,6 +217,15 @@ export const call: LocalJSXCommandCall = async (
   args,
   boundKeyName?: string,
 ) => {
+  // Resolve the mode once, up front: a bad GATEWAY_*_MODE must land as a line in
+  // the dialog, not as an uncaught rejection out of the store helpers (and not
+  // as a throw during dialog render).
+  try {
+    keysafeMode()
+  } catch (error) {
+    onDone(`Credential store error: ${(error as Error).message}`)
+    return null
+  }
   const keyName = boundKeyName ?? (args.trim().startsWith('deepseek') ? 'ds' : 'opencode-go')
   const action = args.trim().toLowerCase()
 

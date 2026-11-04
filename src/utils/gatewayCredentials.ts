@@ -32,7 +32,14 @@ const KEYSAFE_SCRIPT = path.join(
   'keysafe.ps1',
 )
 
-function externalGatewayEnvPath(): string {
+/**
+ * The file the launcher actually reads: MODEL_GATEWAY_ENV_FILE wins, else
+ * <CLAUDE_CONFIG_DIR|~/.claude>/gateway.env. Keep this in one place so the UI
+ * cannot disagree with the launcher about which file holds the keys.
+ */
+export function externalGatewayEnvPath(): string {
+  const explicit = process.env.MODEL_GATEWAY_ENV_FILE
+  if (explicit) return explicit
   const configured = process.env.CLAUDE_CONFIG_DIR
   return path.join(configured || path.join(USER_HOME, '.claude'), 'gateway.env')
 }

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { GATEWAY_RELOAD_EXIT_CODE, buildGatewayLaunch } from './gateway-keysafe.mjs'
+import { keysafeMode } from './keysafe-vault.mjs'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const args = process.argv.slice(2)
@@ -13,6 +14,11 @@ const gatewayPath = gatewayArgIndex >= 0
 if (gatewayArgIndex >= 0) {
   args.splice(gatewayArgIndex, 2)
 }
+
+// Resolve the credential mode once for the life of this supervisor. A key
+// reload restarts the child inside the same generation, and the mode must not
+// change under it; a mode change is a new `cc`.
+const credentialMode = keysafeMode()
 
 // A supervised session must not become permanently disconnected because a
 // provider/runtime crash happened several times in one turn. Set a positive
@@ -91,7 +97,7 @@ function startChild() {
   // Rebuild the keysafe chain from the vault on every spawn, so a key added or
   // removed since the last start is picked up by the next one. See
   // gateway-keysafe.mjs for why the gateway still only ever reads env.
-  const launch = buildGatewayLaunch({ gatewayPath, gatewayArgs: args })
+  const launch = buildGatewayLaunch({ gatewayPath, gatewayArgs: args, mode: credentialMode })
   child = spawn(launch.file, launch.args, {
     cwd: process.cwd(),
     env: launch.env,

@@ -1,6 +1,21 @@
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
+
+# The code default is the cleanroom bundled vault. A machine that already has
+# the legacy keysafe store keeps using it: this launcher sets the explicit
+# external flag itself, so an existing setup is unchanged while a fresh machine
+# (no ~/.keysafe records) stays on the bundled default. Both the supervisor and
+# the harness inherit the flag, so the gateway and the /login UI agree.
+if ([string]::IsNullOrWhiteSpace($env:GATEWAY_CREDENTIALS_MODE)) {
+  $LegacyKeysafeDir = Join-Path $env:USERPROFILE '.keysafe'
+  $LegacyRecordCount = 0
+  if (Test-Path -LiteralPath $LegacyKeysafeDir) {
+    $LegacyRecordCount = @(Get-ChildItem -LiteralPath $LegacyKeysafeDir -Filter '*.cred' -ErrorAction SilentlyContinue).Count
+  }
+  if ($LegacyRecordCount -gt 0) { $env:GATEWAY_CREDENTIALS_MODE = 'external' }
+}
+
 $LaunchDirectory = (Get-Location).Path
 $DiagnosticPath = Join-Path $env:LOCALAPPDATA 'Gateway\launcher.jsonl'
 function Write-LaunchDiagnostic {
@@ -1095,10 +1110,21 @@ try {
   )
   $ClaudeArgs += @('--settings', $ScopedSettingsPath)
 
-  # Start the Gateway through ONE short-lived keysafe child. Optional providers
-  # are included only when their vault record is present, and no value ever
-  # becomes an argument or file.
+  # Start the gateway. In external mode it goes through ONE short-lived keysafe
+  # child: optional providers are included only when their vault record exists,
+  # and no value ever becomes an argument or file. In bundled mode there is no
+  # external store to read; the supervisor injects the bundled vault itself.
   $GatewayCommand = 'node "' + $GatewaySupervisor + '" --port ' + [string]$Port
+  if ($env:GATEWAY_CREDENTIALS_MODE -eq 'bundled') {
+    # Cleanroom: one plain supervisor spawn, no keysafe wrapper.
+    $GatewayArgumentList = @(
+      '-NoProfile'
+      '-ExecutionPolicy'
+      'Bypass'
+      '-Command'
+      $GatewayCommand
+    )
+  } else {
   # keysafe's run-many decrypts several vault records and injects them all into
   # the single Gateway process, so the launcher opens one PowerShell wrapper
   # instead of one per key. Every key still stays out of arguments, files, and
@@ -1134,6 +1160,7 @@ try {
     '-Command'
     $GatewayCommand
   )
+  }
 
   # Start-Process serializes ArgumentList items into a native command line.
   # The -Inject value is pre-quoted above (it contains ';'); quote the -Command
