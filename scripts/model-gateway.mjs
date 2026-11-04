@@ -4893,6 +4893,175 @@ export async function readOpenCodeSubscriptionUsage(credentials = openCodeCreden
   return payload
 }
 
+// ---------------------------------------------------------------------------
+// Command Code usage.
+//
+// Command Code reports three windows: a five-hour cap, a weekly cap, and a
+// monthly credit grant. The first two come straight from
+// `/alpha/billing/credits` as `used`/`cap`; the monthly figure is the plan's
+// grant minus what is left (`credits.monthlyCredits`), which is how the CLI
+// itself derives it. The plan id comes from `/alpha/billing/subscriptions`, and
+// an unrecognised plan leaves the monthly window out rather than inventing a
+// total it cannot know.
+// ---------------------------------------------------------------------------
+const COMMANDCODE_API_BASE =
+  process.env.MODEL_GATEWAY_COMMANDCODE_API_BASE || 'https://api.commandcode.ai'
+
+const COMMANDCODE_PLAN_TOTALS = {
+  'individual-go': 10,
+  'individual-go-v1': 10,
+  'individual-goat': 70,
+  'individual-pro': 30,
+  'individual-pro-v1': 80,
+  'individual-provider': 15,
+  'individual-max': 150,
+  'individual-ultra': 300,
+  'teams-pro': 40,
+}
+
+/** One `{ used, cap, resetAt }` bucket as a normalized quota window. */
+function commandCodeWindow(window) {
+  if (!window || typeof window !== 'object') return null
+  const used = Number(window.used)
+  const cap = Number(window.cap)
+  if (!Number.isFinite(used) || !Number.isFinite(cap) || cap <= 0) return null
+  return {
+    usedPercent: clampUsedPercent((used / cap) * 100),
+    resetsAt: resetToEpochMs(window.resetAt),
+  }
+}
+
+/**
+ * The account's windows from the credits reply and the plan the subscription
+ * names. Exported so the normalization can be tested without a server.
+ */
+export function commandCodeUsageWindows(creditsPayload, planId, periodEnd = null) {
+  const windows = {}
+  const hour = commandCodeWindow(creditsPayload?.windowLimits?.fiveHour)
+  if (hour) windows.H = hour
+  const week = commandCodeWindow(creditsPayload?.windowLimits?.weekly)
+  if (week) windows.W = week
+
+  const granted = COMMANDCODE_PLAN_TOTALS[planId]
+  const monthlyRemaining = Number(creditsPayload?.credits?.monthlyCredits)
+  if (Number.isFinite(granted) && granted > 0 && Number.isFinite(monthlyRemaining)) {
+    const purchased = Number(creditsPayload?.credits?.purchasedCredits) || 0
+    const free = Number(creditsPayload?.credits?.freeCredits) || 0
+    const remaining = Math.max(0, monthlyRemaining) + purchased + free
+    // The grant can be topped up mid-period, so the total is whichever is
+    // larger; only the difference is usage.
+    const total = Math.max(granted, monthlyRemaining) + purchased + free
+    const used = Math.max(0, total - remaining)
+    windows.M = {
+      usedPercent: clampUsedPercent(total > 0 ? (used / total) * 100 : 0),
+      resetsAt: resetToEpochMs(periodEnd),
+    }
+  }
+  return windows
+}
+
+/**
+ * The Command Code subscription's own usage, normalized to the shared
+ * ProviderQuota shape and shared across gateways through the quota cache. As
+ * with OpenCode, the figure belongs to the credential that is actually serving,
+ * so `lastServed` wins over the pool's current selection.
+ */
+export async function readCommandCodeUsage(
+  credentials = commandCodeCredentials,
+  base = COMMANDCODE_API_BASE,
+) {
+  const number = Number.isSafeInteger(credentials.lastServed) && credentials.lastServed > 0
+    ? credentials.lastServed
+    : credentials.number
+  const key = typeof credentials.keyFor === 'function'
+    ? credentials.keyFor(number)
+    : credentials.key
+  if (!key) return { windows: {}, asof: Date.now(), stale: true }
+  const payload = await readQuotaThroughCache({
+    key: quotaKey('commandcode', number),
+    ttlMs: QUOTA_TTL_MS.commandcode,
+    read: async () => {
+      try {
+        const headers = { authorization: `Bearer ${key}`, accept: 'application/json' }
+        const [creditsResponse, subscriptionResponse] = await Promise.all([
+          fetch(`${base}/alpha/billing/credits`, { headers, signal: AbortSignal.timeout(5_000) }),
+          fetch(`${base}/alpha/billing/subscriptions`, { headers, signal: AbortSignal.timeout(5_000) }),
+        ])
+        if (!creditsResponse.ok) return { windows: null }
+        const credits = await creditsResponse.json()
+        const subscription = subscriptionResponse.ok ? await subscriptionResponse.json() : null
+        const planId = subscription?.data?.planId
+        const periodEnd = subscription?.data?.currentPeriodEnd ?? null
+        return {
+          windows: commandCodeUsageWindows(credits, planId, periodEnd),
+          account: number,
+        }
+      } catch {
+        return { windows: null }
+      }
+    },
+  })
+  if (!payload) return { windows: {}, asof: Date.now(), stale: true }
+  return payload
+}
+
+// ---------------------------------------------------------------------------
+// Mistral usage.
+//
+// Mistral's billing endpoint answers both buckets the Vibe plan spends: the
+// plan budget (`vibe_budget`) and the Studio API budget (`api_budget`). Each is
+// account-level, so either credential type can read both; the route passes the
+// credential that is actually serving so the cache entry follows the account.
+// ---------------------------------------------------------------------------
+const MISTRAL_BILLING_ENDPOINT =
+  process.env.MODEL_GATEWAY_MISTRAL_BILLING_URL ||
+  'https://api.mistral.ai/v1/billing/budget'
+
+/**
+ * The two budgets as `{ V, A }` windows of used percent. Mistral reports
+ * `usage_percentage` already on the 0-100 scale, so it is taken as-is.
+ */
+export function mistralUsageWindows(payload) {
+  const windows = {}
+  for (const [field, kind] of [['vibe_budget', 'V'], ['api_budget', 'A']]) {
+    const budget = payload?.[field]
+    const used = clampUsedPercent(Number(budget?.usage_percentage))
+    if (used === null) continue
+    windows[kind] = { usedPercent: used, resetsAt: resetToEpochMs(budget?.reset_at) }
+  }
+  return windows
+}
+
+/** The Vibe and Studio budgets for the credential that is serving. */
+export async function readMistralUsage(
+  credentials = mistralRouteCredentials(),
+  endpoint = MISTRAL_BILLING_ENDPOINT,
+) {
+  const number = Number.isSafeInteger(credentials.lastServed) && credentials.lastServed > 0
+    ? credentials.lastServed
+    : credentials.number
+  const key = credentials.key
+  if (!key) return { windows: {}, asof: Date.now(), stale: true }
+  const payload = await readQuotaThroughCache({
+    key: quotaKey('mistral', number),
+    ttlMs: QUOTA_TTL_MS.mistral,
+    read: async () => {
+      try {
+        const response = await fetch(endpoint, {
+          headers: { authorization: `Bearer ${key}`, accept: 'application/json' },
+          signal: AbortSignal.timeout(5_000),
+        })
+        if (!response.ok) return { windows: null }
+        return { windows: mistralUsageWindows(await response.json()), account: number }
+      } catch {
+        return { windows: null }
+      }
+    },
+  })
+  if (!payload) return { windows: {}, asof: Date.now(), stale: true }
+  return payload
+}
+
 /**
  * The subscription's own usage window, read on demand. The footer needs it in
  * the same slot as the Codex figure, and a gateway session is barred from
@@ -5676,6 +5845,20 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/opencode-usage') {
     const pool = await sessionOpenCodeCredentials(requestUrl.searchParams.get('sessionId'))
     json(res, 200, await readOpenCodeSubscriptionUsage(pool))
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/commandcode-usage') {
+    process.stderr.write('model-gateway route path=/gateway/commandcode-usage backend=commandcode-usage\n')
+    const pool = await sessionCommandCodeCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, await readCommandCodeUsage(pool))
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/mistral-usage') {
+    process.stderr.write('model-gateway route path=/gateway/mistral-usage backend=mistral-usage\n')
+    const studio = await sessionMistralCredentials(requestUrl.searchParams.get('sessionId'))
+    json(res, 200, await readMistralUsage(mistralRouteCredentials(studio)))
     return
   }
 

@@ -23,14 +23,14 @@ export type WeeklyUtilization = {
  * only the windows it has; one it omits is simply not shown, rather than
  * printed as a zero.
  */
-export type QuotaWindowKind = 'H' | 'W' | 'M'
+export type QuotaWindowKind = 'H' | 'W' | 'M' | 'V' | 'A'
 export type QuotaWindow = {
   /** Percent of the window's limit that has been used, 0-100. */
   usedPercent: number
   /** Epoch ms when the window resets, or null when the provider does not say. */
   resetsAt: number | null
 }
-export type ProviderName = 'Codex' | 'Anthropic' | 'OpenCode'
+export type ProviderName = 'Codex' | 'Anthropic' | 'OpenCode' | 'Command Code' | 'Mistral'
 export type ProviderQuota = {
   windows: Partial<Record<QuotaWindowKind, QuotaWindow>>
   /** Epoch ms when the upstream last answered. */
@@ -49,6 +49,22 @@ export const QUOTA_CYCLE: Record<ProviderName, QuotaWindowKind[]> = {
   Codex: ['W', 'H'],
   Anthropic: ['W', 'H'],
   OpenCode: ['W', 'H', 'M'],
+  'Command Code': ['W', 'H', 'M'],
+  // Vibe leads because it is the budget the route spends first.
+  Mistral: ['V', 'A'],
+}
+
+/**
+ * The window's name in the readout. `H`/`W`/`M` are the compact hour, week and
+ * month windows the existing providers print; `V`/`A` name Mistral's two
+ * budgets so neither is mistaken for a time window.
+ */
+export const QUOTA_WINDOW_LABEL: Record<QuotaWindowKind, string> = {
+  H: 'H',
+  W: 'W',
+  M: 'M',
+  V: 'vibe',
+  A: 'api',
 }
 
 /**
@@ -158,6 +174,8 @@ export function getWeeklyRemainingPercent(
 export function getGatewayProviderLabel(model: string): ProviderName | 'Gateway' {
   const lower = model.toLowerCase()
   if (lower.includes('opencode')) return 'OpenCode'
+  if (lower.includes('commandcode')) return 'Command Code'
+  if (lower.includes('mistral')) return 'Mistral'
   if (lower.includes('gateway-claude-')) return 'Anthropic'
   if (lower.includes('gateway-gpt-')) return 'Codex'
   return 'Gateway'
@@ -194,7 +212,7 @@ export function formatProviderQuota(
   const window = quota.windows[kind]
   if (!window) return null
   const remaining = Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)))
-  return `${provider} ${kind} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
+  return `${provider} ${QUOTA_WINDOW_LABEL[kind]} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
 }
 
 export function formatBottomBarUsage(

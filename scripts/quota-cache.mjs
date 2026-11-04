@@ -29,6 +29,8 @@ export const QUOTA_TTL_MS = {
   anthropic: 120_000,
   opencode: 60_000,
   codex: 60_000,
+  commandcode: 60_000,
+  mistral: 60_000,
 }
 
 /**

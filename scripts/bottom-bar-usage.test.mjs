@@ -15,6 +15,8 @@ import {
 } from '../src/utils/bottomBarUsage.ts'
 
 import { openCodeQuotaFromPayload } from '../src/utils/opencodeUsage.ts'
+import { commandCodeQuotaFromPayload } from '../src/utils/commandCodeUsage.ts'
+import { mistralQuotaFromPayload } from '../src/utils/mistralUsage.ts'
 
 const quota = (windows, extra = {}) => ({ windows, asof: 1_000, stale: false, ...extra })
 const win = (usedPercent = 0) => ({ usedPercent, resetsAt: null })
@@ -23,6 +25,8 @@ test('the quota cycle lists each provider windows in click order', () => {
   assert.deepEqual(QUOTA_CYCLE.Codex, ['W', 'H'])
   assert.deepEqual(QUOTA_CYCLE.Anthropic, ['W', 'H'])
   assert.deepEqual(QUOTA_CYCLE.OpenCode, ['W', 'H', 'M'])
+  assert.deepEqual(QUOTA_CYCLE['Command Code'], ['W', 'H', 'M'])
+  assert.deepEqual(QUOTA_CYCLE.Mistral, ['V', 'A'])
 })
 
 test('the available windows are the reported ones, in cycle order', () => {
@@ -257,6 +261,39 @@ test('the readout no longer carries a provider remaining part', () => {
   assert.doesNotMatch(formatBottomBarUsage('gateway-claude-opus-5-5', usage, 200_000), /remaining/)
   assert.doesNotMatch(formatBottomBarUsage('gateway-opencode-deepseek-v4.1-flash', usage, 200_000), /remaining/)
   assert.match(formatBottomBarUsage('gateway-claude-opus-5-5', usage, 200_000), /^model gateway-claude-opus-5-5 · usage .* · context /)
+})
+
+test('Command Code and Mistral keep their own normalized windows', () => {
+  const commandCode = commandCodeQuotaFromPayload({
+    windows: {
+      H: { usedPercent: 25.2, resetsAt: 1_793_828_917_251 },
+      W: { usedPercent: 59.6, resetsAt: 1_794_263_709_685 },
+      M: { usedPercent: 79.8, resetsAt: 1_795_233_050_000 },
+    },
+    asof: 7,
+    account: 2,
+  })
+  assert.deepEqual(commandCode.windows.H, { usedPercent: 25.2, resetsAt: 1_793_828_917_251 })
+  assert.equal(commandCode.account, 2)
+  assert.equal(formatProviderQuota('Command Code', commandCode, 'M'), 'Command Code M remaining 20%')
+
+  const mistral = mistralQuotaFromPayload({
+    windows: {
+      V: { usedPercent: 0.000132, resetsAt: Date.parse('2026-12-01T00:00:00Z') },
+      A: { usedPercent: 0.008607, resetsAt: Date.parse('2026-12-01T00:00:00Z') },
+    },
+    asof: 9,
+  })
+  // V/A are named in the readout so neither budget reads as a time window.
+  assert.equal(formatProviderQuota('Mistral', mistral, 'V'), 'Mistral vibe remaining 100%')
+  assert.equal(formatProviderQuota('Mistral', mistral, 'A'), 'Mistral api remaining 100%')
+  assert.equal(mistralQuotaFromPayload({ windows: {} }), null)
+  assert.equal(commandCodeQuotaFromPayload({ windows: {} }), null)
+})
+
+test('the provider label names Command Code and Mistral routes', () => {
+  assert.equal(getGatewayProviderLabel('gateway-commandcode-deepseek-v4.1-flash'), 'Command Code')
+  assert.equal(getGatewayProviderLabel('gateway-mistral-deepseek-v4.1-flash'), 'Mistral')
 })
 
 test('isAnthropicGatewayModel recognises only the Anthropic route', () => {
