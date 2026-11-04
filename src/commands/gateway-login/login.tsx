@@ -344,7 +344,14 @@ function GatewayLoginDialog(props: {
       return
     }
     setBusy(false)
-    props.onDone(`${label} key saved in the ${result.source}. Run /refreshlogin to load it without restarting cc.`)
+    // OpenRouter has no gateway route yet; say so instead of implying the key
+    // is already in use.
+    const routeNote = props.keyName === 'openrouter'
+      ? ' The gateway has no OpenRouter route yet; the key is stored for when it does.'
+      : ''
+    props.onDone(
+      `${label} key saved in the ${result.source}. Run /refreshlogin to load it without restarting cc.${routeNote}`,
+    )
   }
 
   return (
