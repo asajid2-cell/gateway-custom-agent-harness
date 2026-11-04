@@ -171,6 +171,45 @@ function killPid(pid, tree = false) {
   } catch {}
 }
 
+/**
+ * Raw process-chain evidence for step 11: one line per ancestor, from the
+ * gateway child up to the root, plus a compact summary. Read-only; nothing is
+ * signalled or terminated.
+ */
+function processChain(startPid) {
+  const script =
+    'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine ' +
+    '| ConvertTo-Json -Compress -Depth 3'
+  let table = []
+  try {
+    const raw = execFileSync('powershell', ['-NoProfile', '-Command', script], {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+    }).trim()
+    const parsed = JSON.parse(raw)
+    table = Array.isArray(parsed) ? parsed : [parsed]
+  } catch (error) {
+    return [`# chain lookup failed: ${String(error.message).slice(0, 160)}`]
+  }
+  const byPid = new Map(table.map(entry => [entry.ProcessId, entry]))
+  const lines = [`# chain for pid=${startPid}`]
+  const names = []
+  let current = startPid
+  const seen = new Set()
+  while (current && !seen.has(current) && byPid.has(current)) {
+    seen.add(current)
+    const entry = byPid.get(current)
+    lines.push(
+      `pid=${entry.ProcessId} ppid=${entry.ParentProcessId} name=${entry.Name} ` +
+      `argv=${entry.CommandLine ?? ''}`,
+    )
+    names.push(String(entry.Name ?? '').toLowerCase())
+    current = entry.ParentProcessId
+  }
+  lines.push(`# chain: ${names.join(' -> ')}`)
+  return lines
+}
+
 function childExitLines(log) {
   return [...log.matchAll(CHILD_EXIT_LINE)].map(match => ({
     index: match.index,
@@ -408,6 +447,24 @@ async function main() {
   if (argv.includes('--bonus-only')) {
     ctrlCBonusPhase()
     return finish(asJson)
+  }
+
+  // Step-11 evidence capture: raw ancestor chain for a pid or for whoever is
+  // listening on --port. Read-only; run it while `cc` is up.
+  if (argv.includes('--chain')) {
+    const readArg = flag => {
+      const index = argv.indexOf(flag)
+      return index >= 0 ? argv[index + 1] : undefined
+    }
+    const port = readArg('--port')
+    const pid = readArg('--pid')
+    const target = port ? pidListeningOnPort(Number(port)) : pid ? Number(pid) : null
+    if (!target) {
+      console.error('bundled-injection-proof --chain: pass --port <n> (listener) or --pid <n>')
+      return 2
+    }
+    for (const line of processChain(target)) console.log(line)
+    return 0
   }
 
   for (const [label, file] of [
