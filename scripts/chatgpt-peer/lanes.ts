@@ -19,7 +19,7 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { connect as netConnect, createServer } from 'node:net'
 import { join } from 'node:path'
-import { DriverChild } from './driver.ts'
+import { DriverChild, type DriverReply } from './driver.ts'
 
 export type LaneHandle = {
   laneId: string
@@ -36,6 +36,8 @@ export type LaneStatus = {
   port: number
   state: LaneState
   users: number
+  /** Turns served by this window since it opened. */
+  turns: number
   since: string
   lastUsedAt: string
 }
@@ -57,6 +59,12 @@ export type LaneOptions = {
   idleMs?: number
   /** Write a lane's rotated cookies back to the master on close. */
   syncCookies?: boolean
+  /** Rotate a lane after this many acquired turns (0 disables). */
+  maxTurns?: number
+  /** Rotate a lane this long after it opened (0 disables). */
+  maxAgeMs?: number
+  /** First retry delay when a lane open is rate-limited. */
+  backoffBaseMs?: number
   log?: (line: string) => void
   /** Every open/close/recycle, for the host's audit trail. */
   onEvent?: (event: LaneEvent, laneId: string, detail: string) => void
@@ -79,6 +87,8 @@ type Lane = {
   stateDir: string
   driver: DriverChild
   users: number
+  /** Acquired turns since open; drives `maxTurns` rotation. */
+  turns: number
   ready: boolean
   state: LaneState
   since: number
@@ -100,6 +110,10 @@ const DEFAULT_MAX_LANES = 8
 const DEFAULT_IDLE_MS = 30_000
 const DEFAULT_OPEN_TIMEOUT_MS = 120_000
 const DEFAULT_CLOSE_TIMEOUT_MS = 90_000
+const DEFAULT_MAX_TURNS = 20
+const DEFAULT_MAX_AGE_MS = 10 * 60_000
+const DEFAULT_BACKOFF_BASE_MS = 5_000
+const WARM_ATTEMPTS = 3
 
 /** A lane id is a bus session id; the directory only needs it to be safe. */
 const safeName = (value: string): string => String(value || 'lane').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 60) || 'lane'
@@ -170,6 +184,9 @@ export class LaneManager {
   private readonly sourcePort: number
   private readonly openTimeoutMs: number
   private readonly closeTimeoutMs: number
+  private readonly maxTurns: number
+  private readonly maxAgeMs: number
+  private readonly backoffBaseMs: number
   private opening = 0
   private closed = false
 
@@ -181,6 +198,9 @@ export class LaneManager {
     this.sourcePort = Math.max(1, Math.floor(options.sourcePort ?? 9222))
     this.openTimeoutMs = Math.max(1_000, Math.floor(options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS))
     this.closeTimeoutMs = Math.max(1_000, Math.floor(options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS))
+    this.maxTurns = Math.max(0, Math.floor(options.maxTurns ?? DEFAULT_MAX_TURNS))
+    this.maxAgeMs = Math.max(0, Math.floor(options.maxAgeMs ?? DEFAULT_MAX_AGE_MS))
+    this.backoffBaseMs = Math.max(0, Math.floor(options.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS))
     this.registryPath = join(options.root, 'lanes.json')
   }
 
@@ -246,6 +266,17 @@ export class LaneManager {
     // window offered to a different writer by closing it.
     this.pump()
     if (lane.closing || this.lanes.get(laneId) !== lane || lane.users > 0) return
+    // Bounded lifetime: a window that has served its turn budget or lived too
+    // long is rotated before it can degrade. This is the proactive half of the
+    // health policy; the idle timer is the reactive half.
+    if (this.maxTurns > 0 && lane.turns >= this.maxTurns) {
+      void this.close(laneId, `rotated after ${lane.turns} turns`)
+      return
+    }
+    if (this.maxAgeMs > 0 && this.now - lane.since >= this.maxAgeMs) {
+      void this.close(laneId, `rotated after ${Math.round((this.now - lane.since) / 1000)}s`)
+      return
+    }
     if (this.waiters.length > 0) {
       // A queued writer must not wait out a window nobody is using.
       void this.close(laneId, 'released for a queued writer')
@@ -285,6 +316,7 @@ export class LaneManager {
       port: lane.port,
       state: lane.state,
       users: lane.users,
+      turns: lane.turns,
       since: new Date(lane.since).toISOString(),
       lastUsedAt: new Date(lane.lastUsedAt).toISOString(),
     }))
@@ -338,6 +370,7 @@ export class LaneManager {
     lane.cancelIdle?.()
     lane.cancelIdle = undefined
     lane.users += 1
+    lane.turns += 1
     lane.state = 'active'
     lane.lastUsedAt = this.now
   }
@@ -348,6 +381,29 @@ export class LaneManager {
       onQueued?.()
       this.pump()
     })
+  }
+
+  /**
+   * Open the browser and prove the branched login, retrying only when the
+   * page is rate-limiting us.
+   *
+   * A 429 at open is the account asking for a pause, not a broken lane: sending
+   * the next writer at it immediately turns one throttle into a burst. A real
+   * refusal (signed out, no cookies) keeps its single attempt and its error.
+   */
+  private async warmLane(driver: DriverChild, laneId: string): Promise<DriverReply> {
+    let reply = await driver.call({ op: 'warm' }, { timeoutMs: this.openTimeoutMs })
+    for (let attempt = 1; reply.ok !== true && attempt < WARM_ATTEMPTS && this.rateLimited(reply); attempt++) {
+      const wait = this.backoffBaseMs * 2 ** (attempt - 1)
+      this.log(`lane "${laneId}": warm hit a rate limit; retrying in ${wait} ms (attempt ${attempt + 1}/${WARM_ATTEMPTS})`)
+      await new Promise(resolve => setTimeout(resolve, wait))
+      reply = await driver.call({ op: 'warm' }, { timeoutMs: this.openTimeoutMs })
+    }
+    return reply
+  }
+
+  private rateLimited(reply: DriverReply): boolean {
+    return /429|rate.?limit|too many/i.test(`${String(reply.error ?? '')} ${String((reply as { reason?: unknown }).reason ?? '')}`)
   }
 
   /** A new lane: reserve capacity now, then open Chrome and branch the login. */
@@ -388,6 +444,7 @@ export class LaneManager {
         stateDir,
         driver,
         users: 0,
+        turns: 0,
         ready: false,
         state: 'opening',
         since: this.now,
@@ -398,11 +455,14 @@ export class LaneManager {
       void this.writeRegistry()
       this.emit('open', laneId, `port ${port}`)
       this.log(`lane "${laneId}": opening on port ${port}`)
-      const warm = await driver.call({ op: 'warm' }, { timeoutMs: this.openTimeoutMs })
+      const warm = await this.warmLane(driver, laneId)
       if (warm.ok !== true) throw new Error(`lane "${laneId}" did not warm: ${String(warm.error ?? 'no reason')}`)
       lane.ready = true
       lane.state = 'active'
       lane.users = 1
+      // The open itself serves the caller's first turn; count it, or a lane
+      // would always be one turn short of its rotation budget.
+      lane.turns = 1
       lane.lastUsedAt = this.now
       this.emit('ready', laneId, `signedIn=${warm.signedIn === true} plan=${String(warm.plan ?? 'unknown')}`)
       this.log(`lane "${laneId}": ready on port ${port} (plan ${String(warm.plan ?? 'unknown')})`)

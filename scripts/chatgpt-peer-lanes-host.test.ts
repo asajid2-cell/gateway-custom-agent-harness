@@ -45,6 +45,7 @@ class Page {
   maxActive = 0
   gate?: Gate
   emptyAnswer = false
+  pageGoneOnSend = false
   constructor(readonly answer = 'answered on the page') {}
   private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
   private clock = Math.floor(Date.now() / 1000)
@@ -76,10 +77,32 @@ class Page {
     return id
   }
 
+  /** Put one user/assistant pair into the page's tree and return the user id. */
+  seedTurn(threadId: string, userText: string, assistantText: string, complete = false): string {
+    const userId = this.grow(threadId, 'user', userText)
+    const tree = this.treeOf(threadId)
+    const id = randomUUID()
+    tree.mapping[id] = {
+      id, parent: tree.current, children: [],
+      message: {
+        id, author: { role: 'assistant' }, create_time: this.clock++,
+        end_turn: complete ? true : false,
+        status: complete ? 'finished_successfully' : 'in_progress',
+        content: { content_type: 'text', parts: [assistantText] },
+      },
+    }
+    tree.mapping[tree.current].children.push(id)
+    tree.current = id
+    return userId
+  }
+
   async call(request: Call): Promise<DriverReply> {
     const op = String(request.op ?? '')
     if (op === 'ping') return { ok: true, op }
     this.calls.push({ ...request })
+    if (op === 'send' && this.pageGoneOnSend) {
+      return { ok: false, op, error: 'evaluate: Target page, context or browser has been closed' }
+    }
     if (op === 'send') {
       this.active += 1
       this.maxActive = Math.max(this.maxActive, this.active)
@@ -141,11 +164,12 @@ async function primedBridge(name: string, threadId: string): Promise<BridgeState
   return state
 }
 
-type Built = { host: ChatGptHost; manager: LaneManager; pages: Map<string, Page>; master: Page }
+type Built = { host: ChatGptHost; manager: LaneManager; pages: Map<string, Page>; spawned: Page[]; master: Page }
 
 async function startHost(dir: string, bridges: BridgeState[], master: Page, buildPage: (laneId: string) => Page): Promise<Built> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const pages = new Map<string, Page>()
+  const spawned: Page[] = []
   const manager = new LaneManager({
     driverScript: join(dir, 'unused.mjs'),
     root: join(dir, 'lanes'),
@@ -157,6 +181,7 @@ async function startHost(dir: string, bridges: BridgeState[], master: Page, buil
     spawnLane: lane => {
       const page = buildPage(lane.laneId)
       pages.set(lane.laneId, page)
+      spawned.push(page)
       return page as unknown as DriverChild
     },
     log: () => {},
@@ -174,13 +199,14 @@ async function startHost(dir: string, bridges: BridgeState[], master: Page, buil
     titlesEvery: 0,
     turnTimeoutMs: 20_000,
     waitPollMs: 20,
+    emptyNodeGraceMs: 30_000,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
     lanes: true,
     laneManager: manager,
   }, master as unknown as DriverChild)
   await host.start()
-  return { host, manager, pages, master }
+  return { host, manager, pages, spawned, master }
 }
 
 async function busPeer(dir: string, name: string): Promise<GatewaySessionTransport> {
@@ -282,6 +308,114 @@ describe('lane routing', () => {
       expect(built.manager.status().some(lane => lane.laneId === writer.peer.sessionId)).toBe(false)
       const page = built.pages.get(writer.peer.sessionId)!
       expect(page.calls.some(call => call.op === 'unload')).toBe(true)
+    } finally {
+      await writer.close()
+      await built.host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('an idle empty assistant node is repaired once on a fresh window', async () => {
+    const { dir, cleanup } = await scratch()
+    const writer = await busPeer(dir, 'repair-writer')
+    const alpha = await primedBridge('alpha', THREAD_A)
+    const master = new Page()
+    const userNodeId = master.seedTurn(THREAD_A, 'old question', '', false)
+    const messageId = randomUUID()
+    alpha.pendingTurns = [{
+      threadId: THREAD_A,
+      userNodeId,
+      ourText: 'old question',
+      text: 'old question',
+      senderSessionId: writer.peer.sessionId,
+      messageId,
+      kind: 'inquiry',
+      postedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      anchorNodeId: null,
+      turnNonce: 'abcd1234',
+    }]
+    await seedHost(dir, [alpha])
+    const built = await startHost(dir, [alpha], master, () => new Page())
+    try {
+      await built.host.pollOnce()
+      const reply = await replyFor(writer, messageId, 5_000)
+      expect(reply?.text).toContain('answered on the page')
+      const after = JSON.parse(await readFile(join(dir, 'bridges', `${alpha.sessionId}.json`), 'utf8')) as BridgeState
+      expect(after.pendingTurns.length).toBe(0)
+      // One fresh window, one re-post; the master never typed.
+      expect(built.spawned.length).toBe(1)
+      expect(built.spawned[0]!.calls.filter(call => call.op === 'send').length).toBe(1)
+      expect(master.calls.some(call => call.op === 'send')).toBe(false)
+    } finally {
+      await writer.close()
+      await built.host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('a second empty answer is reported, never typed a third time', async () => {
+    const { dir, cleanup } = await scratch()
+    const writer = await busPeer(dir, 'twice-writer')
+    const alpha = await primedBridge('alpha', THREAD_A)
+    const master = new Page()
+    const userNodeId = master.seedTurn(THREAD_A, 'old question', '', false)
+    const messageId = randomUUID()
+    alpha.pendingTurns = [{
+      threadId: THREAD_A,
+      userNodeId,
+      ourText: 'old question',
+      text: 'old question',
+      senderSessionId: writer.peer.sessionId,
+      messageId,
+      kind: 'inquiry',
+      postedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      anchorNodeId: null,
+      emptyRetries: 1,
+    }]
+    await seedHost(dir, [alpha])
+    const built = await startHost(dir, [alpha], master, () => new Page())
+    try {
+      await built.host.pollOnce()
+      const reply = await replyFor(writer, messageId, 5_000)
+      expect(reply?.text).toContain('empty answer on a second window')
+      expect(built.spawned.length).toBe(0)
+      expect(master.calls.some(call => call.op === 'send')).toBe(false)
+    } finally {
+      await writer.close()
+      await built.host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('a page that closes before the text is typed requeues the turn, then posts it on a fresh window', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    let first = true
+    const master = new Page()
+    const built = await startHost(dir, [alpha], master, () => {
+      const page = new Page()
+      if (first) { page.pageGoneOnSend = true; first = false }
+      return page
+    })
+    const writer = await busPeer(dir, 'gone-writer')
+    try {
+      const sent = await writer.send(alpha.sessionId, 'after the crash', 'health', undefined, 'inquiry', true) as { id?: string }
+      // The failed post must land back in the queue, not as a failure reply.
+      for (let i = 0; i < 200; i++) {
+        const state = JSON.parse(await readFile(join(dir, 'bridges', `${alpha.sessionId}.json`), 'utf8')) as BridgeState
+        const record = state.pendingTurns.find(item => item.messageId === sent.id)
+        if (record && record.postedAt === null) break
+        await delay(20)
+      }
+      expect(await replyFor(writer, sent.id!, 300)).toBeNull()
+      for (let i = 0; i < 200 && built.manager.size > 0; i++) await delay(10)
+      expect(built.spawned.length).toBe(1)
+      await built.host.pollOnce()
+      const reply = await replyFor(writer, sent.id!, 5_000)
+      expect(reply?.text).toContain('answered on the page')
+      expect(built.spawned.length).toBe(2)
+      expect(master.calls.some(call => call.op === 'send')).toBe(false)
     } finally {
       await writer.close()
       await built.host.stop()

@@ -182,7 +182,7 @@ const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'reco
  * of nothing.
  */
 class GeneratingTurn extends Error {
-  constructor(readonly threadId: string | null, readonly driverFault = false, readonly childStated = false) {
+  constructor(readonly threadId: string | null, readonly driverFault = false, readonly childStated = false, readonly pageGone = false) {
     super(`the page was still generating${threadId ? ` in thread ${threadId}` : ''} when the host stopped watching; the turn was not refused and is not a model failure`)
   }
 }
@@ -229,6 +229,30 @@ class PageUnproven extends Error {
 class SendAmbiguous extends Error {
   constructor(readonly threadId: string | null, message: string) {
     super(message)
+  }
+}
+
+/**
+ * The page or its browser died under a call.
+ *
+ * This is evidence about the WINDOW, not about the model: a turn may or may not
+ * have landed. It is treated like a driver fault - no failure line, the turn
+ * stays owed - and the lane is recycled so the next attempt gets a live page.
+ */
+const isPageGone = (text: string): boolean =>
+  /target page, context or browser has been closed|browser has been closed|target closed|page crashed|session closed|the page closed before/i.test(text)
+
+/**
+ * The page died BEFORE the text was typed.
+ *
+ * Different from a page that died after acceptance: nothing landed, so the job
+ * may be queued and posted again instead of being left owed for hours. The
+ * message carries `not-posted` because `postRecordedTurn` keys its queued-path
+ * decision on that word.
+ */
+class PageGoneBeforePost extends Error {
+  constructor(readonly threadId: string | null) {
+    super('not-posted: the page closed before the text was typed')
   }
 }
 
@@ -362,6 +386,18 @@ type Config = {
   laneSourcePort?: number
   /** Write a lane's rotated cookies back into the master on close. */
   laneSyncCookies?: boolean
+  /** Rotate a lane after this many turns, before it degrades. */
+  laneMaxTurns?: number
+  /** Rotate a lane after this long open. */
+  laneMaxAgeMs?: number
+  /** First retry delay when a lane open is rate-limited. */
+  laneBackoffBaseMs?: number
+  /**
+   * How long a posted turn may sit on an IDLE page behind a textless,
+   * unfinished assistant node before that is called an empty answer and
+   * repaired (fresh lane, one re-post).
+   */
+  emptyNodeGraceMs?: number
   /** Test seam: a lane manager built by the test. */
   laneManager?: LaneManager
 }
@@ -473,6 +509,10 @@ function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
     else if (arg === '--lane-base-port') config.laneBasePort = Number(take(index++))
     else if (arg === '--lane-source-port') config.laneSourcePort = Number(take(index++))
     else if (arg === '--lane-sync-cookies') config.laneSyncCookies = take(index++) !== '0'
+    else if (arg === '--lane-max-turns') config.laneMaxTurns = Number(take(index++))
+    else if (arg === '--lane-max-age-ms') config.laneMaxAgeMs = Number(take(index++))
+    else if (arg === '--lane-backoff-base-ms') config.laneBackoffBaseMs = Number(take(index++))
+    else if (arg === '--empty-node-grace-ms') config.emptyNodeGraceMs = Number(take(index++))
   }
   return config
 }
@@ -508,6 +548,10 @@ export function resolveConfig(partial: Partial<Config>): Config {
     laneBasePort: Number.isFinite(partial.laneBasePort) ? Number(partial.laneBasePort) : Number(process.env.CHATGPT_WEB_LANE_BASE_PORT ?? 9300),
     laneSourcePort: Number.isFinite(partial.laneSourcePort) ? Number(partial.laneSourcePort) : Number(process.env.CHATGPT_WEB_LANE_SOURCE_PORT ?? process.env.CHATGPT_CDP_PORT ?? 9222),
     laneSyncCookies: partial.laneSyncCookies ?? (process.env.CHATGPT_WEB_LANE_SYNC_COOKIES !== '0'),
+    laneMaxTurns: Number.isFinite(partial.laneMaxTurns) ? Number(partial.laneMaxTurns) : Number(process.env.CHATGPT_WEB_LANE_MAX_TURNS ?? 20),
+    laneMaxAgeMs: Number.isFinite(partial.laneMaxAgeMs) ? Number(partial.laneMaxAgeMs) : Number(process.env.CHATGPT_WEB_LANE_MAX_AGE_MS ?? 10 * 60_000),
+    laneBackoffBaseMs: Number.isFinite(partial.laneBackoffBaseMs) ? Number(partial.laneBackoffBaseMs) : Number(process.env.CHATGPT_WEB_LANE_BACKOFF_BASE_MS ?? 5_000),
+    emptyNodeGraceMs: Number.isFinite(partial.emptyNodeGraceMs) ? Number(partial.emptyNodeGraceMs) : Number(process.env.CHATGPT_WEB_EMPTY_NODE_GRACE_MS ?? 120_000),
     laneManager: partial.laneManager,
   }
 }
@@ -641,7 +685,7 @@ export class ChatGptHost {
    */
   private readonly masterDriver: DriverChild
   private readonly lanes: LaneManager | null
-  private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean }>()
+  private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean }>()
   private readonly bridges = new Map<string, Bridge>()
   /**
    * One delivery lock per bridge. Collecting a file and writing down that it
@@ -764,6 +808,9 @@ export class ChatGptHost {
           maxLanes: config.laneMax,
           idleMs: config.laneIdleMs,
           syncCookies: config.laneSyncCookies,
+          maxTurns: config.laneMaxTurns,
+          maxAgeMs: config.laneMaxAgeMs,
+          backoffBaseMs: config.laneBackoffBaseMs,
           log: line => log(`lanes: ${line}`),
           onEvent: (event, laneId, detail) => this.onLaneEvent(event, laneId, detail),
         })
@@ -1963,10 +2010,14 @@ export class ChatGptHost {
     const requested = bridge.state.threadId
     const wait = options.wait === true
     const onAccepted = options.onAccepted
+    // Whether the page took THIS text decides what a closed page means: after
+    // acceptance the turn is owed (never re-sent); before it, nothing landed and
+    // the job may be queued and posted again on a fresh window.
+    let acceptedByPage = false
     const reply = await this.sendRecorded(bridge, text, {
       threadId: requested,
       ...(wait ? { wait: true } : { wait: false }),
-      ...(onAccepted ? { onAccepted } : {}),
+      onAccepted: () => { acceptedByPage = true; onAccepted?.() },
       landed: async threadId => {
         if (requested && threadId.toLowerCase() !== requested.toLowerCase()) throw new Error(threadGone(requested, threadId))
         if (threadId !== requested) {
@@ -1988,6 +2039,16 @@ export class ChatGptHost {
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
       if (isDriverFaultReply(reply)) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
+      }
+      // A closed page/browser proves nothing about the model, and the lane
+      // wrapper recycles the window. After acceptance the turn stays owed and
+      // is never re-sent; before it, nothing landed and the job is requeued.
+      if (isPageGone(String(reply.error ?? ''))) {
+        const lane = this.laneContext.getStore()
+        if (lane) lane.pageGone = true
+        const threadId = typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId
+        if (acceptedByPage) throw new GeneratingTurn(threadId, true, false, true)
+        throw new PageGoneBeforePost(threadId)
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
@@ -3079,10 +3140,98 @@ export class ChatGptHost {
         // be safe for a person's node typed after our send, and is not needed.
         continue
       }
+      // An IDLE page whose newest assistant node behind our user node is
+      // unfinished and textless is not "still generating": it is the empty
+      // answer that never completes. The live case on 2026-11-04 sat exactly
+      // this way for hours. It is repairable without duplicating the turn -
+      // recycle the window and post the same prompt once more on a fresh page.
+      const emptyNode = userNodeId ? this.emptyAnswerNodeOf(conversation, userNodeId) : null
+      if (emptyNode) {
+        const postedMs = record.postedAt ? Date.parse(record.postedAt) : Number.NaN
+        const grace = this.config.emptyNodeGraceMs ?? 120_000
+        if (Number.isFinite(postedMs) && Date.now() - postedMs >= grace) {
+          const gate = await this.cheapStatus(record.threadId ?? bridge.state.threadId ?? '')
+          if (gate.state === 'idle') {
+            await this.repairEmptyAnswer(bridge, record, emptyNode)
+            continue
+          }
+        }
+      }
       if (Number.isFinite(postedMs) && Date.now() - postedMs > PENDING_TURN_TTL_MS) {
         await this.deliverSolicitedFailure(bridge, record, `no completed answer within ${Math.round(PENDING_TURN_TTL_MS / 3600_000)}h`)
       }
     }
+  }
+
+  /**
+   * The last assistant node after our user node, when it is unfinished and
+   * textless AND our user node is on the current branch.
+   *
+   * A reasoning node with actual text is not an empty answer, and a missing
+   * user node means the thread moved branches - neither licenses a repair
+   * here. The caller only acts when the page also reports itself idle.
+   */
+  private emptyAnswerNodeOf(conversation: Conversation, userNodeId: string): ConversationNode | null {
+    const path = pathOf(conversation)
+    const at = path.indexOf(userNodeId)
+    if (at < 0) return null
+    const assistants = path.slice(at + 1)
+      .map(id => conversation.mapping[id])
+      .filter((node): node is ConversationNode => node?.message?.author.role === 'assistant')
+    const last = assistants.at(-1)
+    if (!last) return null
+    if (nodeComplete(last)) return null
+    if (nodeTextOf(last).trim()) return null
+    return last
+  }
+
+  /**
+   * Repair an idle empty answer: one fresh window, one re-post.
+   *
+   * The retry count is written BEFORE the post, so a crash cannot turn one
+   * retry into a loop. A retry that is not posted (the page turned busy again)
+   * gives the count back and waits for the next pass. A second empty answer is
+   * reported honestly; it is never typed a third time.
+   */
+  private async repairEmptyAnswer(bridge: Bridge, record: PendingTurn, node: ConversationNode): Promise<void> {
+    const retries = record.emptyRetries ?? 0
+    record.emptySeenAt ??= now()
+    const message = this.inboundMessageOf(bridge, record)
+    const expects = message.replyTo === undefined && message.expectReply !== false
+    audit(this.hostState, {
+      op: 'turn',
+      target: record.senderSessionId,
+      result: `empty assistant node ${shortId(node.id)} (${node.message?.status ?? 'no status'}) on an idle page [${bridge.state.name}]`,
+      messageId: record.messageId,
+    })
+    if (retries >= 1) {
+      await this.persistHostState()
+      if (!expects) {
+        await this.retirePendingTurn(bridge, record.messageId)
+        return
+      }
+      await this.deliverSolicitedFailure(bridge, record, 'the page produced an empty answer on a second window')
+      return
+    }
+    record.emptyRetries = retries + 1
+    await this.notePendingTurn(bridge, record)
+    const laneId = this.laneIdOf({ fromSessionId: record.senderSessionId })
+    if (this.lanes) await this.lanes.recycle(laneId, `empty assistant node ${shortId(node.id)}`)
+    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, record, 0, true))
+    if (!posted.posted) {
+      // The page was busy again after all. Nothing was typed; leave the retry
+      // card unspent so the next idle transition can use it.
+      record.emptyRetries = retries
+      await this.notePendingTurn(bridge, record)
+      return
+    }
+    audit(this.hostState, {
+      op: 'turn',
+      target: record.senderSessionId,
+      result: `re-posted once on a fresh window after an empty answer [${bridge.state.name}]`,
+      messageId: record.messageId,
+    })
+    await this.laneWork(laneId, () => this.settleTurnAnswer(bridge, record, message, posted.text, true))
   }
 
   /**
@@ -5790,14 +5939,20 @@ export class ChatGptHost {
       log(`lane "${laneId}": ${line}`)
       void this.persistHostState()
     })
-    const context: { driver: DriverChild; laneId: string; empty?: boolean } = { driver: lane.driver, laneId }
+    const context: { driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean } = { driver: lane.driver, laneId }
+    let pageGone = false
     try {
       return await this.laneContext.run(context, () => work(lane))
+    } catch (error) {
+      pageGone = isPageGone((error as Error).message) || (error instanceof GeneratingTurn && error.pageGone)
+      throw error
     } finally {
-      // A turn that completed with no text is the random empty answer. The
-      // answer path has already told the sender in the existing words; the
-      // window that produced it is recycled so the next turn starts clean.
+      // Two bad-window states, one repair: a turn that completed with no text,
+      // and a page/browser that died under a call. The answer path has already
+      // spoken to the sender; the window itself is recycled so the next turn
+      // starts clean. A dead page never triggers a re-send here.
       if (context.empty) await this.lanes.recycle(laneId, 'empty answer')
+      else if (pageGone || context.pageGone) await this.lanes.recycle(laneId, 'page or browser closed')
       this.lanes.release(laneId)
     }
   }
@@ -6004,6 +6159,10 @@ async function main(): Promise<void> {
       '  --lane-base-port <n> first lane debugging port (default 9300)',
       '  --lane-source-port <n> master Chrome port lanes branch login from (default 9222)',
       '  --lane-sync-cookies <0|1> write a closing lane\'s cookies back to the master (default 1)',
+      '  --lane-max-turns <n> rotate a lane after this many turns (default 20)',
+      '  --lane-max-age-ms <n> rotate a lane this long after it opened (default 600000)',
+      '  --lane-backoff-base-ms <n> first retry delay for a rate-limited lane open (default 5000)',
+      '  --empty-node-grace-ms <n> idle textless-answer grace before repair (default 120000)',
       '',
       'The instance file (~/.chatgpt-web/instances/<slug>.json) holds a bearer token.',
       'It is the control surface, and /operator is NOT a messaging path: peer work',

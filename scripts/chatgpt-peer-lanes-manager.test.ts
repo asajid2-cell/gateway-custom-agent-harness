@@ -20,12 +20,17 @@ class FakeLaneChild {
   warmDelayMs = 0
   warmOk = true
   unloadOk = true
+  /** The first N warm attempts answer 429 before the child gives a real login. */
+  warmRateLimitAttempts = 0
+  private warmCalls = 0
   constructor(readonly laneId: string) {}
   async call(request: Call): Promise<DriverReply> {
     this.calls.push({ ...request })
     const op = String(request.op ?? '')
     if (op === 'warm') {
+      this.warmCalls += 1
       if (this.warmDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.warmDelayMs))
+      if (this.warmCalls <= this.warmRateLimitAttempts) return { ok: false, op, error: '429 rate limit: too many requests' }
       if (!this.warmOk) return { ok: false, op, error: 'refused to branch the master login' }
       return { ok: true, op, signedIn: true, plan: 'plus' }
     }
@@ -252,9 +257,71 @@ describe('LaneManager', () => {
       expect(status[0]!.port).toBe(lane.port)
       expect(status[0]!.state).toBe('active')
       expect(status[0]!.users).toBe(1)
+      expect(status[0]!.turns).toBe(1)
       expect(manager.queued).toBe(0)
       manager.release('sender-a')
       expect(manager.status()[0]!.state).toBe('idle')
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('a lane rotates after its turn budget instead of serving forever', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const { manager, children, envs } = build(dir, { maxTurns: 2, maxAgeMs: 0, idleMs: 60_000 })
+      await manager.acquire('sender-a')
+      manager.release('sender-a')
+      expect(manager.size).toBe(1)
+      await manager.acquire('sender-a')
+      manager.release('sender-a')
+      for (let i = 0; i < 200 && !children.get('sender-a')!.terminated; i++) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(manager.size).toBe(0)
+      expect(children.get('sender-a')!.terminated).toBe(true)
+      // A fresh window, not the same one.
+      const again = await manager.acquire('sender-a')
+      expect(envs.length).toBe(2)
+      expect(again.stateDir).not.toBe(envs[0]!.CHATGPT_STATE_DIR)
+      manager.release('sender-a')
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('a lane rotates after its age budget', async () => {
+    const { dir, cleanup } = await scratch()
+    let clock = 1_000_000
+    try {
+      const { manager, children } = build(dir, { maxTurns: 0, maxAgeMs: 1_000, idleMs: 60_000, now: () => clock })
+      await manager.acquire('sender-a')
+      clock += 1_500
+      manager.release('sender-a')
+      for (let i = 0; i < 200 && !children.get('sender-a')!.terminated; i++) await new Promise(resolve => setTimeout(resolve, 10))
+      expect(manager.size).toBe(0)
+      expect(children.get('sender-a')!.terminated).toBe(true)
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('a 429 at warm is retried with backoff, then the lane opens', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const child = new FakeLaneChild('sender-a')
+      child.warmRateLimitAttempts = 2
+      const manager = new LaneManager({
+        driverScript: join(dir, 'unused.mjs'),
+        root: join(dir, 'lanes-429'),
+        sourcePort: 9222,
+        basePort: basePort(),
+        maxLanes: 1,
+        idleMs: 30_000,
+        syncCookies: false,
+        backoffBaseMs: 1,
+        spawnLane: () => child as unknown as DriverChild,
+        log: () => {},
+      })
+      const lane = await manager.acquire('sender-a')
+      expect(lane.laneId).toBe('sender-a')
+      expect(child.calls.filter(call => call.op === 'warm').length).toBe(3)
+      manager.release('sender-a')
       await manager.shutdown()
     } finally { await cleanup() }
   })

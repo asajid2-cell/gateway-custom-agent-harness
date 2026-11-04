@@ -274,6 +274,14 @@ export const pendingTurnSchema = z.object({
    * turn, not per pass.
    */
   queuedNoticeAt: z.string().max(40).optional(),
+  /**
+   * How many times this job has been re-posted after the page left an idle,
+   * textless assistant node. Bounded to ONE retry: a second empty answer is a
+   * real failure to report, not something to keep typing into the thread.
+   */
+  emptyRetries: z.number().int().min(0).max(2).optional(),
+  /** When the empty assistant node was first observed (ISO). */
+  emptySeenAt: z.string().max(40).optional(),
 }).strict()
 
 export const PENDING_TURNS_MAX = 8
