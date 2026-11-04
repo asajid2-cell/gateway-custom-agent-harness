@@ -21,7 +21,7 @@ import { normalizeGatewayModelId } from './gatewayModelIds.js'
  *                                   `annotations` (always empty), so the answer
  *                                   text carries the citations
  *   - `gateway-amd-*`   rejects     - HTTP 400 "does not support native web search"
- *   - commandcode/opencode        - emit a `tool_use` named `web_search` that
+ *   - commandcode/mistral/opencode - emit a `tool_use` named `web_search` that
  *                                   nothing executes; opencode-zen is 403
  *                                   ("free tier can only be used inside OpenCode")
  *

@@ -438,6 +438,35 @@ const ROUTE_PREFERENCE_FILES: Record<string, string> = {
  * number, and the report names that limitation rather than guessing.
  */
 async function routeCredentialNumber(provider: string): Promise<number> {
+  // Mistral has two credential pools and the route spends the Vibe one first,
+  // so the file-based Studio preference would advertise the wrong account (its
+  // slot 1 collides with the Vibe slot 1). The gateway's own account read is
+  // the only place that knows which pool a request would actually spend.
+  if (provider === 'mistral' || provider === 'mistral-vibe') {
+    const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
+    if (base) {
+      try {
+        const response = await fetch(new URL('/gateway/mistral-account', base), {
+          signal: AbortSignal.timeout(1_500),
+        })
+        if (response.ok) {
+          const body = (await response.json()) as {
+            number?: number
+            vibe?: { active?: number }
+          }
+          const active = body?.vibe?.active
+          if (Number.isSafeInteger(active) && active! > 0) return active!
+          if (provider === 'mistral-vibe') return 1
+          // Studio slots are reported above the Vibe range by the gateway's
+          // combined credential view; mirror that numbering here.
+          if (Number.isSafeInteger(body?.number) && body.number! > 0) {
+            return 1000 + body.number!
+          }
+        }
+      } catch {}
+    }
+    if (provider === 'mistral-vibe') return 1
+  }
   const preference = ROUTE_PREFERENCE_FILES[provider]
   if (!preference) return 1
   try {
