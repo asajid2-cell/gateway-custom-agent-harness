@@ -523,6 +523,18 @@ if (!existsSync(join(ScriptsDir, 'gateway-supervisor.mjs'))) {
 
 initializeArtifact()
 
+// `cc login` is a CLI subcommand, not a session. The harness fast-paths it and
+// must see the operator's arguments unchanged: starting a gateway and appending
+// session flags made the installer path fail on every invocation.
+if (ClaudeArgs[0] === 'login') {
+  if (!ClaudeRunner) {
+    throw new Error('bun is required to run the harness. Install bun or set CC_CLAUDE_RUNNER_OVERRIDE.')
+  }
+  const result = spawnSync(ClaudeRunner, ['--no-install', ClaudeScript, ...ClaudeArgs], { stdio: 'inherit' })
+  if (result.error) throw new Error(`Could not run the harness: ${result.error.message}`)
+  process.exit(result.status ?? 1)
+}
+
 const port = (await portOccupied(4011)) ? await freeLoopbackPort() : 4011
 const logDir = mkdtempSync(join(tmpdir(), 'model-gateway-'))
 const stdoutLog = join(logDir, 'gateway.out.log')

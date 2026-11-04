@@ -23,6 +23,20 @@ test('both launchers disable Bun auto-install ahead of the script path', async (
   assert.match(launcher, /spawnSync\(ClaudeRunner, \['--no-install', ClaudeScript,/)
 })
 
+test('both launchers pass `login` through before session flags', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  const launcher = await readFile(new URL('./cc-launcher.mjs', import.meta.url), 'utf8')
+  // `cc login` is a CLI subcommand and must not inherit the session's flags or
+  // start a gateway. Anchor on the order, not just presence.
+  const launcherCase = launcher.indexOf("ClaudeArgs[0] === 'login'")
+  assert.ok(launcherCase > 0)
+  assert.ok(launcherCase < launcher.indexOf('--dangerously-skip-permissions'))
+  const psCase = script.indexOf("([string]($ClaudeArgs[0])) -eq 'login'")
+  const psFlags = script.indexOf("$ClaudeArgs += '--dangerously-skip-permissions'")
+  assert.ok(psCase > 0)
+  assert.ok(psCase < psFlags)
+})
+
 test('the external allowlist is one data file shared with the stage', async () => {
   const build = await readFile(new URL('./build.ts', import.meta.url), 'utf8')
   const allowlist = JSON.parse(await readFile(new URL('./bundle-allowlist.json', import.meta.url), 'utf8'))

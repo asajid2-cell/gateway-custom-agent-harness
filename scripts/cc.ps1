@@ -599,6 +599,16 @@ for ($i = 0; $i -lt $ClaudeArgs.Count; $i++) {
 }
 $ClaudeArgs = @($ForwardedArgs)
 
+# `cc login` is a CLI subcommand, not a session. The harness fast-paths it and
+# must see the operator's arguments unchanged: starting a gateway and appending
+# session flags made the installer path fail on every invocation. This runs
+# before those flags are added below.
+if ($ClaudeArgs.Count -ge 1 -and ([string]($ClaudeArgs[0])) -eq 'login') {
+  Initialize-ClaudeArtifact
+  & $ClaudeRunner --no-install $ClaudeScript @ClaudeArgs
+  exit $LASTEXITCODE
+}
+
 # Explicit model/effort arguments are authoritative over inherited launcher
 # defaults. Resolve them before constructing Gateway environment and provenance,
 # so the metadata describes the exact child invocation rather than a stale shell.
@@ -922,6 +932,10 @@ Write-LaunchProgress 'checking the compiled harness...'
 Write-LaunchDiagnostic 'artifact-check'
 Initialize-ClaudeArtifact
 Write-LaunchDiagnostic 'artifact-ready'
+
+# `cc login` is a CLI subcommand, not a session. The harness fast-paths it and
+# must see the operator's arguments unchanged: starting a gateway and appending
+# session flags made the installer path fail on every invocation.
 
 
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
