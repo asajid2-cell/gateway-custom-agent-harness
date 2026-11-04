@@ -50,6 +50,22 @@ test('launcher owns the backend job through startup and unconditional cleanup', 
   assert.doesNotMatch(script, /\$GatewayProcess = Start-Process/)
 })
 
+test('a clean machine launches bundled and does not require the legacy store', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  const launcher = await readFile(new URL('./cc-launcher.mjs', import.meta.url), 'utf8')
+  // An unset mode must resolve to the cleanroom default explicitly; leaving it
+  // unset made every `-eq 'bundled'` branch fall through to the keysafe chain.
+  assert.match(script, /\$env:GATEWAY_CREDENTIALS_MODE = 'bundled'/)
+  assert.match(launcher, /legacyExternalStorePresent\(\) \? 'external' : 'bundled'/)
+  // The keysafe script is an external-mode prerequisite only.
+  assert.match(
+    script,
+    /\$env:GATEWAY_CREDENTIALS_MODE -ne 'bundled' -and -not \(Test-Path -LiteralPath \$Keysafe\)/,
+  )
+  // The default codex home need not exist yet: `codex login` creates it.
+  assert.match(script, /return \$DefaultCodexHome\s*\r?\n\s*\} elseif/)
+})
+
 test('launcher diagnostics use an explicit safe-field allowlist', async () => {
   const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
   assert.match(script, /@\('exitCode', 'attempt', 'port', 'errorType'\)/)

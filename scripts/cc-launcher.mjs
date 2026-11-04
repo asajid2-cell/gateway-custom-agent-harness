@@ -534,10 +534,12 @@ function legacyExternalStorePresent() {
   }
 }
 
-if (!process.env.GATEWAY_CREDENTIALS_MODE && legacyExternalStorePresent()) {
+if (!process.env.GATEWAY_CREDENTIALS_MODE) {
   // Inherited by both the supervisor and the harness, so the gateway and the
-  // /login UI cannot disagree about which store holds the keys.
-  process.env.GATEWAY_CREDENTIALS_MODE = 'external'
+  // /login UI cannot disagree about which store holds the keys. Resolve it
+  // explicitly: an unset value must mean the cleanroom default, never a
+  // fall-through to the legacy branch.
+  process.env.GATEWAY_CREDENTIALS_MODE = legacyExternalStorePresent() ? 'external' : 'bundled'
 }
 
 const gatewayEnv = { ...gatewayEnvBase, CLAUDE_CODE_GATEWAY_PORT: String(port) }

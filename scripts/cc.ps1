@@ -15,6 +15,12 @@ if ([string]::IsNullOrWhiteSpace($env:GATEWAY_CREDENTIALS_MODE)) {
   }
   if ($LegacyRecordCount -gt 0) { $env:GATEWAY_CREDENTIALS_MODE = 'external' }
 }
+# No legacy store and no explicit flag is the cleanroom default. Set it
+# explicitly rather than leaving it unset, so every child sees a resolved mode
+# and no branch can read "unset" as "external".
+if ([string]::IsNullOrWhiteSpace($env:GATEWAY_CREDENTIALS_MODE)) {
+  $env:GATEWAY_CREDENTIALS_MODE = 'bundled'
+}
 
 $LaunchDirectory = (Get-Location).Path
 $DiagnosticPath = Join-Path $env:LOCALAPPDATA 'Gateway\launcher.jsonl'
@@ -89,7 +95,9 @@ function Resolve-SelectedCodexHome {
     $account = (Get-Content -Raw -LiteralPath $CodexSelectionPath).Trim()
   }
   if ([string]::IsNullOrWhiteSpace($account) -or $account -eq 'default') {
-    $selectedHome = $DefaultCodexHome
+    # The default home is where `codex login` will create the account. On a
+    # clean machine it does not exist yet, and that is not an error.
+    return $DefaultCodexHome
   } elseif ($account -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') {
     throw "Invalid selected Codex account name: $account"
   } else {
@@ -890,7 +898,9 @@ if (-not (Test-Path -LiteralPath $GatewayScript)) {
 if (-not (Test-Path -LiteralPath $GatewaySupervisor)) {
   throw "Model gateway supervisor is missing: $GatewaySupervisor"
 }
-if (-not (Test-Path -LiteralPath $Keysafe)) {
+# Bundled mode never touches the external keysafe script, and a clean machine
+# does not have one. Only require it when the external store is in use.
+if ($env:GATEWAY_CREDENTIALS_MODE -ne 'bundled' -and -not (Test-Path -LiteralPath $Keysafe)) {
   throw "Keysafe is missing: $Keysafe"
 }
 

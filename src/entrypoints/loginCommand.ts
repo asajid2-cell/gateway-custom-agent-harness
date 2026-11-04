@@ -12,7 +12,7 @@ import {
   removeGatewayCredential,
   saveGatewayCredential,
 } from '../utils/gatewayCredentials.js'
-import { isValidRecordName } from '../utils/keysafe/index.js'
+import { isValidRecordName, listSecrets } from '../utils/keysafe/index.js'
 
 const PROVIDERS: Record<string, string> = {
   opencode: 'opencode-go',
@@ -45,6 +45,16 @@ async function readStdin(stdin: AsyncIterable<Buffer | string>): Promise<string>
   const chunks: Buffer[] = []
   for await (const chunk of stdin) chunks.push(Buffer.from(chunk))
   return Buffer.concat(chunks).toString('utf8')
+}
+
+/** Which slot a record name represents, or null if it is not this provider's. */
+function slotFor(provider: string, name: string): number | null {
+  const base = PROVIDERS[provider]
+  if (!base) return null
+  if (name === base) return 1
+  if (!NUMBERED.has(provider) || !name.startsWith(base)) return null
+  const suffix = name.slice(base.length)
+  return /^[2-9][0-9]*$/.test(suffix) ? Number(suffix) : null
 }
 
 function recordName(provider: string, slot: string | null): string | null {
@@ -86,10 +96,34 @@ export async function runLoginCommand(args: string[], io: LoginIO = {}): Promise
   if (status) {
     try {
       const store = await describeCredentialStore()
+      // Bundled mode can enumerate every record, so numbered providers report
+      // their actual slots. A slot-2-only save must not read as "not
+      // configured". External mode stays base-record only here; its legacy UI
+      // already lists slots.
+      let records: string[] = []
+      if (store.keysafe === 'bundled') {
+        try {
+          records = (await listSecrets()).map(entry => entry.name)
+        } catch {
+          records = []
+        }
+      }
       const providers = []
       for (const [name, record] of Object.entries(PROVIDERS)) {
         const state = await gatewayCredentialStatus(record)
-        providers.push({ provider: name, present: state.present, source: state.source })
+        const slots = NUMBERED.has(name)
+          ? records
+              .map(candidate => slotFor(name, candidate))
+              .filter((slot): slot is number => slot !== null)
+              .sort((a, b) => a - b)
+          : []
+        providers.push({
+          provider: name,
+          // A numbered provider is configured when any of its slots is.
+          present: state.present || slots.length > 0,
+          source: state.source,
+          ...(NUMBERED.has(name) ? { slots } : {}),
+        })
       }
       // Presence only. A status command must never be a way to read a key.
       console.log(

@@ -99,6 +99,20 @@ test('a TTY with no piped key is refused instead of hanging', async () => {
   })
 })
 
+async function statusJson(): Promise<{ providers: Array<{ provider: string; present: boolean; slots?: number[] }> }> {
+  const lines: string[] = []
+  const original = console.log
+  console.log = (line: unknown) => {
+    lines.push(String(line))
+  }
+  try {
+    assert.equal(await runLoginCommand(['--status']), 0)
+  } finally {
+    console.log = original
+  }
+  return JSON.parse(lines.join('\n'))
+}
+
 test('--status reports presence only', async () => {
   await withScratch(async () => {
     await runLoginCommand(['--provider', 'deepseek', '--key-stdin'], { stdin: streamOf('ds-sentinel') })
@@ -116,5 +130,32 @@ test('--status reports presence only', async () => {
     assert.match(text, /"provider": "deepseek"/)
     assert.match(text, /"present": true/)
     assert.equal(text.includes('ds-sentinel'), false)
+  })
+})
+
+test('--status sees numbered slots, and a slot-only save reads as configured', async () => {
+  await withScratch(async () => {
+    assert.equal(
+      await runLoginCommand(['--provider', 'commandcode', '--slot', '2', '--key-stdin'], {
+        stdin: streamOf('cc-two'),
+      }),
+      0,
+    )
+    const saved = (await statusJson()).providers.find(entry => entry.provider === 'commandcode')
+    assert.equal(saved?.present, true)
+    assert.deepEqual(saved?.slots, [2])
+
+    // A numbered provider is configured when any slot exists, and the other
+    // providers must not inherit that state.
+    const deepseek = (await statusJson()).providers.find(entry => entry.provider === 'deepseek')
+    assert.equal(deepseek?.present, false)
+
+    assert.equal(
+      await runLoginCommand(['--provider', 'commandcode', '--slot', '2', '--remove']),
+      0,
+    )
+    const removed = (await statusJson()).providers.find(entry => entry.provider === 'commandcode')
+    assert.equal(removed?.present, false)
+    assert.deepEqual(removed?.slots, [])
   })
 })
