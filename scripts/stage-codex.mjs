@@ -106,6 +106,30 @@ if (versionCheck.status !== 0) {
   process.exit(1)
 }
 
+/** Content-addressed digest of the staged tree, so an artifact can detect drift. */
+async function walkFiles(directory, base = directory) {
+  const files = []
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await walkFiles(full, base))
+    else if (entry.isFile()) files.push(path.relative(base, full).split(path.sep).join('/'))
+  }
+  return files
+}
+
+async function treeDigest(directory) {
+  const hash = createHash('sha256')
+  for (const relative of (await walkFiles(directory)).sort()) {
+    hash.update(relative)
+    hash.update('\0')
+    hash.update(createHash('sha256').update(await readFile(path.join(directory, relative))).digest('hex'))
+    hash.update('\n')
+  }
+  return hash.digest('hex')
+}
+
+const treeSha256 = await treeDigest(dir)
+
 // The manifest is the pin: a later run compares the asset hash it would stage
 // with this record instead of trusting whatever the URL serves that day.
 const manifestPath = path.join(ROOT, 'resources', 'codex', 'manifest.json')
@@ -119,6 +143,7 @@ manifest.entries[key] = {
   version,
   asset: spec.asset,
   sha256,
+  treeSha256,
   entrypoint,
 }
 await mkdir(path.dirname(manifestPath), { recursive: true })

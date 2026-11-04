@@ -1,0 +1,347 @@
+#!/usr/bin/env node
+/**
+ * Build the per-platform release artifact directory and prove it works.
+ *
+ * The artifact is self-contained: the compiled harness, the runtime scripts,
+ * lockfile-pinned native dependencies, the platform tool resources (codex, and
+ * on darwin the Keychain helper), and nothing the bundle does not need.
+ *
+ * The stage is not finished when the copy is: it starts a supervisor out of the
+ * staged tree and requires a healthy /health, and it requires the two launcher
+ * negative rows to fail for the right reason. A stage that only survives --version
+ * has proved nothing about the thing being shipped.
+ *
+ * Usage: node scripts/stage-artifact.mjs [--out DIR] [--sha SHA] [--no-smoke]
+ * Writes <out>/stage-report.json and prints the same JSON on stdout.
+ */
+import { createHash } from 'node:crypto'
+import { chmod, cp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
+
+function arg(name) {
+  const index = process.argv.indexOf(`--${name}`)
+  return index >= 0 ? process.argv[index + 1] : undefined
+}
+
+const sha = arg('sha') ?? spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8' }).stdout.trim()
+const out = path.resolve(arg('out') ?? path.join(os.tmpdir(), `stage-${sha.slice(0, 7)}`))
+const smoke = !process.argv.includes('--no-smoke')
+const platform = process.platform
+const arch = process.arch
+
+// The runtime set is explicit on purpose: cc.ps1 dot-sources
+// owned-gateway-process.ps1, which no import walk can see, and shipping the
+// whole scripts/ directory would drag build-only and test files into the
+// artifact.
+const RUNTIME_COMMON = [
+  'cc-launcher.mjs',
+  'gateway-supervisor.mjs',
+  'gateway-vault-launch.mjs',
+  'gateway-key-inject.mjs',
+  'model-gateway.mjs',
+  'gateway-keysafe.mjs',
+  'keysafe-vault.mjs',
+  'codex-quota.mjs',
+  'codex-resource.mjs',
+  'commandcode.mjs',
+  'effort-capabilities.mjs',
+  'effort-capabilities.json',
+  'gateway-contract.mjs',
+  'opencode-go.mjs',
+  'opencode-zen.mjs',
+  'quota-cache.mjs',
+  'launcher-policy.json',
+]
+const RUNTIME_PLATFORM = platform === 'win32'
+  ? ['cc.ps1', 'owned-gateway-process.ps1']
+  : ['cc']
+
+function fail(message) {
+  console.error(`stage-artifact: ${message}`)
+  process.exit(1)
+}
+
+async function digestFile(file) {
+  return createHash('sha256').update(await readFile(file)).digest('hex')
+}
+
+async function walk(directory, base = directory) {
+  const files = []
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const full = path.join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await walk(full, base))
+    else if (entry.isFile()) files.push(path.relative(base, full).split(path.sep).join('/'))
+  }
+  return files.sort()
+}
+
+/** Content-addressed digest of a directory: paths and file bytes, order fixed. */
+async function treeDigest(directory) {
+  const hash = createHash('sha256')
+  for (const relative of await walk(directory)) {
+    hash.update(relative)
+    hash.update('\0')
+    hash.update(await digestFile(path.join(directory, relative)))
+    hash.update('\n')
+  }
+  return hash.digest('hex')
+}
+
+const report = {
+  sha,
+  platform,
+  arch,
+  out,
+  createdAt: new Date().toISOString(),
+  bytes: 0,
+  files: 0,
+  classes: {},
+  sha256: {},
+  nodeModules: [],
+  smoke: {},
+}
+
+await rm(out, { recursive: true, force: true })
+await mkdir(out, { recursive: true })
+
+// --- harness and manifests -------------------------------------------------
+const cli = path.join(ROOT, 'dist', 'cli.js')
+if (!existsSync(cli)) fail('dist/cli.js is missing; run the build first')
+await cp(cli, path.join(out, 'dist', 'cli.js'), { recursive: true })
+for (const name of ['package.json', 'bun.lock']) {
+  const source = path.join(ROOT, name)
+  if (!existsSync(source)) fail(`${name} is missing; the artifact must pin dependencies`)
+  await cp(source, path.join(out, name))
+}
+report.sha256.cli = await digestFile(path.join(out, 'dist', 'cli.js'))
+
+// --- runtime scripts -------------------------------------------------------
+await mkdir(path.join(out, 'scripts'), { recursive: true })
+for (const name of [...RUNTIME_COMMON, ...RUNTIME_PLATFORM]) {
+  const source = path.join(ROOT, 'scripts', name)
+  if (!existsSync(source)) fail(`runtime script is missing: scripts/${name}`)
+  await cp(source, path.join(out, 'scripts', name))
+}
+// cc.cmd in the repository hardcodes the worktree path. The artifact gets a
+// shim that resolves its sibling instead.
+if (platform === 'win32') {
+  await writeFile(
+    path.join(out, 'scripts', 'cc.cmd'),
+    '@echo off\r\npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0cc.ps1" %*\r\nexit /b %ERRORLEVEL%\r\n',
+  )
+}
+if (platform !== 'win32') await chmod(path.join(out, 'scripts', 'cc'), 0o755)
+
+// --- native dependencies, pinned to bun.lock ------------------------------
+const allowlist = JSON.parse(await readFile(path.join(ROOT, 'scripts', 'bundle-allowlist.json'), 'utf8'))
+const lockText = await readFile(path.join(ROOT, 'bun.lock'), 'utf8')
+const lockVersions = new Map()
+for (const match of lockText.matchAll(/^\s*"([^"]+)": \["[^"]+@([^"]+)",/gm)) {
+  if (!lockVersions.has(match[1])) lockVersions.set(match[1], match[2])
+}
+
+const staged = new Set()
+async function collectPackage(name) {
+  if (staged.has(name)) return
+  const dir = path.join(ROOT, 'node_modules', name)
+  if (!existsSync(dir)) fail(`node_modules/${name} is missing; run bun install`)
+  const manifest = JSON.parse(await readFile(path.join(dir, 'package.json'), 'utf8'))
+  const locked = lockVersions.get(name)
+  if (locked && manifest.version !== locked) {
+    fail(`${name} is ${manifest.version} on disk but bun.lock pins ${locked}`)
+  }
+  staged.add(name)
+  report.nodeModules.push({ name, version: manifest.version })
+  for (const dependency of Object.keys(manifest.dependencies ?? {})) await collectPackage(dependency)
+}
+
+for (const name of allowlist.nativePackages) await collectPackage(name)
+// sharp's native side is an optional dependency per target, and it is the only
+// .node in a correct artifact.
+for (const prefix of ['@img/sharp', '@img/sharp-libvips']) {
+  const candidate = `${prefix}-${platform === 'win32' ? 'win32' : platform}-${arch}`
+  if (existsSync(path.join(ROOT, 'node_modules', candidate))) await collectPackage(candidate)
+}
+
+for (const name of [...staged].sort()) {
+  await cp(path.join(ROOT, 'node_modules', name), path.join(out, 'node_modules', name), { recursive: true })
+}
+for (const name of allowlist.buildGeneratedExternals) {
+  if (existsSync(path.join(out, 'node_modules', name))) fail(`${name} must never be staged`)
+}
+for (const name of allowlist.lazyOptional) {
+  if (existsSync(path.join(out, 'node_modules', name))) fail(`${name} must never be staged`)
+}
+
+// --- platform tool resources ----------------------------------------------
+const codexManifestPath = path.join(ROOT, 'resources', 'codex', 'manifest.json')
+if (!existsSync(codexManifestPath)) fail('resources/codex/manifest.json is missing; run scripts/stage-codex.mjs')
+const codexManifest = JSON.parse(await readFile(codexManifestPath, 'utf8'))
+const key = `${platform}-${arch}`
+const entry = codexManifest.entries?.[key]
+if (!entry) fail(`resources/codex/manifest.json has no entry for ${key}`)
+const codexSource = path.join(ROOT, 'resources', 'codex', entry.version, key)
+if (!existsSync(codexSource)) fail(`staged codex tree is missing: ${path.relative(ROOT, codexSource)}`)
+const codexDigest = await treeDigest(codexSource)
+if (entry.treeSha256 && entry.treeSha256 !== codexDigest) {
+  fail(`staged codex tree does not match the manifest (${codexDigest} != ${entry.treeSha256}); re-run stage-codex`)
+}
+await cp(codexSource, path.join(out, 'resources', 'codex', entry.version, key), { recursive: true })
+await cp(codexManifestPath, path.join(out, 'resources', 'codex', 'manifest.json'))
+report.sha256.codexArchive = entry.sha256
+report.sha256.codexTree = codexDigest
+
+if (platform === 'darwin') {
+  const helper = path.join(ROOT, 'scripts', 'macos', 'bin', 'keysafe-keychain')
+  if (!existsSync(helper)) fail('scripts/macos/bin/keysafe-keychain is missing; run scripts/macos/build-keysafe-keychain.sh')
+  await cp(helper, path.join(out, 'scripts', 'macos', 'bin', 'keysafe-keychain'), { recursive: true })
+  await chmod(path.join(out, 'scripts', 'macos', 'bin', 'keysafe-keychain'), 0o755)
+  report.sha256.keychainHelper = await digestFile(path.join(out, 'scripts', 'macos', 'bin', 'keysafe-keychain'))
+}
+
+// --- invariants ------------------------------------------------------------
+await assertNoForeignPrebuilds()
+async function assertNoForeignPrebuilds() {
+  const imgDirs = existsSync(path.join(out, 'node_modules', '@img'))
+    ? (await readdir(path.join(out, 'node_modules', '@img'))).sort()
+    : []
+  const allowed = [...staged].filter(name => name.startsWith('@img/')).map(name => name.slice('@img/'.length)).sort()
+  if (JSON.stringify(imgDirs) !== JSON.stringify(allowed)) {
+    fail(`@img directory set does not match the allowlist closure: ${imgDirs.join(', ') || '(none)'}`)
+  }
+  const natives = (await walk(out)).filter(file => file.endsWith('.node'))
+  if (natives.length !== 1) fail(`expected exactly one .node in the artifact, found ${natives.length}: ${natives.join(', ')}`)
+}
+
+// dist must look newer than the manifests so a source-tree freshness check
+// cannot fire on the artifact.
+const cliStat = await stat(path.join(out, 'dist', 'cli.js'))
+const older = new Date(cliStat.mtimeMs - 60_000)
+for (const name of ['package.json', 'bun.lock']) await utimes(path.join(out, name), older, older)
+
+async function measure() {
+  let bytes = 0
+  const files = await walk(out)
+  for (const file of files) bytes += (await stat(path.join(out, file))).size
+  report.bytes = bytes
+  report.files = files.length
+  report.classes = {
+    dist: files.filter(file => file.startsWith('dist/')).length,
+    manifests: files.filter(file => file === 'package.json' || file === 'bun.lock').length,
+    scripts: files.filter(file => file.startsWith('scripts/')).length,
+    nodeModules: files.filter(file => file.startsWith('node_modules/')).length,
+    resources: files.filter(file => file.startsWith('resources/')).length,
+  }
+}
+await measure()
+
+// --- smoke -----------------------------------------------------------------
+async function run(command, args, options = {}) {
+  return spawnSync(command, args, { cwd: out, encoding: 'utf8', timeout: 120_000, ...options })
+}
+
+async function healthSmoke(port) {
+  const child = spawn(process.execPath, [path.join(out, 'scripts', 'gateway-supervisor.mjs'), '--port', String(port)], {
+    cwd: out,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: path.join(out, '.scratch-config') },
+    stdio: 'ignore',
+    detached: platform !== 'win32',
+  })
+  const deadline = Date.now() + 45_000
+  try {
+    while (Date.now() < deadline) {
+      const ok = await new Promise(resolve => {
+        const request = http.get(`http://127.0.0.1:${port}/health`, response => {
+          response.resume()
+          resolve(response.statusCode === 200)
+        })
+        request.on('error', () => resolve(false))
+        request.setTimeout(2000, () => {
+          request.destroy()
+          resolve(false)
+        })
+      })
+      if (ok) return true
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+    return false
+  } finally {
+    try {
+      if (platform === 'win32') spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { stdio: 'ignore' })
+      else process.kill(-child.pid, 'SIGKILL')
+    } catch {}
+  }
+}
+
+if (smoke) {
+  const bun = spawnSync('bun', ['--version'], { encoding: 'utf8' })
+  if (bun.status !== 0) fail('bun is required for the artifact smoke')
+  const version = await run('bun', ['--no-install', 'dist/cli.js', '--version'])
+  if (version.status !== 0) fail(`staged CLI failed --version: ${version.stderr || version.stdout}`)
+  report.smoke.version = version.stdout.trim()
+
+  const scratchConfig = path.join(out, '.scratch-config')
+  await mkdir(scratchConfig, { recursive: true })
+  const status = await run('bun', ['--no-install', 'dist/cli.js', 'login', '--status'], {
+    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+  })
+  if (status.status !== 0) fail(`staged CLI failed login --status: ${status.stderr || status.stdout}`)
+  report.smoke.loginStatus = JSON.parse(status.stdout).mode
+
+  const port = 41000 + Math.floor(Math.random() * 2000)
+  if (!await healthSmoke(port)) fail(`staged supervisor did not serve /health on ${port}`)
+  report.smoke.health = port
+
+  // Negative 1: manifests newer than dist must not trigger a rebuild.
+  const now = new Date()
+  for (const name of ['package.json', 'bun.lock']) await utimes(path.join(out, name), now, now)
+  const prewarm = await run(process.execPath, ['scripts/cc-launcher.mjs', '--prewarm'], {
+    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+    timeout: 60_000,
+  })
+  if (prewarm.status !== 0) fail(`mtime-inverted prewarm failed: ${prewarm.stderr || prewarm.stdout}`)
+  const noise = `${prewarm.stdout}${prewarm.stderr}`
+  if (/compiled harness is stale|rebuilding before launch/i.test(noise)) fail('mtime-inverted prewarm attempted a rebuild')
+  report.smoke.mtimeInverted = 'ok'
+
+  // Negative 2: a missing dist must be reported, never rebuilt.
+  const copy = path.join(os.tmpdir(), `stage-no-dist-${process.pid}`)
+  await rm(copy, { recursive: true, force: true })
+  await cp(out, copy, { recursive: true })
+  await rm(path.join(copy, 'dist'), { recursive: true, force: true })
+  const missing = spawnSync(process.execPath, ['scripts/cc-launcher.mjs', '--prewarm'], {
+    cwd: copy,
+    encoding: 'utf8',
+    timeout: 60_000,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+  })
+  await rm(copy, { recursive: true, force: true })
+  if (missing.status === 0) fail('missing dist/cli.js did not fail the launch')
+  if (!/compiled harness is missing/i.test(`${missing.stdout}${missing.stderr}`)) {
+    fail(`missing dist produced the wrong error: ${missing.stderr || missing.stdout}`)
+  }
+  report.smoke.missingDist = 'reported'
+
+  if (platform === 'win32') {
+    const ps = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(out, 'scripts', 'cc.ps1'), '--prewarm'], {
+      cwd: out,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, CLAUDE_CONFIG_DIR: scratchConfig },
+    })
+    if (ps.status !== 0) fail(`staged cc.ps1 --prewarm failed: ${ps.stderr || ps.stdout}`)
+    report.smoke.ccPrewarm = 'ok'
+  }
+}
+
+await rm(path.join(out, '.scratch-config'), { recursive: true, force: true })
+await measure()
+await writeFile(path.join(out, 'stage-report.json'), `${JSON.stringify(report, null, 2)}\n`)
+console.log(JSON.stringify(report, null, 2))

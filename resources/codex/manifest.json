@@ -5,6 +5,7 @@
       "version": "0.166.0",
       "asset": "codex-x86_64-pc-windows-msvc.exe.zip",
       "sha256": "bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d",
+      "treeSha256": "86907eff414036b20fafca834f0b2419d2d18e521c1b87b3ebb25522b5720dad",
       "entrypoint": "codex-x86_64-pc-windows-msvc.exe"
     }
   }
