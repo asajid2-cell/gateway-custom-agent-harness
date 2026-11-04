@@ -281,6 +281,18 @@ async function reloadPhase(env, { vault, vaultDir } = {}) {
       'started before the save, so the new slot is not in its env yet)')
 
     await waitFor(healthy, 45000, '/health after second reload')
+    // The chain lives in the respawned process; ask it directly rather than
+    // trusting the reload response body.
+    const accounts = await httpRequest('GET', `http://127.0.0.1:${port}/gateway/opencode-account`)
+    let accountsBody = null
+    try {
+      accountsBody = JSON.parse(accounts.body)
+    } catch {}
+    record('next generation serves the new slot',
+      accounts.status === 200 && Array.isArray(accountsBody?.available) &&
+      accountsBody.available.includes(1) && accountsBody.available.includes(2) ? 'PASS' : 'FAIL',
+      `HTTP ${accounts.status} available=${JSON.stringify(accountsBody?.available ?? null)} (expected [1,2])`)
+
     const thirdReload = await reload('third')
     record('mid-run save lands on the next generation',
       Array.isArray(thirdReload.body?.available) && thirdReload.body.available.includes(1) &&
