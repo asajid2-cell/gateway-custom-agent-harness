@@ -351,7 +351,9 @@ test('replay returns only the events after the watermark', async () => {
   }
 })
 
-test('concurrent appends from two processes keep the sequence contiguous and unique', async () => {
+// Two subprocesses while a build runs can exceed node:test's 5 s default without
+// anything being wrong with the writer.
+test('concurrent appends from two processes keep the sequence contiguous and unique', { timeout: 120_000 }, async () => {
   const root = await seeded()
   const worker = path.join(import.meta.dirname, 'vault-journal-worker.ts')
   try {
@@ -375,6 +377,4 @@ test('concurrent appends from two processes keep the sequence contiguous and uni
   } finally {
     await rm(root, { recursive: true, force: true })
   }
-  // Two subprocesses on a box that is building at the same time can exceed
-  // node:test's 5 s default without anything being wrong with the writer.
-}, 120_000)
+})
