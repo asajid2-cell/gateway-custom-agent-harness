@@ -676,3 +676,56 @@ test('cc zenith resolves the role before launch and refuses a live holder', asyn
     'the headless claim must be taken only after the registration lands',
   )
 })
+
+test('cc login forwards the credential subcommand without session flags', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'gateway-login-'))
+  try {
+    const runner = process.execPath
+    await mkdir(path.join(root, 'scripts'))
+    await mkdir(path.join(root, 'src'))
+    await copyFile(new URL('./cc.ps1', import.meta.url), path.join(root, 'scripts', 'cc.ps1'))
+    await copyFile(new URL('./cc-launcher.mjs', import.meta.url), path.join(root, 'scripts', 'cc-launcher.mjs'))
+    await copyFile(new URL('./effort-capabilities.json', import.meta.url), path.join(root, 'scripts', 'effort-capabilities.json'))
+    await writeFile(path.join(root, 'src', 'input.ts'), 'export {}')
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'bun scripts/build.ts' } }))
+    await writeFile(path.join(root, 'scripts', 'build.ts'), 'export {}')
+    // Presence checks run before the login branch in the POSIX launcher.
+    await writeFile(path.join(root, 'scripts', 'model-gateway.mjs'), 'export {}')
+    await writeFile(path.join(root, 'scripts', 'gateway-supervisor.mjs'), 'export {}')
+    await mkdir(path.join(root, 'dist'))
+    // Written last so the fake harness is fresher than every build input.
+    await writeFile(path.join(root, 'dist', 'cli.js'), `
+      const fs = require('node:fs');
+      fs.writeFileSync(process.env.LOGIN_ARGV_LOG, JSON.stringify(process.argv.slice(2)));
+    `)
+
+    const envFor = log => {
+      const env = { ...process.env, CC_CLAUDE_RUNNER_OVERRIDE: runner, LOCALAPPDATA: root,
+        USERPROFILE: path.join(root, 'missing-home'), LOGIN_ARGV_LOG: log }
+      delete env.CC_CLAUDE_SCRIPT_OVERRIDE
+      delete env.TANDEM_GATEWAY_CODEX_HOME
+      delete env.CC_RAW_ARGS
+      return env
+    }
+
+    const psLog = path.join(root, 'ps-argv.json')
+    const ps = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'scripts', 'cc.ps1')], {
+      env: { ...envFor(psLog), CC_RAW_ARGS: 'login status' }, encoding: 'utf8', timeout: 60000,
+    })
+    assert.equal(ps.status, 0, `${ps.stdout}\n${ps.stderr}`)
+    assert.deepEqual(JSON.parse(await readFile(psLog, 'utf8')), ['login', 'status'])
+
+    const mjsLog = path.join(root, 'mjs-argv.json')
+    const mjs = spawnSync(runner, [path.join(root, 'scripts', 'cc-launcher.mjs'), 'login', 'status'], {
+      env: envFor(mjsLog), encoding: 'utf8', timeout: 60000,
+    })
+    assert.equal(mjs.status, 0, `${mjs.stdout}\n${mjs.stderr}`)
+    assert.deepEqual(JSON.parse(await readFile(mjsLog, 'utf8')), ['login', 'status'])
+
+    let events = []
+    try { events = (await readFile(path.join(root, 'Gateway', 'launcher.jsonl'), 'utf8')).trim().split('\n').filter(Boolean).map(JSON.parse) } catch {}
+    assert.equal(events.some(event => event.event === 'gateway-spawn-start'), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

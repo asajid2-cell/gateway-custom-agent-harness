@@ -933,11 +933,6 @@ Write-LaunchDiagnostic 'artifact-check'
 Initialize-ClaudeArtifact
 Write-LaunchDiagnostic 'artifact-ready'
 
-# `cc login` is a CLI subcommand, not a session. The harness fast-paths it and
-# must see the operator's arguments unchanged: starting a gateway and appending
-# session flags made the installer path fail on every invocation.
-
-
 # Reuse the reference port only when it is free; otherwise reserve an ephemeral
 # loopback port so an unrelated or stale listener is never adopted.
 $Port = 4011
