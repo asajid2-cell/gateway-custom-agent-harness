@@ -160,6 +160,175 @@ export async function readJournal(vaultRoot: string, familyId: string): Promise<
   return readJournalFile(familyJournalPath(vaultRoot, familyId))
 }
 
+export type TornTailRepair =
+  | { repaired: false; reason: 'clean' | 'missing' }
+  | {
+      repaired: true
+      /** Byte offset where the dropped tail began (the end of the last complete line). */
+      offset: number
+      byteCount: number
+      sha256: string
+      quarantinedTo: string
+      watermark: number
+    }
+
+/**
+ * Cut a torn tail off the journal, preserving exactly what was cut.
+ *
+ * A crash can leave a partial final line; the complete lines before it are
+ * still authoritative, so the repair truncates to the last newline. The dropped
+ * bytes are written to a quarantine file first and described in
+ * quarantine.jsonl, so nothing is discarded silently and the operation can be
+ * audited later. Running it twice is a no-op - there is nothing left to cut.
+ *
+ * A corrupt line that is NOT at the tail is a different failure: the ordering
+ * after it cannot be trusted, so this refuses and leaves the file untouched for
+ * an explicit rebuild.
+ */
+export async function repairTornTail(vaultRoot: string, familyId: string): Promise<TornTailRepair> {
+  const journalPath = familyJournalPath(vaultRoot, familyId)
+  const dir = dirname(journalPath)
+  return withVaultLock(dir, async () => {
+    let buffer: Buffer
+    try {
+      buffer = await readFile(journalPath)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { repaired: false, reason: 'missing' } as const
+      throw error
+    }
+    if (buffer.length === 0) return { repaired: false, reason: 'clean' } as const
+    const lastNewline = buffer.lastIndexOf(0x0a)
+    if (lastNewline === buffer.length - 1) return { repaired: false, reason: 'clean' } as const
+
+    const offset = lastNewline + 1
+    const dropped = buffer.subarray(offset)
+    // Before cutting anything, prove nothing else in the file is broken: a
+    // torn tail is the only damage this call is allowed to repair.
+    const complete = buffer.subarray(0, offset).toString('utf8')
+    for (const [index, line] of complete.split('\n').entries()) {
+      if (line.trim() === '') continue
+      try {
+        JSON.parse(line)
+      } catch (error) {
+        throw new Error(
+          `journal ${journalPath} has a corrupt line ${index + 1} that is not a torn tail; ` +
+            `repair refuses and the file is untouched: ${(error as Error).message}`,
+        )
+      }
+    }
+
+    const hash = createHash('sha256').update(dropped).digest('hex')
+    const quarantineDir = join(vaultRoot, 'quarantine', familyId)
+    await mkdir(quarantineDir, { recursive: true })
+    const quarantinedTo = join(quarantineDir, `tail-${Date.now()}-${dropped.length}-${hash.slice(0, 12)}.bin`)
+    const bytes = await open(quarantinedTo, 'wx')
+    try {
+      await bytes.writeFile(dropped)
+      await bytes.sync()
+    } finally {
+      await bytes.close()
+    }
+    const record = {
+      kind: 'tail_recovered',
+      family_id: familyId,
+      at: new Date().toISOString(),
+      offset,
+      byteCount: dropped.length,
+      sha256: hash,
+      quarantinedTo,
+    }
+    const auditPath = join(vaultRoot, 'quarantine', 'quarantine.jsonl')
+    const audit = await open(auditPath, 'a')
+    try {
+      await audit.writeFile(`${JSON.stringify(record)}\n`)
+      await audit.sync()
+    } finally {
+      await audit.close()
+    }
+
+    const handle = await open(journalPath, 'r+')
+    try {
+      await handle.truncate(offset)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+
+    const kept = complete.split('\n').filter(line => line.trim() !== '')
+    const watermark = kept.reduce((max, line) => Math.max(max, Number(JSON.parse(line).sequence) || 0), 0)
+    return { repaired: true, offset, byteCount: dropped.length, sha256: hash, quarantinedTo, watermark }
+  })
+}
+
+export type JournalVerification =
+  | { ok: true; checked: number; watermark: number }
+  | {
+      ok: false
+      checked: number
+      watermark: number
+      mismatches: Array<{ line: number; event_id?: string; expected?: string; actual?: string; reason?: string }>
+      tornTail: boolean
+    }
+
+/**
+ * Re-hash every committed line and compare it to the hash it carries.
+ *
+ * The check parses the line and hashes the canonical form of the parsed object,
+ * never the raw text: a line that was re-serialized with different spacing is
+ * still the same event, and a line whose content changed is not.
+ */
+export async function verifyJournal(vaultRoot: string, familyId: string): Promise<JournalVerification> {
+  const path = familyJournalPath(vaultRoot, familyId)
+  let raw: string
+  try {
+    raw = await readFile(path, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, checked: 0, watermark: 0 }
+    throw error
+  }
+  const tornTail = raw.length > 0 && !raw.endsWith('\n')
+  const lines = raw.split('\n')
+  if (tornTail) lines.pop()
+  const mismatches: Array<{ line: number; event_id?: string; expected?: string; actual?: string; reason?: string }> = []
+  let checked = 0
+  let watermark = 0
+  lines.forEach((line, index) => {
+    if (line.trim() === '') return
+    let event: Record<string, unknown>
+    try {
+      event = JSON.parse(line)
+    } catch (error) {
+      mismatches.push({ line: index + 1, reason: `not JSON: ${(error as Error).message}` })
+      return
+    }
+    checked += 1
+    watermark = Math.max(watermark, Number(event.sequence) || 0)
+    const stored = typeof event.content_hash === 'string' ? event.content_hash : undefined
+    const actual = contentHash(event)
+    if (stored !== actual) {
+      mismatches.push({ line: index + 1, event_id: String(event.event_id ?? ''), expected: stored, actual })
+    }
+  })
+  return mismatches.length === 0
+    ? { ok: true, checked, watermark }
+    : { ok: false, checked, watermark, mismatches, tornTail }
+}
+
+/** Events after a watermark, in committed order - the projection's replay input. */
+export async function replayFrom(
+  vaultRoot: string,
+  familyId: string,
+  after = 0,
+): Promise<JournalEvent[]> {
+  const journal = await readJournalFile(familyJournalPath(vaultRoot, familyId))
+  if (journal.tornTail) {
+    throw new Error('journal ends with a torn line; run repairTornTail before replaying')
+  }
+  return journal.events
+    .filter(event => Number(event.sequence) > after)
+    .sort((left, right) => Number(left.sequence) - Number(right.sequence))
+}
+
 /**
  * The active generation for a family, read from the rotation journal. `null`
  * means no generation has been admitted yet, and nothing may be committed
@@ -250,6 +419,13 @@ export async function appendEvents(
       }
       if (seen.has(eventId)) {
         duplicates.push(eventId)
+        continue
+      }
+      if ('content_hash' in proposal) {
+        // Only the writer computes a hash, and only after it assigns sequence.
+        // A proposal carrying one is either confused or trying to fix its own
+        // identity, so it is refused rather than trusted or overwritten.
+        rejected.push({ event_id: eventId, reason: 'content_hash is writer-owned and must not be proposed' })
         continue
       }
       const generation = proposal.generation_id

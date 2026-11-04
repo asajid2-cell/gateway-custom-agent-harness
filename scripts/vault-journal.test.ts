@@ -12,6 +12,9 @@ import {
   contentHash,
   familyJournalPath,
   readJournal,
+  repairTornTail,
+  replayFrom,
+  verifyJournal,
 } from '../src/utils/vault/journal.js'
 
 const FAMILY = 'fam-1'
@@ -150,6 +153,148 @@ test('concurrent appends in one process keep the sequence contiguous', async () 
     const results = await Promise.all(batches)
     const sequences = results.flatMap(result => result.committed.map(event => event.sequence)).sort((a, b) => a - b)
     assert.deepEqual(sequences, [1, 2, 3, 4, 5, 6, 7, 8])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a proposal that carries content_hash is refused', async () => {
+  const root = await seeded()
+  try {
+    const result = await appendEvents(root, FAMILY, [
+      { event_id: 'h', generation_id: 'gen-1', content_hash: 'sha256:forged', body: 'x' } as never,
+    ])
+    assert.equal(result.committed.length, 0)
+    assert.match(result.rejected[0]?.reason ?? '', /content_hash is writer-owned/)
+    assert.equal((await readJournal(root, FAMILY)).watermark, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('torn-tail repair preserves the dropped bytes and is idempotent', async () => {
+  const root = await seeded()
+  try {
+    await appendEvents(root, FAMILY, [
+      { event_id: 'keep-1', generation_id: 'gen-1', kind: 'finding', body: 'one' },
+      { event_id: 'keep-2', generation_id: 'gen-1', kind: 'finding', body: 'two' },
+    ])
+    const journalPath = familyJournalPath(root, FAMILY)
+    const clean = await readFile(journalPath, 'utf8')
+    const torn = '{"event_id":"half","sequence":3'
+    await writeFile(journalPath, `${clean}${torn}`)
+
+    const repair = await repairTornTail(root, FAMILY)
+    assert.equal(repair.repaired, true)
+    if (!repair.repaired) return
+    assert.equal(repair.offset, Buffer.byteLength(clean, 'utf8'))
+    assert.equal(repair.byteCount, Buffer.byteLength(torn, 'utf8'))
+    assert.equal(repair.watermark, 2)
+    // The bytes are preserved exactly, not described.
+    const preserved = await readFile(repair.quarantinedTo, 'utf8')
+    assert.equal(preserved, torn)
+    assert.equal((await readFile(journalPath, 'utf8')), clean)
+
+    const audit = await readFile(path.join(root, 'quarantine', 'quarantine.jsonl'), 'utf8')
+    const record = JSON.parse(audit.trim())
+    assert.equal(record.kind, 'tail_recovered')
+    assert.equal(record.byteCount, repair.byteCount)
+    assert.equal(record.sha256, repair.sha256)
+    assert.equal(record.offset, repair.offset)
+
+    const second = await repairTornTail(root, FAMILY)
+    assert.deepEqual(second, { repaired: false, reason: 'clean' })
+
+    const after = await appendEvents(root, FAMILY, [{ event_id: 'next', generation_id: 'gen-1', body: 'x' }])
+    assert.deepEqual(after.committed.map(event => event.sequence), [3])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('repair on a missing journal is a no-op', async () => {
+  const root = await seeded()
+  try {
+    assert.deepEqual(await repairTornTail(root, FAMILY), { repaired: false, reason: 'missing' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a corrupt line that is not a torn tail halts the family instead of being repaired', async () => {
+  const root = await seeded()
+  try {
+    await appendEvents(root, FAMILY, [
+      { event_id: 'a', generation_id: 'gen-1', body: 'one' },
+      { event_id: 'b', generation_id: 'gen-1', body: 'two' },
+    ])
+    const journalPath = familyJournalPath(root, FAMILY)
+    const lines = (await readFile(journalPath, 'utf8')).split('\n').filter(Boolean)
+    const corrupted = [lines[0], '{not json}', lines[1]].join('\n') + '\n'
+    await writeFile(journalPath, corrupted)
+    // The file is complete but its order cannot be trusted, so every reader
+    // halts rather than skipping the line, and repair has nothing to cut.
+    await assert.rejects(() => readJournal(root, FAMILY), /corrupt line/)
+    assert.deepEqual(await repairTornTail(root, FAMILY), { repaired: false, reason: 'clean' })
+    assert.equal(await readFile(journalPath, 'utf8'), corrupted)
+    assert.equal((await verifyJournal(root, FAMILY)).ok, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('repair validates the surviving lines before it cuts', async () => {
+  const root = await seeded()
+  try {
+    await appendEvents(root, FAMILY, [{ event_id: 'a', generation_id: 'gen-1', body: 'one' }])
+    const journalPath = familyJournalPath(root, FAMILY)
+    const lines = (await readFile(journalPath, 'utf8')).split('\n').filter(Boolean)
+    // A corrupt line before a torn tail: cutting would silently bless it.
+    await writeFile(journalPath, `{bad json}\n${lines[0]}\n{"half":`)
+    await assert.rejects(() => repairTornTail(root, FAMILY), /not a torn tail|corrupt line/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('verify re-hashes every committed line and catches a changed body', async () => {
+  const root = await seeded()
+  try {
+    await appendEvents(root, FAMILY, [
+      { event_id: 'v1', generation_id: 'gen-1', kind: 'decision', body: 'settled' },
+      { event_id: 'v2', generation_id: 'gen-1', body: 'x' },
+    ])
+    const clean = await verifyJournal(root, FAMILY)
+    assert.equal(clean.ok, true)
+    assert.equal(clean.ok && clean.checked, 2)
+    assert.equal(clean.watermark, 2)
+
+    const journalPath = familyJournalPath(root, FAMILY)
+    const lines = (await readFile(journalPath, 'utf8')).split('\n').filter(Boolean)
+    const first = JSON.parse(lines[0])
+    first.body = 'rewritten'
+    await writeFile(journalPath, `${lines.map((line, index) => (index === 0 ? JSON.stringify(first) : line)).join('\n')}\n`)
+
+    const tampered = await verifyJournal(root, FAMILY)
+    assert.equal(tampered.ok, false)
+    assert.equal(tampered.ok === false ? tampered.mismatches.length : -1, 1)
+    assert.equal(tampered.ok === false ? tampered.mismatches[0]?.event_id : '', 'v1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('replay returns only the events after the watermark', async () => {
+  const root = await seeded()
+  try {
+    await appendEvents(root, FAMILY, [
+      { event_id: 'r1', generation_id: 'gen-1', body: '1' },
+      { event_id: 'r2', generation_id: 'gen-1', body: '2' },
+      { event_id: 'r3', generation_id: 'gen-1', body: '3' },
+    ])
+    const tail = await replayFrom(root, FAMILY, 1)
+    assert.deepEqual(tail.map(event => event.event_id), ['r2', 'r3'])
+    assert.deepEqual((await replayFrom(root, FAMILY, 3)).length, 0)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
