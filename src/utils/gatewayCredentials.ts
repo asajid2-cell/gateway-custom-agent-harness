@@ -119,7 +119,12 @@ export async function saveGatewayCredential(
   const result = await runKeysafe(['capture', name, '-FromStdin'], value)
   return result.code === 0
     ? { ok: true, mode, source: sourceFor(mode) }
-    : { ok: false, mode, source: sourceFor(mode), reason: `external keysafe exited ${result.code}` }
+    : {
+        ok: false,
+        mode,
+        source: sourceFor(mode),
+        reason: `external keysafe exited ${result.code}: ${result.stderr.trim().slice(0, 200)}`,
+      }
 }
 
 export async function removeGatewayCredential(
@@ -145,7 +150,12 @@ export async function removeGatewayCredential(
   const result = await runKeysafe(['rm', name])
   return result.code === 0
     ? { ok: true, mode, source: sourceFor(mode) }
-    : { ok: false, mode, source: sourceFor(mode), reason: `external keysafe exited ${result.code}` }
+    : {
+        ok: false,
+        mode,
+        source: sourceFor(mode),
+        reason: `external keysafe exited ${result.code}: ${result.stderr.trim().slice(0, 200)}`,
+      }
 }
 
 /** Sync mode matrix. Backend discovery is async; use describeCredentialStore. */
@@ -175,18 +185,24 @@ export async function describeCredentialStore() {
 function runKeysafe(
   args: string[],
   input?: string,
-): Promise<{ code: number }> {
+): Promise<{ code: number; stderr: string }> {
   return new Promise(resolve => {
+    let stderr = ''
     const child = spawn(
       process.env.ComSpec ? 'powershell.exe' : 'pwsh',
       ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', KEYSAFE_SCRIPT, ...args],
       {
-        stdio: ['pipe', 'ignore', 'ignore'],
+        stdio: ['pipe', 'ignore', 'pipe'],
         windowsHide: true,
       },
     )
-    child.on('error', () => resolve({ code: 1 }))
-    child.on('close', code => resolve({ code: code ?? 1 }))
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', chunk => {
+      stderr += chunk
+    })
+    child.stdin.on('error', () => {})
+    child.on('error', error => resolve({ code: 1, stderr: error.message }))
+    child.on('close', code => resolve({ code: code ?? 1, stderr }))
     if (input !== undefined) child.stdin.end(input)
     else child.stdin.end()
   })

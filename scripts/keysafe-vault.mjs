@@ -23,7 +23,7 @@
  * covered by this vault.
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
-import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -54,15 +54,28 @@ export function envVarForRecord(name) {
   }
 }
 
-/** @param {string} name */
+const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+
+/**
+ * @param {string} name
+ * NTFS makes `foo.` and `foo` the same file, and CON/NUL/etc are devices.
+ * A name is also a filename and part of the GCM AAD, so keep one canonical
+ * spelling: no trailing dot/space, no reserved device names.
+ */
 export function isValidRecordName(name) {
-  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) return false
+  if (/[. ]$/.test(name)) return false
+  if (RESERVED_NAMES.test(name)) return false
+  return true
 }
 
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultVaultDir(env = process.env) {
   const configDir = env.CLAUDE_CONFIG_DIR
-  const home = env.USERPROFILE || env.HOME || ''
+  const home = env.USERPROFILE || env.HOME || os.homedir()
+  if (!configDir && !home) {
+    throw new Error('keysafe: cannot resolve a home directory; set CLAUDE_CONFIG_DIR or HOME')
+  }
   return path.join(configDir || path.join(home, '.claude'), 'keysafe')
 }
 
@@ -147,7 +160,14 @@ export const defaultRun = (file, args, stdin) =>
     })
     child.on('error', error => finish({ code: 127, stdout, stderr: `${stderr}${error.message}` }))
     child.on('close', code => finish({ code: code ?? 1, stdout, stderr }))
-    child.stdin.end(stdin)
+    // A helper that exits early (policy block, fast failure) makes the write
+    // raise EPIPE; without a handler that is an unhandled stream error.
+    child.stdin.on('error', () => {})
+    try {
+      child.stdin.end(stdin)
+    } catch {
+      // The close/error handler above reports the outcome.
+    }
   })
 
 const LOCKED_HINT =
@@ -212,6 +232,13 @@ function requireSuccess(result, what) {
 }
 
 const hardenedDirs = new Set()
+const hardenedFiles = new Set()
+
+function windowsPrincipal() {
+  const user = process.env.USERNAME || os.userInfo().username
+  const domain = process.env.USERDOMAIN
+  return domain && domain.toLowerCase() !== user.toLowerCase() ? `${domain}\\${user}` : user
+}
 
 /**
  * A protected DACL on the vault directory: no inherited ACEs, then explicit
@@ -223,9 +250,7 @@ async function hardenWindowsAcl(dir, run = defaultRun) {
   if (process.platform !== 'win32' || hardenedDirs.has(dir) || process.env.KEYSAFE_SKIP_ACL === '1') {
     return
   }
-  const user = process.env.USERNAME || os.userInfo().username
-  const domain = process.env.USERDOMAIN
-  const principal = domain && domain.toLowerCase() !== user.toLowerCase() ? `${domain}\\${user}` : user
+  const principal = windowsPrincipal()
   const result = await run(
     'icacls',
     [
@@ -249,17 +274,96 @@ async function hardenWindowsAcl(dir, run = defaultRun) {
   hardenedDirs.add(dir)
 }
 
+/**
+ * A vault that predates the DACL fix keeps inherited ACEs on its files even
+ * after the directory is protected. Harden the existing files once per process.
+ */
+async function hardenWindowsFiles(dir, run) {
+  if (
+    process.platform !== 'win32' ||
+    hardenedFiles.has(dir) ||
+    process.env.KEYSAFE_SKIP_ACL === '1'
+  ) {
+    return
+  }
+  let entries
+  try {
+    entries = await readdir(dir)
+  } catch {
+    return
+  }
+  const principal = windowsPrincipal()
+  for (const entry of entries) {
+    if (entry.endsWith('.tmp')) continue
+    const result = await run(
+      'icacls',
+      [
+        path.join(dir, entry),
+        '/inheritance:r',
+        '/grant:r',
+        `${principal}:(F)`,
+        '/grant:r',
+        'SYSTEM:(F)',
+        '/grant:r',
+        'BUILTIN\\Administrators:(F)',
+      ],
+      '',
+    )
+    if (result.code !== 0) {
+      throw new Error(
+        `keysafe: could not protect ${entry} (exit ${result.code}): ` +
+          `${String(result.stderr).trim().slice(0, 200)}`,
+      )
+    }
+  }
+  hardenedFiles.add(dir)
+}
+
 async function ensureDir(dir, run = defaultRun) {
   await mkdir(dir, { recursive: true, mode: 0o700 })
   if (process.platform !== 'win32') await chmod(dir, 0o700).catch(() => {})
   await hardenWindowsAcl(dir, run)
+  await hardenWindowsFiles(dir, run)
+}
+
+async function replaceFile(tmp, file) {
+  // Windows fails a replace with EPERM/EBUSY while a reader holds the target.
+  // Bounded retry; anything else is a real error.
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(tmp, file)
+      return
+    } catch (error) {
+      if (attempt >= 5 || !['EPERM', 'EBUSY', 'EACCES'].includes(error?.code)) throw error
+      await new Promise(resolve => setTimeout(resolve, 20 * (attempt + 1)))
+    }
+  }
 }
 
 async function writePrivate(file, contents) {
   const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
   await writeFile(tmp, contents, { encoding: 'utf8', mode: 0o600 })
-  await rename(tmp, file)
+  await replaceFile(tmp, file)
   if (process.platform !== 'win32') await chmod(file, 0o600).catch(() => {})
+}
+
+/**
+ * Create `file` only if it does not exist. Two processes opening the same fresh
+ * vault must not both mint a master key: the loser adopts the winner's file.
+ */
+async function writePrivateExclusive(file, contents) {
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
+  await writeFile(tmp, contents, { encoding: 'utf8', mode: 0o600 })
+  try {
+    await link(tmp, file)
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {})
+    if (error?.code === 'EEXIST') return false
+    throw error
+  }
+  await rm(tmp, { force: true }).catch(() => {})
+  if (process.platform !== 'win32') await chmod(file, 0o600).catch(() => {})
+  return true
 }
 
 function accountFor(vaultDir) {
@@ -270,10 +374,17 @@ async function dpapiMasterKey(vaultDir, run, { create = true } = {}) {
   const file = path.join(vaultDir, 'master.dpapi')
   try {
     const sealed = (await readFile(file, 'utf8')).trim()
-    const raw = requireSuccess(
-      await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DPAPI_UNPROTECT], sealed),
-      'unsealing the DPAPI master key',
-    )
+    let raw
+    try {
+      raw = requireSuccess(
+        await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DPAPI_UNPROTECT], sealed),
+        'unsealing the DPAPI master key',
+      )
+    } catch (error) {
+      // Profile moved/changed, DPAPI reset, corrupt blob: a typed, actionable
+      // state, never a raw PowerShell error and never a silent re-key.
+      throw lockedError('the DPAPI master key', (error)?.message ?? String(error))
+    }
     const key = Buffer.from(raw, 'base64')
     assertKey(key)
     return key
@@ -288,7 +399,18 @@ async function dpapiMasterKey(vaultDir, run, { create = true } = {}) {
     await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DPAPI_PROTECT], key.toString('base64')),
     'sealing the DPAPI master key',
   )
-  await writePrivate(file, sealed)
+  if (!(await writePrivateExclusive(file, sealed))) {
+    // Another process won the creation race. Adopt its key; do not orphan the
+    // records it may already have written.
+    const winner = (await readFile(file, 'utf8')).trim()
+    const raw = requireSuccess(
+      await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DPAPI_UNPROTECT], winner),
+      'unsealing the DPAPI master key',
+    )
+    const shared = Buffer.from(raw, 'base64')
+    assertKey(shared)
+    return shared
+  }
   return key
 }
 
@@ -355,7 +477,11 @@ async function fileMasterKey(vaultDir, { create = true } = {}) {
     }
   }
   const key = randomBytes(KEY_BYTES)
-  await writePrivate(file, key.toString('hex'))
+  if (!(await writePrivateExclusive(file, key.toString('hex')))) {
+    const existing = Buffer.from((await readFile(file, 'utf8')).trim(), 'hex')
+    assertKey(existing)
+    return existing
+  }
   return key
 }
 

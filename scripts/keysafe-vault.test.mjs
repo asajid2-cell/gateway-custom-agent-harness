@@ -276,6 +276,23 @@ test('defaultVaultDir honors CLAUDE_CONFIG_DIR', async () => {
   assert.equal(defaultVaultDir({ USERPROFILE: 'C:/u' }), path.join('C:/u', '.claude', 'keysafe'))
 })
 
+test('reserved and non-canonical record names are refused', async () => {
+  const { isValidRecordName } = await import('./keysafe-vault.mjs')
+  assert.equal(isValidRecordName('ds'), true)
+  assert.equal(isValidRecordName('opencode-go2'), true)
+  assert.equal(isValidRecordName('con'), false)
+  assert.equal(isValidRecordName('nul'), false)
+  assert.equal(isValidRecordName('COM1'), false)
+  assert.equal(isValidRecordName('ds.'), false)
+  assert.equal(isValidRecordName('ds '), false)
+})
+
+test('a helper that exits before stdin is written does not crash the process', async () => {
+  const { defaultRun } = await import('./keysafe-vault.mjs')
+  const result = await defaultRun(process.execPath, ['-e', ''], 'x'.repeat(200_000))
+  assert.equal(typeof result.code, 'number')
+})
+
 test('peekVault observes without creating anything', async () => {
   const dir = path.join(await mkdtemp(path.join(os.tmpdir(), 'keysafe-peek-')), 'missing')
   try {
