@@ -626,3 +626,82 @@ test('bundled mode injects the vault and a reload picks up a saved key', { timeo
     await rm(temp, { recursive: true, force: true })
   }
 })
+
+async function pipeFixture() {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'gateway-supervisor-stdin-'))
+  const childScript = path.join(temp, 'stdin-gateway.mjs')
+  await writeFile(childScript, `
+    import http from 'node:http'
+    const server = http.createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ status: 'ok' }))
+    })
+    server.listen(Number(process.argv[process.argv.indexOf('--port') + 1]), '127.0.0.1')
+  `)
+  return { temp, childScript, port: await findPort() }
+}
+
+function spawnSupervisorForStdin({ temp, childScript, port }, stdin) {
+  const child = spawn(process.execPath, [
+    supervisor,
+    '--gateway',
+    childScript,
+    '--port',
+    String(port),
+  ], {
+    cwd: root,
+    env: {
+      ...process.env,
+      MODEL_GATEWAY_KEYSAFE_HOME: temp,
+      GATEWAY_CREDENTIALS_MODE: 'external',
+      MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS: '10',
+    },
+    stdio: [stdin, 'ignore', 'pipe'],
+    windowsHide: true,
+  })
+  return child
+}
+
+async function waitHealthy(port, giveMs = 10_000) {
+  const deadline = Date.now() + giveMs
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/health`)
+      if (response.ok) return true
+    } catch {}
+    await wait(20)
+  }
+  return false
+}
+
+test('a supervisor with closed /dev/null stdin is not mistaken for dead', { skip: process.platform === 'win32', timeout: 30_000 }, async () => {
+  const fixture = await pipeFixture()
+  // 'ignore' is /dev/null: an immediate EOF that says nothing about the parent.
+  const child = spawnSupervisorForStdin(fixture, 'ignore')
+  try {
+    assert.equal(await waitHealthy(fixture.port), true)
+    // Still alive after the EOF would have been delivered.
+    await wait(1_500)
+    assert.equal(child.exitCode, null)
+  } finally {
+    await stopTree(child)
+    await rm(fixture.temp, { recursive: true, force: true })
+  }
+})
+
+test('a supervisor watched through a pipe exits when the pipe closes', { skip: process.platform === 'win32', timeout: 30_000 }, async () => {
+  const fixture = await pipeFixture()
+  const child = spawnSupervisorForStdin(fixture, 'pipe')
+  try {
+    assert.equal(await waitHealthy(fixture.port), true)
+    child.stdin.end()
+    const exited = await Promise.race([
+      once(child, 'exit').then(() => true),
+      wait(5_000).then(() => false),
+    ])
+    assert.equal(exited, true)
+  } finally {
+    await stopTree(child)
+    await rm(fixture.temp, { recursive: true, force: true })
+  }
+})

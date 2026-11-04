@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process'
+import { fstatSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { GATEWAY_RELOAD_EXIT_CODE, buildGatewayLaunch } from './gateway-keysafe.mjs'
@@ -79,14 +80,30 @@ function shutdown(signal) {
 process.once('SIGINT', () => shutdown('SIGINT'))
 process.once('SIGTERM', () => shutdown('SIGTERM'))
 
+/**
+ * Is stdin the parent-death pipe, or something that only looks like EOF?
+ *
+ * A pipe is what the launcher holds open, and its close is real parent death. A
+ * terminal close sends SIGHUP anyway, and /dev/null - systemd, nohup, an
+ * installer, a test harness - is an immediate EOF that says nothing about the
+ * parent. Treating that as death makes the supervisor kill itself the instant
+ * it starts.
+ */
+function stdinIsParentPipe() {
+  if (process.stdin.isTTY) return true
+  try {
+    return fstatSync(0).isFIFO()
+  } catch {
+    return false
+  }
+}
+
 // Parent-death detection, the POSIX stand-in for the Windows job object's
 // KILL_ON_JOB_CLOSE. On POSIX the launcher holds our stdin open as a pipe, so
 // when the launcher dies - including a SIGKILL it cannot trap - the write end
 // closes, we see EOF, and we take the gateway down with us. Windows is
-// deliberately excluded: the job object already guarantees this there, and a
-// Windows supervisor's stdin is NUL, which is an immediate EOF that would shut
-// every session down the instant it started.
-if (process.platform !== 'win32') {
+// deliberately excluded: the job object already guarantees this there.
+if (process.platform !== 'win32' && stdinIsParentPipe()) {
   process.stdin.on('end', () => shutdown('stdin-close'))
   process.stdin.on('close', () => shutdown('stdin-close'))
   process.stdin.resume()
