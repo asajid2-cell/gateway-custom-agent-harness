@@ -449,6 +449,18 @@ function Test-ClaudeArtifactFresh {
 }
 
 function Initialize-ClaudeArtifact {
+  # A packaged tree carries the compiled artifact and no build inputs. Archive
+  # tools may rewrite manifest mtimes so package.json/bun.lock look newer than
+  # dist/cli.js; rebuilding there would fail with no src/ to build. Only a tree
+  # with the build sources may decide the artifact is stale.
+  $buildTool = Join-Path $Root 'scripts\build.ts'
+  $sourceTree = Join-Path $Root 'src'
+  if (-not (Test-Path -LiteralPath $buildTool) -or -not (Test-Path -LiteralPath $sourceTree)) {
+    if (-not (Test-Path -LiteralPath $ClaudeScript -PathType Leaf)) {
+      throw "The compiled harness is missing: $ClaudeScript"
+    }
+    return
+  }
   if (-not (Test-ClaudeArtifactFresh)) {
     if ($env:CC_CLAUDE_SCRIPT_OVERRIDE) {
       throw 'Selected candidate is missing or stale; build it explicitly before launch.'

@@ -348,7 +348,21 @@ function artifactFresh() {
   return statSync(ClaudeScript).mtimeMs >= latest
 }
 
+// A packaged tree has a compiled artifact and no build inputs. Archive tools
+// may rewrite manifest mtimes so package.json/bun.lock look newer than
+// dist/cli.js; rebuilding there would fail with no src/ to build. Only a tree
+// that carries the build sources may decide the artifact is stale.
+function isSourceCheckout() {
+  return existsSync(join(Root, 'src')) && existsSync(join(Root, 'scripts', 'build.ts'))
+}
+
 function initializeArtifact() {
+  if (!isSourceCheckout()) {
+    if (!existsSync(ClaudeScript)) {
+      throw new Error(`The compiled harness is missing: ${ClaudeScript}`)
+    }
+    return
+  }
   if (artifactFresh()) return
   if (process.env.CC_CLAUDE_SCRIPT_OVERRIDE) {
     throw new Error('Selected candidate is missing or stale; build it explicitly before launch.')
