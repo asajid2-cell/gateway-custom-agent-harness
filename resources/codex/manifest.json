@@ -1,0 +1,11 @@
+{
+  "version": "0.166.0",
+  "entries": {
+    "win32-x64": {
+      "version": "0.166.0",
+      "asset": "codex-x86_64-pc-windows-msvc.exe.zip",
+      "sha256": "bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d",
+      "entrypoint": "codex-x86_64-pc-windows-msvc.exe"
+    }
+  }
+}

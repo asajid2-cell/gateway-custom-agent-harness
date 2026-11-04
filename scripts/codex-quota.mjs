@@ -21,6 +21,7 @@
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+import { resolveBundledCodex } from './codex-resource.mjs'
 
 // A backstop only: the app-server pushes `account/rateLimits/updated` when the
 // limits change, so a minute between re-reads is enough to catch a missed push.
@@ -117,6 +118,12 @@ function getCodexHome() {
 function codexSpawnSpec() {
   const fake = process.env.MODEL_GATEWAY_CODEX_APP_SERVER
   if (fake) return { command: process.execPath, args: [fake], shell: false }
+  // A packaged artifact carries the pinned binary beside the executable; a
+  // development tree has none and keeps the installed lookup below.
+  const bundled = resolveBundledCodex()
+  if (bundled) {
+    return { command: bundled, args: ['app-server', '--listen', 'stdio://'], shell: false }
+  }
   const command = process.platform === 'win32'
     ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'npm', 'codex.cmd')
     : 'codex'
