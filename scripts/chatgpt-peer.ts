@@ -20,7 +20,6 @@ import { execFile } from 'node:child_process'
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { connect } from 'node:net'
-import { homedir } from 'node:os'
 import { basename, dirname, extname, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewaySessionTransport.js'
@@ -28,6 +27,7 @@ import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
 import { LaneManager, type LaneEvent, type LaneHandle } from './chatgpt-peer/lanes.ts'
+import { providerEnv, providerOf, type Provider } from './chatgpt-peer/providers.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, PROMPT_PREFIX_MIN, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
@@ -41,11 +41,8 @@ type PendingTurn = typeof pendingTurnSchema._output
 
 const execFileAsync = promisify(execFile)
 
-const NAME = 'chatgpt-web'
-const PROVIDER = 'chatgpt-web'
 /** The lane host-initiated work runs in: scheduled wakes, operator requests. */
 const HOST_LANE = '__host__'
-const PURPOSE = 'A signed-in ChatGPT web thread on this machine\'s account, addressed like any other live session.'
 
 /**
  * Observation budget.
@@ -340,8 +337,8 @@ export function filesLine(path: string, bytes: number, sha256: string): string {
   return `- ${path} (${bytes} bytes, sha256 ${sha256.slice(0, 16)})`
 }
 
-/** Host-private files: where the instance identity is written. */
-const PRIVATE_HOME = process.env.CHATGPT_WEB_PRIVATE_HOME ?? join(homedir(), '.chatgpt-web')
+/** Host-private files: the provider decides the directory; env may override it. */
+const privateHomeOf = (provider: Provider): string => providerEnv('PRIVATE_HOME') ?? provider.privateHome
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** Only the operator's local-file picker needs a guess; transcripts are text. */
@@ -354,6 +351,10 @@ const MIME: Record<string, string> = {
 type HealthState = 'serving' | 'exhausted' | 'unauthorized' | 'unknown'
 
 type Config = {
+  /** Which site this host bridges. Absent means the ChatGPT profile. */
+  provider?: Provider
+  /** Override the provider's primer file (tests). */
+  primerPath?: string
   home: string
   statePath: string
   driverPath: string
@@ -510,12 +511,14 @@ type Bridge = {
 type Scope = { full: boolean; threads: Set<string> }
 
 function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
-  const home = process.env.CHATGPT_WEB_HOME ?? join(homedir(), 'chatgpt-web')
-  const config: Partial<Config> & { help?: boolean } = { home }
+  // Every default (home, profile, driver, ports) follows the provider, so the
+  // provider is resolved AFTER the flags, in resolveConfig.
+  const config: Partial<Config> & { help?: boolean } = {}
   const take = (index: number): string => String(argv[index + 1] ?? '')
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (arg === '--help' || arg === '-h') config.help = true
+    else if (arg === '--provider') config.provider = providerOf(take(index++))
     else if (arg === '--home') config.home = take(index++)
     else if (arg === '--state') config.statePath = take(index++)
     else if (arg === '--driver') config.driverPath = take(index++)
@@ -543,40 +546,46 @@ function parseArgs(argv: string[]): Partial<Config> & { help?: boolean } {
 }
 
 export function resolveConfig(partial: Partial<Config>): Config {
-  const home = partial.home ?? join(homedir(), 'chatgpt-web')
+  const provider = partial.provider ?? providerOf(providerEnv('PROVIDER'))
+  const home = partial.home ?? providerEnv('HOME') ?? provider.home
+  const envNumber = (name: string, fallback: number): number => {
+    const raw = providerEnv(name)
+    return raw !== undefined && raw !== '' && Number.isFinite(Number(raw)) ? Number(raw) : fallback
+  }
   return {
+    provider,
     home,
-    statePath: partial.statePath ?? process.env.CHATGPT_WEB_STATE ?? join(home, 'peer.json'),
-    driverPath: partial.driverPath ?? process.env.CHATGPT_WEB_DRIVER ?? join(home, 'chatgpt.mjs'),
-    profile: partial.profile ?? process.env.CHATGPT_WEB_PROFILE ?? join(PRIVATE_HOME, 'profile'),
-    instanceId: partial.instanceId ?? process.env.CHATGPT_WEB_INSTANCE ?? 'default',
-    healthPort: Number.isFinite(partial.healthPort) ? Number(partial.healthPort) : Number(process.env.CHATGPT_WEB_HEALTH_PORT ?? 0),
-    idleUnloadMinutes: Number.isFinite(partial.idleUnloadMinutes) ? Number(partial.idleUnloadMinutes) : Number(process.env.CHATGPT_WEB_IDLE_MINUTES ?? 0),
+    statePath: partial.statePath ?? providerEnv('STATE') ?? join(home, 'peer.json'),
+    driverPath: partial.driverPath ?? providerEnv('DRIVER') ?? join(home, provider.driver),
+    profile: partial.profile ?? providerEnv('PROFILE') ?? provider.profile,
+    instanceId: partial.instanceId ?? providerEnv('INSTANCE') ?? 'default',
+    healthPort: Number.isFinite(partial.healthPort) ? Number(partial.healthPort) : envNumber('HEALTH_PORT', 0),
+    idleUnloadMinutes: Number.isFinite(partial.idleUnloadMinutes) ? Number(partial.idleUnloadMinutes) : envNumber('IDLE_MINUTES', 0),
     number: Number.isFinite(partial.number) && Number(partial.number) > 0 ? Number(partial.number) : 1,
-    pollSeconds: Number.isFinite(partial.pollSeconds) ? Number(partial.pollSeconds) : Number(process.env.CHATGPT_WEB_POLL_SECONDS ?? 60),
+    pollSeconds: Number.isFinite(partial.pollSeconds) ? Number(partial.pollSeconds) : envNumber('POLL_SECONDS', 60),
     // `--poll-seconds` is the old name for the reconcile interval; it keeps
     // working. An explicit --observe-every wins.
     observeEvery: Number.isFinite(partial.observeEvery)
       ? Number(partial.observeEvery)
       : Number.isFinite(partial.pollSeconds)
         ? Number(partial.pollSeconds)
-        : Number(process.env.CHATGPT_WEB_OBSERVE_EVERY ?? 300),
-    titlesEvery: Number.isFinite(partial.titlesEvery)
-      ? Number(partial.titlesEvery)
-      : Number(process.env.CHATGPT_WEB_TITLES_EVERY ?? 120),
+        : envNumber('OBSERVE_EVERY', 300),
+    titlesEvery: Number.isFinite(partial.titlesEvery) ? Number(partial.titlesEvery) : envNumber('TITLES_EVERY', 120),
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
     // Production (the CLI path) runs lanes unless told not to. Tests build a
     // Config directly and therefore stay on the injected one-window driver.
-    lanes: partial.lanes ?? (process.env.CHATGPT_WEB_LANES !== '0'),
-    laneMax: Number.isFinite(partial.laneMax) ? Number(partial.laneMax) : Number(process.env.CHATGPT_WEB_LANE_MAX ?? 8),
-    laneIdleMs: Number.isFinite(partial.laneIdleMs) ? Number(partial.laneIdleMs) : Number(process.env.CHATGPT_WEB_LANE_IDLE_MS ?? 30_000),
-    laneBasePort: Number.isFinite(partial.laneBasePort) ? Number(partial.laneBasePort) : Number(process.env.CHATGPT_WEB_LANE_BASE_PORT ?? 9300),
-    laneSourcePort: Number.isFinite(partial.laneSourcePort) ? Number(partial.laneSourcePort) : Number(process.env.CHATGPT_WEB_LANE_SOURCE_PORT ?? process.env.CHATGPT_CDP_PORT ?? 9222),
-    laneSyncCookies: partial.laneSyncCookies ?? (process.env.CHATGPT_WEB_LANE_SYNC_COOKIES !== '0'),
-    laneMaxTurns: Number.isFinite(partial.laneMaxTurns) ? Number(partial.laneMaxTurns) : Number(process.env.CHATGPT_WEB_LANE_MAX_TURNS ?? 20),
-    laneMaxAgeMs: Number.isFinite(partial.laneMaxAgeMs) ? Number(partial.laneMaxAgeMs) : Number(process.env.CHATGPT_WEB_LANE_MAX_AGE_MS ?? 10 * 60_000),
-    laneBackoffBaseMs: Number.isFinite(partial.laneBackoffBaseMs) ? Number(partial.laneBackoffBaseMs) : Number(process.env.CHATGPT_WEB_LANE_BACKOFF_BASE_MS ?? 5_000),
-    emptyNodeGraceMs: Number.isFinite(partial.emptyNodeGraceMs) ? Number(partial.emptyNodeGraceMs) : Number(process.env.CHATGPT_WEB_EMPTY_NODE_GRACE_MS ?? 120_000),
+    lanes: partial.lanes ?? (providerEnv('LANES') !== '0'),
+    laneMax: Number.isFinite(partial.laneMax) ? Number(partial.laneMax) : envNumber('LANE_MAX', 8),
+    laneIdleMs: Number.isFinite(partial.laneIdleMs) ? Number(partial.laneIdleMs) : envNumber('LANE_IDLE_MS', 30_000),
+    laneBasePort: Number.isFinite(partial.laneBasePort) ? Number(partial.laneBasePort) : envNumber('LANE_BASE_PORT', provider.laneBasePort),
+    laneSourcePort: Number.isFinite(partial.laneSourcePort)
+      ? Number(partial.laneSourcePort)
+      : Number(providerEnv('LANE_SOURCE_PORT') ?? process.env.CHATGPT_CDP_PORT ?? provider.masterPort),
+    laneSyncCookies: partial.laneSyncCookies ?? (providerEnv('LANE_SYNC_COOKIES') !== '0'),
+    laneMaxTurns: Number.isFinite(partial.laneMaxTurns) ? Number(partial.laneMaxTurns) : envNumber('LANE_MAX_TURNS', 20),
+    laneMaxAgeMs: Number.isFinite(partial.laneMaxAgeMs) ? Number(partial.laneMaxAgeMs) : envNumber('LANE_MAX_AGE_MS', 10 * 60_000),
+    laneBackoffBaseMs: Number.isFinite(partial.laneBackoffBaseMs) ? Number(partial.laneBackoffBaseMs) : envNumber('LANE_BACKOFF_BASE_MS', 5_000),
+    emptyNodeGraceMs: Number.isFinite(partial.emptyNodeGraceMs) ? Number(partial.emptyNodeGraceMs) : envNumber('EMPTY_NODE_GRACE_MS', 120_000),
     laneManager: partial.laneManager,
   }
 }
@@ -710,6 +719,8 @@ export class ChatGptHost {
    */
   private readonly masterDriver: DriverChild
   private readonly lanes: LaneManager | null
+  /** The site profile this host serves; see providers.ts. */
+  private readonly provider: Provider
   private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean; pageFault?: string }>()
   private readonly bridges = new Map<string, Bridge>()
   /**
@@ -818,6 +829,7 @@ export class ChatGptHost {
 
   constructor(config: Config, driver?: DriverChild) {
     this.config = config
+    this.provider = config.provider ?? providerOf(providerEnv('PROVIDER'))
     this.primer = { text: '', sha: '' }
     this.files = config.files ?? { stat, readFile }
     this.maxAttachmentBytes = config.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES
@@ -1055,7 +1067,7 @@ export class ChatGptHost {
       socket.on('error', () => done('silent'))
       socket.on('connect', () => {
         connected = true
-        socket.write(`GET /gateway/route-health?provider=${encodeURIComponent(PROVIDER)} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+        socket.write(`GET /gateway/route-health?provider=${encodeURIComponent(this.provider.id)} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
       })
       socket.on('data', chunk => { reply += chunk.toString('utf8'); if (reply.length >= 256) done(classify()) })
       socket.on('end', () => done(classify()))
@@ -1103,7 +1115,7 @@ export class ChatGptHost {
     // way, because a new host cannot adopt it.
     if (this.lanes) await this.lanes.reapOrphans().catch(error => log(`lane reap failed: ${(error as Error).message}`))
 
-    const loadedPrimer = await readFile(join(import.meta.dir, 'chatgpt-peer', 'primer.md'), 'utf8').catch(() => '')
+    const loadedPrimer = await readFile(this.config.primerPath ?? join(import.meta.dir, 'chatgpt-peer', this.provider.primer), 'utf8').catch(() => '')
     this.primer.text = loadedPrimer
     this.primer.sha = createHash('sha256').update(loadedPrimer, 'utf8').digest('hex')
 
@@ -1112,7 +1124,7 @@ export class ChatGptHost {
     // two writes would forget the thread. Writing an existing bridge file is
     // skipped - it is newer truth than the legacy snapshot.
     if (loaded.legacy) {
-      const migrated = bridgeFromLegacy(loaded.legacy, NAME)
+      const migrated = bridgeFromLegacy(loaded.legacy, this.provider.name)
       const path = this.bridgePath(migrated.sessionId)
       const exists = await stat(path).then(() => true).catch(() => false)
       if (!exists) {
@@ -1135,7 +1147,7 @@ export class ChatGptHost {
     // a minted address and the name `chatgpt-web`. A host whose bridges were
     // all removed on purpose is NOT repopulated.
     if (loaded.fresh && this.bridges.size === 0) {
-      const state = newBridgeState({ sessionId: randomUUID(), name: this.uniqueName(NAME, null, NAME) })
+      const state = newBridgeState({ sessionId: randomUUID(), name: this.uniqueName(this.provider.name, null, this.provider.name) })
       await saveJson(this.bridgePath(state.sessionId), state)
       this.registerBridge(state)
     }
@@ -1230,7 +1242,7 @@ export class ChatGptHost {
       // else (operator display, bridgeView, audits, `bridgeFor` matching, and
       // uniqueness). The prefix is what a peer reply line renders as
       // "from web; <name>".
-      name: `web; ${bridge.state.name}`,
+      name: `${this.provider.peerPrefix}; ${bridge.state.name}`,
       cwd: process.cwd(),
       purpose: this.purposeFor(bridge),
       route: this.route(bridge),
@@ -1245,12 +1257,12 @@ export class ChatGptHost {
   private purposeFor(bridge: Bridge): string {
     const title = bridge.state.title ? ` Bridged thread: "${one(bridge.state.title, 160)}".` : ''
     const missing = bridge.state.threadMissingAt ? ' The bound thread was deleted on the page; adopt another thread.' : ''
-    return `${PURPOSE}${title}${missing}`.slice(0, 1000)
+    return `${this.provider.purpose}${title}${missing}`.slice(0, 1000)
   }
 
   private route(bridge: Bridge): { provider: string; number: number; baseUrl: string; model?: string; effort?: string } {
     return {
-      provider: PROVIDER,
+      provider: this.provider.id,
       number: this.config.number,
       baseUrl: `http://127.0.0.1:${this.hostState.healthPort}`,
       ...(bridge.state.model ? { model: bridge.state.model } : {}),
@@ -1364,7 +1376,7 @@ export class ChatGptHost {
   }
 
   private async writeInstanceFile(): Promise<void> {
-    const directory = join(this.config.privateHome ?? PRIVATE_HOME, 'instances')
+    const directory = join(this.config.privateHome ?? privateHomeOf(this.provider), 'instances')
     await mkdir(directory, { recursive: true })
     await this.restrictToOwner(directory, 'directory')
     const path = join(directory, `${this.hostState.instanceId}.json`)
@@ -1400,7 +1412,7 @@ export class ChatGptHost {
   }
 
   private async removeInstanceFile(): Promise<void> {
-    await rm(join(this.config.privateHome ?? PRIVATE_HOME, 'instances', `${this.hostState.instanceId}.json`), { force: true }).catch(() => {})
+    await rm(join(this.config.privateHome ?? privateHomeOf(this.provider), 'instances', `${this.hostState.instanceId}.json`), { force: true }).catch(() => {})
   }
 
   // --------------------------------------------------------------------- http
@@ -1451,12 +1463,12 @@ export class ChatGptHost {
    * route gate asks about a peer whose page may be unloaded.
    */
   private routeHealth(url: URL, response: ServerResponse): void {
-    if ((url.searchParams.get('provider') ?? '') !== PROVIDER) { this.send(response, 404, { error: 'unknown provider' }); return }
+    if ((url.searchParams.get('provider') ?? '') !== this.provider.id) { this.send(response, 404, { error: 'unknown provider' }); return }
     const number = url.searchParams.get('number')
     if (number !== null) {
       const mine = Number(number) === this.config.number
       this.send(response, 200, {
-        provider: PROVIDER,
+        provider: this.provider.id,
         number: Number(number),
         state: mine ? this.health.state : 'unknown',
         ...(mine && this.health.reason ? { reason: this.health.reason } : {}),
@@ -1465,7 +1477,7 @@ export class ChatGptHost {
       return
     }
     this.send(response, 200, {
-      provider: PROVIDER,
+      provider: this.provider.id,
       fleet: this.health.state,
       size: 1,
       numbers: [{
@@ -1515,7 +1527,7 @@ export class ChatGptHost {
     const bridgeList = [...this.bridges.values()]
     const first = bridgeList[0]
     return {
-      name: NAME,
+      name: this.provider.name,
       hostId: this.hostState.hostId,
       instanceId: this.hostState.instanceId,
       health: this.health,
@@ -1786,7 +1798,7 @@ export class ChatGptHost {
    */
   private async adoptThread(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; title: string; line: string }> {
     const explicit = typeof body.threadId === 'string' ? body.threadId.trim() : ''
-    if (explicit && !UUID.test(explicit)) throw new Error('adopt threadId must be a conversation uuid')
+    if (explicit && !this.provider.threadId(explicit)) throw new Error('adopt threadId is not a thread id this provider hands back')
     let bridge: Bridge | undefined
     let chosen: { id: string; title: string } | undefined
     try {
@@ -1811,7 +1823,7 @@ export class ChatGptHost {
         // own cursor, node ids and dedup set. Refuse rather than split it.
         const owner = this.liveThreadOwner(chosen.id)
         if (owner) throw new Error(`thread ${chosen.id} is already bridged by "${owner.state.name}"; one live bridge per thread`)
-        const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, chosen.title, `chatgpt-${randomUUID().slice(0, 8)}`)
+        const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, chosen.title, `${this.provider.fallbackName}-${randomUUID().slice(0, 8)}`)
         const created = await this.createBridge(newBridgeState({
           sessionId: randomUUID(),
           name,
@@ -1852,7 +1864,7 @@ export class ChatGptHost {
 
   /** Mint a peer and a brand-new ChatGPT thread for it. */
   private async createNewBridge(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; line: string }> {
-    const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, null, `chatgpt-${randomUUID().slice(0, 8)}`)
+    const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, null, `${this.provider.fallbackName}-${randomUUID().slice(0, 8)}`)
     const bridge = await this.createBridge(newBridgeState({ sessionId: randomUUID(), name }))
     try {
       await this.pageWork(() => this.ensurePrimerAndThread(bridge))
@@ -1877,7 +1889,7 @@ export class ChatGptHost {
     }
     if (action === 'use') {
       const threadId = String(body.threadId ?? '')
-      if (!UUID.test(threadId)) throw new Error('use requires a thread id')
+      if (!this.provider.threadId(threadId)) throw new Error('use requires a thread id')
       // Refused before the page moves: one conversation, one live bridge.
       const owner = this.liveThreadOwner(threadId, bridge)
       if (owner) throw new Error(`thread ${threadId} is already bridged by "${owner.state.name}"; one live bridge per thread`)
@@ -1943,7 +1955,7 @@ export class ChatGptHost {
     const reply = await this.sendRecorded(bridge, prompt, {
       threadId: selected,
       landed: async threadId => {
-        if (!UUID.test(threadId)) throw new Error('the page did not return a thread id for the primer')
+        if (!this.provider.threadId(threadId)) throw new Error('the page did not return a thread id for the primer')
         if (selected && threadId.toLowerCase() !== selected.toLowerCase()) throw new Error(threadGone(selected, threadId))
         // A first send into a new chat IS a thread change; anything it could
         // have carried belongs to the old conversation. A re-post into the
@@ -6200,13 +6212,14 @@ async function main(): Promise<void> {
   const parsed = parseArgs(process.argv.slice(2))
   if (parsed.help) {
     process.stdout.write([
-      'chatgpt-peer - ChatGPT web threads on the Gateway peer bus',
+      'chatgpt-peer - web chat threads on the Gateway peer bus',
       '',
       '  bun run scripts/chatgpt-peer.ts [options]',
       '',
-      '  --home <dir>        state root (default ~/chatgpt-web)',
+      '  --provider <id>     chatgpt-web (default) or gemini-web; picks every default below',
+      '  --home <dir>        state root (default ~/<provider>)',
       '  --state <file>      host peer.json path',
-      '  --driver <file>     the page driver (chatgpt.mjs)',
+      '  --driver <file>     the page driver (default <home>/<provider>.mjs)',
       '  --profile <dir>     Chrome profile directory',
       '  --instance <id>     instance slug (default "default")',
       '  --health-port <n>   loopback port for the control API and route health (0 = ephemeral)',
@@ -6226,7 +6239,7 @@ async function main(): Promise<void> {
       '  --lane-backoff-base-ms <n> first retry delay for a rate-limited lane open (default 5000)',
       '  --empty-node-grace-ms <n> idle textless-answer grace before repair (default 120000)',
       '',
-      'The instance file (~/.chatgpt-web/instances/<slug>.json) holds a bearer token.',
+      'The instance file (~/.<provider>/instances/<slug>.json) holds a bearer token.',
       'It is the control surface, and /operator is NOT a messaging path: peer work',
       '(posting a turn, waiting for an answer, delivering files) travels only on',
       'the bus, to the bridge\'s own gateway session. /operator only brings a',
