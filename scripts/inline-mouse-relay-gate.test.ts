@@ -157,16 +157,15 @@ afterEach(() => {
 })
 
 test('this suite restores the TTY descriptors it overrides', () => {
-  // The in-file proof for the teardown: take the descriptors as they are, arm
-  // the session, restore, and require the exact descriptors back.
-  const beforeStdout = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')
-  const beforeStdin = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
+  // The in-file proof for the teardown: arm the session, restore, and require
+  // the descriptors this file found at load time back exactly.
   enableLocalInlineSession()
+  expect(Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')?.value).toBe(true)
   expect(Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')?.value).toBe(true)
   restoreTTY(process.stdout, 'isTTY', savedStdoutTTY)
   restoreTTY(process.stdin, 'isTTY', savedStdinTTY)
-  expect(Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')).toEqual(beforeStdout)
-  expect(Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')).toEqual(beforeStdin)
+  expect(Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')).toEqual(savedStdoutTTY)
+  expect(Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')).toEqual(savedStdinTTY)
 })
 
 // ---------------------------------------------------------------------------
