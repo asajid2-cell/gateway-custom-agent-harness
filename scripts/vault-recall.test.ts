@@ -189,6 +189,29 @@ test('nothing recorded is said explicitly, and obligations are reported', async 
   }
 })
 
+test('supersession is followed from the answering event, not from term coverage', async () => {
+  const root = await vault([
+    proposal({ event_id: 'old', summary: 'opencode route removed', topic_id: 'ops' }),
+    proposal({
+      event_id: 'new',
+      kind: 'correction',
+      summary: 'opencode route retired because the key expired',
+      topic_id: 'ops',
+      recorded_at: '2026-11-04T12:00:00.000Z',
+      relations: [{ type: 'supersedes', target_event_id: 'old' }],
+    }),
+  ])
+  try {
+    const packet = await recall({ vaultRoot: root, familyId: FAMILY, query: 'why did the opencode route get retired' })
+    assert.deepEqual(packet.current.map(item => item.event_id), ['new'])
+    const old = packet.history.find(item => item.event_id === 'old')
+    assert.ok(old, 'the target of an answering supersession must be in history even without the words')
+    assert.deepEqual(old.superseded_by, ['new'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a term match that does not answer the question lands in candidates, not current', async () => {
   const root = await vault([
     proposal({ event_id: 'r1', summary: 'the relay stays on build 29', topic_id: 'release' }),

@@ -77,8 +77,9 @@ const SCOPE_RANK: Record<string, number> = { task: 4, driver: 3, family: 2, glob
  */
 const STOPWORDS = new Set([
   'a', 'about', 'all', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'been', 'before', 'by', 'can',
-  'could', 'did', 'do', 'does', 'for', 'from', 'had', 'has', 'have', 'how', 'i', 'if', 'in', 'into',
-  'is', 'it', 'its', 'me', 'my', 'no', 'not', 'of', 'on', 'or', 'our', 'should', 'so', 'that', 'the',
+  'could', 'did', 'do', 'does', 'for', 'from', 'get', 'go', 'going', 'got', 'had', 'has', 'have', 'how',
+  'i', 'if', 'in', 'into', 'is', 'it', 'its', 'know', 'made', 'make', 'me', 'my', 'need', 'no', 'not',
+  'of', 'on', 'or', 'our', 'put', 'said', 'say', 'should', 'so', 'take', 'taken', 'that', 'the',
   'their', 'them', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'we', 'were', 'what', 'when',
   'where', 'which', 'who', 'why', 'will', 'with', 'would', 'you', 'your',
 ])
@@ -447,6 +448,35 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
       }
       if (current.length >= limit) continue
       current.push(toItem(familyId, entry.entry.row, null))
+    }
+
+    // A supersession packet is closed over the relation, not over term
+    // coverage: follow `supersedes` from the events that answered and put those
+    // targets in history with a back-link. Only an answering event's own
+    // relations can pull something in, so this does not reopen the leak where a
+    // weak term match filled history.
+    const inHistory = new Set(history.map(item => item.event_id))
+    const targets: string[] = []
+    for (const item of current) {
+      for (const relation of item.relations) {
+        if (!relation || typeof relation !== 'object') continue
+        const entry = relation as { type?: unknown; target_event_id?: unknown }
+        if (entry.type === 'supersedes' && typeof entry.target_event_id === 'string') {
+          if (!inHistory.has(entry.target_event_id)) targets.push(entry.target_event_id)
+        }
+      }
+    }
+    for (const targetId of [...new Set(targets)]) {
+      const row = projection.db
+        .query('SELECT sequence, event_id, json FROM events WHERE family_id = ? AND event_id = ?')
+        .get(familyId, targetId) as Row | null
+      if (!row) continue
+      const record = asRecord(row)
+      if (!validAt(record, asOf)) continue
+      const item = toItem(familyId, row, expired(record, asOf) ? 'expired' : null)
+      item.superseded_by = [...new Set([...(item.superseded_by ?? []), ...(supersededBy.get(targetId) ?? [])])]
+      history.push(item)
+      inHistory.add(targetId)
     }
 
     const obligations = await obligationsFor(vaultRoot, familyId, asOf)
