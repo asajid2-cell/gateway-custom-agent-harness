@@ -15,6 +15,13 @@
       "treeSha256": "c8be0251f442cdc26932a03fc1c15548d9b86e501a8368aa2f44811c521d7855",
       "entrypoint": "bin/codex",
       "libc": "musl"
+    },
+    "darwin-arm64": {
+      "version": "0.166.0",
+      "asset": "codex-package-aarch64-apple-darwin.tar.gz",
+      "sha256": "55a440cb579f970abe7c79ab181e54b0ea4c419be99f333bbd868eebac9c21f0",
+      "treeSha256": "c0b9edf12c26219aad7e76e800886396e370635ad3fbf0509af93253d4cf22de",
+      "entrypoint": "bin/codex"
     }
   }
 }
