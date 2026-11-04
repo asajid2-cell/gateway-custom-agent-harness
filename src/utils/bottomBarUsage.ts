@@ -218,7 +218,32 @@ export function formatProviderQuota(
   const window = quota.windows[kind]
   if (!window) return null
   const remaining = Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)))
-  return `${QUOTA_WINDOW_LABEL[kind]} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
+  return `${QUOTA_WINDOW_LABEL[kind]} usage ${remaining}% left${quota.stale ? ' (stale)' : ''}`
+}
+
+/**
+ * The provider name a click can reveal. The model already names Mistral's
+ * route, so the two budgets read as different providers here rather than the
+ * same one twice: a Vibe route spends plan keys, an API route spends Studio
+ * credits, and confusing the two is exactly what the split exists to prevent.
+ */
+export function getGatewayProviderDisplayName(model: string): string {
+  const lower = model.toLowerCase()
+  if (lower.includes('gateway-mistral-api-')) return 'Mistral API'
+  if (lower.includes('gateway-mistral-')) return 'Mistral Vibe'
+  return getGatewayProviderLabel(model)
+}
+
+/**
+ * The window a Mistral route should show first: its own budget. Both V/A come
+ * back from the same billing read, so without this the API route would open on
+ * the Vibe figure and read as the wrong pool.
+ */
+export function preferredQuotaKind(model: string): QuotaWindowKind | null {
+  const lower = model.toLowerCase()
+  if (lower.includes('gateway-mistral-api-')) return 'A'
+  if (lower.includes('gateway-mistral-')) return 'V'
+  return null
 }
 
 export function formatBottomBarUsage(

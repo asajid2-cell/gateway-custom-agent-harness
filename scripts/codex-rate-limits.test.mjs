@@ -66,8 +66,8 @@ test('the payload maps to the normalized windows the gateway serves', () => {
   assert.deepEqual(parsed.windows.W, { usedPercent: 0, resetsAt: 1_788_980_213_000 })
   assert.equal(parsed.asof, 5)
   assert.equal(parsed.stale, false)
-  assert.equal(formatProviderQuota('Codex', parsed, 'H'), '5hr remaining 42%')
-  assert.equal(formatProviderQuota('Codex', parsed, 'W'), 'weekly remaining 100%')
+  assert.equal(formatProviderQuota('Codex', parsed, 'H'), '5hr usage 42% left')
+  assert.equal(formatProviderQuota('Codex', parsed, 'W'), 'weekly usage 100% left')
   // A window the gateway did not report is simply absent, not a zero.
   const onlyPrimary = codexQuotaFromPayload({ windows: { H: { usedPercent: 58 } } })
   assert.deepEqual(Object.keys(onlyPrimary.windows), ['H'])

@@ -438,11 +438,15 @@ const ROUTE_PREFERENCE_FILES: Record<string, string> = {
  * number, and the report names that limitation rather than guessing.
  */
 async function routeCredentialNumber(provider: string): Promise<number> {
-  // Mistral has two credential pools and the route spends the Vibe one first,
-  // so the file-based Studio preference would advertise the wrong account (its
-  // slot 1 collides with the Vibe slot 1). The gateway's own account read is
-  // the only place that knows which pool a request would actually spend.
-  if (provider === 'mistral' || provider === 'mistral-vibe') {
+  // Mistral's two credential types are separate pools, and each explicit route
+  // spends exactly one of them. The legacy unsuffixed route keeps Vibe-first
+  // fallback, so its number is the combined view's. The file-based Studio
+  // preference cannot answer any of this: its slot 1 collides with Vibe's.
+  if (
+    provider === 'mistral' ||
+    provider === 'mistral-api' ||
+    provider === 'mistral-vibe'
+  ) {
     const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
     if (base) {
       try {
@@ -455,17 +459,24 @@ async function routeCredentialNumber(provider: string): Promise<number> {
             vibe?: { active?: number }
           }
           const active = body?.vibe?.active
-          if (Number.isSafeInteger(active) && active! > 0) return active!
-          if (provider === 'mistral-vibe') return 1
-          // Studio slots are reported above the Vibe range by the gateway's
-          // combined credential view; mirror that numbering here.
-          if (Number.isSafeInteger(body?.number) && body.number! > 0) {
-            return 1000 + body.number!
+          if (provider === 'mistral-api') {
+            if (Number.isSafeInteger(body?.number) && body.number! > 0) {
+              return body.number!
+            }
+          } else {
+            if (Number.isSafeInteger(active) && active! > 0) return active!
+            if (provider === 'mistral-vibe') return 1
+            // Studio slots are reported above the Vibe range by the gateway's
+            // combined credential view; mirror that numbering here.
+            if (Number.isSafeInteger(body?.number) && body.number! > 0) {
+              return 1000 + body.number!
+            }
           }
         }
       } catch {}
     }
     if (provider === 'mistral-vibe') return 1
+    if (provider === 'mistral-api') return 1
   }
   const preference = ROUTE_PREFERENCE_FILES[provider]
   if (!preference) return 1
@@ -505,7 +516,14 @@ async function describeOwnRoute(): Promise<GatewayPeerRoute | undefined> {
       ? override.trim()
       : process.env.MODEL_GATEWAY_MODEL?.trim()
     if (!model) return undefined
-    const provider = resolveModelBackend(model)
+    // The explicit Mistral routes spend one credential type each, and that is
+    // the fact a refusal must name; the legacy route keeps the combined view.
+    const explicitMistral = model.toLowerCase().startsWith('gateway-mistral-api-')
+      ? 'mistral-api'
+      : model.toLowerCase().startsWith('gateway-mistral-vibe-')
+        ? 'mistral-vibe'
+        : null
+    const provider = explicitMistral ?? resolveModelBackend(model)
     if (provider === 'unknown') return undefined
     const number = await routeCredentialNumber(provider)
     let effort: string | undefined

@@ -7,7 +7,9 @@ import {
   formatProviderQuota,
   formatSessionResumeCommand,
   getContextUsageValues,
+  getGatewayProviderDisplayName,
   getGatewayProviderLabel,
+  preferredQuotaKind,
   getWeeklyRemainingPercent,
   isAnthropicGatewayModel,
   nextQuotaKind,
@@ -77,8 +79,8 @@ test('a quota window prints the window and what is left, never the provider', ()
     H: { usedPercent: 0, resetsAt: null },
     W: { usedPercent: 23, resetsAt: null },
   })
-  assert.equal(formatProviderQuota('Codex', codex, 'W'), 'weekly remaining 77%')
-  assert.equal(formatProviderQuota('Codex', codex, 'H'), '5hr remaining 100%')
+  assert.equal(formatProviderQuota('Codex', codex, 'W'), 'weekly usage 77% left')
+  assert.equal(formatProviderQuota('Codex', codex, 'H'), '5hr usage 100% left')
   // A window the provider did not report prints nothing rather than a zero.
   assert.equal(formatProviderQuota('Codex', codex, 'M'), null)
 })
@@ -90,15 +92,15 @@ test('a stale figure says so and a wild used percent is clamped', () => {
       quota({ M: { usedPercent: 100, resetsAt: null } }, { stale: true }),
       'M',
     ),
-    'monthly remaining 0% (stale)',
+    'monthly usage 0% left (stale)',
   )
   assert.equal(
     formatProviderQuota('Anthropic', quota({ H: { usedPercent: 140, resetsAt: null } }), 'H'),
-    '5hr remaining 0%',
+    '5hr usage 0% left',
   )
   assert.equal(
     formatProviderQuota('Anthropic', quota({ H: { usedPercent: -20, resetsAt: null } }), 'H'),
-    '5hr remaining 100%',
+    '5hr usage 100% left',
   )
 })
 
@@ -119,8 +121,8 @@ test('OpenCode keeps each normalized window rather than collapsing them', () => 
   assert.deepEqual(parsed.windows.M, { usedPercent: 100, resetsAt: null })
   assert.equal(parsed.asof, 7)
   assert.equal(parsed.account, 3)
-  assert.equal(formatProviderQuota('OpenCode', parsed, 'M'), 'monthly remaining 0%')
-  assert.equal(formatProviderQuota('OpenCode', parsed, 'W'), 'weekly remaining 100%')
+  assert.equal(formatProviderQuota('OpenCode', parsed, 'M'), 'monthly usage 0% left')
+  assert.equal(formatProviderQuota('OpenCode', parsed, 'W'), 'weekly usage 100% left')
   // The legacy usage object is no longer accepted; the gateway owns that mapping.
   assert.equal(openCodeQuotaFromPayload({
     usage: { rolling: { percent: 0 }, weekly: { percent: 0 }, monthly: { percent: 100 } },
@@ -275,7 +277,7 @@ test('Command Code and Mistral keep their own normalized windows', () => {
   })
   assert.deepEqual(commandCode.windows.H, { usedPercent: 25.2, resetsAt: 1_793_828_917_251 })
   assert.equal(commandCode.account, 2)
-  assert.equal(formatProviderQuota('Command Code', commandCode, 'M'), 'monthly remaining 20%')
+  assert.equal(formatProviderQuota('Command Code', commandCode, 'M'), 'monthly usage 20% left')
 
   const mistral = mistralQuotaFromPayload({
     windows: {
@@ -285,8 +287,8 @@ test('Command Code and Mistral keep their own normalized windows', () => {
     asof: 9,
   })
   // V/A are named in the readout so neither budget reads as a time window.
-  assert.equal(formatProviderQuota('Mistral', mistral, 'V'), 'vibe remaining 100%')
-  assert.equal(formatProviderQuota('Mistral', mistral, 'A'), 'api remaining 100%')
+  assert.equal(formatProviderQuota('Mistral', mistral, 'V'), 'vibe usage 100% left')
+  assert.equal(formatProviderQuota('Mistral', mistral, 'A'), 'api usage 100% left')
   assert.equal(mistralQuotaFromPayload({ windows: {} }), null)
   assert.equal(commandCodeQuotaFromPayload({ windows: {} }), null)
 })
@@ -294,6 +296,26 @@ test('Command Code and Mistral keep their own normalized windows', () => {
 test('the provider label names Command Code and Mistral routes', () => {
   assert.equal(getGatewayProviderLabel('gateway-commandcode-deepseek-v4.1-flash'), 'Command Code')
   assert.equal(getGatewayProviderLabel('gateway-mistral-deepseek-v4.1-flash'), 'Mistral')
+})
+
+test('the click can reveal which Mistral budget a route spends', () => {
+  assert.equal(
+    getGatewayProviderDisplayName('gateway-mistral-api-deepseek-v4.1-flash'),
+    'Mistral API',
+  )
+  assert.equal(
+    getGatewayProviderDisplayName('gateway-mistral-vibe-deepseek-v4.1-flash'),
+    'Mistral Vibe',
+  )
+  // The legacy id keeps spending Vibe, so it names the Vibe budget too.
+  assert.equal(
+    getGatewayProviderDisplayName('gateway-mistral-deepseek-v4.1-flash'),
+    'Mistral Vibe',
+  )
+  assert.equal(preferredQuotaKind('gateway-mistral-api-deepseek-v4.1-flash'), 'A')
+  assert.equal(preferredQuotaKind('gateway-mistral-vibe-deepseek-v4.1-flash'), 'V')
+  assert.equal(preferredQuotaKind('gateway-mistral-deepseek-v4.1-flash'), 'V')
+  assert.equal(preferredQuotaKind('gateway-commandcode-deepseek-v4.1-flash'), null)
 })
 
 test('isAnthropicGatewayModel recognises only the Anthropic route', () => {

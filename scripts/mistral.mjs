@@ -48,6 +48,23 @@ export function mistralGatewayId(model) {
     .replace(/^-+|-+$/g, '')}`
 }
 
+/**
+ * The Gateway ids for one provider model. Vibe and Studio are separate
+ * credential types - the key decides which budget a request spends - so the
+ * picker exposes one route per budget instead of a single route whose cost
+ * depends on hidden fallback state. The unsuffixed id stays routable for
+ * existing transcripts and direct callers, and keeps its old Vibe-first
+ * behaviour; it is hidden from discovery.
+ */
+export function mistralRouteVariants(model) {
+  const base = mistralGatewayId(model).replace(/^gateway-mistral-/, '')
+  return [
+    { id: `gateway-mistral-vibe-${base}`, credential: 'vibe' },
+    { id: `gateway-mistral-api-${base}`, credential: 'api' },
+    { id: mistralGatewayId(model), credential: 'auto' },
+  ]
+}
+
 export function mistralEffortLevels(model) {
   return effortLevelsForMistralModel(model)
 }
