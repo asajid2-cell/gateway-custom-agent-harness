@@ -7,6 +7,14 @@
       "sha256": "bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d",
       "treeSha256": "86907eff414036b20fafca834f0b2419d2d18e521c1b87b3ebb25522b5720dad",
       "entrypoint": "codex-x86_64-pc-windows-msvc.exe"
+    },
+    "linux-x64": {
+      "version": "0.166.0",
+      "asset": "codex-package-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "1d44b28bc4ac9937d7d3532264baa68a507ce364956a0d4ebb856f331cdee254",
+      "treeSha256": "c8be0251f442cdc26932a03fc1c15548d9b86e501a8368aa2f44811c521d7855",
+      "entrypoint": "bin/codex",
+      "libc": "musl"
     }
   }
 }

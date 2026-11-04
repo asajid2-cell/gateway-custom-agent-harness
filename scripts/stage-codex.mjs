@@ -145,7 +145,22 @@ try {
   manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
 } catch {}
 manifest.entries ??= {}
-const previous = manifest.entries[key]?.sha256
+const previous = manifest.entries[key]
+// A re-published or re-tagged upstream asset is a supply-chain event, not a
+// refresh. Recording a new pin over an old one silently would erase the only
+// evidence that the bytes changed.
+if (previous && (previous.sha256 !== sha256 || previous.treeSha256 !== treeSha256)) {
+  if (!process.argv.includes('--accept-asset-drift')) {
+    console.error('stage-codex: refusing to re-pin a changed asset')
+    console.error(`  ${key} sha256      recorded ${previous.sha256 ?? '(none)'}  downloaded ${sha256}`)
+    console.error(`  ${key} treeSha256 recorded ${previous.treeSha256 ?? '(none)'}  staged ${treeSha256}`)
+    console.error('  re-run with --accept-asset-drift and a stated reason to replace the pin')
+    process.exit(1)
+  }
+  console.error(
+    `stage-codex: re-pinning ${key} (sha256 was ${previous.sha256 ?? '(none)'}, tree was ${previous.treeSha256 ?? '(none)'})`,
+  )
+}
 manifest.entries[key] = {
   version,
   asset: spec.asset,
@@ -158,5 +173,5 @@ await mkdir(path.dirname(manifestPath), { recursive: true })
 await writeFile(manifestPath, `${JSON.stringify({ version, entries: manifest.entries }, null, 2)}\n`)
 
 console.log(`stage-codex: ${path.relative(ROOT, target)}`)
-console.log(`stage-codex: sha256 ${sha256}${previous ? previous === sha256 ? ' (unchanged)' : ` (was ${previous})` : ''}`)
+console.log(`stage-codex: sha256 ${sha256}${previous?.sha256 === sha256 ? ' (unchanged)' : ''}`)
 console.log(`stage-codex: ${versionCheck.stdout.trim()}`)
