@@ -40,6 +40,13 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_by_event_id ON events (event_id);
 CREATE INDEX IF NOT EXISTS events_by_topic ON events (family_id, topic_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5 (
+  family_id UNINDEXED,
+  event_id UNINDEXED,
+  summary,
+  body,
+  tokenize = 'unicode61'
+);
 `
 
 export type Projection = { db: Database; path: string }
@@ -96,6 +103,12 @@ function insertEvent(projection: Projection, familyId: string, event: JournalEve
       String(event.content_hash ?? ''),
       JSON.stringify(event),
     )
+  // The index is derived from the row, so it is written in the same place the
+  // row is and rebuilt by the same code path.
+  projection.db.query('DELETE FROM events_fts WHERE family_id = ? AND event_id = ?').run(familyId, String(event.event_id))
+  projection.db
+    .query('INSERT INTO events_fts (family_id, event_id, summary, body) VALUES (?, ?, ?, ?)')
+    .run(familyId, String(event.event_id), field(record, 'summary') ?? '', field(record, 'body') ?? '')
 }
 
 /**

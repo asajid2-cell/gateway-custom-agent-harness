@@ -13,7 +13,7 @@
  * than a second import.
  */
 import { createHash } from 'node:crypto'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile, readdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   activeGeneration,
@@ -22,6 +22,7 @@ import {
   repairTornTail,
   verifyJournal,
 } from '../src/utils/vault/journal.js'
+import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
 type Args = Record<string, string | true>
@@ -114,6 +115,25 @@ async function main(): Promise<number> {
       actor: typeof args.actor === 'string' ? args.actor : 'vault-cli',
     })
     print({ ok: true, family_id: familyId, generation, kind, already: false })
+    return 0
+  }
+
+  if (command === 'recall') {
+    const familyId = required(args, 'family')
+    const query = required(args, 'query')
+    const packet = await recall({
+      vaultRoot,
+      familyId,
+      query,
+      filters: {
+        asOf: typeof args['as-of'] === 'string' ? (args['as-of'] as string) : undefined,
+        limit: typeof args.limit === 'string' ? Number(args.limit) : undefined,
+      },
+    })
+    if (typeof args.dump === 'string') {
+      await writeFile(args.dump as string, `${JSON.stringify(packet, null, 2)}\n`, 'utf8')
+    }
+    print(packet)
     return 0
   }
 
