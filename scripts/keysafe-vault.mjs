@@ -23,10 +23,12 @@
  * covered by this vault.
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { chmod, link, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const ALGORITHM = 'aes-256-gcm'
 const IV_BYTES = 12
@@ -504,7 +506,67 @@ async function dpapiMasterKey(vaultDir, run, { create = true } = {}) {
   return key
 }
 
-async function keychainMasterKey(vaultDir, run, { create = true } = {}) {
+// The helper ships beside the vault script in a source checkout and beside the
+// bundle's scripts directory in the artifact, so look in both places.
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url))
+const KEYCHAIN_HELPERS = [
+  path.join(MODULE_DIR, 'macos', 'bin', 'keysafe-keychain'),
+  path.join(MODULE_DIR, '..', 'scripts', 'macos', 'bin', 'keysafe-keychain'),
+]
+
+/**
+ * The compiled helper beside the vault script. `KEYSAFE_KEYCHAIN_HELPER`
+ * overrides the path; `keychainHelper: false` forces the `security` CLI path
+ * (source checkouts without the binary, and the tests that cover that path).
+ */
+function keychainHelperPath(options) {
+  if (options.keychainHelper === false) return null
+  if (typeof options.keychainHelper === 'string') return options.keychainHelper
+  const override = process.env.KEYSAFE_KEYCHAIN_HELPER
+  if (override) return override
+  return KEYCHAIN_HELPERS.find(candidate => existsSync(candidate)) ?? null
+}
+
+/**
+ * Native path: Security.framework through the small Swift helper. Exit codes
+ * say what happened (44 not found, 45 interaction) instead of English error
+ * text, and the item carries an any-application ACL so a rebuilt helper cannot
+ * lock the vault behind an approval prompt.
+ */
+async function nativeKeychainMasterKey(vaultDir, run, helper, { create = true } = {}) {
+  const account = accountFor(vaultDir)
+  const lookup = await run(helper, ['get', SERVICE, account], '')
+  if (lookup.code === 0 && String(lookup.stdout).trim()) {
+    const key = Buffer.from(String(lookup.stdout).trim(), 'base64')
+    assertKey(key)
+    return key
+  }
+  const detail = `${lookup.stderr}\n${lookup.stdout}`.trim() || `the Keychain helper exited ${lookup.code}`
+  if (lookup.code === 45) {
+    throw lockedError('the Keychain master key', detail, 'KEYSAFE_LOCKED_INTERACTION')
+  }
+  if (lookup.code !== 44 || !create) {
+    throw lockedError('the Keychain master key', detail)
+  }
+  const key = randomBytes(KEY_BYTES)
+  const stored = await run(helper, ['set', SERVICE, account], key.toString('base64'))
+  if (stored.code !== 0) {
+    throw lockedError(
+      'the Keychain master key',
+      `${stored.stderr}\n${stored.stdout}`.trim() || `the Keychain helper exited ${stored.code}`,
+      stored.code === 45 ? 'KEYSAFE_LOCKED_INTERACTION' : 'KEYSAFE_LOCKED',
+    )
+  }
+  return key
+}
+
+async function keychainMasterKey(vaultDir, run, opts = {}) {
+  const helper = keychainHelperPath(opts)
+  if (helper) return nativeKeychainMasterKey(vaultDir, run, helper, opts)
+  return securityCliMasterKey(vaultDir, run, opts)
+}
+
+async function securityCliMasterKey(vaultDir, run, { create = true } = {}) {
   const account = accountFor(vaultDir)
   const lookup = await run('security', ['-i'], `find-generic-password -s ${SERVICE} -a ${account} -w\n`)
   if (lookup.code === 0 && String(lookup.stdout).trim()) {
@@ -525,10 +587,22 @@ async function keychainMasterKey(vaultDir, run, { create = true } = {}) {
     throw lockedError('the Keychain master key', detail)
   }
   const key = randomBytes(KEY_BYTES)
-  requireSuccess(
-    await run('security', ['-i'], `add-generic-password -U -s ${SERVICE} -a ${account} -w ${key.toString('base64')}\n`),
-    'storing the Keychain master key',
+  // The lookup can answer "not found" while the *store* is what the session is
+  // not allowed to do, so classify here too: a fresh vault outside a GUI
+  // session falls back instead of failing after it has already chosen a key.
+  const stored = await run(
+    'security',
+    ['-i'],
+    `add-generic-password -U -s ${SERVICE} -a ${account} -w ${key.toString('base64')}\n`,
   )
+  if (stored.code !== 0) {
+    const storeDetail = `${stored.stderr}\n${stored.stdout}`
+    throw lockedError(
+      'the Keychain master key',
+      storeDetail,
+      INTERACTION_HINT.test(storeDetail) ? 'KEYSAFE_LOCKED_INTERACTION' : 'KEYSAFE_LOCKED',
+    )
+  }
   return key
 }
 
@@ -612,7 +686,10 @@ export async function resolveMasterKey(options = {}) {
   }
   const backend = meta?.backend ?? requested
   const allowCreate = !(await vaultHasRecords(vaultDir))
-  const opts = { create: allowCreate }
+  const opts = {
+    create: allowCreate,
+    ...(options.keychainHelper !== undefined ? { keychainHelper: options.keychainHelper } : {}),
+  }
 
   let resolved
   if (backend === 'dpapi') {

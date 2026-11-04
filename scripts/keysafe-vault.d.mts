@@ -9,6 +9,8 @@ export type KeysafeOptions = {
   backend?: MasterKeyBackend
   platform?: NodeJS.Platform
   run?: RunFn
+  /** macOS Keychain helper path, or false to force the `security` CLI path. */
+  keychainHelper?: string | false
 }
 
 export type KeysafeEntry = { name: string; envVar: string; updatedAt: string }

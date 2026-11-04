@@ -190,7 +190,14 @@ test('the Keychain and libsecret helpers receive the master key on stdin', async
       return { code: 0, stdout: '', stderr: '' }
     }
     try {
-      await captureSecret('ds', `${backend}-sentinel`, { vaultDir: dir, backend, platform: backend === 'keychain' ? 'darwin' : 'linux', run })
+      await captureSecret('ds', `${backend}-sentinel`, {
+        vaultDir: dir,
+        backend,
+        platform: backend === 'keychain' ? 'darwin' : 'linux',
+        // This row covers the CLI path on purpose; the native helper has its own.
+        ...(backend === 'keychain' ? { keychainHelper: false } : {}),
+        run,
+      })
       const stored = calls.find(c => c.args.includes('store') || c.args[0] === '-i')
       assert.ok(stored, `${backend} store call missing`)
       assert.equal(stored.args.join(' ').includes('sentinel'), false)
@@ -258,6 +265,7 @@ test('a fresh vault outside a GUI session falls back to file and says so', async
       vaultDir: dir,
       backend: 'keychain',
       platform: 'darwin',
+      keychainHelper: false,
       run: async () => INTERACTION_FAILURE,
     })
     assert.equal(resolved.backend, 'file')
@@ -282,6 +290,7 @@ test('captureSecret reports the backend it actually used', async () => {
       vaultDir: dir,
       backend: 'keychain',
       platform: 'darwin',
+      keychainHelper: false,
       run: async () => INTERACTION_FAILURE,
     })
     assert.equal(stored.backend, 'file')
@@ -308,11 +317,18 @@ test('a populated vault never falls back when the keychain is unreachable', asyn
       vaultDir: dir,
       backend: 'keychain',
       platform: 'darwin',
+      keychainHelper: false,
       run: keychainWorks,
     })
     clearMasterKeyCache()
     await assert.rejects(
-      () => resolveMasterKey({ vaultDir: dir, platform: 'darwin', run: async () => INTERACTION_FAILURE }),
+      () =>
+        resolveMasterKey({
+          vaultDir: dir,
+          platform: 'darwin',
+          keychainHelper: false,
+          run: async () => INTERACTION_FAILURE,
+        }),
       /KEYSAFE_LOCKED/,
     )
     const { readdir } = await import('node:fs/promises')
@@ -320,6 +336,98 @@ test('a populated vault never falls back when the keychain is unreachable', asyn
     // No second master key was minted beside the records.
     assert.equal(entries.includes('master.key'), false)
     assert.equal(JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8')).backend, 'keychain')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('the native Keychain helper keeps the master key on stdin', async () => {
+  const { dir } = await scratch()
+  const helper = '/fake/keysafe-keychain'
+  const calls = []
+  const run = async (file, args, stdin) => {
+    calls.push({ file, args, stdin })
+    if (args[0] === 'get') return { code: 44, stdout: '', stderr: 'errSecItemNotFound (-25300)' }
+    return { code: 0, stdout: '', stderr: '' }
+  }
+  try {
+    const stored = await captureSecret('ds', 'native-sentinel', {
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      keychainHelper: helper,
+      run,
+    })
+    assert.equal(stored.backend, 'keychain')
+    const set = calls.find(call => call.args[0] === 'set')
+    assert.equal(set.file, helper)
+    assert.equal(calls.some(call => call.args.includes('native-sentinel')), false)
+    const key = Buffer.from(String(set.stdin), 'base64')
+    assert.equal(key.length, 32)
+
+    // A later process reads the item back through the same helper.
+    clearMasterKeyCache()
+    const value = await readSecret('ds', {
+      vaultDir: dir,
+      backend: 'keychain',
+      keychainHelper: helper,
+      run: async (_file, args) =>
+        args[0] === 'get'
+          ? { code: 0, stdout: `${key.toString('base64')}\n`, stderr: '' }
+          : { code: 1, stdout: '', stderr: 'unexpected write' },
+    })
+    assert.equal(value, 'native-sentinel')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('the native helper distinguishes a locked Keychain from a missing item', async () => {
+  const { dir } = await scratch()
+  const calls = []
+  try {
+    const stored = await captureSecret('ds', 'locked-sentinel', {
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      keychainHelper: '/fake/keysafe-keychain',
+      run: async (_file, args) => {
+        calls.push(args[0])
+        return args[0] === 'get'
+          ? { code: 45, stdout: '', stderr: 'errSecInteractionNotAllowed (-25308)' }
+          : { code: 0, stdout: '', stderr: '' }
+      },
+    })
+    // Exit 45 is the one failure a fresh vault falls back from; it must not
+    // write a second master key into a Keychain the session cannot use.
+    assert.equal(calls.includes('set'), false)
+    assert.equal(stored.backend, 'file')
+    assert.match(stored.warning, /Keychain is not usable/)
+    const meta = JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8'))
+    assert.equal(meta.reason, 'keychain-unavailable')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a Keychain that refuses the first store still falls back on a fresh vault', async () => {
+  const { dir } = await scratch()
+  try {
+    // What a plain ssh session actually looks like: the lookup says "not
+    // found", and only the add is refused for interaction.
+    const stored = await captureSecret('ds', 'store-locked-sentinel', {
+      vaultDir: dir,
+      backend: 'keychain',
+      platform: 'darwin',
+      keychainHelper: '/fake/keysafe-keychain',
+      run: async (_file, args) =>
+        args[0] === 'get'
+          ? { code: 44, stdout: '', stderr: 'errSecItemNotFound (-25300)' }
+          : { code: 45, stdout: '', stderr: 'User interaction is not allowed. (-25308)' },
+    })
+    assert.equal(stored.backend, 'file')
+    assert.match(stored.warning, /Keychain is not usable/)
+    assert.equal(JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8')).reason, 'keychain-unavailable')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -335,6 +443,7 @@ test('a locked keychain for another reason does not fall back', async () => {
           vaultDir: dir,
           backend: 'keychain',
           platform: 'darwin',
+          keychainHelper: false,
           run: async () => ({ code: 1, stdout: '', stderr: 'errSecAuthFailed -25293' }),
         }),
       /KEYSAFE_LOCKED/,
