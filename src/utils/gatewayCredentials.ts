@@ -49,7 +49,7 @@ function sourceFor(mode: CredentialMode): string {
   return process.platform === 'win32' ? 'external keysafe' : 'external gateway.env'
 }
 
-async function externalPosixHas(name: GatewayCredentialName): Promise<boolean> {
+async function externalPosixHas(name: string): Promise<boolean> {
   const envVar = envVarForRecord(name)
   if (!envVar) return false
   try {
@@ -62,7 +62,7 @@ async function externalPosixHas(name: GatewayCredentialName): Promise<boolean> {
 
 /** Presence is mode-aware: the bundled vault or the selected external source. */
 export async function gatewayCredentialStatus(
-  name: GatewayCredentialName,
+  name: string,
 ): Promise<CredentialResult & { present: boolean }> {
   const envVar = envVarForRecord(name)
   const mode = keysafeMode()
@@ -93,7 +93,7 @@ export async function hasGatewayCredential(
  * rewriting it would make the two credential sources disagree.
  */
 export async function saveGatewayCredential(
-  name: GatewayCredentialName,
+  name: string,
   value: string,
 ): Promise<CredentialResult> {
   const mode = keysafeMode()
@@ -135,7 +135,7 @@ export async function saveGatewayCredential(
 }
 
 export async function removeGatewayCredential(
-  name: GatewayCredentialName,
+  name: string,
 ): Promise<CredentialResult> {
   const mode = keysafeMode()
   if (mode === 'bundled') {
