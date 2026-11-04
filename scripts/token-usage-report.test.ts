@@ -286,6 +286,9 @@ function empty() {
     cacheWrite: 0,
     costUSD: 0,
     sessions: 0,
+    speedRows: 0,
+    speedOutput: 0,
+    speedMs: 0,
   }
 }
 
