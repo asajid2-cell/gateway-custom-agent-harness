@@ -29,6 +29,105 @@ export type SettingsRead =
 
 export const DEFAULT_VAULT_NAME = 'main'
 
+const TOP_LEVEL = new Set(['schemaVersion', 'vaultRoot', 'capture', 'retrieval', 'writer'])
+
+/**
+ * The rules a JSON Schema cannot express, enforced before a write so the file
+ * on disk is always one the reader can trust.
+ *
+ * The rotation caps are the interesting one: `every` is the literal count and
+ * the two caps are an all-or-nothing pair ("whichever comes first"). Both set
+ * is the standing default; both null is the literal-only ruling Ahmed has not
+ * given, so it is legal to write deliberately and never a default to invent.
+ */
+export function validateGatewaySettings(settings: GatewaySettings): string[] {
+  const reasons: string[] = []
+  for (const key of Object.keys(settings)) {
+    if (!TOP_LEVEL.has(key)) reasons.push(`unknown key '${key}'; allowed: ${[...TOP_LEVEL].join(', ')}`)
+  }
+  if ('schemaVersion' in settings && settings.schemaVersion !== 1) {
+    reasons.push(`schemaVersion must be 1, not ${JSON.stringify(settings.schemaVersion)}`)
+  }
+  if ('vaultRoot' in settings) {
+    const value = settings.vaultRoot
+    if (typeof value !== 'string' || value.trim() === '') {
+      reasons.push('vaultRoot must be a non-empty string')
+    } else if (value.split(/[\\/]/).includes('..')) {
+      reasons.push('vaultRoot must not contain ..; a settings file must not depend on the working directory')
+    }
+  }
+
+  const asRecord = (value: unknown): Record<string, unknown> | null =>
+    value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+
+  if ('capture' in settings) {
+    const capture = asRecord(settings.capture)
+    if (!capture) reasons.push('capture must be an object')
+    else {
+      if ('mode' in capture && capture.mode !== 'monitor' && capture.mode !== 'enforce') {
+        reasons.push("capture.mode must be 'monitor' or 'enforce'")
+      }
+      const scribe = 'scribe' in capture ? asRecord(capture.scribe) : null
+      if ('scribe' in capture && !scribe) reasons.push('capture.scribe must be an object')
+      const rotation = scribe && 'rotation' in scribe ? asRecord(scribe.rotation) : null
+      if (scribe && 'rotation' in scribe && !rotation) reasons.push('capture.scribe.rotation must be an object')
+      if (rotation) {
+        if ('every' in rotation && (!Number.isInteger(rotation.every) || Number(rotation.every) < 1)) {
+          reasons.push('capture.scribe.rotation.every must be an integer >= 1')
+        }
+        const hasAge = 'maxAgeHours' in rotation
+        const hasEvents = 'maxEvents' in rotation
+        const ageNull = rotation.maxAgeHours === null
+        const eventsNull = rotation.maxEvents === null
+        if (hasAge !== hasEvents) {
+          reasons.push('maxAgeHours and maxEvents must be set together; half a cap pair is not a rule')
+        } else if (hasAge && hasEvents && ageNull !== eventsNull) {
+          reasons.push('maxAgeHours and maxEvents must both be numbers or both null')
+        } else if (hasAge && !ageNull && (!Number.isInteger(rotation.maxAgeHours) || Number(rotation.maxAgeHours) < 1)) {
+          reasons.push('capture.scribe.rotation.maxAgeHours must be an integer >= 1 or null')
+        } else if (hasEvents && !eventsNull && (!Number.isInteger(rotation.maxEvents) || Number(rotation.maxEvents) < 1)) {
+          reasons.push('capture.scribe.rotation.maxEvents must be an integer >= 1 or null')
+        }
+      }
+      const obligations = 'obligations' in capture ? asRecord(capture.obligations) : null
+      if ('obligations' in capture && !obligations) reasons.push('capture.obligations must be an object')
+      if (obligations) {
+        if ('overdueHours' in obligations && (!Number.isInteger(obligations.overdueHours) || Number(obligations.overdueHours) < 1)) {
+          reasons.push('capture.obligations.overdueHours must be an integer >= 1')
+        }
+        if ('maxPending' in obligations && obligations.maxPending !== null && (!Number.isInteger(obligations.maxPending) || Number(obligations.maxPending) < 0)) {
+          reasons.push('capture.obligations.maxPending must be an integer >= 0 or null')
+        }
+      }
+    }
+  }
+
+  if ('retrieval' in settings) {
+    const retrieval = asRecord(settings.retrieval)
+    if (!retrieval) reasons.push('retrieval must be an object')
+    else {
+      if ('engine' in retrieval && retrieval.engine !== 'sqlite-fts5') {
+        reasons.push("retrieval.engine must be 'sqlite-fts5'")
+      }
+      const embeddings = 'embeddings' in retrieval ? asRecord(retrieval.embeddings) : null
+      if ('embeddings' in retrieval && !embeddings) reasons.push('retrieval.embeddings must be an object')
+      if (embeddings && 'enabled' in embeddings && embeddings.enabled !== false) {
+        reasons.push('retrieval.embeddings.enabled must be false; enabling paid embeddings is a spec change, not a settings edit')
+      }
+    }
+  }
+
+  if ('writer' in settings) {
+    const writer = asRecord(settings.writer)
+    if (!writer) reasons.push('writer must be an object')
+    else if ('fsync' in writer && writer.fsync !== true) {
+      reasons.push('writer.fsync must be true; a commit not on disk has not happened')
+    }
+  }
+
+  return reasons
+}
+
 /**
  * Relative paths resolve against the config home, so a settings file copied
  * between machines - or a `vaultRoot` written as `vaults/main` - cannot follow
@@ -71,7 +170,14 @@ export async function readGatewaySettings(env: NodeJS.ProcessEnv = process.env):
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { ok: false, path, reason: `${path} must contain a JSON object` }
   }
-  return { ok: true, path, settings: parsed as GatewaySettings, existed: true }
+  const settings = parsed as GatewaySettings
+  // Read-side validation too: a file with a mistyped key is refused rather than
+  // silently ignored, which is how a vault ends up somewhere nobody meant.
+  const reasons = validateGatewaySettings(settings)
+  if (reasons.length > 0) {
+    return { ok: false, path, reason: `${path}: ${reasons.join('; ')}` }
+  }
+  return { ok: true, path, settings, existed: true }
 }
 
 /**
@@ -86,7 +192,11 @@ export async function writeGatewaySettings(
   const path = gatewaySettingsPath(env)
   const current = await readGatewaySettings(env)
   if (!current.ok) return current
-  const merged: GatewaySettings = { ...current.settings, ...patch }
+  const merged: GatewaySettings = { ...current.settings, ...patch, schemaVersion: 1 }
+  const reasons = validateGatewaySettings(merged)
+  if (reasons.length > 0) {
+    return { ok: false, path, reason: reasons.join('; ') }
+  }
   const temp = `${path}.${process.pid}.${Date.now()}.tmp`
   try {
     await mkdir(dirname(path), { recursive: true })

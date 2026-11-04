@@ -9,6 +9,7 @@ import {
   gatewaySettingsPath,
   readGatewaySettings,
   resolveInstallPath,
+  validateGatewaySettings,
   vaultRootFor,
   writeGatewaySettings,
 } from '../src/utils/vault/settings.js'
@@ -77,11 +78,15 @@ test('writing merges with the existing object and replaces the file atomically',
     const env = { GATEWAY_SETTINGS: file } as NodeJS.ProcessEnv
     const first = await writeGatewaySettings({ vaultRoot: path.join(root, 'a') }, env)
     assert.equal(first.ok, true)
-    const second = await writeGatewaySettings({ note: 'kept' }, env)
+    const second = await writeGatewaySettings({ capture: { mode: 'monitor' } }, env)
     assert.equal(second.ok, true)
     const parsed = JSON.parse(await readFile(file, 'utf8'))
     assert.equal(parsed.vaultRoot, path.join(root, 'a'))
-    assert.equal(parsed.note, 'kept')
+    assert.equal(parsed.capture.mode, 'monitor')
+    // The key set is closed: a typo is refused rather than written and ignored.
+    const refused = await writeGatewaySettings({ note: 'kept' } as never, env)
+    assert.equal(refused.ok, false)
+    assert.match(refused.ok === false ? refused.reason : '', /unknown key 'note'/)
     const leftovers = (await import('node:fs/promises')).readdir(root)
     assert.deepEqual((await leftovers).filter(name => name.endsWith('.tmp')), [])
   } finally {
@@ -150,6 +155,85 @@ test('/gateway-settings sets a probed vault root and reports the default when un
     await writeFile(notDir, 'x')
     const refusedFile = await call(`vaultRoot ${notDir}`, {} as never)
     assert.match(refusedFile.type === 'text' ? refusedFile.value : '', /not a directory/)
+  } finally {
+    if (previous === undefined) delete process.env.GATEWAY_SETTINGS
+    else process.env.GATEWAY_SETTINGS = previous
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the settings contract is closed and its cross-field rules are enforced', () => {
+  assert.deepEqual(validateGatewaySettings({}), [])
+  assert.deepEqual(validateGatewaySettings({ schemaVersion: 1, vaultRoot: 'vaults/main' }), [])
+
+  const unknown = validateGatewaySettings({ vaults: {} } as never)
+  assert.ok(unknown.some(reason => /unknown key 'vaults'/.test(reason)))
+  const traversal = validateGatewaySettings({ vaultRoot: '../outside' })
+  assert.ok(traversal.some(reason => /must not contain \.\./.test(reason)))
+  const version = validateGatewaySettings({ schemaVersion: 2 })
+  assert.ok(version.some(reason => /schemaVersion must be 1/.test(reason)))
+  const halfPair = validateGatewaySettings({
+    capture: { scribe: { rotation: { maxAgeHours: 8 } } },
+  })
+  assert.ok(halfPair.some(reason => /must be set together/.test(reason)))
+  const mixedPair = validateGatewaySettings({
+    capture: { scribe: { rotation: { maxAgeHours: null, maxEvents: 200 } } },
+  })
+  assert.ok(mixedPair.some(reason => /both null/.test(reason)))
+  assert.deepEqual(
+    validateGatewaySettings({ capture: { scribe: { rotation: { every: 5, maxAgeHours: null, maxEvents: null } } } }),
+    [],
+    'literal-only is legal to write deliberately',
+  )
+  const embeddings = validateGatewaySettings({ retrieval: { embeddings: { enabled: true } } })
+  assert.ok(embeddings.some(reason => /embeddings\.enabled must be false/.test(reason)))
+  const fsync = validateGatewaySettings({ writer: { fsync: false } })
+  assert.ok(fsync.some(reason => /writer\.fsync must be true/.test(reason)))
+  const mode = validateGatewaySettings({ capture: { mode: 'sometimes' } })
+  assert.ok(mode.some(reason => /capture\.mode/.test(reason)))
+})
+
+test('a save writes schemaVersion 1 and refuses an invalid merge', async () => {
+  const root = await scratch()
+  try {
+    const file = path.join(root, 'gateway-settings.json')
+    const env = { GATEWAY_SETTINGS: file } as NodeJS.ProcessEnv
+    const written = await writeGatewaySettings({ vaultRoot: path.join(root, 'v') }, env)
+    assert.equal(written.ok, true)
+    const parsed = JSON.parse(await readFile(file, 'utf8'))
+    assert.equal(parsed.schemaVersion, 1)
+
+    const refused = await writeGatewaySettings({ vaultRoot: '../escape' }, env)
+    assert.equal(refused.ok, false)
+    assert.match(refused.ok === false ? refused.reason : '', /must not contain \.\./)
+
+    const bad = path.join(root, 'bad.json')
+    await writeFile(bad, JSON.stringify({ writer: { fsync: false } }))
+    const read = await readGatewaySettings({ GATEWAY_SETTINGS: bad } as NodeJS.ProcessEnv)
+    assert.equal(read.ok, false)
+    assert.match(read.ok === false ? read.reason : '', /writer\.fsync must be true/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('/gateway-settings shows the effective policy and refuses a read-only key', async () => {
+  const root = await scratch()
+  const previous = process.env.GATEWAY_SETTINGS
+  try {
+    process.env.GATEWAY_SETTINGS = path.join(root, 'gateway-settings.json')
+    const shown = await call('', {} as never)
+    const text = shown.type === 'text' ? shown.value : ''
+    assert.match(text, /schemaVersion: 1/)
+    assert.match(text, /capture\.mode: monitor/)
+    assert.match(text, /5 admissions, or 8h \/ 200 events/)
+    assert.match(text, /retrieval: sqlite-fts5, embeddings disabled/)
+
+    const readOnly = await call('capture enforce', {} as never)
+    assert.match(readOnly.type === 'text' ? readOnly.value : '', /read-only/)
+
+    const traversal = await call('vaultRoot ../escape', {} as never)
+    assert.match(traversal.type === 'text' ? traversal.value : '', /must not contain \.\./)
   } finally {
     if (previous === undefined) delete process.env.GATEWAY_SETTINGS
     else process.env.GATEWAY_SETTINGS = previous
