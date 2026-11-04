@@ -13,7 +13,7 @@ import {
   type MasterKeyBackend,
 } from './keysafe/index.js'
 
-export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode' | 'openrouter'
+export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode' | 'mistral' | 'mistralvibe' | 'mistral-vibe' | 'openrouter'
 
 export type CredentialResult = {
   ok: boolean

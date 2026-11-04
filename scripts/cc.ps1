@@ -1167,7 +1167,25 @@ try {
       $suffix = $_.BaseName.Substring('opencode-go'.Length)
       @{ Credential = $_.BaseName; EnvVar = ('OPENCODE_API_KEY' + $suffix) }
     })
-  $OptionalKeyProviders = $OpenCodeProviders + @(
+  # Vibe plan keys and Studio API keys are separate credential types; both are
+  # numbered pools and every stored slot is injected.
+  # The console writes `mistralvibe`; the hyphenated `mistral-vibe` is accepted
+  # too. Both spellings address the same Vibe credential pool.
+  $MistralVibeProviders = @(Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.keysafe') -Filter 'mistral*vibe*.cred' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match '^mistral-?vibe([2-9]|[1-9][0-9]+)?$' } |
+    Sort-Object { $s = $_.BaseName -replace '^mistral-?vibe',''; if ($s -eq '') { 1 } else { [int]$s } } |
+    ForEach-Object {
+      $suffix = $_.BaseName -replace '^mistral-?vibe',''
+      @{ Credential = $_.BaseName; EnvVar = ('MISTRAL_VIBE_KEY' + $suffix) }
+    })
+  $MistralProviders = @(Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE '.keysafe') -Filter 'mistral*.cred' -ErrorAction SilentlyContinue |
+    Where-Object { $_.BaseName -match '^mistral([2-9]|[1-9][0-9]+)?$' } |
+    Sort-Object { if ($_.BaseName -eq 'mistral') { 1 } else { [int]$_.BaseName.Substring('mistral'.Length) } } |
+    ForEach-Object {
+      $suffix = $_.BaseName.Substring('mistral'.Length)
+      @{ Credential = $_.BaseName; EnvVar = ('MISTRAL_API_KEY' + $suffix) }
+    })
+  $OptionalKeyProviders = $OpenCodeProviders + $MistralVibeProviders + $MistralProviders + @(
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
     @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )

@@ -34,6 +34,14 @@ function keyLabel(keyName: string): string {
     const suffix = keyName.slice('commandcode'.length)
     return suffix ? `Command Code ${suffix}` : 'Command Code'
   }
+  if (keyName.startsWith('mistralvibe') || keyName.startsWith('mistral-vibe')) {
+    const suffix = keyName.replace(/^mistral-?vibe/, '')
+    return suffix ? `Mistral Vibe ${suffix}` : 'Mistral Vibe'
+  }
+  if (keyName.startsWith('mistral')) {
+    const suffix = keyName.slice('mistral'.length)
+    return suffix ? `Mistral ${suffix}` : 'Mistral'
+  }
   const suffix = keyName.slice('opencode-go'.length)
   return suffix ? `OpenCode Go ${suffix}` : 'OpenCode Go'
 }
@@ -58,8 +66,12 @@ async function storedNames(): Promise<string[]> {
         else {
           const opencode = /^OPENCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const commandcode = /^COMMANDCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          const mistralVibe = /^MISTRAL_VIBE_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          const mistral = /^MISTRAL_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           if (opencode) names.push(`opencode-go${opencode[1] ?? ''}`)
           if (commandcode) names.push(`commandcode${commandcode[1] ?? ''}`)
+          if (mistralVibe) names.push(`mistralvibe${mistralVibe[1] ?? ''}`)
+          if (mistral) names.push(`mistral${mistral[1] ?? ''}`)
         }
       }
       return names
@@ -170,6 +182,8 @@ function keyCommand(keyName: string): string {
   if (keyName === 'ds') return 'deepseeklogin'
   if (keyName === 'openrouter') return 'openrouterlogin'
   if (keyName.startsWith('commandcode')) return 'commandcodelogin'
+  if (keyName.startsWith('mistralvibe') || keyName.startsWith('mistral-vibe')) return 'mistralvibelogin'
+  if (keyName.startsWith('mistral')) return 'mistrallogin'
   return 'opencodelogin'
 }
 
@@ -220,12 +234,14 @@ export const call: LocalJSXCommandCall = async (
 
   const accountKeyPrefix = keyName.startsWith('commandcode')
     ? 'commandcode'
-    : keyName === 'opencode-go'
-      ? 'opencode-go'
-      : null
+    : /^mistral(?:[2-9]|[1-9][0-9]+)?$/.test(keyName)
+      ? 'mistral'
+      : keyName === 'opencode-go'
+        ? 'opencode-go'
+        : null
   if (accountKeyPrefix && action) {
-    const label = accountKeyPrefix === 'commandcode' ? 'Command Code' : 'OpenCode'
-    const accountPath = accountKeyPrefix === 'commandcode' ? '/gateway/commandcode-account' : '/gateway/opencode-account'
+    const label = accountKeyPrefix === 'commandcode' ? 'Command Code' : accountKeyPrefix === 'mistral' ? 'Mistral' : 'OpenCode'
+    const accountPath = accountKeyPrefix === 'commandcode' ? '/gateway/commandcode-account' : accountKeyPrefix === 'mistral' ? '/gateway/mistral-account' : '/gateway/opencode-account'
     const match = new RegExp(`^(?:switch\\s+)?(?:${accountKeyPrefix})?([1-9][0-9]*)(?:\\s+(session|global))?$`).exec(action)
     if (match || action === 'status') {
       const base = process.env.CLAUDE_CODE_GATEWAY_BASE_URL
@@ -255,7 +271,7 @@ export const call: LocalJSXCommandCall = async (
       return (
         <GatewayLoginDialog
           keyName={slot}
-          accountKind={accountKeyPrefix === 'commandcode' ? 'commandcode' : 'opencode'}
+          accountKind={accountKeyPrefix === 'commandcode' ? 'commandcode' : accountKeyPrefix === 'mistral' ? 'mistral' : 'opencode'}
           reload
           onDone={onDone}
         />
@@ -317,7 +333,7 @@ function GatewayLoginDialog(props: {
   keyName: string
   onDone: (result?: string) => void
   reload?: boolean
-  accountKind?: 'opencode' | 'commandcode'
+  accountKind?: 'opencode' | 'commandcode' | 'mistral'
 }): React.ReactNode {
   const [value, setValue] = useState('')
   const [cursorOffset, setCursorOffset] = useState(0)
@@ -325,8 +341,8 @@ function GatewayLoginDialog(props: {
   const [error, setError] = useState<string | null>(null)
   const terminalSize = useTerminalSize()
   const label = keyLabel(props.keyName)
-  const accountsName = props.accountKind === 'commandcode' ? 'Command Code' : 'OpenCode'
-  const accountsPath = props.accountKind === 'commandcode' ? '/gateway/commandcode-account' : '/gateway/opencode-account'
+  const accountsName = props.accountKind === 'commandcode' ? 'Command Code' : props.accountKind === 'mistral' ? 'Mistral' : 'OpenCode'
+  const accountsPath = props.accountKind === 'commandcode' ? '/gateway/commandcode-account' : props.accountKind === 'mistral' ? '/gateway/mistral-account' : '/gateway/opencode-account'
 
   const submit = async () => {
     if (busy) return

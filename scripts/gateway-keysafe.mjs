@@ -47,13 +47,17 @@ export const GATEWAY_KEY_ENV_VARS = [
   'DEEPSEEK_API_KEY',
   'AMD_API_KEY',
   'COMMANDCODE_API_KEY',
+  'MISTRAL_API_KEY',
+  'MISTRAL_VIBE_KEY',
   'OPENROUTER_API_KEY',
 ]
 
 export function isGatewayKeyEnvVar(name) {
   return GATEWAY_KEY_ENV_VARS.includes(name) ||
     /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
-    /^COMMANDCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
+    /^COMMANDCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
+    /^MISTRAL_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
+    /^MISTRAL_VIBE_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
 }
 
 function openCodeNumber(name) {
@@ -64,11 +68,20 @@ function commandCodeNumber(name) {
   return Number(name.slice('commandcode'.length) || 1)
 }
 
+function mistralNumber(name) {
+  return Number(name.slice('mistral'.length) || 1)
+}
+
+function mistralVibeNumber(name) {
+  return Number(name.replace(/^mistral-?vibe/, '') || 1)
+}
+
 /**
  * The provider records for this machine's vault: numbered OpenCode records,
- * then amd-ds, then numbered commandcode records, then the always-required ds
- * base layer. The order no longer affects nesting (one invocation injects them
- * all) but keeps the list stable for callers and tests.
+ * then amd-ds, then numbered commandcode and mistral records, then openrouter,
+ * then the always-required ds base layer. The order no longer affects nesting
+ * (one invocation injects them all) but keeps the list stable for callers and
+ * tests.
  */
 export function listKeysafeProviders(home = keysafeHome()) {
   let entries = []
@@ -91,6 +104,27 @@ export function listKeysafeProviders(home = keysafeHome()) {
     .filter(name => /^commandcode([2-9]|[1-9][0-9]+)?$/.test(name))
     .sort((a, b) => commandCodeNumber(a) - commandCodeNumber(b))) {
     providers.push({ credential: name, envVar: `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}` })
+  }
+  // `mistralvibe` is the console's spelling; the hyphenated form is accepted
+  // too. Both address the same Vibe pool, so the first record for an env slot
+  // wins and a duplicate spelling cannot inject the variable twice.
+  const vibeRecords = [
+    [...names].filter(name => /^mistralvibe([2-9]|[1-9][0-9]+)?$/.test(name)),
+    [...names].filter(name => /^mistral-vibe([2-9]|[1-9][0-9]+)?$/.test(name)),
+  ]
+    .flat()
+    .sort((a, b) => mistralVibeNumber(a) - mistralVibeNumber(b))
+  const seenVibeEnv = new Set()
+  for (const name of vibeRecords) {
+    const envVar = `MISTRAL_VIBE_KEY${name.replace(/^mistral-?vibe/, '')}`
+    if (seenVibeEnv.has(envVar)) continue
+    seenVibeEnv.add(envVar)
+    providers.push({ credential: name, envVar })
+  }
+  for (const name of [...names]
+    .filter(name => /^mistral([2-9]|[1-9][0-9]+)?$/.test(name))
+    .sort((a, b) => mistralNumber(a) - mistralNumber(b))) {
+    providers.push({ credential: name, envVar: `MISTRAL_API_KEY${name.slice('mistral'.length)}` })
   }
   if (names.has('openrouter')) providers.push({ credential: 'openrouter', envVar: 'OPENROUTER_API_KEY' })
   if (names.has('ds')) providers.push({ credential: 'ds', envVar: 'DEEPSEEK_API_KEY' })

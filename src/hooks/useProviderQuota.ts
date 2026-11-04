@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { readAnthropicQuota } from '../utils/anthropicUsage.js'
 import { readOpenCodeQuota } from '../utils/opencodeUsage.js'
+import { readCommandCodeQuota } from '../utils/commandCodeUsage.js'
+import { readMistralQuota } from '../utils/mistralUsage.js'
 import { readCodexQuota } from '../utils/codexRateLimits.js'
 import type { ProviderName, ProviderQuota } from '../utils/bottomBarUsage.js'
 
@@ -18,6 +20,8 @@ async function readProviderQuota(provider: ProviderName): Promise<QuotaRead> {
   try {
     if (provider === 'Anthropic') return { ok: true, quota: await readAnthropicQuota() }
     if (provider === 'OpenCode') return { ok: true, quota: await readOpenCodeQuota() }
+    if (provider === 'Command Code') return { ok: true, quota: await readCommandCodeQuota() }
+    if (provider === 'Mistral') return { ok: true, quota: await readMistralQuota() }
     // All three are read from the gateway's normalized endpoints now; Codex no
     // longer spawns a local app-server.
     return { ok: true, quota: await readCodexQuota() }

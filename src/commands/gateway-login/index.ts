@@ -6,7 +6,7 @@ const command = (name: string, description: string, keyName: string) =>
     name,
     description,
     argumentHint:
-      keyName === 'opencode-go' || keyName === 'commandcode'
+      keyName === 'opencode-go' || keyName === 'commandcode' || keyName === 'mistral'
         ? '[new|switch <number> [session|global]|status|remove]'
         : '[status|remove]',
     load: async () => {
@@ -79,6 +79,20 @@ export const commandCodeLogin = command(
   'commandcodelogin',
   'Add, replace, inspect, or remove the Command Code API key',
   'commandcode',
+)
+
+export const mistralLogin = command(
+  'mistrallogin',
+  'Add, replace, inspect, or remove the Mistral API key',
+  'mistral',
+)
+
+// Vibe plan keys are a separate Mistral credential type (Code > Vibe CLI) and
+// are spent before Studio API usage.
+export const mistralVibeLogin = command(
+  'mistralvibelogin',
+  'Add, replace, inspect, or remove the Mistral Vibe plan key',
+  'mistralvibe',
 )
 
 // Compatibility aliases for the original command registry names.

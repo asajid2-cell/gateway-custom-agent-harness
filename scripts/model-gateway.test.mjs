@@ -27,7 +27,12 @@ import {
   gatewayRequestShape,
   credentialPool,
   openCodeCredentialPool,
+  commandCodeCredentialPool,
   readOpenCodeSubscriptionUsage,
+  readCommandCodeUsage,
+  readMistralUsage,
+  commandCodeUsageWindows,
+  mistralUsageWindows,
   fetchWithRetry,
   fleetRouteHealth,
   recordRouteHealth,
@@ -846,6 +851,125 @@ test('OpenCode usage reports an empty figure stale when the endpoint fails', asy
     // whatever it last showed rather than reading "no limit".
     assert.deepEqual(payload.windows, {})
     assert.equal(payload.stale, true)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    if (previousCache === undefined) delete process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+    else process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = previousCache
+  }
+})
+
+test('Command Code windows normalize the five-hour, weekly and monthly caps', () => {
+  const credits = {
+    credits: { monthlyCredits: 14.1178581193, purchasedCredits: 0, freeCredits: 0 },
+    windowLimits: {
+      fiveHour: { used: 3.5327223414, cap: 14, resetAt: 1793828917251 },
+      weekly: { used: 20.8610266704, cap: 35, resetAt: 1794263709685 },
+    },
+  }
+  const windows = commandCodeUsageWindows(credits, 'individual-goat', '2026-11-26T05:54:10.000Z')
+  assert.ok(Math.abs(windows.H.usedPercent - (3.5327223414 / 14) * 100) < 1e-9)
+  assert.ok(Math.abs(windows.W.usedPercent - (20.8610266704 / 35) * 100) < 1e-9)
+  // The monthly figure is the plan's 70-credit grant minus what is left.
+  assert.ok(Math.abs(windows.M.usedPercent - ((70 - 14.1178581193) / 70) * 100) < 1e-9)
+  assert.equal(windows.H.resetsAt, 1793828917251)
+  assert.equal(windows.M.resetsAt, Date.parse('2026-11-26T05:54:10.000Z'))
+  // An unrecognised plan has no monthly total to divide by, so it is omitted
+  // rather than reported as a fabricated 0%.
+  assert.equal(commandCodeUsageWindows(credits, 'mystery-plan').M, undefined)
+})
+
+test('Mistral billing normalizes the Vibe and API budgets', () => {
+  const windows = mistralUsageWindows({
+    vibe_budget: { usage_percentage: 0.000132, initial_budget: 150, reset_at: '2026-12-01T00:00:00Z' },
+    api_budget: { usage_percentage: 0.008606786666666666, initial_budget: 15, reset_at: '2026-12-01T00:00:00Z' },
+  })
+  assert.equal(windows.V.usedPercent, 0.000132)
+  assert.equal(windows.A.usedPercent, 0.008606786666666666)
+  assert.equal(windows.V.resetsAt, Date.parse('2026-12-01T00:00:00Z'))
+  // A bucket the account does not have is omitted, not printed as zero.
+  assert.deepEqual(mistralUsageWindows({ api_budget: { usage_percentage: 5 } }), {
+    A: { usedPercent: 5, resetsAt: null },
+  })
+  assert.deepEqual(mistralUsageWindows({}), {})
+})
+
+test('Command Code usage reads both endpoints once and caches per account', async () => {
+  const key = randomUUID()
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.url)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    if (req.url === '/alpha/billing/subscriptions') {
+      res.end(JSON.stringify({
+        success: true,
+        data: { planId: 'individual-goat', currentPeriodEnd: '2026-11-26T05:54:10.000Z' },
+      }))
+    } else {
+      res.end(JSON.stringify({
+        credits: { monthlyCredits: 14.1178581193, purchasedCredits: 0, freeCredits: 0 },
+        windowLimits: {
+          fiveHour: { used: 3.5327223414, cap: 14, resetAt: 1793828917251 },
+          weekly: { used: 20.8610266704, cap: 35, resetAt: 1794263709685 },
+        },
+      }))
+    }
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const previousCache = process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = freshQuotaCacheDir()
+  try {
+    const credentials = commandCodeCredentialPool({ COMMANDCODE_API_KEY: key })
+    const url = `http://127.0.0.1:${server.address().port}`
+    const first = await readCommandCodeUsage(credentials, url)
+    assert.equal(first.account, 1)
+    assert.ok(first.windows.H && first.windows.W && first.windows.M)
+    assert.deepEqual(seen.sort(), ['/alpha/billing/credits', '/alpha/billing/subscriptions'])
+    // A second read inside the TTL is served from the shared snapshot.
+    await readCommandCodeUsage(credentials, url)
+    assert.equal(seen.length, 2)
+    // A failure with nothing cached is an empty stale figure, not an absent one.
+    // Key 2 is a different account slot, so it has its own cache entry rather
+    // than inheriting key 1's fresh snapshot.
+    const failed = await readCommandCodeUsage(
+      commandCodeCredentialPool({ COMMANDCODE_API_KEY2: randomUUID() }),
+      'http://127.0.0.1:1',
+    )
+    assert.deepEqual(failed.windows, {})
+    assert.equal(failed.stale, true)
+  } finally {
+    server.closeAllConnections()
+    await new Promise(resolve => server.close(resolve))
+    if (previousCache === undefined) delete process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+    else process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = previousCache
+  }
+})
+
+test('Mistral usage reads the billing budget through the shared cache', async () => {
+  const key = randomUUID()
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers.authorization)
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      vibe_budget: { usage_percentage: 0.000132, reset_at: '2026-12-01T00:00:00Z' },
+      api_budget: { usage_percentage: 0.008607, reset_at: '2026-12-01T00:00:00Z' },
+    }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const previousCache = process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR
+  process.env.MODEL_GATEWAY_QUOTA_CACHE_DIR = freshQuotaCacheDir()
+  try {
+    const url = `http://127.0.0.1:${server.address().port}`
+    const credentials = { key, number: 1, lastServed: null }
+    const first = await readMistralUsage(credentials, url)
+    assert.equal(first.windows.V.usedPercent, 0.000132)
+    assert.equal(first.windows.A.usedPercent, 0.008607)
+    assert.equal(first.account, 1)
+    await readMistralUsage(credentials, url)
+    assert.deepEqual(seen, [`Bearer ${key}`])
   } finally {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))

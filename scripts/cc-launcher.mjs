@@ -412,7 +412,7 @@ process.env.CODEX_HOME = resolveCodexHome()
 // Gateway keys: the environment is the source of truth on POSIX.
 // ---------------------------------------------------------------------------
 
-const GATEWAY_KEY_RE = /^(DEEPSEEK_API_KEY|AMD_API_KEY|COMMANDCODE_API_KEY|OPENCODE_API_KEY)(?:[2-9]|[1-9][0-9]+)?$/
+const GATEWAY_KEY_RE = /^(DEEPSEEK_API_KEY|AMD_API_KEY|COMMANDCODE_API_KEY|MISTRAL_VIBE_KEY|MISTRAL_API_KEY|OPENCODE_API_KEY)(?:[2-9]|[1-9][0-9]+)?$/
 
 function loadGatewayEnv() {
   const env = { ...process.env }
