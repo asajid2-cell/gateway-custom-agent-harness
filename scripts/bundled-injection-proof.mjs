@@ -14,20 +14,26 @@
  *      powershell/keysafe.ps1 chain (the regression guard for "bundled
  *      accidentally used the external chain").
  *   D. The launcher propagates exit code 75 (GATEWAY_RELOAD_EXIT_CODE).
+ *   E. The supervisor counts a deliberate reload as a reload, never a crash,
+ *      and resets its restart counter (asserted on its own stderr contract:
+ *      `model-gateway supervisor child-exit ... restart=<n>/<limit>` and
+ *      `model-gateway supervisor reload-keys requested; restarting with a
+ *      fresh <mode> credential chain`).
  *
- * The "gateway" is a stub that writes {present, length, sha256 prefix} for each
- * gateway variable and its own ppid. No key value is ever written or printed.
- *
- * Phase E (supervisor restart-count across a reload) needs the supervisor's own
- * log contract; it is reported as SKIP until that is supplied.
+ * For A-D the "gateway" is a stub that writes {present, length, sha256 prefix}
+ * for each gateway variable and its own ppid. Phase E runs the real supervisor
+ * and model gateway on a free loopback port with MODEL_GATEWAY_* cleared, so it
+ * never touches the live rig. No key value is ever written or printed.
  *
  * Exit codes: 0 all assertions pass, 1 a real failure, 2 the branch does not
  * have the bundled code yet (run it after auth/core merges into this branch).
  */
 
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
+import http from 'node:http'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -36,6 +42,15 @@ const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const VAULT_MODULE = path.join(ROOT, 'scripts', 'keysafe-vault.mjs')
 const LAUNCH_MODULE = path.join(ROOT, 'scripts', 'gateway-keysafe.mjs')
 const LAUNCH_SCRIPT = path.join(ROOT, 'scripts', 'gateway-vault-launch.mjs')
+const SUPERVISOR_SCRIPT = path.join(ROOT, 'scripts', 'gateway-supervisor.mjs')
+const GATEWAY_SCRIPT = path.join(ROOT, 'scripts', 'model-gateway.mjs')
+
+// Supervisor log contract (see gateway-supervisor.mjs). Line-anchored on the
+// stderr pipe the supervisor writes to; the gateway's own lines share it.
+const SUP_PREFIX = 'model-gateway supervisor '
+const RELOAD_LINE = /^model-gateway supervisor reload-keys requested; restarting with a fresh (\S+) credential chain$/m
+const CHILD_EXIT_LINE = /^model-gateway supervisor child-exit code=(\S+) signal=(\S+) restart=(\d+)\/(\d+) delay_ms=(\d+)$/gm
+const LIMIT_LINE = /^model-gateway supervisor restart-limit-exhausted/m
 const STALE = 'STALE_SENTINEL_MUST_NOT_SURVIVE'
 const WATCHED = ['DEEPSEEK_API_KEY', 'OPENROUTER_API_KEY', 'AMD_API_KEY', 'COMMANDCODE_API_KEY']
 
@@ -87,6 +102,169 @@ async function waitForFile(file, timeoutMs) {
     await sleep(50)
   }
   return false
+}
+
+async function waitFor(predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      if (await predicate()) return true
+    } catch {}
+    await sleep(100)
+  }
+  console.error(`bundled-injection-proof: timed out waiting for ${label}`)
+  return false
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer()
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address()
+      server.close(() => resolve(port))
+    })
+  })
+}
+
+function httpRequest(method, url) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { method, timeout: 10000 }, response => {
+      let body = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => {
+        body += chunk
+      })
+      response.on('end', () => resolve({ status: response.statusCode, body }))
+    })
+    request.on('timeout', () => request.destroy(new Error('timeout')))
+    request.on('error', reject)
+    request.end()
+  })
+}
+
+function pidListeningOnPort(port) {
+  try {
+    const script =
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue ` +
+      '| Select-Object -First 1 -ExpandProperty OwningProcess'
+    const out = execFileSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8' }).trim()
+    return out ? Number(out) : null
+  } catch {
+    return null
+  }
+}
+
+function killPid(pid, tree = false) {
+  try {
+    execFileSync('taskkill', [...(tree ? ['/T'] : []), '/F', '/PID', String(pid)], { stdio: 'ignore' })
+  } catch {}
+}
+
+function childExitLines(log) {
+  return [...log.matchAll(CHILD_EXIT_LINE)].map(match => ({
+    index: match.index,
+    code: match[1],
+    signal: match[2],
+    restart: Number(match[3]),
+    limit: Number(match[4]),
+    delay: Number(match[5]),
+  }))
+}
+
+/**
+ * Phase E: supervisor restart accounting across a deliberate key reload.
+ * Sequence: healthy start -> crash the child (restart=1) -> POST reload ->
+ * crash again (restart must be 1, not 2). Line-anchored on the supervisor's
+ * own stderr contract; no prose heuristics.
+ */
+async function reloadPhase(env) {
+  if (!existsSync(SUPERVISOR_SCRIPT) || !existsSync(GATEWAY_SCRIPT)) {
+    record('supervisor reload accounting', 'SKIP', 'supervisor/model-gateway not present in this tree')
+    return
+  }
+  const port = await freePort()
+  const supEnv = { ...env }
+  // Hermetic: never inherit the live rig's gateway configuration.
+  for (const name of Object.keys(supEnv)) {
+    if (/^MODEL_GATEWAY_(?!SUPERVISOR_)/.test(name)) delete supEnv[name]
+  }
+  supEnv.MODEL_GATEWAY_SUPERVISOR_RESTART_BASE_MS = '100'
+  supEnv.MODEL_GATEWAY_SUPERVISOR_RESTART_MAX_MS = '200'
+  supEnv.MODEL_GATEWAY_SUPERVISOR_MAX_RESTARTS = '0'
+
+  let log = ''
+  const supervisor = spawn(process.execPath, [SUPERVISOR_SCRIPT, '--port', String(port)], {
+    env: supEnv,
+    windowsHide: true,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  supervisor.stderr.setEncoding('utf8')
+  supervisor.stderr.on('data', chunk => {
+    log += chunk
+  })
+
+  const health = () => httpRequest('GET', `http://127.0.0.1:${port}/health`)
+  const healthy = async () => (await health()).status === 200
+
+  try {
+    if (!(await waitFor(healthy, 45000, 'initial /health'))) {
+      record('supervisor payload boots', 'FAIL', `no /health; log=${log.slice(-300)}`)
+      return
+    }
+    record('supervisor payload boots', 'PASS', `bundled chain, /health 200 on port ${port}`)
+    record('clean start has no crash line', childExitLines(log).length === 0 ? 'PASS' : 'FAIL',
+      `child-exit lines=${childExitLines(log).length}`)
+
+    const crash = async label => {
+      const pid = pidListeningOnPort(port)
+      if (!pid) return null
+      killPid(pid)
+      await waitFor(() => pidListeningOnPort(port) && pidListeningOnPort(port) !== pid, 20000, `${label} restart`)
+      return pid
+    }
+
+    // One deliberate crash before the reload, so the reset is meaningful.
+    await crash('pre-reload')
+    if (!(await waitFor(() => childExitLines(log).length >= 1, 20000, 'first child-exit line'))) {
+      record('pre-reload crash counted', 'FAIL', `log=${log.slice(-300)}`)
+    } else {
+      const first = childExitLines(log)[0]
+      record('pre-reload crash counted', first.restart === 1 ? 'PASS' : 'FAIL',
+        `child-exit code=${first.code} signal=${first.signal} restart=${first.restart}/${first.limit}`)
+    }
+    await waitFor(healthy, 45000, '/health after first restart')
+
+    const beforeReload = log.length
+    const response = await httpRequest('POST', `http://127.0.0.1:${port}/gateway/reload-keys`)
+    record('reload route answers 200', response.status === 200 ? 'PASS' : 'FAIL',
+      `HTTP ${response.status} ${String(response.body).slice(0, 80)}`)
+
+    const reloadSeen = await waitFor(() => RELOAD_LINE.test(log), 25000, 'reload line')
+    const reloadMatch = log.match(RELOAD_LINE)
+    record('reload line names the bundled chain', reloadSeen && reloadMatch?.[1] === 'bundled' ? 'PASS' : 'FAIL',
+      reloadSeen ? reloadMatch[0] : `no reload line; log=${log.slice(beforeReload).slice(-300)}`)
+
+    const reloadIndex = reloadSeen ? log.search(RELOAD_LINE) : -1
+    const tail = reloadIndex >= 0 ? log.slice(reloadIndex) : ''
+    record('reload does not log a crash', tail && !/^model-gateway supervisor child-exit /m.test(tail) ? 'PASS' : 'FAIL',
+      `child-exit lines after reload=${(tail.match(/^model-gateway supervisor child-exit /gm) ?? []).length}`)
+    record('reload never exhausts the restart limit', !LIMIT_LINE.test(log) ? 'PASS' : 'FAIL',
+      `restart-limit-exhausted lines=${(log.match(/^model-gateway supervisor restart-limit-exhausted /gm) ?? []).length}`)
+
+    await waitFor(healthy, 45000, '/health after reload')
+    await crash('post-reload')
+    const exits = childExitLines(log)
+    const afterReload = exits[exits.length - 1]
+    record('restart counter reset by reload',
+      exits.length >= 2 && afterReload && afterReload.restart === 1 ? 'PASS' : 'FAIL',
+      afterReload ? `post-reload crash restart=${afterReload.restart}/${afterReload.limit} (expected 1)` :
+        'no second child-exit line')
+  } finally {
+    killPid(supervisor.pid, true)
+    await sleep(300)
+    killPid(supervisor.pid, true)
+  }
 }
 
 async function main() {
@@ -224,8 +402,7 @@ async function main() {
     record('reload exit code propagates', code === 75 ? 'PASS' : 'FAIL',
       `launcher exit=${code} (expected 75)`)
 
-    record('supervisor restart count across a reload', 'SKIP',
-      'needs the supervisor log contract; supply the runbook for phase E')
+    await reloadPhase(env)
   } finally {
     try {
       if (launcher && launcher.exitCode === null) launcher.kill()
