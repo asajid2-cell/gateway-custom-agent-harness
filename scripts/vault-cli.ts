@@ -4,7 +4,7 @@
  *
  *   bun scripts/vault-cli.ts verify --vault <path> [--family <id>]
  *   bun scripts/vault-cli.ts repair --vault <path> --family <id>
- *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g>
+ *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
@@ -93,20 +93,27 @@ async function main(): Promise<number> {
 
   if (command === 'admit') {
     // Imports and the first activation need a generation before a writer will
-    // accept anything; this is the same admission the activation gate writes.
+    // accept anything. An import fence is a different kind: it sets the active
+    // generation but is not an activation and must say why it exists.
     const familyId = required(args, 'family')
     const generation = required(args, 'generation')
+    const kind = args.import === true || args.kind === 'import_admission' ? 'import_admission' : 'admission'
+    const reason = typeof args.reason === 'string' ? args.reason : ''
+    if (kind === 'import_admission' && reason.trim() === '') {
+      throw new Error('--reason is required for an import admission')
+    }
     const existing = await activeGeneration(vaultRoot, familyId)
     if (existing === generation) {
-      print({ ok: true, family_id: familyId, generation, already: true })
+      print({ ok: true, family_id: familyId, generation, kind, already: true })
       return 0
     }
     await admitGeneration(vaultRoot, familyId, {
-      kind: 'admission',
+      kind,
       generation_id: generation,
+      ...(kind === 'import_admission' ? { reason } : {}),
       actor: typeof args.actor === 'string' ? args.actor : 'vault-cli',
     })
-    print({ ok: true, family_id: familyId, generation, already: false })
+    print({ ok: true, family_id: familyId, generation, kind, already: false })
     return 0
   }
 

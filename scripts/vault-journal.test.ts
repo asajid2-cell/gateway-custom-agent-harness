@@ -158,6 +158,57 @@ test('concurrent appends in one process keep the sequence contiguous', async () 
   }
 })
 
+test('an import admission sets the active generation, carries a reason, and is not an activation', async () => {
+  const root = await scratch()
+  try {
+    await admitGeneration(root, FAMILY, {
+      kind: 'import_admission',
+      generation_id: 'import-1',
+      reason: 'legacy ledger import, 15 files',
+      actor: 'sndo',
+    })
+    assert.equal(await activeGeneration(root, FAMILY), 'import-1')
+    const line = JSON.parse(
+      (await readFile(path.join(root, 'families', FAMILY, 'rotation.jsonl'), 'utf8')).trim(),
+    )
+    assert.equal(line.kind, 'import_admission')
+    assert.equal(line.family_id, FAMILY)
+    assert.equal(line.reason, 'legacy ledger import, 15 files')
+    assert.equal('invocation_id' in line, false)
+
+    // The generation it set accepts commits, exactly like an admission.
+    const committed = await appendEvents(root, FAMILY, [
+      { event_id: 'imported-1', generation_id: 'import-1', kind: 'finding', body: 'x' },
+    ])
+    assert.equal(committed.committed.length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an import admission without a reason, or with an invocation id, is refused', async () => {
+  const root = await scratch()
+  try {
+    await assert.rejects(
+      () => admitGeneration(root, FAMILY, { kind: 'import_admission', generation_id: 'i', reason: '' }),
+      /must carry a reason/,
+    )
+    await assert.rejects(
+      () =>
+        admitGeneration(root, FAMILY, {
+          kind: 'import_admission',
+          generation_id: 'i',
+          reason: 'x',
+          invocation_id: 'uuid',
+        }),
+      /must not carry an invocation id/,
+    )
+    assert.equal(await activeGeneration(root, FAMILY), null)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a proposal that carries content_hash is refused', async () => {
   const root = await seeded()
   try {

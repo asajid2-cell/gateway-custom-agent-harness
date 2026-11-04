@@ -342,6 +342,8 @@ export async function replayFrom(
  * means no generation has been admitted yet, and nothing may be committed
  * until one is - a missing generation is not a default, it is a refusal.
  */
+export type AdmissionKind = 'admission' | 'rotation' | 'import_admission'
+
 export async function activeGeneration(vaultRoot: string, familyId: string): Promise<string | null> {
   let raw: string
   try {
@@ -359,7 +361,14 @@ export async function activeGeneration(vaultRoot: string, familyId: string): Pro
     } catch {
       continue
     }
-    if (record.kind === 'admission' || record.kind === 'rotation') {
+    // An import fence sets the active generation exactly like an admission, or
+    // imported families could never commit; it is not an activation and never
+    // counts toward rotation.
+    if (
+      record.kind === 'admission' ||
+      record.kind === 'rotation' ||
+      record.kind === 'import_admission'
+    ) {
       if (typeof record.generation_id === 'string') active = record.generation_id
     }
   }
@@ -369,13 +378,23 @@ export async function activeGeneration(vaultRoot: string, familyId: string): Pro
 export async function admitGeneration(
   vaultRoot: string,
   familyId: string,
-  record: Record<string, unknown> & { generation_id: string; kind: 'admission' | 'rotation' },
+  record: Record<string, unknown> & { generation_id: string; kind: AdmissionKind },
 ): Promise<void> {
+  if (record.kind === 'import_admission') {
+    // An unexplained state change is not auditable, and an invocation id would
+    // let a rebuild advance the rotation counter.
+    if (typeof record.reason !== 'string' || record.reason.trim() === '') {
+      throw new Error('an import_admission must carry a reason')
+    }
+    if ('invocation_id' in record || 'invocationId' in record) {
+      throw new Error('an import_admission must not carry an invocation id; it is not an activation')
+    }
+  }
   const dir = dirname(familyRotationPath(vaultRoot, familyId))
   await mkdir(dir, { recursive: true })
   await withVaultLock(dir, async () => {
     const path = familyRotationPath(vaultRoot, familyId)
-    const line = `${JSON.stringify({ ...record, at: new Date().toISOString() })}\n`
+    const line = `${JSON.stringify({ ...record, family_id: familyId, at: new Date().toISOString() })}\n`
     let needsNewline = false
     try {
       const existing = await readFile(path, 'utf8')
