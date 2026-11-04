@@ -19,6 +19,11 @@
  *      `model-gateway supervisor child-exit ... restart=<n>/<limit>` and
  *      `model-gateway supervisor reload-keys requested; restarting with a
  *      fresh <mode> credential chain`).
+ *   BONUS. Double Ctrl-C closes a setup dialog and the process actually exits.
+ *      This is NOT part of the auth/core injection proof: the fix under test is
+ *      8507d9e "Exit when the exit keybinding closes a setup dialog", which
+ *      rides along in the merged tree. It is reported separately and SKIPs
+ *      when python/pywinpty is unavailable.
  *
  * For A-D the "gateway" is a stub that writes {present, length, sha256 prefix}
  * for each gateway variable and its own ppid. Phase E runs the real supervisor
@@ -61,15 +66,18 @@ const record = (item, status, evidence) => results.push({ item, status, evidence
 const sha12 = value => createHash('sha256').update(String(value)).digest('hex').slice(0, 12)
 
 function finish(asJson) {
-  const failed = results.filter(result => result.status === 'FAIL').length
+  const count = status => results.filter(result => result.status === status).length
+  const failed = count('FAIL')
+  const passed = count('PASS')
+  const skipped = count('SKIP')
   if (asJson) {
-    console.log(JSON.stringify({ pass: results.length - failed, fail: failed, results }, null, 2))
+    console.log(JSON.stringify({ pass: passed, fail: failed, skip: skipped, results }, null, 2))
   } else {
     const width = Math.max(...results.map(result => result.item.length), 8)
     for (const result of results) {
       console.log(`${result.item.padEnd(width)} | ${result.status.padEnd(6)} | ${result.evidence}`)
     }
-    console.log(`\n${results.length - failed}/${results.length} PASS, ${failed} FAIL`)
+    console.log(`\n${passed} PASS, ${failed} FAIL, ${skipped} SKIP (${results.length} rows)`)
   }
   return failed ? 1 : 0
 }
@@ -175,6 +183,56 @@ function childExitLines(log) {
 }
 
 /**
+ * BONUS: drive the real TUI through ConPTY and surface the double-Ctrl-C row.
+ * Delegates to scripts/tui-conpty-smoke.py because a PTY needs pywinpty; the
+ * row is labelled BONUS and cites 8507d9e, not auth/core.
+ */
+function ctrlCBonusPhase() {
+  const label = 'BONUS double Ctrl-C exits (8507d9e)'
+  const harness = path.join(ROOT, 'scripts', 'tui-conpty-smoke.py')
+  const built = path.join(ROOT, 'dist', 'cli.js')
+  if (!existsSync(harness) || !existsSync(built)) {
+    record(label, 'SKIP', `missing ${!existsSync(harness) ? 'tui-conpty-smoke.py' : 'dist/cli.js'}`)
+    return
+  }
+  let stdout = ''
+  try {
+    stdout = execFileSync('python', [harness, '--json'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      timeout: 300000,
+      windowsHide: true,
+      maxBuffer: 8 * 1024 * 1024,
+    })
+  } catch (error) {
+    // A non-zero exit still carries the JSON matrix for a genuine failure; only
+    // an absent payload means the harness could not run at all.
+    stdout = (error.stdout ?? '').toString()
+    if (!stdout.includes('{')) {
+      const stderr = String(error.stderr ?? '').trim().split('\n').slice(-2).join(' ')
+      record(label, 'SKIP', `harness unavailable: ${stderr || String(error.message).slice(0, 140)}`)
+      return
+    }
+  }
+  let parsed = null
+  try {
+    parsed = JSON.parse(stdout.slice(stdout.indexOf('{')))
+  } catch {
+    record(label, 'FAIL', 'harness output was not valid JSON')
+    return
+  }
+  const rows = Array.isArray(parsed.results) ? parsed.results : []
+  const row = name => rows.find(entry => entry.item === name)
+  const exitRow = row('Ctrl-C twice exits')
+  const pendingRow = row('Ctrl-C once asks for confirmation')
+  const modesRow = row('terminal modes restored')
+  record(label, exitRow?.status === 'PASS' ? 'PASS' : 'FAIL',
+    `${exitRow?.evidence ?? 'row missing'}; ` +
+    `pending=${pendingRow?.status ?? 'n/a'} modes=${modesRow?.status ?? 'n/a'}; ` +
+    'fix under test 8507d9e (not auth/core)')
+}
+
+/**
  * Phase E: supervisor restart accounting across a deliberate key reload.
  * Sequence: healthy start -> crash the child (restart=1) -> POST reload ->
  * crash again (restart must be 1, not 2). Line-anchored on the supervisor's
@@ -219,11 +277,17 @@ async function reloadPhase(env, { vault, vaultDir } = {}) {
       `child-exit lines=${childExitLines(log).length}`)
 
     const crash = async label => {
+      const exitsBefore = childExitLines(log).length
       const pid = pidListeningOnPort(port)
-      if (!pid) return null
+      if (!pid) return { label, pid: null, exitsBefore, counted: false }
       killPid(pid)
-      await waitFor(() => pidListeningOnPort(port) && pidListeningOnPort(port) !== pid, 20000, `${label} restart`)
-      return pid
+      const counted = await waitFor(() => childExitLines(log).length > exitsBefore, 20000,
+        `${label} child-exit line`)
+      await waitFor(() => {
+        const current = pidListeningOnPort(port)
+        return current && current !== pid
+      }, 20000, `${label} respawn`)
+      return { label, pid, exitsBefore, counted }
     }
 
     // Slot 1 of opencode lives in the vault for the whole run; slot 2 is saved
@@ -233,12 +297,20 @@ async function reloadPhase(env, { vault, vaultDir } = {}) {
 
     const reload = async label => {
       const before = log.length
+      const pidBefore = pidListeningOnPort(port)
       const response = await httpRequest('POST', `http://127.0.0.1:${port}/gateway/reload-keys`)
       let body = null
       try {
         body = JSON.parse(response.body)
       } catch {}
       await waitFor(() => log.slice(before).match(RELOAD_LINE), 25000, `${label} reload line`)
+      // The old process answers /health until it exits a few ms after the 200,
+      // so wait for the listener pid to change before trusting health or
+      // crashing the child.
+      await waitFor(() => {
+        const current = pidListeningOnPort(port)
+        return current && current !== pidBefore
+      }, 25000, `${label} respawned gateway pid`)
       return { status: response.status, body, segment: log.slice(before) }
     }
 
@@ -309,13 +381,15 @@ async function reloadPhase(env, { vault, vaultDir } = {}) {
       `restart-limit-exhausted lines=${(log.match(/^model-gateway supervisor restart-limit-exhausted /gm) ?? []).length}`)
 
     await waitFor(healthy, 45000, '/health after second reload')
-    await crash('post-reload')
+    const postCrash = await crash('post-reload')
     const exits = childExitLines(log)
     const afterReload = exits[exits.length - 1]
     record('restart counter reset by reload',
       exits.length >= 2 && afterReload && afterReload.restart === 1 ? 'PASS' : 'FAIL',
-      afterReload ? `post-reload crash restart=${afterReload.restart}/${afterReload.limit} (expected 1)` :
-        'no second child-exit line')
+      afterReload
+        ? `post-reload kill pid=${postCrash.pid ?? 'none'} counted=${postCrash.counted} ` +
+          `restart=${afterReload.restart}/${afterReload.limit} (expected 1), exits=${exits.length}`
+        : 'no second child-exit line')
   } finally {
     killPid(supervisor.pid, true)
     await sleep(300)
@@ -327,6 +401,14 @@ async function main() {
   const argv = process.argv.slice(2)
   const asJson = argv.includes('--json')
   const keep = argv.includes('--keep')
+
+  // The Ctrl-C row has nothing to do with the vault, and it is the one phase
+  // that needs `node_modules` present (the artifact resolves npm packages at
+  // runtime). Let it run on its own.
+  if (argv.includes('--bonus-only')) {
+    ctrlCBonusPhase()
+    return finish(asJson)
+  }
 
   for (const [label, file] of [
     ['bundled vault module', VAULT_MODULE],
@@ -459,6 +541,7 @@ async function main() {
       `launcher exit=${code} (expected 75)`)
 
     await reloadPhase(env, { vault, vaultDir })
+    ctrlCBonusPhase()
   } finally {
     try {
       if (launcher && launcher.exitCode === null) launcher.kill()
