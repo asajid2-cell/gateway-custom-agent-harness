@@ -753,8 +753,14 @@ test('a gateway that dies on a missing keysafe record names that record', { skip
     await writeFile(path.join(root, 'src', 'input.ts'), 'export {}')
     await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'bun scripts/build.ts' } }))
     await writeFile(path.join(root, 'dist', 'cli.js'), 'throw new Error("the harness must not start")')
+    // The wrapper is only used when at least one record exists, so give the
+    // home a vault with a real record for the stub to choke on.
+    const injectLog = path.join(root, 'inject.txt')
+    await mkdir(path.join(home, '.keysafe'), { recursive: true })
+    await writeFile(path.join(home, '.keysafe', 'opencode-go.cred'), 'fixture\n')
     await writeFile(path.join(keysafeDir, 'keysafe.ps1'), [
       'param([string]$Action, [string]$Inject, [string]$Command)',
+      `[IO.File]::WriteAllText('${injectLog.replace(/'/g, "''")}', [string]$Inject)`,
       '[Console]::Error.WriteLine("no key named \'ds\' - capture it first")',
       'exit 1',
     ].join('\r\n'))
@@ -774,6 +780,55 @@ test('a gateway that dies on a missing keysafe record names that record', { skip
     // that the code is named rather than rendered as an empty parenthesis.
     assert.match(noise, /exited \(code (?:1|unknown)\)/, noise)
     assert.match(noise, /the 'ds' credential is missing from the legacy keysafe\s+store/, noise)
+    // The absent record must not be requested: only records that exist go into
+    // the run-many spec, so `/login` in a live session is the save path rather
+    // than a precondition for launching.
+    assert.equal((await readFile(injectLog, 'utf8')).trim(), 'opencode-go=OPENCODE_API_KEY')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a vault with no records starts the supervisor without a keysafe child', { skip: process.platform !== 'win32', timeout: 120000 }, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'gateway-empty-vault-'))
+  try {
+    const home = path.join(root, 'home')
+    const keysafeDir = path.join(home, '.claude', 'skills', 'keysafe', 'scripts')
+    const marker = path.join(root, 'keysafe-ran.txt')
+    await mkdir(keysafeDir, { recursive: true })
+    await mkdir(path.join(home, '.keysafe'), { recursive: true })
+    await mkdir(path.join(root, 'scripts'))
+    await mkdir(path.join(root, 'src'))
+    await mkdir(path.join(root, 'dist'))
+    await mkdir(path.join(root, 'tmp'))
+    await copyFile(new URL('./cc.ps1', import.meta.url), path.join(root, 'scripts', 'cc.ps1'))
+    await copyFile(new URL('./owned-gateway-process.ps1', import.meta.url), path.join(root, 'scripts', 'owned-gateway-process.ps1'))
+    await copyFile(new URL('./effort-capabilities.json', import.meta.url), path.join(root, 'scripts', 'effort-capabilities.json'))
+    await writeFile(path.join(root, 'scripts', 'model-gateway.mjs'), 'export {}')
+    await writeFile(path.join(root, 'scripts', 'gateway-supervisor.mjs'), 'export {}')
+    await writeFile(path.join(root, 'scripts', 'build.ts'), 'export {}')
+    await writeFile(path.join(root, 'src', 'input.ts'), 'export {}')
+    await writeFile(path.join(root, 'package.json'), JSON.stringify({ scripts: { build: 'bun scripts/build.ts' } }))
+    await writeFile(path.join(root, 'dist', 'cli.js'), 'throw new Error("the harness must not start")')
+    await writeFile(path.join(keysafeDir, 'keysafe.ps1'), [
+      'param([string]$Action, [string]$Inject, [string]$Command)',
+      `[IO.File]::WriteAllText('${marker.replace(/'/g, "''")}', 'invoked')`,
+      'exit 1',
+    ].join('\r\n'))
+
+    const env = { ...process.env, GATEWAY_CREDENTIALS_MODE: '[REDACTED:GATEWAY_CREDENTIALS_MODE]', CC_RAW_ARGS: 'hello',
+      CC_CLAUDE_RUNNER_OVERRIDE: process.execPath, LOCALAPPDATA: root, USERPROFILE: home,
+      TEMP: path.join(root, 'tmp'), TMP: path.join(root, 'tmp') }
+    delete env.CC_CLAUDE_SCRIPT_OVERRIDE
+    delete env.TANDEM_GATEWAY_CODEX_HOME
+
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(root, 'scripts', 'cc.ps1')], {
+      env, encoding: 'utf8', timeout: 60000,
+    })
+    assert.notEqual(result.status, 0)
+    // An empty vault must not be routed through run-many: keysafe rejects an
+    // empty spec, which would turn "no keys yet" into a launch failure.
+    assert.equal(statSync(marker, { throwIfNoEntry: false }), undefined)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

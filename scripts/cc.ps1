@@ -1171,14 +1171,33 @@ try {
     @{ Credential = 'amd-ds';      EnvVar = 'AMD_API_KEY' }
     @{ Credential = 'commandcode'; EnvVar = 'COMMANDCODE_API_KEY' }
   )
-  # DeepSeek is the base layer and is always required.
-  $InjectSpecs = @('ds=DEEPSEEK_API_KEY')
+  # Every provider, DeepSeek included, is injected only when its record exists.
+  # keysafe's run-many is all-or-nothing: asking for one missing name aborts the
+  # whole child, so a hard-coded `ds` turned a single absent record into "no
+  # session at all" even though the gateway serves the other providers and
+  # `/login` in the running session is the path that captures a new key.
+  $InjectSpecs = @()
+  if (Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.keysafe\ds.cred') -PathType Leaf) {
+    $InjectSpecs += 'ds=DEEPSEEK_API_KEY'
+  }
   foreach ($Provider in $OptionalKeyProviders) {
     if (-not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ('.keysafe\' + $Provider.Credential + '.cred')) -PathType Leaf)) {
       continue
     }
     $InjectSpecs += ($Provider.Credential + '=' + $Provider.EnvVar)
   }
+  if ($InjectSpecs.Count -eq 0) {
+    # Nothing to inject: start the supervisor plainly, exactly as bundled mode
+    # does. It resolves the vault itself on every restart and reload, so a key
+    # captured by /login reaches the gateway without relaunching cc.
+    $GatewayArgumentList = @(
+      '-NoProfile'
+      '-ExecutionPolicy'
+      'Bypass'
+      '-Command'
+      $GatewayCommand
+    )
+  } else {
   $GatewayArgumentList = @(
     '-NoProfile'
     '-ExecutionPolicy'
@@ -1191,6 +1210,7 @@ try {
     '-Command'
     $GatewayCommand
   )
+  }
   }
 
   # Start-Process serializes ArgumentList items into a native command line.
@@ -1278,7 +1298,7 @@ try {
           }
         } catch {}
         if ($missingCredential) {
-          throw "Model gateway backend exited (code $codeText) after ${elapsedMs}ms: the '$missingCredential' credential is missing from the legacy keysafe store. Capture it with /login inside a gateway session or with cc login, then launch again. Safe diagnostics: $DiagnosticPath"
+          throw "Model gateway backend exited (code $codeText) after ${elapsedMs}ms: the '$missingCredential' credential is missing from the legacy keysafe store. Open a gateway session and run /login to capture it, then send again. Safe diagnostics: $DiagnosticPath"
         }
         throw "Model gateway backend exited (code $codeText) after ${elapsedMs}ms without becoming healthy. Safe diagnostics: $DiagnosticPath"
       }
