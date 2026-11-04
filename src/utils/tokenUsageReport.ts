@@ -34,6 +34,12 @@ export interface UsageTotals {
   cacheWrite: number
   costUSD: number
   sessions: number
+  /** Responses that carried a measured generation window. */
+  speedRows: number
+  /** Output tokens from those responses only - never all rows. */
+  speedOutput: number
+  /** Total generation milliseconds from those responses. */
+  speedMs: number
 }
 
 export interface UsageGroup {
@@ -97,6 +103,9 @@ function emptyTotals(): UsageTotals {
     cacheWrite: 0,
     costUSD: 0,
     sessions: 0,
+    speedRows: 0,
+    speedOutput: 0,
+    speedMs: 0,
   }
 }
 
@@ -118,6 +127,27 @@ export function addRow(totals: UsageTotals, row: TokenLedgerRow): void {
   totals.cacheRead += row.cacheRead
   totals.cacheWrite += row.cacheWrite
   totals.costUSD += row.costUSD
+  // Throughput is a weighted average over the rows that measured it: summing
+  // tok/s values would let a one-token sample outvote a long answer. Rows with
+  // no generation window (replays, older ledger lines) are left out of both
+  // sides rather than counted as zero.
+  if (
+    typeof row.genMs === 'number' &&
+    Number.isFinite(row.genMs) &&
+    row.genMs > 0 &&
+    row.output > 0
+  ) {
+    totals.speedRows += 1
+    totals.speedOutput += row.output
+    totals.speedMs += row.genMs
+  }
+}
+
+/** The output rate implied by a group's measured rows, or null when none did. */
+export function averageTokPerSecond(totals: UsageTotals): number | null {
+  if (totals.speedMs <= 0 || totals.speedOutput <= 0) return null
+  const rate = totals.speedOutput / (totals.speedMs / 1000)
+  return Number.isFinite(rate) && rate > 0 ? rate : null
 }
 
 export function totalTokens(totals: UsageTotals): number {
@@ -155,6 +185,18 @@ function toLedgerRow(raw: unknown): TokenLedgerRow | null {
       : 0,
     src:
       row.src === 'advisor' || row.src === 'replay' ? row.src : 'response',
+    ...(typeof row.genMs === 'number' && Number.isFinite(row.genMs) && row.genMs > 0
+      ? {
+          ttftMs: num(row.ttftMs),
+          genMs: Math.trunc(row.genMs),
+          totalMs: num(row.totalMs),
+          ...(typeof row.tokPerSec === 'number' &&
+          Number.isFinite(row.tokPerSec) &&
+          row.tokPerSec > 0
+            ? { tokPerSec: row.tokPerSec }
+            : {}),
+        }
+      : {}),
   }
 }
 

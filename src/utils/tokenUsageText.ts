@@ -1,5 +1,6 @@
 import { tokenLedgerDirectory } from './tokenLedger.js'
 import {
+  averageTokPerSecond,
   buildUsageReport,
   cachedShare,
   totalTokens,
@@ -137,6 +138,10 @@ function tokens(value: number): string {
   return String(value)
 }
 
+function rate(value: number): string {
+  return (Math.round(value * 10) / 10).toFixed(1)
+}
+
 function money(value: number): string {
   return value > 0 ? `$${value.toFixed(4)}` : '—'
 }
@@ -189,7 +194,10 @@ function barSection(
       value: totalTokens(group.totals),
       detail:
         `${tokens(totalTokens(group.totals))} · ${share(cachedShare(group.totals))} cached` +
-        ` · ${num(group.totals.requests)} req · ${money(group.totals.costUSD)}`,
+        ` · ${num(group.totals.requests)} req · ${money(group.totals.costUSD)}` +
+        (averageTokPerSecond(group.totals) === null
+          ? ''
+          : ` · ${rate(averageTokPerSecond(group.totals)!)} tok/s`),
     })),
     Math.max(40, width),
     { labelWidth },
@@ -263,6 +271,12 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
   lines.push(`TOTAL`)
   lines.push(TABLE_HEADER)
   lines.push(tableRow(report.totals))
+  const averageSpeed = averageTokPerSecond(report.totals)
+  if (averageSpeed !== null) {
+    lines.push(
+      `  speed ${rate(averageSpeed)} tok/s over ${num(report.totals.speedRows)} measured response(s)`,
+    )
+  }
   if (report.totals.requests === 0) {
     lines.push('')
     lines.push('No usage recorded in this window.')
@@ -308,7 +322,9 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
   lines.push('')
   lines.push(
     'input, output, cache read and cache write are the four figures the provider reported and\n' +
-      'do not overlap. "cached" is the share of the total spent re-reading cache.',
+      'do not overlap. "cached" is the share of the total spent re-reading cache. "tok/s" is\n' +
+      'output tokens over the time between the first and last streamed token, weighted across\n' +
+      'the responses that measured it.',
   )
   return `${lines.join('\n')}\n`
 }
