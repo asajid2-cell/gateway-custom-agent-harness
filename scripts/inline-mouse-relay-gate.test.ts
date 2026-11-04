@@ -102,6 +102,16 @@ const savedEnv = {
 const savedStdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')
 const savedStdinTTY = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
 
+// Put back what was found, or remove the own property this file created. An
+// own non-writable `isTTY` left behind is a cross-file hazard: bun runs test
+// files in one process, so a later file's plain `stdin.isTTY = true` throws in
+// strict mode. The saved descriptor is usually undefined on Linux (no own
+// property), which is why the old `if (saved) define(...)` never cleaned up.
+function restoreTTY(target: object, name: string, saved: PropertyDescriptor | undefined): void {
+  if (saved) Object.defineProperty(target, name, saved)
+  else delete (target as Record<string, unknown>)[name]
+}
+
 function enableLocalInlineSession(): void {
   setIsInteractive(true)
   process.env.CLAUDE_CODE_USE_GATEWAY = '1'
@@ -110,11 +120,21 @@ function enableLocalInlineSession(): void {
   delete process.env.CLAUDE_CODE_DISABLE_MOUSE_CLICKS
   delete process.env.TMUX
   delete process.env.TERM_PROGRAM
-  Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true })
-  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true })
+  // Writable as well as configurable: even mid-suite, another file's plain
+  // assignment must not throw.
+  Object.defineProperty(process.stdout, 'isTTY', { value: true, configurable: true, writable: true })
+  Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true, writable: true })
 }
 
 beforeEach(() => {
+  // Fail loudly if any earlier test (here or in another file) left a
+  // non-writable own isTTY behind - that is the leak, not a state we tolerate.
+  for (const [label, stream] of [['stdout', process.stdout], ['stdin', process.stdin]] as const) {
+    const own = Object.getOwnPropertyDescriptor(stream, 'isTTY')
+    if (own && own.writable === false) {
+      throw new Error(`process.${label}.isTTY is a non-writable own property; an earlier test leaked it`)
+    }
+  }
   enableLocalInlineSession()
 })
 
@@ -132,8 +152,21 @@ afterEach(() => {
   else process.env.TMUX = savedEnv.tmux
   if (savedEnv.termProgram === undefined) delete process.env.TERM_PROGRAM
   else process.env.TERM_PROGRAM = savedEnv.termProgram
-  if (savedStdoutTTY) Object.defineProperty(process.stdout, 'isTTY', savedStdoutTTY)
-  if (savedStdinTTY) Object.defineProperty(process.stdin, 'isTTY', savedStdinTTY)
+  restoreTTY(process.stdout, 'isTTY', savedStdoutTTY)
+  restoreTTY(process.stdin, 'isTTY', savedStdinTTY)
+})
+
+test('this suite restores the TTY descriptors it overrides', () => {
+  // The in-file proof for the teardown: take the descriptors as they are, arm
+  // the session, restore, and require the exact descriptors back.
+  const beforeStdout = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')
+  const beforeStdin = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')
+  enableLocalInlineSession()
+  expect(Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')?.value).toBe(true)
+  restoreTTY(process.stdout, 'isTTY', savedStdoutTTY)
+  restoreTTY(process.stdin, 'isTTY', savedStdinTTY)
+  expect(Object.getOwnPropertyDescriptor(process.stdout, 'isTTY')).toEqual(beforeStdout)
+  expect(Object.getOwnPropertyDescriptor(process.stdin, 'isTTY')).toEqual(beforeStdin)
 })
 
 // ---------------------------------------------------------------------------

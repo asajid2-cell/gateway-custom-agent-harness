@@ -1,22 +1,30 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import os, { tmpdir } from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+import test, { after } from 'node:test'
+import { mock } from 'bun:test'
 
 // The picker's `e` writes a per-model default effort to this file and cc.ps1
 // reads it back, so the launcher and the harness agree on what `auto` resolves
 // to. Each test loads a fresh module instance against a temp home so the
 // in-session pin map never leaks between cases.
+//
+// The module reaches its file through os.homedir(). bun 1.4.4 on Linux reads
+// the passwd entry and ignores $HOME (node honours it), so a temp HOME cannot
+// redirect that lookup. Steer it at the seam the module actually uses: mock
+// node:os and delegate to the real module except for homedir.
+let activeHome
+mock.module('node:os', () => ({ ...os, homedir: () => activeHome ?? os.homedir() }))
+after(() => {
+  // Leave the process as we found it for any file that runs after this one.
+  mock.module('node:os', () => os)
+})
+
 async function withHome(run, snapshot) {
   const home = await mkdtemp(path.join(tmpdir(), 'gateway-effort-defaults-'))
-  const previous = {
-    USERPROFILE: process.env.USERPROFILE,
-    HOME: process.env.HOME,
-    defaults: process.env.MODEL_GATEWAY_EFFORT_DEFAULTS,
-  }
-  process.env.USERPROFILE = home
-  process.env.HOME = home
+  const previousDefaults = process.env.MODEL_GATEWAY_EFFORT_DEFAULTS
+  activeHome = home
   if (snapshot === undefined) delete process.env.MODEL_GATEWAY_EFFORT_DEFAULTS
   else process.env.MODEL_GATEWAY_EFFORT_DEFAULTS = snapshot
   try {
@@ -25,14 +33,9 @@ async function withHome(run, snapshot) {
     )
     await run(module, home)
   } finally {
-    for (const [key, value] of Object.entries({
-      USERPROFILE: previous.USERPROFILE,
-      HOME: previous.HOME,
-      MODEL_GATEWAY_EFFORT_DEFAULTS: previous.defaults,
-    })) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
+    if (previousDefaults === undefined) delete process.env.MODEL_GATEWAY_EFFORT_DEFAULTS
+    else process.env.MODEL_GATEWAY_EFFORT_DEFAULTS = previousDefaults
+    activeHome = undefined
     await rm(home, { recursive: true, force: true })
   }
 }
