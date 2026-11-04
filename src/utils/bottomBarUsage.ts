@@ -56,14 +56,16 @@ export const QUOTA_CYCLE: Record<ProviderName, QuotaWindowKind[]> = {
 }
 
 /**
- * The window's name in the readout. `H`/`W`/`M` are the compact hour, week and
- * month windows the existing providers print; `V`/`A` name Mistral's two
- * budgets so neither is mistaken for a time window.
+ * The window's name in the readout, and the only word a click changes. The
+ * provider is deliberately absent: the selected model already names it, and
+ * printing it a second time in this control cost columns in a row that is
+ * always tight. `V`/`A` name Mistral's two budgets so neither is mistaken for
+ * a time window.
  */
 export const QUOTA_WINDOW_LABEL: Record<QuotaWindowKind, string> = {
-  H: 'H',
-  W: 'W',
-  M: 'M',
+  H: '5hr',
+  W: 'weekly',
+  M: 'monthly',
   V: 'vibe',
   A: 'api',
 }
@@ -206,14 +208,17 @@ export function formatSessionResumeCommand(
  * not report prints nothing, and a figure served from a fallback says so.
  */
 export function formatProviderQuota(
-  provider: ProviderName,
+  // Kept in the signature so callers keep their provider context (and can
+  // change which provider is shown without touching this function), but the
+  // label no longer repeats it.
+  _provider: ProviderName,
   quota: ProviderQuota,
   kind: QuotaWindowKind,
 ): string | null {
   const window = quota.windows[kind]
   if (!window) return null
   const remaining = Math.round(Math.max(0, Math.min(100, 100 - window.usedPercent)))
-  return `${provider} ${QUOTA_WINDOW_LABEL[kind]} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
+  return `${QUOTA_WINDOW_LABEL[kind]} remaining ${remaining}%${quota.stale ? ' (stale)' : ''}`
 }
 
 export function formatBottomBarUsage(

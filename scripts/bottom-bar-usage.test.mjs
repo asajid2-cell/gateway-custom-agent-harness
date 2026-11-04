@@ -72,13 +72,13 @@ test('a click steps to the next reported window and wraps', () => {
   assert.equal(nextQuotaKind('Codex', codex, 'M'), 'W')
 })
 
-test('a quota window prints the provider, the window and what is left', () => {
+test('a quota window prints the window and what is left, never the provider', () => {
   const codex = quota({
     H: { usedPercent: 0, resetsAt: null },
     W: { usedPercent: 23, resetsAt: null },
   })
-  assert.equal(formatProviderQuota('Codex', codex, 'W'), 'Codex W remaining 77%')
-  assert.equal(formatProviderQuota('Codex', codex, 'H'), 'Codex H remaining 100%')
+  assert.equal(formatProviderQuota('Codex', codex, 'W'), 'weekly remaining 77%')
+  assert.equal(formatProviderQuota('Codex', codex, 'H'), '5hr remaining 100%')
   // A window the provider did not report prints nothing rather than a zero.
   assert.equal(formatProviderQuota('Codex', codex, 'M'), null)
 })
@@ -90,15 +90,15 @@ test('a stale figure says so and a wild used percent is clamped', () => {
       quota({ M: { usedPercent: 100, resetsAt: null } }, { stale: true }),
       'M',
     ),
-    'OpenCode M remaining 0% (stale)',
+    'monthly remaining 0% (stale)',
   )
   assert.equal(
     formatProviderQuota('Anthropic', quota({ H: { usedPercent: 140, resetsAt: null } }), 'H'),
-    'Anthropic H remaining 0%',
+    '5hr remaining 0%',
   )
   assert.equal(
     formatProviderQuota('Anthropic', quota({ H: { usedPercent: -20, resetsAt: null } }), 'H'),
-    'Anthropic H remaining 100%',
+    '5hr remaining 100%',
   )
 })
 
@@ -119,8 +119,8 @@ test('OpenCode keeps each normalized window rather than collapsing them', () => 
   assert.deepEqual(parsed.windows.M, { usedPercent: 100, resetsAt: null })
   assert.equal(parsed.asof, 7)
   assert.equal(parsed.account, 3)
-  assert.equal(formatProviderQuota('OpenCode', parsed, 'M'), 'OpenCode M remaining 0%')
-  assert.equal(formatProviderQuota('OpenCode', parsed, 'W'), 'OpenCode W remaining 100%')
+  assert.equal(formatProviderQuota('OpenCode', parsed, 'M'), 'monthly remaining 0%')
+  assert.equal(formatProviderQuota('OpenCode', parsed, 'W'), 'weekly remaining 100%')
   // The legacy usage object is no longer accepted; the gateway owns that mapping.
   assert.equal(openCodeQuotaFromPayload({
     usage: { rolling: { percent: 0 }, weekly: { percent: 0 }, monthly: { percent: 100 } },
@@ -275,7 +275,7 @@ test('Command Code and Mistral keep their own normalized windows', () => {
   })
   assert.deepEqual(commandCode.windows.H, { usedPercent: 25.2, resetsAt: 1_793_828_917_251 })
   assert.equal(commandCode.account, 2)
-  assert.equal(formatProviderQuota('Command Code', commandCode, 'M'), 'Command Code M remaining 20%')
+  assert.equal(formatProviderQuota('Command Code', commandCode, 'M'), 'monthly remaining 20%')
 
   const mistral = mistralQuotaFromPayload({
     windows: {
@@ -285,8 +285,8 @@ test('Command Code and Mistral keep their own normalized windows', () => {
     asof: 9,
   })
   // V/A are named in the readout so neither budget reads as a time window.
-  assert.equal(formatProviderQuota('Mistral', mistral, 'V'), 'Mistral vibe remaining 100%')
-  assert.equal(formatProviderQuota('Mistral', mistral, 'A'), 'Mistral api remaining 100%')
+  assert.equal(formatProviderQuota('Mistral', mistral, 'V'), 'vibe remaining 100%')
+  assert.equal(formatProviderQuota('Mistral', mistral, 'A'), 'api remaining 100%')
   assert.equal(mistralQuotaFromPayload({ windows: {} }), null)
   assert.equal(commandCodeQuotaFromPayload({ windows: {} }), null)
 })
