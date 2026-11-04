@@ -399,7 +399,21 @@ export async function appendEvents(
 ): Promise<AppendResult> {
   const dir = dirname(familyJournalPath(vaultRoot, familyId))
   await mkdir(dir, { recursive: true })
-  return withVaultLock(dir, async () => {
+  return withVaultLock(dir, () => appendEventsLocked(vaultRoot, familyId, proposals, options))
+}
+
+/**
+ * The commit body without the lock, for callers that already hold it. Taking
+ * the lock twice in one process is a deadlock, not a re-entrant lock, so the
+ * submit seam calls this rather than the exported wrapper.
+ */
+export async function appendEventsLocked(
+  vaultRoot: string,
+  familyId: string,
+  proposals: readonly ProposedEvent[],
+  options: { schemaVersion?: number } = {},
+): Promise<AppendResult> {
+  {
     const active = await activeGeneration(vaultRoot, familyId)
     const journal = await readJournalFile(familyJournalPath(vaultRoot, familyId))
     if (journal.tornTail) {
@@ -446,7 +460,10 @@ export async function appendEvents(
       sequence += 1
       const body: Record<string, unknown> = {
         ...proposal,
+        // Writer-owned fields come last so a proposal cannot claim a family or
+        // a position it was not given.
         schema_version: options.schemaVersion ?? 1,
+        family_id: familyId,
         sequence,
       }
       const event = { ...body, content_hash: contentHash(body) } as JournalEvent
@@ -467,5 +484,5 @@ export async function appendEvents(
     }
 
     return { committed, duplicates, rejected, watermark: sequence }
-  })
+  }
 }
