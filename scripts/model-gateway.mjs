@@ -2889,6 +2889,100 @@ async function ensureMistralPreference(sessionId) {
   return sessionMistralCredentials(sessionId)
 }
 
+// Vibe plan keys are a separate credential TYPE from Studio API keys, not a
+// different endpoint, header or model id: Mistral decides which budget a
+// request spends from the key it was authenticated with. Vibe Code budget is
+// consumed before pay-as-you-go, so the route tries a Vibe key first and only
+// falls to the Studio pool when every Vibe slot has failed.
+//
+// A Vibe key that cannot serve answers 401 (ambiguous with an invalid key) or
+// 402 (prepaid credits gone). 401/402/403 are already the pool's credential
+// failures, so the fallback needs no special status handling. A failed Vibe
+// number is remembered for the life of the process: retrying an exhausted
+// monthly budget on every turn would spend a call to learn what the last one
+// already proved.
+export function mistralVibeCredentialPool(env = process.env, overlay = null) {
+  return credentialPool({ env, prefix: 'MISTRAL_VIBE_KEY', overlay })
+}
+
+const mistralVibeCredentials = mistralVibeCredentialPool(process.env, gatewayKeyOverlay)
+const mistralVibeFailed = new Set()
+
+// Studio numbers are reported above the Vibe range so a health bit names the
+// credential that produced it rather than a slot number shared by both pools.
+const MISTRAL_STUDIO_SLOT_OFFSET = 1000
+
+/**
+ * The credential surface the Mistral handler spends: Vibe first, Studio second.
+ *
+ * `vibePool` and `failed` are passed in so the ordering contract can be unit
+ * tested with synthetic keys; the production wrapper below supplies the live
+ * pools. Every getter re-reads the pools, so a key injected into a running
+ * gateway is visible without a restart.
+ */
+export function createMistralRouteCredentials(vibePool, apiPool, failed = new Set()) {
+  let lastServed = null
+  const availableVibe = () => vibePool.numbers.filter(number => !failed.has(number))
+  const selectedVibe = () => availableVibe()[0]
+  return {
+    get key() {
+      const number = selectedVibe()
+      return number === undefined ? apiPool.key : vibePool.keyFor(number)
+    },
+    get size() {
+      return vibePool.size + apiPool.size
+    },
+    get number() {
+      const number = selectedVibe()
+      return number === undefined ? MISTRAL_STUDIO_SLOT_OFFSET + apiPool.number : number
+    },
+    get numbers() {
+      return [
+        ...vibePool.numbers,
+        ...apiPool.numbers.map(number => MISTRAL_STUDIO_SLOT_OFFSET + number),
+      ]
+    },
+    get lastServed() {
+      return lastServed
+    },
+    markServed() {
+      const number = selectedVibe()
+      lastServed = number === undefined ? MISTRAL_STUDIO_SLOT_OFFSET + apiPool.number : number
+      if (number === undefined) apiPool.markServed()
+      else vibePool.markServed()
+    },
+    /**
+     * A credential failure moves off the key that produced it. Within Vibe the
+     * next live key is tried; once none remain the Studio pool rotates
+     * normally, and Vibe is not revisited until the gateway respawns.
+     */
+    advance() {
+      const number = selectedVibe()
+      if (number !== undefined) {
+        failed.add(number)
+        const next = selectedVibe()
+        if (next !== undefined) vibePool.select(next)
+        return
+      }
+      apiPool.advance()
+    },
+    redact(message) {
+      return apiPool.redact(vibePool.redact(message))
+    },
+  }
+}
+
+/**
+ * Vibe plan keys are a separate credential type from Studio API keys; the
+ * route spends the Vibe plan budget first and only falls back to Studio when
+ * every Vibe slot has failed. The Studio pool is per session (its account can
+ * be pinned); the Vibe pool is process-wide because its only selection is
+ * "which key is still alive".
+ */
+export function mistralRouteCredentials(apiPool = mistralCredentials) {
+  return createMistralRouteCredentials(mistralVibeCredentials, apiPool, mistralVibeFailed)
+}
+
 // A key just landed in the overlay: touch the owning pool so the new number is
 // detected and promoted now, rather than on whichever request reads it next.
 function noteGatewayKeyInjected(name) {
@@ -2896,6 +2990,8 @@ function noteGatewayKeyInjected(name) {
     for (const pool of openCodePoolList()) void pool.numbers
   } else if (name.startsWith('COMMANDCODE_API_KEY')) {
     for (const pool of commandCodePoolList()) void pool.numbers
+  } else if (name.startsWith('MISTRAL_VIBE_KEY')) {
+    void mistralVibeCredentials.numbers
   } else if (name.startsWith('MISTRAL_API_KEY')) {
     for (const pool of mistralPoolList()) void pool.numbers
   }
@@ -2922,6 +3018,8 @@ const ROUTE_HEALTH_PROVIDERS = new Map([
   ['command code', 'commandcode'],
   ['commandcode', 'commandcode'],
   ['mistral', 'mistral'],
+  ['mistral vibe', 'mistral-vibe'],
+  ['mistral-vibe', 'mistral-vibe'],
   ['opencode go', 'opencode-go'],
   ['opencode-go', 'opencode-go'],
   ['opencode zen', 'opencode-zen'],
@@ -2992,7 +3090,8 @@ export function resetRouteHealth() {
 /** The credential number a session's pool would select for a provider. */
 async function sessionRouteNumber(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).number
-  if (providerId === 'mistral') return (await sessionMistralCredentials(sessionId)).number
+  if (providerId === 'mistral') return mistralRouteCredentials(await sessionMistralCredentials(sessionId)).number
+  if (providerId === 'mistral-vibe') return mistralVibeCredentials.number
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).number
   return 1
 }
@@ -3010,7 +3109,8 @@ async function sessionRouteNumber(providerId, sessionId) {
  */
 async function providerRouteNumbers(providerId, sessionId) {
   if (providerId === 'commandcode') return (await sessionCommandCodeCredentials(sessionId)).numbers
-  if (providerId === 'mistral') return (await sessionMistralCredentials(sessionId)).numbers
+  if (providerId === 'mistral') return mistralRouteCredentials(await sessionMistralCredentials(sessionId)).numbers
+  if (providerId === 'mistral-vibe') return mistralVibeCredentials.numbers
   if (providerId === 'opencode-go' || providerId === 'opencode-zen') return (await sessionOpenCodeCredentials(sessionId)).numbers
   return [1]
 }
@@ -3049,7 +3149,7 @@ export function fleetRouteHealth(providerId, numbers) {
 
 // Only the numbered pools consult the overlay, so only their variables can be
 // live-injected. A single-key provider (DeepSeek, AMD) would be a silent no-op.
-const POOLED_KEY_PATTERN = /^(?:OPENCODE|COMMANDCODE|MISTRAL)_API_KEY(?:[2-9]|[1-9][0-9]+)?$/
+const POOLED_KEY_PATTERN = /^(?:OPENCODE_API_KEY|COMMANDCODE_API_KEY|MISTRAL_API_KEY|MISTRAL_VIBE_KEY)(?:[2-9]|[1-9][0-9]+)?$/
 
 function isPooledKeyEnvVar(name) {
   return typeof name === 'string' && POOLED_KEY_PATTERN.test(name)
@@ -4227,7 +4327,8 @@ async function handleMistral(body, req, res, modelName, route) {
   const trace = createGatewayTrace({ model: modelName, backend: 'mistral', protocol: route.protocol })
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
-  const credentials = await ensureMistralPreference(sessionId)
+  const apiPool = await ensureMistralPreference(sessionId)
+  const credentials = mistralRouteCredentials(apiPool)
   let apiKey = credentials.key
   if (!apiKey) {
     anthropicError(res, 401, 'Mistral API key is not configured')
@@ -5453,7 +5554,20 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/mistral-account') {
     const pool = await sessionMistralCredentials(requestUrl.searchParams.get('sessionId'))
-    json(res, 200, { number: pool.number, global: mistralGlobalNumber, available: pool.numbers })
+    const vibeAvailable = mistralVibeCredentials.numbers.filter(number => !mistralVibeFailed.has(number))
+    json(res, 200, {
+      number: pool.number,
+      global: mistralGlobalNumber,
+      available: pool.numbers,
+      // Vibe plan keys are a separate credential type and are always tried
+      // before the Studio pool; `active` is the Vibe number a request would
+      // spend now, or null when the plan budget has been marked exhausted.
+      vibe: {
+        active: vibeAvailable[0] ?? null,
+        available: mistralVibeCredentials.numbers,
+        failed: [...mistralVibeFailed],
+      },
+    })
     return
   }
 
@@ -5477,6 +5591,7 @@ const server = http.createServer(async (req, res) => {
       available: pool.numbers,
       commandcodeAvailable: commandCodePool.numbers,
       mistralAvailable: mistralPool.numbers,
+      mistralVibeAvailable: mistralVibeCredentials.numbers,
     }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })
@@ -5521,7 +5636,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && requestUrl.pathname === '/gateway/route-health') {
     const providerId = routeHealthProviderId(requestUrl.searchParams.get('provider'))
     if (!providerId) {
-      json(res, 400, { error: 'Use provider=commandcode|mistral|opencode-go|opencode-zen|deepseek|amd-radeon|anthropic|codex' })
+      json(res, 400, { error: 'Use provider=commandcode|mistral|mistral-vibe|opencode-go|opencode-zen|deepseek|amd-radeon|anthropic|codex' })
       return
     }
     const sessionId = requestUrl.searchParams.get('sessionId')

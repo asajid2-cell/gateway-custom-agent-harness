@@ -30,6 +30,10 @@ function keyLabel(keyName: string): string {
     const suffix = keyName.slice('commandcode'.length)
     return suffix ? `Command Code ${suffix}` : 'Command Code'
   }
+  if (keyName.startsWith('mistral-vibe')) {
+    const suffix = keyName.slice('mistral-vibe'.length)
+    return suffix ? `Mistral Vibe ${suffix}` : 'Mistral Vibe'
+  }
   if (keyName.startsWith('mistral')) {
     const suffix = keyName.slice('mistral'.length)
     return suffix ? `Mistral ${suffix}` : 'Mistral'
@@ -58,9 +62,11 @@ async function storedNames(): Promise<string[]> {
         else {
           const opencode = /^OPENCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const commandcode = /^COMMANDCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          const mistralVibe = /^MISTRAL_VIBE_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const mistral = /^MISTRAL_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           if (opencode) names.push(`opencode-go${opencode[1] ?? ''}`)
           if (commandcode) names.push(`commandcode${commandcode[1] ?? ''}`)
+          if (mistralVibe) names.push(`mistral-vibe${mistralVibe[1] ?? ''}`)
           if (mistral) names.push(`mistral${mistral[1] ?? ''}`)
         }
       }
@@ -187,6 +193,7 @@ function keyCommand(keyName: string): string {
   if (keyName === 'ds') return 'deepseeklogin'
   if (keyName === 'openrouter') return 'openrouterlogin'
   if (keyName.startsWith('commandcode')) return 'commandcodelogin'
+  if (keyName.startsWith('mistral-vibe')) return 'mistralvibelogin'
   if (keyName.startsWith('mistral')) return 'mistrallogin'
   return 'opencodelogin'
 }
@@ -238,7 +245,7 @@ export const call: LocalJSXCommandCall = async (
 
   const accountKeyPrefix = keyName.startsWith('commandcode')
     ? 'commandcode'
-    : keyName.startsWith('mistral')
+    : /^mistral(?:[2-9]|[1-9][0-9]+)?$/.test(keyName)
       ? 'mistral'
       : keyName === 'opencode-go'
         ? 'opencode-go'

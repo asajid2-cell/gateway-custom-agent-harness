@@ -12,7 +12,7 @@ import {
   type CredentialMode,
 } from './keysafe/index.js'
 
-export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode' | 'mistral' | 'openrouter'
+export type GatewayCredentialName = 'opencode-go' | 'ds' | 'commandcode' | 'mistral' | 'mistral-vibe' | 'openrouter'
 
 export type CredentialResult = {
   ok: boolean

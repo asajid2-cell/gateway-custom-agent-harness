@@ -61,6 +61,14 @@ export const mistralLogin = command(
   'mistral',
 )
 
+// Vibe plan keys are a separate Mistral credential type (Code > Vibe CLI) and
+// are spent before Studio API usage.
+export const mistralVibeLogin = command(
+  'mistralvibelogin',
+  'Add, replace, inspect, or remove the Mistral Vibe plan key',
+  'mistral-vibe',
+)
+
 // Compatibility aliases for the original command registry names.
 export const openCodeLoginCommand = openCodeLogin
 export const deepSeekLoginCommand = deepSeekLogin

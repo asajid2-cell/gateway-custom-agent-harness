@@ -48,6 +48,7 @@ export const GATEWAY_KEY_ENV_VARS = [
   'AMD_API_KEY',
   'COMMANDCODE_API_KEY',
   'MISTRAL_API_KEY',
+  'MISTRAL_VIBE_KEY',
   'OPENROUTER_API_KEY',
 ]
 
@@ -55,7 +56,8 @@ export function isGatewayKeyEnvVar(name) {
   return GATEWAY_KEY_ENV_VARS.includes(name) ||
     /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
     /^COMMANDCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
-    /^MISTRAL_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
+    /^MISTRAL_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
+    /^MISTRAL_VIBE_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
 }
 
 function openCodeNumber(name) {
@@ -98,6 +100,11 @@ export function listKeysafeProviders(home = keysafeHome()) {
     .filter(name => /^commandcode([2-9]|[1-9][0-9]+)?$/.test(name))
     .sort((a, b) => commandCodeNumber(a) - commandCodeNumber(b))) {
     providers.push({ credential: name, envVar: `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}` })
+  }
+  for (const name of [...names]
+    .filter(name => /^mistral-vibe([2-9]|[1-9][0-9]+)?$/.test(name))
+    .sort((a, b) => mistralNumber(a.replace('mistral-vibe', 'mistral')) - mistralNumber(b.replace('mistral-vibe', 'mistral')))) {
+    providers.push({ credential: name, envVar: `MISTRAL_VIBE_KEY${name.slice('mistral-vibe'.length)}` })
   }
   for (const name of [...names]
     .filter(name => /^mistral([2-9]|[1-9][0-9]+)?$/.test(name))

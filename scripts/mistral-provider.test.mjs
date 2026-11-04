@@ -14,7 +14,11 @@ import {
   GATEWAY_MODEL_OPTIONS,
 } from './effort-capabilities.mjs'
 import { relayOpenCodeChatResponse } from './opencode-go.mjs'
-import { mistralCredentialPool } from './model-gateway.mjs'
+import {
+  createMistralRouteCredentials,
+  mistralCredentialPool,
+  mistralVibeCredentialPool,
+} from './model-gateway.mjs'
 import { envVarForRecord } from './keysafe-vault.mjs'
 import { listKeysafeProviders } from './gateway-keysafe.mjs'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
@@ -139,17 +143,79 @@ test('Mistral records map to numbered environment slots', () => {
   assert.equal(envVarForRecord('mistral2'), 'MISTRAL_API_KEY2')
   assert.equal(envVarForRecord('mistral9'), 'MISTRAL_API_KEY9')
   assert.equal(envVarForRecord('mistral1'), null)
+  // Vibe plan keys are a separate credential type, not a Mistral API slot.
+  assert.equal(envVarForRecord('mistral-vibe'), 'MISTRAL_VIBE_KEY')
+  assert.equal(envVarForRecord('mistral-vibe3'), 'MISTRAL_VIBE_KEY3')
+  assert.equal(envVarForRecord('mistral-vibe1'), null)
+})
+
+test('Vibe keys are spent before Studio keys and never revisited after failure', () => {
+  const vibe = mistralVibeCredentialPool({
+    MISTRAL_VIBE_KEY: 'vibe-one',
+    MISTRAL_VIBE_KEY2: 'vibe-two',
+  })
+  const api = mistralCredentialPool({
+    MISTRAL_API_KEY: 'api-one',
+    MISTRAL_API_KEY2: 'api-two',
+  })
+  const failed = new Set()
+  const credentials = createMistralRouteCredentials(vibe, api, failed)
+
+  assert.equal(credentials.key, 'vibe-one')
+  assert.equal(credentials.number, 1)
+  assert.deepEqual(credentials.numbers, [1, 2, 1001, 1002])
+
+  credentials.advance()
+  assert.deepEqual([...failed], [1])
+  assert.equal(credentials.key, 'vibe-two')
+  credentials.markServed()
+  assert.equal(credentials.lastServed, 2)
+
+  // The second Vibe key fails too: the Studio pool takes over and its numbers
+  // sit above the Vibe range so health cannot confuse the two.
+  credentials.advance()
+  assert.equal(credentials.key, 'api-one')
+  assert.equal(credentials.number, 1001)
+  credentials.markServed()
+  assert.equal(credentials.lastServed, 1001)
+
+  credentials.advance()
+  assert.equal(credentials.key, 'api-two')
+  // No wrap back to Vibe: an exhausted plan budget is not retried every turn.
+  assert.equal(failed.has(1), true)
+  assert.equal(failed.has(2), true)
+})
+
+test('without a Vibe key the route is the Studio pool alone', () => {
+  const vibe = mistralVibeCredentialPool({})
+  const api = mistralCredentialPool({ MISTRAL_API_KEY: 'api-one' })
+  const credentials = createMistralRouteCredentials(vibe, api)
+  assert.equal(credentials.size, 1)
+  assert.equal(credentials.key, 'api-one')
+  assert.equal(credentials.number, 1001)
+  assert.deepEqual(credentials.numbers, [1001])
 })
 
 test('the keysafe chain injects every Mistral record', async () => {
   const home = await mkdtemp(join(tmpdir(), 'mistral-keysafe-'))
   const vault = join(home, '.keysafe')
   await mkdir(vault)
-  for (const name of ['mistral.cred', 'mistral2.cred', 'mistral3.cred', 'ds.cred']) {
+  for (const name of [
+    'mistral-vibe.cred',
+    'mistral-vibe2.cred',
+    'mistral.cred',
+    'mistral2.cred',
+    'mistral3.cred',
+    'ds.cred',
+  ]) {
     await writeFile(join(vault, name), '')
   }
   const providers = listKeysafeProviders(home).filter(entry => entry.envVar.startsWith('MISTRAL'))
+  // Vibe records are injected before Studio records; the gateway's pool order
+  // is independent of this list, but keeping it stable makes the chain readable.
   assert.deepEqual(providers, [
+    { credential: 'mistral-vibe', envVar: 'MISTRAL_VIBE_KEY' },
+    { credential: 'mistral-vibe2', envVar: 'MISTRAL_VIBE_KEY2' },
     { credential: 'mistral', envVar: 'MISTRAL_API_KEY' },
     { credential: 'mistral2', envVar: 'MISTRAL_API_KEY2' },
     { credential: 'mistral3', envVar: 'MISTRAL_API_KEY3' },
