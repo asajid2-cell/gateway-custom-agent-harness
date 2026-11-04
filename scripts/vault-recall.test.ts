@@ -186,6 +186,38 @@ test('nothing recorded is said explicitly, and obligations are reported', async 
   }
 })
 
+test('a term match that does not answer the question lands in candidates, not current', async () => {
+  const root = await vault([
+    proposal({ event_id: 'r1', summary: 'the relay stays on build 29', topic_id: 'release' }),
+  ])
+  try {
+    const packet = await recall({ vaultRoot: root, familyId: FAMILY, query: 'what is the p99 relay latency' })
+    assert.deepEqual(packet.current, [], 'an unanswerable question must not put anything in current')
+    assert.equal(packet.nothing_recorded, true)
+    assert.deepEqual(packet.candidates.map(item => item.event_id), ['r1'], 'the weak match is still shown, as a candidate')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a question about a file that was never recorded is not answered by a mention of the word', async () => {
+  const root = await vault([
+    proposal({ event_id: 'v1', summary: 'the vault topics are stored under topics.json', topic_id: 'release' }),
+  ])
+  try {
+    const packet = await recall({
+      vaultRoot: root,
+      familyId: FAMILY,
+      query: "what is the contents of the vault's topics file",
+    })
+    assert.deepEqual(packet.current, [])
+    assert.equal(packet.nothing_recorded, true)
+    assert.ok(packet.candidates.length >= 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('the same query twice returns byte-identical packets', async () => {
   const root = await vault([
     proposal({ event_id: 'a', summary: 'relay alpha', topic_id: 'release' }),

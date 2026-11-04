@@ -53,6 +53,8 @@ export type RecallPacket = {
   family_id: string
   as_of: string
   current: RecallItem[]
+  /** Term matches that do not answer the question. They are not answers. */
+  candidates: RecallItem[]
   history: RecallItem[]
   nothing_recorded: boolean
   obligations: { pending: ObligationRow[]; overdue: ObligationRow[] }
@@ -67,6 +69,35 @@ const AUTHORITY_RANK: Record<string, number> = {
 }
 
 const SCOPE_RANK: Record<string, number> = { task: 4, driver: 3, family: 2, global: 1 }
+
+/**
+ * A word that carries no answer by itself. Removing these is what lets
+ * "what is the p99 relay latency" be judged on p99/relay/latency rather than on
+ * the question's grammar.
+ */
+const STOPWORDS = new Set([
+  'a', 'about', 'all', 'an', 'and', 'any', 'are', 'as', 'at', 'be', 'been', 'before', 'by', 'can',
+  'could', 'did', 'do', 'does', 'for', 'from', 'had', 'has', 'have', 'how', 'i', 'if', 'in', 'into',
+  'is', 'it', 'its', 'me', 'my', 'no', 'not', 'of', 'on', 'or', 'our', 'should', 'so', 'that', 'the',
+  'their', 'them', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'we', 'were', 'what', 'when',
+  'where', 'which', 'who', 'why', 'will', 'with', 'would', 'you', 'your',
+])
+
+export function significantTerms(query: string): string[] {
+  const raw =
+    query
+      .toLowerCase()
+      .replace(/[\u2019']s\b/g, '')
+      .match(/[a-z0-9][a-z0-9_.:/-]*/g) ?? []
+  return [...new Set(raw.filter(term => term.length >= 2 && !STOPWORDS.has(term)))]
+}
+
+function coversTerm(text: string, term: string): boolean {
+  if (text.includes(term)) return true
+  // Plural tolerance without a stemmer: compare on a stripped trailing s.
+  const stem = term.replace(/s$/, '')
+  return stem.length >= 3 && text.includes(stem)
+}
 
 type Row = {
   sequence: number
@@ -181,24 +212,32 @@ function validAt(record: Record<string, unknown>, asOf: number): boolean {
   return true
 }
 
-function aliasMap(db: Database, familyId: string): Map<string, string> {
+function aliasMap(db: Database, familyId: string): { map: Map<string, string>; blobs: Map<string, string> } {
   const map = new Map<string, string>()
+  const blobs = new Map<string, string>()
   const rows = db
     .query("SELECT json FROM events WHERE family_id = ? AND kind = 'topic' ORDER BY sequence")
     .all(familyId) as Array<{ json: string }>
+  const addBlob = (topicId: string, part: string | null) => {
+    if (!part) return
+    blobs.set(topicId, `${blobs.get(topicId) ?? ''} ${part.toLowerCase()}`)
+  }
   for (const row of rows) {
     const record = JSON.parse(row.json) as Record<string, unknown>
     const op = text(record, 'topic_op')
     const topicId = text(record, 'topic_id') ?? text(record, 'event_id')
     if (!topicId) continue
     if (op === 'create') {
-      const definition = text(record, 'definition')
-      if (definition) map.set(definition.toLowerCase(), topicId)
+      addBlob(topicId, text(record, 'definition'))
+      addBlob(topicId, topicId)
       map.set(topicId.toLowerCase(), topicId)
     }
     if (op === 'alias' && Array.isArray(record.aliases)) {
       for (const alias of record.aliases) {
-        if (typeof alias === 'string') map.set(alias.toLowerCase(), topicId)
+        if (typeof alias === 'string') {
+          map.set(alias.toLowerCase(), topicId)
+          addBlob(topicId, alias)
+        }
       }
     }
     if (op === 'merge') {
@@ -206,7 +245,7 @@ function aliasMap(db: Database, familyId: string): Map<string, string> {
       if (into) map.set(topicId.toLowerCase(), into)
     }
   }
-  return map
+  return { map, blobs }
 }
 
 async function obligationsFor(
@@ -275,7 +314,7 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
     await applyFamily(projection, vaultRoot, familyId)
     const expression = ftsExpression(query)
     const identifiers = identifiersIn(query)
-    const aliases = aliasMap(projection.db, familyId)
+    const { map: aliases, blobs: topicBlobs } = aliasMap(projection.db, familyId)
     const queryTopics = new Set<string>()
     const lowered = query.toLowerCase()
     for (const term of lowered.match(/[a-z0-9_.:/-]+/g) ?? []) {
@@ -286,6 +325,7 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
     for (const [alias, topicId] of aliases) {
       if (alias.length >= 4 && lowered.includes(alias)) queryTopics.add(topicId)
     }
+    const terms = significantTerms(query)
 
     let rows: Array<Row & { rank?: number }> = []
     if (expression) {
@@ -342,11 +382,23 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
         const body = String(record.body ?? '')
         const topicId = String(record.topic_id ?? '')
         const textBlob = `${summary}\n${body}`.toLowerCase()
+        const identifierHit = identifiers.some(identifier => textBlob.includes(identifier.toLowerCase()))
+        // An answer must be *about* the question, not merely share a word with
+        // it. Coverage of every significant term, an exact identifier, or a
+        // named topic whose definition carries the terms - anything less is a
+        // candidate and never appears in current[].
+        const coveredByText = terms.length > 0 && terms.every(term => coversTerm(textBlob, term))
+        const coveredByTopic =
+          terms.length > 0 &&
+          queryTopics.has(topicId) &&
+          terms.every(term => coversTerm(topicBlobs.get(topicId) ?? '', term))
+        const answers = identifierHit || coveredByText || coveredByTopic
         return {
           entry,
+          answers,
           score: [
             queryTopics.has(topicId) ? 1 : 0,
-            identifiers.some(identifier => textBlob.includes(identifier.toLowerCase())) ? 1 : 0,
+            identifierHit ? 1 : 0,
             AUTHORITY_RANK[String(record.authority ?? '')] ?? 0,
             record.status === 'validated' && record.kind === 'decision' ? 1 : 0,
             SCOPE_RANK[String(record.scope ?? '')] ?? 0,
@@ -367,6 +419,7 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
 
     const limit = filters.limit && filters.limit > 0 ? filters.limit : 10
     const current: RecallItem[] = []
+    const candidates: RecallItem[] = []
     const history: RecallItem[] = []
     for (const entry of scored) {
       const record = entry.entry.record
@@ -383,6 +436,10 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
         history.push(toItem(familyId, entry.entry.row, 'expired'))
         continue
       }
+      if (!entry.answers) {
+        if (candidates.length < limit) candidates.push(toItem(familyId, entry.entry.row, null))
+        continue
+      }
       if (current.length >= limit) continue
       current.push(toItem(familyId, entry.entry.row, null))
     }
@@ -393,6 +450,7 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
       family_id: familyId,
       as_of: new Date(asOf).toISOString(),
       current,
+      candidates,
       history,
       nothing_recorded: current.length === 0 && history.length === 0,
       obligations,
