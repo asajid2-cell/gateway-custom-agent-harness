@@ -46,6 +46,8 @@ class Page {
   gate?: Gate
   emptyAnswer = false
   pageGoneOnSend = false
+  /** The first send on this page reports the page's "couldn't load messages" banner. */
+  loadErrorOnSend = false
   constructor(readonly answer = 'answered on the page') {}
   private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
   private clock = Math.floor(Date.now() / 1000)
@@ -102,6 +104,13 @@ class Page {
     this.calls.push({ ...request })
     if (op === 'send' && this.pageGoneOnSend) {
       return { ok: false, op, error: 'evaluate: Target page, context or browser has been closed' }
+    }
+    if (op === 'send' && this.loadErrorOnSend) {
+      this.loadErrorOnSend = false
+      return {
+        ok: false, op, reason: 'page-load-error', threadId: String(request.threadId ?? ''),
+        error: 'the page could not load the messages in thread ' + String(request.threadId ?? ''),
+      }
     }
     if (op === 'send') {
       this.active += 1
@@ -416,6 +425,48 @@ describe('lane routing', () => {
       expect(reply?.text).toContain('answered on the page')
       expect(built.spawned.length).toBe(2)
       expect(master.calls.some(call => call.op === 'send')).toBe(false)
+    } finally {
+      await writer.close()
+      await built.host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('a window that cannot load the messages is recycled, and the turn is posted again on a fresh one', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    let first = true
+    const master = new Page()
+    const built = await startHost(dir, [alpha], master, () => {
+      const page = new Page()
+      if (first) { page.loadErrorOnSend = true; first = false }
+      return page
+    })
+    const writer = await busPeer(dir, 'load-writer')
+    try {
+      const sent = await writer.send(alpha.sessionId, 'after the load failure', 'health', undefined, 'inquiry', true) as { id?: string }
+      // Nothing was typed successfully: the turn must land back in the queue,
+      // never as a failure reply the page did not earn.
+      for (let i = 0; i < 200; i++) {
+        const state = JSON.parse(await readFile(join(dir, 'bridges', `${alpha.sessionId}.json`), 'utf8')) as BridgeState
+        const record = state.pendingTurns.find(item => item.messageId === sent.id)
+        if (record && record.postedAt === null) break
+        await delay(20)
+      }
+      expect(await replyFor(writer, sent.id!, 300)).toBeNull()
+      for (let i = 0; i < 200 && built.manager.size > 0; i++) await delay(10)
+      expect(built.spawned.length).toBe(1)
+      await built.host.pollOnce()
+      const reply = await replyFor(writer, sent.id!, 5_000)
+      expect(reply?.text).toContain('answered on the page')
+      expect(built.spawned.length).toBe(2)
+      expect(master.calls.some(call => call.op === 'send')).toBe(false)
+      // The failed window is gone for good (this manager emits no host audit in
+      // the test harness), and the retry went to a different page object.
+      expect(built.spawned[0]!.calls.filter(call => call.op === 'send').length).toBe(1)
+      expect(built.spawned[1]!.calls.filter(call => call.op === 'send').length).toBe(1)
+      expect(built.spawned[0]).not.toBe(built.spawned[1])
     } finally {
       await writer.close()
       await built.host.stop()

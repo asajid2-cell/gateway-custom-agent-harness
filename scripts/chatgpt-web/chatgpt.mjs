@@ -991,7 +991,16 @@ function liveTurnSample() {
   const states = [...document.querySelectorAll('[data-talvt-turn-state]')]
     .map(node => (node.getAttribute('data-talvt-turn-state') || '').toLowerCase())
     .filter(Boolean)
-  return { stop, states, live: stop || states.some(state => !/complete/.test(state)) }
+  // A conversation-level load failure. Only asked when no answer bubble carries
+  // text, so a real answer that quotes the phrase is never a failure.
+  const bubbles = [...document.querySelectorAll('[data-markdown-text-style="assistant-message"]')]
+  const hasText = bubbles.some(node => (node.textContent || '').trim())
+  let problem = null
+  if (!hasText) {
+    const body = (document.body && document.body.innerText || '').slice(0, 20000)
+    if (/(couldn'?t load (the )?messages|could not load messages|unable to load (the )?(messages|conversation)|error loading (the )?(messages|conversation)|there was a problem loading (the )?(messages|conversation))/i.test(body)) problem = 'load'
+  }
+  return { stop, states, problem, live: stop || states.some(state => !/complete/.test(state)) }
 }
 
 /**
@@ -1024,6 +1033,7 @@ async function cheapLiveTurn(threadId) {
       thread: threadOf(page.url()) || null,
       live: sample?.live === true,
       stop: sample?.stop === true,
+      problem: sample?.problem === 'load' ? 'load' : null,
       states: Array.isArray(sample?.states) ? sample.states.slice(0, 8) : [],
     }
   } catch {
@@ -2286,6 +2296,9 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
   const deadline = startedAt + SEND_TIMEOUT_MS
   let last = ''
   let agree = 0
+  // The load-error banner: when it first appeared, and when we last looked.
+  let loadSeenAt = null
+  let loadProbeAt = 0
   let stableSince = null
   // The completion signal, when the caller has one. Absent, unavailable or
   // failed, every branch below is exactly the loop it was before.
@@ -2511,6 +2524,23 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
     if (!snapshot) { await sleepOrCompletion(500); continue }
     const busy = await busyState(page)
     if (!snapshot.found || !snapshot.text) {
+      // While there is no answer, ask whether the window is broken rather than
+      // slow. A banner that persists is a window fault: the host recycles the
+      // lane and re-posts, instead of waiting out the whole send budget.
+      const atNow = Date.now()
+      if (atNow - loadProbeAt >= LOAD_PROBE_MS) {
+        loadProbeAt = atNow
+        const problem = await pageLoadProblem(page)
+        if (problem === 'load') loadSeenAt ??= atNow
+        else loadSeenAt = null
+        if (loadSeenAt !== null && atNow - loadSeenAt >= LOAD_CONFIRM_MS) {
+          const threadId = threadOf(page.url())
+          throw new TurnError(
+            `the page could not load the messages${threadId ? ` in thread ${threadId}` : ''}`,
+            { reason: 'page-load-error', ...(threadId ? { threadId } : {}) },
+          )
+        }
+      }
       last = ''
       lastIsReply = false
       agree = 0
@@ -2585,6 +2615,27 @@ const MARKER_CONFIRM_MS = 400
 
 /** Sampling interval inside the marker confirm window. */
 const MARKER_SAMPLE_MS = 50
+
+/**
+ * How long a "could not load messages" banner must persist before the turn is
+ * handed back as a window fault. A transient render hiccup is not a fault; five
+ * seconds of a textless page with the banner visible is.
+ */
+const LOAD_CONFIRM_MS = 5_000
+/** How often the reply guard re-checks for that banner while no answer is up. */
+const LOAD_PROBE_MS = 2_000
+
+/**
+ * The banner test, one bounded look. Same pattern and same guard as the
+ * observer: only when no answer bubble has text.
+ */
+const pageLoadProblem = page => page.evaluate(() => {
+  const bubbles = document.querySelectorAll('[data-markdown-text-style="assistant-message"]')
+  const newest = bubbles[bubbles.length - 1]
+  if (newest && (newest.textContent || '').trim()) return null
+  const body = (document.body && document.body.innerText || '').slice(0, 20000)
+  return /(couldn'?t load (the )?messages|could not load messages|unable to load (the )?(messages|conversation)|error loading (the )?(messages|conversation)|there was a problem loading (the )?(messages|conversation))/i.test(body) ? 'load' : null
+}).catch(() => null)
 
 /**
  * How long after the marker the first confirming read is taken. The source
@@ -3791,6 +3842,17 @@ const OBSERVER_SCRIPT = `(() => {
   // assistant bubble against these patterns and pushes only the word
   // 'failed' - never the matched text, never any page content.
   const FAILURE = /(this response couldn't load|couldn't load|something went wrong|you've reached (your )?limit|unusual activity|verify you are human|error generating|network error)/i
+  // A conversation that cannot render its messages. The banner ("Couldn't load
+  // messages" and its variants) sits outside the newest assistant bubble, so
+  // the bubble test cannot see it. Only consulted when the newest bubble has
+  // no text, so an answer that merely QUOTES the phrase is never a failure.
+  const LOAD_FAILURE = /(couldn'?t load (the )?messages|could not load messages|unable to load (the )?(messages|conversation)|error loading (the )?(messages|conversation)|there was a problem loading (the )?(messages|conversation))/i
+  const loadFailed = () => {
+    const assistant = document.querySelectorAll('[data-markdown-text-style="assistant-message"]')
+    const newest = assistant[assistant.length - 1]
+    if (newest && (newest.textContent || '').trim()) return false
+    return LOAD_FAILURE.test((document.body && document.body.innerText || '').slice(0, 20000))
+  }
   const sample = () => {
     // The phase of the LATEST turn only, read from the newest assistant
     // bubble's nearest turn state. Scanning every historical node was wrong:
@@ -3802,6 +3864,10 @@ const OBSERVER_SCRIPT = `(() => {
     const bubbles = document.querySelectorAll('[data-markdown-text-style="assistant-message"]')
     const bubble = bubbles[bubbles.length - 1]
     let phase = null
+    // Why a turn reads as failed, for the host's repair rule: a load failure is
+    // the window's fault and is repairable; a limit/challenge is the account's
+    // and is not. Word only - never page text.
+    let problem = null
     for (let el = bubble, i = 0; el && i < 12; i++, el = el.parentElement) {
       const value = el.getAttribute && el.getAttribute('data-talvt-turn-state')
       if (value) { phase = classify(value); break }
@@ -3817,7 +3883,13 @@ const OBSERVER_SCRIPT = `(() => {
     // The chip wins over in_progress: a live failure had the turn state saying
     // in_progress while the bubble already said "This response couldn't load".
     // textContent, not innerText: reading during streaming must not force layout.
-    if (bubble && FAILURE.test(bubble.textContent || '')) phase = 'failed'
+    if (bubble && FAILURE.test(bubble.textContent || '')) {
+      phase = 'failed'
+      problem = /limit|unusual activity|verify you are human/i.test(bubble.textContent || '') ? 'blocked' : 'load'
+    }
+    // A conversation-level load failure is the same verdict for this turn: no
+    // answer is coming through this window, so the host must recycle it.
+    if (loadFailed()) { phase = 'failed'; problem = 'load' }
     const threadId = threadOf()
     if (threadId !== lastThread) {
       // The first look at a thread is not a transition: adopt its state
@@ -3826,7 +3898,7 @@ const OBSERVER_SCRIPT = `(() => {
       lastThread = threadId
       lastPhase = phase
       if (threadId) send({ event: 'navigated', threadId })
-      send({ event: 'signal', threadId, phase, at: Date.now() })
+      send({ event: 'signal', threadId, phase, problem, at: Date.now() })
       return
     }
     if (phase === lastPhase) return
@@ -3835,7 +3907,7 @@ const OBSERVER_SCRIPT = `(() => {
     // from a turn finishing here to the host acting on it can be measured
     // rather than argued about. No backticks in here: this whole script is
     // a template literal.
-    send({ event: 'signal', threadId, phase, at: Date.now() })
+    send({ event: 'signal', threadId, phase, problem, at: Date.now() })
   }
   // A fresh driver child attaches to a page whose observer is already
   // installed; without this hook it would hear nothing until the page next
@@ -3890,13 +3962,14 @@ const OBSERVER_SCRIPT = `(() => {
  * `phase` is one of `streaming`, `complete`, `failed`, or null when the page
  * shows no turn at all.
  */
-const PUSHED = { phase: null, threadId: null, at: null }
+const PUSHED = { phase: null, threadId: null, at: null, problem: null }
 
 /** Record one page push. Called only from the event channel. */
-function notePush(phase, threadId, at) {
+function notePush(phase, threadId, at, problem = null) {
   PUSHED.phase = phase === 'streaming' || phase === 'complete' || phase === 'failed' ? phase : null
   PUSHED.threadId = typeof threadId === 'string' && threadId ? threadId.toLowerCase() : null
   PUSHED.at = Number.isFinite(at) ? at : Date.now()
+  PUSHED.problem = problem === 'load' || problem === 'blocked' ? problem : null
 }
 
 /** The state a pushed phase implies, for one thread. */
@@ -3905,7 +3978,7 @@ function pushedState(threadId) {
   const matches = PUSHED.threadId && threadId ? PUSHED.threadId === threadId.toLowerCase() : null
   if (PUSHED.at === null) return { state: 'unknown', phase: null, ageMs, matchesThread: matches }
   if (matches === false) return { state: 'other-thread', phase: null, ageMs, matchesThread: false }
-  if (PUSHED.phase === 'failed') return { state: 'failed', phase: 'failed', ageMs, matchesThread: matches }
+  if (PUSHED.phase === 'failed') return { state: 'failed', phase: 'failed', problem: PUSHED.problem, ageMs, matchesThread: matches }
   if (PUSHED.phase === 'streaming') return { state: 'generating', phase: 'streaming', ageMs, matchesThread: matches }
   return { state: 'idle', phase: PUSHED.phase, ageMs, matchesThread: matches }
 }
@@ -3932,6 +4005,11 @@ function statusVerdict({ pushed, phase, live, threadId }) {
   if (pushed === 'generating') return { state: 'generating', phase: phase ?? 'streaming', cost: 'push' }
   if (!live || live.askable !== true || live.page !== true) {
     return { state: 'unknown', phase: null, cost: 'push', evidence: 'the page could not be asked' }
+  }
+  // A page that says it cannot load the messages is not "idle": the window is
+  // broken and must be recycled, so say `failed` with the reason the host acts on.
+  if (live.problem === 'load') {
+    return { state: 'failed', phase: 'failed', cost: 'page', evidence: 'the page could not load the messages', problem: 'load' }
   }
   const thread = typeof live.thread === 'string' ? live.thread.toLowerCase() : null
   if (thread && thread !== String(threadId).toLowerCase()) {
@@ -4143,7 +4221,8 @@ function startEventChannel(emit, claimed = () => false) {
         const threadId = typeof message.threadId === 'string' && message.threadId ? message.threadId.toLowerCase() : null
         const phase = message.phase === 'complete' || message.phase === 'streaming' || message.phase === 'failed' ? message.phase : null
         const at = Number.isFinite(message.at) ? message.at : Date.now()
-        notePush(phase, threadId, at)
+        const problem = message.problem === 'load' || message.problem === 'blocked' ? message.problem : null
+        notePush(phase, threadId, at, problem)
         emitSafe({ event: 'signal', threadId, phase, at })
         return
       }
@@ -4390,11 +4469,13 @@ async function serve() {
           const needsLook = cheap.state !== 'failed' && cheap.state !== 'generating'
           const live = needsLook ? await cheapLiveTurn(threadId) : null
           const verdict = statusVerdict({ pushed: cheap.state, phase: cheap.phase, live, threadId })
+          const problem = verdict.problem ?? live?.problem ?? cheap.problem ?? null
           return {
             ok: true, op, cost: verdict.cost, threadId,
             pushedThreadId: PUSHED.threadId,
             matchesThread: cheap.matchesThread,
             state: verdict.state, phase: verdict.phase, ageMs: cheap.ageMs, at,
+            ...(problem ? { problem } : {}),
             ...(verdict.evidence ? { evidence: verdict.evidence } : {}),
           }
         }
@@ -4412,6 +4493,7 @@ async function serve() {
         const common = {
           ok: true, op, cost: 'conversation', threadId,
           phase: cheap.phase, ageMs: cheap.ageMs, at,
+          ...(cheap.problem ? { problem: cheap.problem } : {}),
           matchesThread: cheap.matchesThread,
           latestAssistant: detail,
           nodeActivity: nodeActivityOf(read.body),

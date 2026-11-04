@@ -256,6 +256,25 @@ class PageGoneBeforePost extends Error {
   }
 }
 
+/** The page's own words for a window that cannot render the conversation. */
+const isPageLoadError = (text: string): boolean =>
+  /couldn'?t load (the )?messages|could not load messages|unable to load (the )?(messages|conversation)|error loading (the )?(messages|conversation)/i.test(text)
+
+/**
+ * The window failed to render the messages ("Couldn't load messages").
+ *
+ * This is a fact about the WINDOW, not the model, and the fix is a fresh one:
+ * the lane is recycled. Before acceptance nothing landed, so the job is
+ * queued and re-posted on the new window (`not-posted:` keys that path). After
+ * acceptance the turn stays owed and is never re-sent - the observation pass
+ * reads the answer from the conversation backend instead.
+ */
+class PageLoadFault extends Error {
+  constructor(readonly threadId: string | null, readonly accepted: boolean, readonly pageText: string) {
+    super(`${accepted ? '' : 'not-posted: '}the page could not load the messages${pageText ? ` (${pageText})` : ''}`)
+  }
+}
+
 /**
  * R11-F3: the driver could not prove an attach send either way.
  *
@@ -284,6 +303,12 @@ type CheapStatus = {
   matchesThread: boolean | null
   /** True when the DRIVER could not answer the status read (a timeout or a replacement). */
   fault: boolean
+  /**
+   * Why the page says it failed. `load` is the window failing to render the
+   * messages (repairable by recycling it); `blocked` is an account limit or a
+   * challenge (a restart cannot repair that).
+   */
+  problem?: 'load' | 'blocked' | null
 }
 
 /**
@@ -685,7 +710,7 @@ export class ChatGptHost {
    */
   private readonly masterDriver: DriverChild
   private readonly lanes: LaneManager | null
-  private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean }>()
+  private readonly laneContext = new AsyncLocalStorage<{ driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean; pageFault?: string }>()
   private readonly bridges = new Map<string, Bridge>()
   /**
    * One delivery lock per bridge. Collecting a file and writing down that it
@@ -1986,6 +2011,11 @@ export class ChatGptHost {
       if (isDriverFaultReply(reply)) {
         throw new GeneratingTurn(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, true)
       }
+      if (reply.reason === 'page-load-error' || isPageLoadError(String(reply.error ?? ''))) {
+        const lane = this.laneContext.getStore()
+        if (lane) lane.pageFault = 'the messages could not load'
+        throw new PageLoadFault(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, false, one(reply.error, 200))
+      }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
@@ -2035,6 +2065,15 @@ export class ChatGptHost {
       // "initiated, node unknown" state, never a refusal (see postRecordedTurn).
       if (reply.reason === 'ambiguous') {
         throw new SendAmbiguous(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, one(reply.error, 300) || 'the send may have landed')
+      }
+      // The window could not render the conversation. Recycle it; before
+      // acceptance the job is queued and re-posted on the fresh window, after
+      // acceptance it stays owed for the observation pass (never re-sent).
+      if (reply.reason === 'page-load-error' || isPageLoadError(String(reply.error ?? ''))) {
+        const lane = this.laneContext.getStore()
+        if (lane) lane.pageFault = 'the messages could not load'
+        const threadId = typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId
+        throw new PageLoadFault(threadId, acceptedByPage, one(reply.error, 200))
       }
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
       if (isDriverFaultReply(reply)) {
@@ -2167,6 +2206,14 @@ export class ChatGptHost {
         deadline = Date.now() + this.turnTimeout
       }
       if (known.state === 'failed') {
+        if (known.problem === 'load') {
+          // The thread cannot render, so this wait can never finish. Recycle
+          // the lane and leave the turn owed; the observation pass reads the
+          // answer from the conversation backend on the fresh window.
+          const lane = this.laneContext.getStore()
+          if (lane) lane.pageFault = 'the messages could not load'
+          throw new PageLoadFault(threadId, true, 'the page rendered a load failure')
+        }
         throw new Error('the page reported a problem: the page rendered a failure message')
       }
       // One conversation read per page signal, not one per poll: the page's
@@ -2497,6 +2544,7 @@ export class ChatGptHost {
       at: typeof reply.at === 'string' ? reply.at : null,
       matchesThread: typeof reply.matchesThread === 'boolean' ? reply.matchesThread : null,
       fault: false,
+      problem: reply.problem === 'load' || reply.problem === 'blocked' ? reply.problem : null,
     }
   }
 
@@ -5108,6 +5156,19 @@ export class ChatGptHost {
         // stopped. Nothing is refused. A live-generating page never reaches here
         // (its signal keeps moving, which extends the wait), so this is only the
         // genuinely stuck page, and giving up on it is the honest outcome.
+        if (error instanceof PageLoadFault) {
+          // The window could not render the conversation. The lane is already
+          // being recycled by laneWork. This is not a model failure: before
+          // acceptance the job is queued and re-posted on the fresh window;
+          // after acceptance it stays owed and the observation pass delivers.
+          const line = error.accepted
+            ? `the page could not load the messages; the turn stays owed for the observation pass`
+            : `the page could not load the messages; nothing was posted, the turn stays queued`
+          log(`turn ${shortId(message.id)}: ${line} [${bridge.state.name}]`)
+          audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
+          await this.persistHostState()
+          return
+        }
         if (error instanceof GeneratingTurn) {
           const line = error.message
           log(`turn ${shortId(message.id)}: ${line}; left for the observation pass`)
@@ -5939,7 +6000,7 @@ export class ChatGptHost {
       log(`lane "${laneId}": ${line}`)
       void this.persistHostState()
     })
-    const context: { driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean } = { driver: lane.driver, laneId }
+    const context: { driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean; pageFault?: string } = { driver: lane.driver, laneId }
     let pageGone = false
     try {
       return await this.laneContext.run(context, () => work(lane))
@@ -5951,7 +6012,8 @@ export class ChatGptHost {
       // and a page/browser that died under a call. The answer path has already
       // spoken to the sender; the window itself is recycled so the next turn
       // starts clean. A dead page never triggers a re-send here.
-      if (context.empty) await this.lanes.recycle(laneId, 'empty answer')
+      if (context.pageFault) await this.lanes.recycle(laneId, `page load failure: ${context.pageFault}`)
+      else if (context.empty) await this.lanes.recycle(laneId, 'empty answer')
       else if (pageGone || context.pageGone) await this.lanes.recycle(laneId, 'page or browser closed')
       this.lanes.release(laneId)
     }
