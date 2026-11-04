@@ -40,6 +40,7 @@ import {
 } from '../src/skills/bundled/persist.ts'
 import type { SessionHooksState } from '../src/utils/hooks/sessionHooks.ts'
 import { getContextWindowForModel } from '../src/utils/context.ts'
+import { saveGlobalConfig } from '../src/utils/config.ts'
 import {
   getAutoCompactThreshold,
   getEffectiveContextWindowSize,
@@ -650,6 +651,45 @@ test('the Haiku 5.5 route accounts for a 100k window and compacts below it', () 
       `${spelling} autocompact trigger`,
     )
   }
+})
+
+test('a per-route context override beats the catalog and drives autocompact', () => {
+  // The override is what the session metadata dialog writes. It must resolve
+  // through the alias fold, beat the catalog, and move the derived compaction
+  // numbers with it - otherwise the dialog would show a number nothing uses.
+  saveGlobalConfig(current => ({
+    ...current,
+    gatewayContextWindows: {
+      ...current.gatewayContextWindows,
+      'gateway-gpt-luna': 450_000,
+    },
+  }))
+  try {
+    for (const spelling of [
+      'gateway-gpt-luna',
+      'gpt-5.6-luna',
+      'claude-gpt-luna',
+    ]) {
+      assert.equal(
+        getContextWindowForModel(spelling),
+        450_000,
+        `${spelling} must use the route override`,
+      )
+    }
+    assert.equal(getEffectiveContextWindowSize('gateway-gpt-luna'), 430_000)
+    assert.equal(getAutoCompactThreshold('gateway-gpt-luna'), 417_000)
+  } finally {
+    saveGlobalConfig(current => {
+      const next = { ...(current.gatewayContextWindows ?? {}) }
+      delete next['gateway-gpt-luna']
+      return { ...current, gatewayContextWindows: next }
+    })
+  }
+  assert.equal(
+    getContextWindowForModel('gateway-gpt-luna'),
+    272_000,
+    'clearing the override must restore the catalog window',
+  )
 })
 
 test('gateway preserves native effort levels on GPT aliases', () => {

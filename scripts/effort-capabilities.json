@@ -115,6 +115,9 @@
     },
     "gateway-claude-haiku-5-5": {
       "contextWindow": 100000
+    },
+    "gateway-commandcode-deepseek-v4.1-flash": {
+      "contextWindow": 450000
     }
   },
   "gatewayWebSearch": {
