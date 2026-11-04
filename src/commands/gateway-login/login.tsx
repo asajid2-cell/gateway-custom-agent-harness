@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { access, readdir } from 'node:fs/promises'
+import { access, readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { execFileNoThrow } from '../../utils/execFileNoThrow.js'
@@ -12,6 +12,13 @@ import TextInput from '../../components/TextInput.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { getSessionId } from '../../bootstrap/state.js'
+import {
+  captureSecret,
+  hasSecret,
+  keysafeMode,
+  listSecrets,
+  removeSecret,
+} from '../../utils/keysafe/index.js'
 
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
 
@@ -30,18 +37,103 @@ function keyLabel(keyName: string): string {
   return suffix ? `OpenCode Go ${suffix}` : 'OpenCode Go'
 }
 
+/**
+ * Record names in the selected store. Bundled reads the vault; external reads
+ * the legacy keysafe on Windows or gateway.env on POSIX.
+ */
+async function storedNames(): Promise<string[]> {
+  if (keysafeMode() === 'bundled') return (await listSecrets()).map(entry => entry.name)
+  if (process.platform !== 'win32') {
+    try {
+      const raw = await readFile(join(homedir(), '.claude', 'gateway.env'), 'utf8')
+      const names: string[] = []
+      for (const line of raw.split(/\r?\n/)) {
+        const match = /^\s*(?:export\s+)?([A-Z0-9_]+)=/.exec(line)
+        if (!match) continue
+        const envVar = match[1]
+        if (envVar === 'DEEPSEEK_API_KEY') names.push('ds')
+        else if (envVar === 'AMD_API_KEY') names.push('amd-ds')
+        else if (envVar === 'OPENROUTER_API_KEY') names.push('openrouter')
+        else {
+          const opencode = /^OPENCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          const commandcode = /^COMMANDCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          if (opencode) names.push(`opencode-go${opencode[1] ?? ''}`)
+          if (commandcode) names.push(`commandcode${commandcode[1] ?? ''}`)
+        }
+      }
+      return names
+    } catch {
+      return []
+    }
+  }
+  const listed = await runKeysafe('', 'list')
+  if (!listed.ok) return []
+  return listed.output
+    .split(/\r?\n/)
+    .map(line => /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s+\(stored\b/.exec(line)?.[1])
+    .filter((name): name is string => Boolean(name))
+}
+
+async function storeHas(name: string): Promise<boolean> {
+  if (keysafeMode() === 'bundled') return hasSecret(name)
+  return (await storedNames()).includes(name)
+}
+
+async function storeCapture(
+  name: string,
+  value: string,
+): Promise<{ ok: boolean; source: string; reason?: string }> {
+  if (keysafeMode() === 'bundled') {
+    try {
+      await captureSecret(name, value)
+      return { ok: true, source: 'bundled vault' }
+    } catch (error) {
+      return { ok: false, source: 'bundled vault', reason: (error as Error).message.slice(0, 300) }
+    }
+  }
+  if (process.platform !== 'win32') {
+    return {
+      ok: false,
+      source: 'external gateway.env',
+      reason: 'external mode on this platform is read-only; the launcher owns gateway.env',
+    }
+  }
+  const result = await runKeysafe(name, 'capture', value)
+  return { ok: result.ok, source: 'external keysafe', reason: result.output }
+}
+
+async function storeRemove(
+  name: string,
+): Promise<{ ok: boolean; source: string; reason?: string }> {
+  if (keysafeMode() === 'bundled') {
+    try {
+      const removed = await removeSecret(name)
+      return { ok: removed, source: 'bundled vault', reason: removed ? undefined : 'not present' }
+    } catch (error) {
+      return { ok: false, source: 'bundled vault', reason: (error as Error).message.slice(0, 300) }
+    }
+  }
+  if (process.platform !== 'win32') {
+    return {
+      ok: false,
+      source: 'external gateway.env',
+      reason: 'external mode on this platform is read-only',
+    }
+  }
+  const result = await runKeysafe(name, 'remove')
+  return { ok: result.ok, source: 'external keysafe', reason: result.output }
+}
+
 // The next free vault slot for a key prefix: `<prefix>` is slot 1, then
 // `<prefix>2`, `<prefix>3`, ... in the first gap. This is the number the gateway
 // will report for the key, so it is chosen before the key is stored.
 async function nextKeySlot(prefix: string): Promise<string> {
   const used = new Set<number>()
-  const pattern = new RegExp(`^${prefix}([2-9]|[1-9][0-9]+)?\\.cred$`)
-  try {
-    for (const entry of await readdir(join(homedir(), '.keysafe'))) {
-      const match = pattern.exec(entry)
-      if (match) used.add(Number(match[1] || 1))
-    }
-  } catch {}
+  const pattern = new RegExp(`^${prefix}([2-9]|[1-9][0-9]+)?$`)
+  for (const name of await storedNames()) {
+    const match = pattern.exec(name)
+    if (match) used.add(Number(match[1] || 1))
+  }
   let number = 1
   while (used.has(number)) number += 1
   return number === 1 ? prefix : `${prefix}${number}`
@@ -182,21 +274,21 @@ export const call: LocalJSXCommandCall = async (
   }
 
   if (action === 'status') {
-    const stored = await access(keyPath(keyName)).then(() => true).catch(() => false)
+    const stored = await storeHas(keyName)
     onDone(
       stored
-        ? `${keyLabel(keyName)} key is stored in Keysafe. Run /refreshlogin after changing it.`
+        ? `${keyLabel(keyName)} key is stored in the ${keysafeMode()} credential store. Run /refreshlogin after changing it.`
         : `${keyLabel(keyName)} key is not configured. Run /${keyCommand(keyName)} to add it.`,
     )
     return null
   }
 
   if (action === 'remove') {
-    const result = await runKeysafe(keyName, 'remove')
+    const result = await storeRemove(keyName)
     onDone(
       result.ok
-        ? `${keyLabel(keyName)} key removed from Keysafe.`
-        : `Could not remove the ${keyLabel(keyName)} key: ${result.output || 'unknown error'}`,
+        ? `${keyLabel(keyName)} key removed from the ${result.source}.`
+        : `Could not remove the ${keyLabel(keyName)} key (${result.source}): ${result.reason || 'unknown error'}`,
     )
     return null
   }
@@ -227,10 +319,10 @@ function GatewayLoginDialog(props: {
     }
     setBusy(true)
     setError(null)
-    const result = await runKeysafe(props.keyName, 'capture', value.trim())
+    const result = await storeCapture(props.keyName, value.trim())
     if (!result.ok) {
       setBusy(false)
-      setError(result.output || 'Keysafe could not store the key.')
+      setError(result.reason || `The ${result.source} could not store the key.`)
       return
     }
     setValue('')
@@ -240,13 +332,13 @@ function GatewayLoginDialog(props: {
       setBusy(false)
       props.onDone(
         reload.ok
-          ? `${label} key saved in Keysafe. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
-          : `${label} key saved in Keysafe, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.`,
+          ? `${label} key saved in the ${result.source}. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.`
+          : `${label} key saved in the ${result.source}, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.`,
       )
       return
     }
     setBusy(false)
-    props.onDone(`${label} key saved in Keysafe. Run /refreshlogin to load it without restarting cc.`)
+    props.onDone(`${label} key saved in the ${result.source}. Run /refreshlogin to load it without restarting cc.`)
   }
 
   return (
@@ -257,7 +349,7 @@ function GatewayLoginDialog(props: {
     >
       <Box flexDirection="column">
         <Text dimColor>
-          Enter the key once. It is stored encrypted in the local Keysafe vault.
+          Enter the key once. It is stored in the {keysafeMode() === 'bundled' ? 'bundled, encrypted vault' : 'external credential store'}.
         </Text>
         <Box marginTop={1}>
           <TextInput
