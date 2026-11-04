@@ -53,3 +53,9 @@ export function hasSecret(name: string, options?: KeysafeOptions): Promise<boole
 export function removeSecret(name: string, options?: KeysafeOptions): Promise<boolean>
 export function listSecrets(options?: KeysafeOptions): Promise<KeysafeEntry[]>
 export function secretsEnv(options?: KeysafeOptions): Promise<Record<string, string>>
+export function peekVault(vaultDir?: string): Promise<{
+  vaultDir: string
+  created: boolean
+  backend: MasterKeyBackend | null
+  records: boolean
+}>

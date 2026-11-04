@@ -19,6 +19,7 @@ export {
   keysafeMode,
   listSecrets,
   oauthMode,
+  peekVault,
   readSecret,
   removeSecret,
   resolveMasterKey,

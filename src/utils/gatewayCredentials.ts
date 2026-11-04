@@ -7,8 +7,8 @@ import {
   envVarForRecord,
   hasSecret,
   keysafeMode,
+  peekVault,
   removeSecret,
-  resolveMasterKey,
   type CredentialMode,
 } from './keysafe/index.js'
 
@@ -160,8 +160,13 @@ export async function describeCredentialStore() {
     return { ...matrix, backend: process.platform === 'win32' ? 'external-keysafe' : 'external-gateway-env' }
   }
   try {
-    const resolved = await resolveMasterKey()
-    return { ...matrix, backend: resolved.backend, warning: resolved.warning }
+    // Observation only: status must not create a vault or mint a master key.
+    const peek = await peekVault(matrix.vaultDir)
+    return {
+      ...matrix,
+      backend: peek.created ? peek.backend : 'no vault yet',
+      records: peek.records,
+    }
   } catch (error) {
     return { ...matrix, backend: 'unavailable', warning: (error as Error).message.slice(0, 300) }
   }

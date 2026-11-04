@@ -219,14 +219,14 @@ const hardenedDirs = new Set()
  * descendants. This is what removes an inherited CodexSandboxUsers grant.
  * New files created inside inherit these ACEs; chmod(0600) is not enough here.
  */
-async function hardenWindowsAcl(dir) {
+async function hardenWindowsAcl(dir, run = defaultRun) {
   if (process.platform !== 'win32' || hardenedDirs.has(dir) || process.env.KEYSAFE_SKIP_ACL === '1') {
     return
   }
   const user = process.env.USERNAME || os.userInfo().username
   const domain = process.env.USERDOMAIN
   const principal = domain && domain.toLowerCase() !== user.toLowerCase() ? `${domain}\\${user}` : user
-  const result = await defaultRun(
+  const result = await run(
     'icacls',
     [
       dir,
@@ -249,10 +249,10 @@ async function hardenWindowsAcl(dir) {
   hardenedDirs.add(dir)
 }
 
-async function ensureDir(dir) {
+async function ensureDir(dir, run = defaultRun) {
   await mkdir(dir, { recursive: true, mode: 0o700 })
   if (process.platform !== 'win32') await chmod(dir, 0o700).catch(() => {})
-  await hardenWindowsAcl(dir)
+  await hardenWindowsAcl(dir, run)
 }
 
 async function writePrivate(file, contents) {
@@ -374,8 +374,8 @@ export async function resolveMasterKey(options = {}) {
   const cached = masterKeyCache.get(vaultDir)
   if (cached && (!options.backend || options.backend === cached.backend)) return cached
 
-  await ensureDir(vaultDir)
   const run = options.run ?? defaultRun
+  await ensureDir(vaultDir, run)
   const platform = options.platform ?? process.platform
   const requested =
     options.backend ?? (platform === 'win32' ? 'dpapi' : platform === 'darwin' ? 'keychain' : 'libsecret')
@@ -481,7 +481,7 @@ export async function captureSecret(name, secret, options = {}) {
   const value = String(secret).trim()
   if (!value) throw new Error(`keysafe: refusing to store an empty secret for "${name}"`)
   const vaultDir = options.vaultDir ?? defaultVaultDir()
-  await ensureDir(vaultDir)
+  await ensureDir(vaultDir, options.run ?? defaultRun)
   const { key } = await resolveMasterKey({ ...options, vaultDir })
   const envVar = envVarForRecord(name)
   const existing = await readRecordFile(vaultDir, name)
@@ -547,6 +547,17 @@ export async function listSecrets(options = {}) {
     records.push({ name, envVar: expected, updatedAt: record.updatedAt })
   }
   return records.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/**
+ * Observation only. Never creates the directory, a master key or vault.meta,
+ * so `cc doctor` / `/login status` are not writes. `created: false` means there
+ * is no vault yet.
+ */
+export async function peekVault(vaultDir = defaultVaultDir()) {
+  const meta = await readVaultMeta(vaultDir)
+  const records = await vaultHasRecords(vaultDir)
+  return { vaultDir, created: Boolean(meta), backend: meta?.backend ?? null, records }
 }
 
 /** The environment overlay for a gateway child. */

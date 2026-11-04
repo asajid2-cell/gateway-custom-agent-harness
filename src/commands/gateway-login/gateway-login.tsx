@@ -44,23 +44,29 @@ function GatewayLogin({
 
     let cancelled = false
     void (async () => {
-      if (action === 'status' || action === 'check') {
-        const present = await hasGatewayCredential(credential)
+      try {
+        if (action === 'status' || action === 'check') {
+          const present = await hasGatewayCredential(credential)
+          if (!cancelled) {
+            onDone(
+              `${label} key: ${present ? 'present in the credential store' : 'not configured'}`,
+            )
+          }
+          return
+        }
+
+        const removed = await removeGatewayCredential(credential)
         if (!cancelled) {
           onDone(
-            `${label} key: ${present ? 'present in keysafe' : 'not configured'}`,
+            removed.ok
+              ? `${label} key removed from the ${removed.source}`
+              : `No ${label} key was removed (${removed.source}${removed.reason ? `: ${removed.reason}` : ''})`,
           )
         }
-        return
-      }
-
-      const removed = await removeGatewayCredential(credential)
-      if (!cancelled) {
-        onDone(
-          removed.ok
-            ? `${label} key removed from the ${removed.source}`
-            : `No ${label} key was removed (${removed.source}${removed.reason ? `: ${removed.reason}` : ''})`,
-        )
+      } catch (error) {
+        // A bad GATEWAY_*_MODE must name the variable, not leave the dialog
+        // "Checking ..." forever.
+        if (!cancelled) onDone(`Credential store error: ${(error as Error).message}`)
       }
     })()
 
@@ -84,7 +90,14 @@ function GatewayLogin({
       setStatus('A non-empty key is required.')
       return
     }
-    setStatus(`Saving ${label} key to the ${gatewayCredentialModes().keysafe} store…`)
+    let store = 'credential'
+    try {
+      store = gatewayCredentialModes().keysafe
+    } catch (error) {
+      setStatus(`Credential store error: ${(error as Error).message}`)
+      return
+    }
+    setStatus(`Saving ${label} key to the ${store} store…`)
     const saved = await saveGatewayCredential(credential, secret)
     setValue('')
     setCursorOffset(0)

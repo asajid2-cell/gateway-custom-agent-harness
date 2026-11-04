@@ -1,5 +1,10 @@
+// Most rows are about the vault, not the host ACL; keep them environment-
+// independent. The ACL row below unsets this deliberately.
+process.env.KEYSAFE_SKIP_ACL = '1'
+
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, copyFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { access, mkdtemp, readFile, rm, copyFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -269,6 +274,33 @@ test('defaultVaultDir honors CLAUDE_CONFIG_DIR', async () => {
   const { defaultVaultDir } = await import('./keysafe-vault.mjs')
   assert.equal(defaultVaultDir({ CLAUDE_CONFIG_DIR: 'C:/tmp/cfg', USERPROFILE: 'C:/u' }), path.join('C:/tmp/cfg', 'keysafe'))
   assert.equal(defaultVaultDir({ USERPROFILE: 'C:/u' }), path.join('C:/u', '.claude', 'keysafe'))
+})
+
+test('peekVault observes without creating anything', async () => {
+  const dir = path.join(await mkdtemp(path.join(os.tmpdir(), 'keysafe-peek-')), 'missing')
+  try {
+    const { peekVault } = await import('./keysafe-vault.mjs')
+    const peek = await peekVault(dir)
+    assert.deepEqual(peek, { vaultDir: dir, created: false, backend: null, records: false })
+    await assert.rejects(access(dir))
+  } finally {
+    await rm(path.dirname(dir), { recursive: true, force: true })
+  }
+})
+
+test('the Windows vault directory has a protected DACL', { skip: process.platform !== 'win32' }, async () => {
+  delete process.env.KEYSAFE_SKIP_ACL
+  const { dir, options } = await scratch()
+  try {
+    await captureSecret('ds', 'acl-sentinel', options)
+    const out = execFileSync('icacls', [dir], { encoding: 'utf8' })
+    assert.match(out, /BUILTIN\\Administrators/)
+    assert.match(out, /NT AUTHORITY\\SYSTEM/)
+    assert.doesNotMatch(out, /CodexSandboxUsers/i)
+  } finally {
+    process.env.KEYSAFE_SKIP_ACL = '1'
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test('POSIX vault files are private', { skip: process.platform === 'win32' }, async () => {
