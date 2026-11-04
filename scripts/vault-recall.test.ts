@@ -99,12 +99,17 @@ test('an expired observation never appears as current state', async () => {
     proposal({
       event_id: 'obs',
       kind: 'observation',
-      class: 'live',
       summary: 'gateway pid 31212 is serving on port 33245',
       topic_id: 'fleet',
       authority: 'verified_artifact',
       observed_at: '2026-11-04T09:00:00.000Z',
-      expires_at: '2026-11-04T11:00:00.000Z',
+      live: {
+        subject: 'host:box',
+        predicate: 'process_status',
+        value: 'running',
+        expires_at: '2026-11-04T11:00:00.000Z',
+        boot_id: 'boot-1',
+      },
     }),
   ])
   try {
@@ -276,6 +281,38 @@ test('the same query twice returns byte-identical packets', async () => {
     const first = await recall({ vaultRoot: root, familyId: FAMILY, query: 'relay', filters: { asOf: at } })
     const second = await recall({ vaultRoot: root, familyId: FAMILY, query: 'relay', filters: { asOf: at } })
     assert.equal(JSON.stringify(first), JSON.stringify(second))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a superseded event is not current even when its superseder is off-query', async () => {
+  const root = await vault([
+    proposal({
+      event_id: 'target',
+      kind: 'finding',
+      summary: 'gateway-opencode-deepseek-v4.1-flash is available',
+      topic_id: 'models',
+    }),
+    proposal({
+      event_id: 'superseder',
+      kind: 'correction',
+      summary: 'unrelated note about the lunch order',
+      topic_id: 'ops',
+      recorded_at: '2026-11-04T12:00:00.000Z',
+      relations: [{ type: 'supersedes', target_event_id: 'target' }],
+    }),
+  ])
+  try {
+    const packet = await recall({
+      vaultRoot: root,
+      familyId: FAMILY,
+      query: 'is gateway-opencode-deepseek-v4.1-flash available',
+    })
+    assert.deepEqual(packet.current.map(item => item.event_id), [], 'a superseded event must never be current')
+    const retired = packet.history.find(item => item.event_id === 'target')
+    assert.ok(retired, 'the target belongs in history')
+    assert.deepEqual(retired.superseded_by, ['superseder'])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

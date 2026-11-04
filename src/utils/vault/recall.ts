@@ -182,7 +182,10 @@ function toItem(familyId: string, row: Row, itemClass: string | null): RecallIte
     sequence: Number(record.sequence ?? row.sequence),
     kind: text(record, 'kind'),
     status: text(record, 'status'),
-    class: itemClass ?? text(record, 'class'),
+    class:
+      itemClass ??
+      text(record, 'class') ??
+      (record.live && typeof record.live === 'object' ? 'live' : null),
     authority: text(record, 'authority'),
     scope: text(record, 'scope'),
     topic_id: text(record, 'topic_id'),
@@ -194,7 +197,10 @@ function toItem(familyId: string, row: Row, itemClass: string | null): RecallIte
 }
 
 function expired(record: Record<string, unknown>, asOf: number): boolean {
-  const expires = text(record, 'expires_at')
+  // Expiry lives in the live block, which is where the schema puts it for every
+  // observation; a top-level expires_at is not part of the envelope.
+  const live = record.live && typeof record.live === 'object' ? (record.live as Record<string, unknown>) : null
+  const expires = live ? text(live, 'expires_at') : null
   if (!expires) return false
   const at = Date.parse(expires)
   return Number.isFinite(at) && at <= asOf
@@ -363,8 +369,16 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
     }
 
     const all = rows.map(row => ({ row, record: asRecord(row) }))
+    // Supersession is a property of the family, not of the result set: a target
+    // whose superseder does not match the query must still be known to be
+    // superseded, or it is served as current state.
+    const relationRows = projection.db
+      .query(
+        "SELECT event_id, json FROM events WHERE family_id = ? AND json LIKE '%supersedes%'",
+      )
+      .all(familyId) as Array<{ event_id: string; json: string }>
     const { superseded, supersededBy } = supersession(
-      all.map(entry => ({ event_id: entry.row.event_id, record: entry.record })),
+      relationRows.map(row => ({ event_id: row.event_id, record: JSON.parse(row.json) as Record<string, unknown> })),
     )
 
     const scored = all
