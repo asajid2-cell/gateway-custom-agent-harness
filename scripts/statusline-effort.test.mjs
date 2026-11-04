@@ -14,6 +14,7 @@ const {
   setOriginalCwd,
   setSessionResumeDirectory,
 } = await import('../src/bootstrap/state.ts')
+const { recordSpeedSample, resetSpeedForTests } = await import('../src/utils/speed.ts')
 
 const settings = { statusLine: { type: 'command', command: 'noop' } }
 
@@ -70,6 +71,31 @@ test('statusline tracks a mid-session effort change', () => {
   const after = statuslineInput('gateway-gpt-luna', 'xhigh').effort?.level
   assert.equal(before, 'medium')
   assert.equal(after, 'xhigh')
+})
+
+test('statusline carries the measured output rate, or omits the key', () => {
+  resetSpeedForTests()
+  assert.equal(
+    Object.hasOwn(
+      statuslineInput('gateway-mistral-deepseek-v4.1-flash', undefined),
+      'speed',
+    ),
+    false,
+  )
+  recordSpeedSample({
+    model: 'gateway-mistral-deepseek-v4.1-flash',
+    outputTokens: 200,
+    startedAt: 10_000,
+    firstTokenAt: 11_000,
+    endedAt: 13_000,
+  })
+  const input = statuslineInput('gateway-mistral-deepseek-v4.1-flash', undefined)
+  assert.equal(input.speed.output_tokens_per_second, 100)
+  assert.equal(input.speed.session_output_tokens_per_second, 100)
+  assert.equal(input.speed.output_tokens, 200)
+  assert.equal(input.speed.generation_ms, 2_000)
+  assert.equal(input.speed.ttft_ms, 1_000)
+  assert.ok(input.speed.measured_at)
 })
 
 test('statusline names the session directory rather than the live shell cwd', () => {

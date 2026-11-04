@@ -1,6 +1,7 @@
 import { calculateContextPercentages } from './context.js'
 import { quotePowerShellLiteral } from './shell/powershellQuote.js'
 import { formatTokens } from './format.js'
+import { formatTokensPerSecond } from './speed.js'
 
 export type CurrentUsage = {
   input_tokens: number
@@ -220,7 +221,7 @@ export function formatBottomBarUsage(
   usage: CurrentUsage | null,
   contextWindowSize: number,
   weekly?: WeeklyUtilization,
-  options?: { includeModel?: boolean },
+  options?: { includeModel?: boolean; speedTokPerSec?: number | null },
 ): string {
   const context = getContextUsageValues(usage, contextWindowSize)
   const weeklyRemaining = getWeeklyRemainingPercent(weekly)
@@ -256,6 +257,12 @@ export function formatBottomBarUsage(
     )
   } else {
     parts.push('context unavailable')
+  }
+
+  // The last response's sampling rate. It is omitted when this process has not
+  // measured one yet; a zero would read as a real, terrible figure.
+  if (options?.speedTokPerSec !== undefined && options.speedTokPerSec !== null) {
+    parts.push(`${formatTokensPerSecond(options.speedTokPerSec)} tok/s`)
   }
 
   if (weeklyRemaining !== null) {
