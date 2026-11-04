@@ -42,7 +42,12 @@ export function keysafeVaultDir(home = keysafeHome()) {
 }
 
 // Non-OpenCode providers always sit in the chain when their vault record exists.
-export const GATEWAY_KEY_ENV_VARS = ['DEEPSEEK_API_KEY', 'AMD_API_KEY', 'COMMANDCODE_API_KEY']
+export const GATEWAY_KEY_ENV_VARS = [
+  'DEEPSEEK_API_KEY',
+  'AMD_API_KEY',
+  'COMMANDCODE_API_KEY',
+  'OPENROUTER_API_KEY',
+]
 
 export function isGatewayKeyEnvVar(name) {
   return GATEWAY_KEY_ENV_VARS.includes(name) ||
@@ -86,6 +91,7 @@ export function listKeysafeProviders(home = keysafeHome()) {
     .sort((a, b) => commandCodeNumber(a) - commandCodeNumber(b))) {
     providers.push({ credential: name, envVar: `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}` })
   }
+  if (names.has('openrouter')) providers.push({ credential: 'openrouter', envVar: 'OPENROUTER_API_KEY' })
   if (names.has('ds')) providers.push({ credential: 'ds', envVar: 'DEEPSEEK_API_KEY' })
   return providers
 }

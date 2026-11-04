@@ -176,7 +176,7 @@ test('the Keychain and libsecret helpers receive the master key on stdin', async
     const run = async (file, args, stdin) => {
       calls.push({ file, args, stdin })
       if (args.includes('lookup') || (args[0] === '-i' && String(stdin).startsWith('find-generic-password'))) {
-        return { code: 1, stdout: '', stderr: 'not found' }
+        return { code: 1, stdout: '', stderr: 'The specified item could not be found.' }
       }
       if (args.includes('store') || args[0] === '-i') return { code: 0, stdout: '', stderr: '' }
       return { code: 0, stdout: '', stderr: '' }
@@ -191,6 +191,84 @@ test('the Keychain and libsecret helpers receive the master key on stdin', async
       await rm(dir, { recursive: true, force: true })
     }
   }
+})
+
+test('a populated vault never re-keys when its keyring is unavailable', async () => {
+  const { dir, options } = await scratch()
+  try {
+    await captureSecret('ds', 'first-sentinel', options)
+    clearMasterKeyCache()
+    // The vault was created with the file backend; a later open that names
+    // libsecret must still use the recorded backend, not mint a second key.
+    const { resolveMasterKey, readSecret } = await import('./keysafe-vault.mjs')
+    // No explicit backend: the platform default (libsecret) is requested, but
+    // the recorded backend wins.
+    const resolved = await resolveMasterKey({ vaultDir: dir, platform: 'linux', run: async () => ({ code: 1, stdout: '', stderr: 'Cannot autolaunch D-Bus' }) })
+    assert.equal(resolved.backend, 'file')
+    assert.equal(await readSecret('ds', { vaultDir: dir, backend: 'file' }), 'first-sentinel')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a fresh vault falls back to file and records the backend', async () => {
+  const { dir } = await scratch()
+  try {
+    const { resolveMasterKey } = await import('./keysafe-vault.mjs')
+    const resolved = await resolveMasterKey({
+      vaultDir: dir,
+      platform: 'linux',
+      run: async () => ({ code: 1, stdout: '', stderr: 'Cannot autolaunch D-Bus' }),
+    })
+    assert.equal(resolved.backend, 'file')
+    assert.ok(resolved.warning)
+    const meta = JSON.parse(await readFile(`${dir}/vault.meta`, 'utf8'))
+    assert.equal(meta.backend, 'file')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a locked keychain is not "no record" and does not mint a key', async () => {
+  const { dir } = await scratch()
+  try {
+    const { resolveMasterKey } = await import('./keysafe-vault.mjs')
+    await assert.rejects(
+      () =>
+        resolveMasterKey({
+          vaultDir: dir,
+          backend: 'keychain',
+          platform: 'darwin',
+          run: async () => ({ code: 1, stdout: '', stderr: 'errSecInteractionNotAllowed -25308' }),
+        }),
+      /KEYSAFE_LOCKED/,
+    )
+    const entries = await (await import('node:fs/promises')).readdir(dir)
+    assert.equal(entries.some(entry => entry === 'master.key'), false)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a record whose stored envVar was tampered with is refused', async () => {
+  const { dir, options } = await scratch()
+  try {
+    await captureSecret('ds', 'tamper-sentinel', options)
+    const file = `${dir}/ds.json`
+    const record = JSON.parse(await readFile(file, 'utf8'))
+    record.envVar = 'LD_PRELOAD'
+    await (await import('node:fs/promises')).writeFile(file, JSON.stringify(record))
+    const { listSecrets } = await import('./keysafe-vault.mjs')
+    await assert.rejects(() => listSecrets(options), /wrong environment variable/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('defaultVaultDir honors CLAUDE_CONFIG_DIR', async () => {
+  const { defaultVaultDir } = await import('./keysafe-vault.mjs')
+  assert.equal(defaultVaultDir({ CLAUDE_CONFIG_DIR: 'C:/tmp/cfg', USERPROFILE: 'C:/u' }), path.join('C:/tmp/cfg', 'keysafe'))
+  assert.equal(defaultVaultDir({ USERPROFILE: 'C:/u' }), path.join('C:/u', '.claude', 'keysafe'))
 })
 
 test('POSIX vault files are private', { skip: process.platform === 'win32' }, async () => {

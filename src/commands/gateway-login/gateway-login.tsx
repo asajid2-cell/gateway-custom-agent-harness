@@ -7,6 +7,7 @@ import type {
   LocalJSXCommandOnDone,
 } from '../../types/command.js'
 import {
+  gatewayCredentialModes,
   hasGatewayCredential,
   removeGatewayCredential,
   saveGatewayCredential,
@@ -56,9 +57,9 @@ function GatewayLogin({
       const removed = await removeGatewayCredential(credential)
       if (!cancelled) {
         onDone(
-          removed
-            ? `${label} key removed from keysafe`
-            : `No ${label} key was removed`,
+          removed.ok
+            ? `${label} key removed from the ${removed.source}`
+            : `No ${label} key was removed (${removed.source}${removed.reason ? `: ${removed.reason}` : ''})`,
         )
       }
     })()
@@ -83,17 +84,17 @@ function GatewayLogin({
       setStatus('A non-empty key is required.')
       return
     }
-    setStatus(`Saving ${label} key to keysafe…`)
+    setStatus(`Saving ${label} key to the ${gatewayCredentialModes().keysafe} store…`)
     const saved = await saveGatewayCredential(credential, secret)
     setValue('')
     setCursorOffset(0)
-    if (saved) {
+    if (saved.ok) {
       onDone(
-        `${label} key saved in keysafe. Restart cc to inject it into a new gateway process.`,
+        `${label} key saved in the ${saved.source}. Restart cc to inject it into a new gateway process.`,
       )
       return
     }
-    setStatus(`Could not save the ${label} key.`)
+    setStatus(`Could not save the ${label} key (${saved.source}): ${saved.reason ?? 'unknown error'}`)
   }
 
   return (

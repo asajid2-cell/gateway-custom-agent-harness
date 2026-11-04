@@ -15,8 +15,12 @@
  * ds, amd-ds, commandcode, commandcode2, openrouter), so GATEWAY_CREDENTIALS_MODE
  * changes where a credential lives, never what a consumer asks for.
  *
- * Plaintext is never written. Secrets move on stdin to platform helpers, never
- * in argv, and the master key never appears in an error message.
+ * Provider records are never plaintext. Secrets move on stdin to platform
+ * helpers, never in argv, and the master key never appears in an error message.
+ * Scope: this guarantee covers the provider records only. The `file` backend
+ * necessarily holds the master key in a 0600 file and protects it by file
+ * permissions alone; OAuth tokens stay in their native locations and are not
+ * covered by this vault.
  */
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
 import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
@@ -110,11 +114,28 @@ export function credentialModeMatrix(env = process.env) {
 // platform helpers (secret on stdin, never argv)
 // ---------------------------------------------------------------------------
 
+export const HELPER_TIMEOUT_MS = 15_000
+
+/**
+ * A helper that never returns is a locked keychain or a blocked D-Bus prompt,
+ * not a slow vault. Bound every call and classify the timeout distinctly.
+ */
 export const defaultRun = (file, args, stdin) =>
   new Promise(resolve => {
     const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    const finish = result => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(result)
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      finish({ code: 124, stdout, stderr: `${stderr}keysafe: helper timed out after ${HELPER_TIMEOUT_MS}ms` })
+    }, HELPER_TIMEOUT_MS)
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', chunk => {
@@ -123,10 +144,48 @@ export const defaultRun = (file, args, stdin) =>
     child.stderr.on('data', chunk => {
       stderr += chunk
     })
-    child.on('error', error => resolve({ code: 127, stdout, stderr: `${stderr}${error.message}` }))
-    child.on('close', code => resolve({ code: code ?? 1, stdout, stderr }))
+    child.on('error', error => finish({ code: 127, stdout, stderr: `${stderr}${error.message}` }))
+    child.on('close', code => finish({ code: code ?? 1, stdout, stderr }))
     child.stdin.end(stdin)
   })
+
+const LOCKED_HINT =
+  /errSecInteractionNotAllowed|-25308|errSecAuthFailed|-25293|interaction not allowed|keychain is locked|could not switch to audit session/i
+const NOT_FOUND_HINT =
+  /errSecItemNotFound|-25300|The specified item could not be found|could not be found|No such secret|no such object/i
+
+function lockedError(what, detail) {
+  const error = new Error(
+    `keysafe: [KEYSAFE_LOCKED] ${what} could not be read; the credential store is locked ` +
+      `or unavailable. Unlock it in the user's GUI session and retry. ${String(detail).trim().slice(0, 240)}`,
+  )
+  error.code = 'KEYSAFE_LOCKED'
+  return error
+}
+
+async function vaultHasRecords(vaultDir) {
+  try {
+    const entries = await readdir(vaultDir)
+    return entries.some(entry => entry.endsWith('.json'))
+  } catch {
+    return false
+  }
+}
+
+/** The backend that created a vault is recorded once and is sticky. */
+async function readVaultMeta(vaultDir) {
+  try {
+    const meta = JSON.parse(await readFile(path.join(vaultDir, 'vault.meta'), 'utf8'))
+    if (meta?.version === 1 && typeof meta.backend === 'string') return meta
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  return null
+}
+
+async function writeVaultMeta(vaultDir, backend) {
+  await writePrivate(path.join(vaultDir, 'vault.meta'), `${JSON.stringify({ version: 1, backend })}\n`)
+}
 
 const DPAPI_PROTECT = [
   'Add-Type -AssemblyName System.Security | Out-Null',
@@ -157,7 +216,7 @@ async function ensureDir(dir) {
 }
 
 async function writePrivate(file, contents) {
-  const tmp = `${file}.${process.pid}.tmp`
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
   await writeFile(tmp, contents, { encoding: 'utf8', mode: 0o600 })
   await rename(tmp, file)
   if (process.platform !== 'win32') await chmod(file, 0o600).catch(() => {})
@@ -167,7 +226,7 @@ function accountFor(vaultDir) {
   return createHash('sha256').update(path.resolve(vaultDir)).digest('hex').slice(0, 16)
 }
 
-async function dpapiMasterKey(vaultDir, run) {
+async function dpapiMasterKey(vaultDir, run, { create = true } = {}) {
   const file = path.join(vaultDir, 'master.dpapi')
   try {
     const sealed = (await readFile(file, 'utf8')).trim()
@@ -180,6 +239,9 @@ async function dpapiMasterKey(vaultDir, run) {
     return key
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
+    if (!create) {
+      throw lockedError('the DPAPI master key', 'the vault has records but master.dpapi is missing')
+    }
   }
   const key = randomBytes(KEY_BYTES)
   const sealed = requireSuccess(
@@ -190,13 +252,19 @@ async function dpapiMasterKey(vaultDir, run) {
   return key
 }
 
-async function keychainMasterKey(vaultDir, run) {
+async function keychainMasterKey(vaultDir, run, { create = true } = {}) {
   const account = accountFor(vaultDir)
   const lookup = await run('security', ['-i'], `find-generic-password -s ${SERVICE} -a ${account} -w\n`)
   if (lookup.code === 0 && String(lookup.stdout).trim()) {
     const key = Buffer.from(String(lookup.stdout).trim(), 'base64')
     assertKey(key)
     return key
+  }
+  const detail = `${lookup.stderr}\n${lookup.stdout}`
+  // A failed lookup is NOT "no key": generating a replacement here would
+  // orphan every record encrypted under the real one.
+  if (!NOT_FOUND_HINT.test(detail) || !create) {
+    throw lockedError('the Keychain master key', detail)
   }
   const key = randomBytes(KEY_BYTES)
   requireSuccess(
@@ -206,13 +274,21 @@ async function keychainMasterKey(vaultDir, run) {
   return key
 }
 
-async function libsecretMasterKey(vaultDir, run) {
+async function libsecretMasterKey(vaultDir, run, { create = true } = {}) {
   const account = accountFor(vaultDir)
   const lookup = await run('secret-tool', ['lookup', 'service', SERVICE, 'account', account], '')
   if (lookup.code === 0 && String(lookup.stdout).trim()) {
     const key = Buffer.from(String(lookup.stdout).trim(), 'base64')
     assertKey(key)
     return key
+  }
+  const detail = `${lookup.stderr}\n${lookup.stdout}`
+  if (!NOT_FOUND_HINT.test(detail) && LOCKED_HINT.test(detail)) {
+    throw lockedError('the libsecret master key', detail)
+  }
+  if (!NOT_FOUND_HINT.test(detail) || !create) {
+    // Existing records mean a master key exists. Never mint a second one.
+    throw lockedError('the libsecret master key', detail)
   }
   const key = randomBytes(KEY_BYTES)
   requireSuccess(
@@ -226,7 +302,7 @@ async function libsecretMasterKey(vaultDir, run) {
   return key
 }
 
-async function fileMasterKey(vaultDir) {
+async function fileMasterKey(vaultDir, { create = true } = {}) {
   const file = path.join(vaultDir, 'master.key')
   try {
     const key = Buffer.from((await readFile(file, 'utf8')).trim(), 'hex')
@@ -234,6 +310,9 @@ async function fileMasterKey(vaultDir) {
     return key
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error
+    if (!create) {
+      throw lockedError('the file master key', 'the vault has records but master.key is missing')
+    }
   }
   const key = randomBytes(KEY_BYTES)
   await writePrivate(file, key.toString('hex'))
@@ -258,27 +337,44 @@ export async function resolveMasterKey(options = {}) {
   await ensureDir(vaultDir)
   const run = options.run ?? defaultRun
   const platform = options.platform ?? process.platform
-  const backend =
+  const requested =
     options.backend ?? (platform === 'win32' ? 'dpapi' : platform === 'darwin' ? 'keychain' : 'libsecret')
+  const meta = await readVaultMeta(vaultDir)
+
+  // The backend that created the vault is sticky. A different explicit request
+  // is a configuration error, never a silent re-key.
+  if (meta && options.backend && options.backend !== meta.backend) {
+    throw new Error(
+      `keysafe: this vault was created with the ${meta.backend} backend; refusing to open it as ${options.backend}`,
+    )
+  }
+  const backend = meta?.backend ?? requested
+  const allowCreate = !(await vaultHasRecords(vaultDir))
+  const opts = { create: allowCreate }
 
   let resolved
   if (backend === 'dpapi') {
-    resolved = { key: await dpapiMasterKey(vaultDir, run), backend }
+    resolved = { key: await dpapiMasterKey(vaultDir, run, opts), backend }
   } else if (backend === 'keychain') {
-    resolved = { key: await keychainMasterKey(vaultDir, run), backend }
+    resolved = { key: await keychainMasterKey(vaultDir, run, opts), backend }
   } else if (backend === 'libsecret') {
     try {
-      resolved = { key: await libsecretMasterKey(vaultDir, run), backend }
+      resolved = { key: await libsecretMasterKey(vaultDir, run, opts), backend }
     } catch (error) {
-      // No D-Bus session / no keyring: the documented fallback, never silent.
+      // Existing records mean a master key exists somewhere. Never mint a
+      // second one: it would orphan every record encrypted under the first.
+      if (!allowCreate) throw error
+      // No D-Bus session / no keyring and a fresh vault: the documented
+      // fallback, recorded so subsequent opens stay on it.
       const warning =
         `keysafe: libsecret is unavailable (${String(error?.message ?? error).slice(0, 160)}); ` +
         'using a 0600 master-key file in the config directory'
-      resolved = { key: await fileMasterKey(vaultDir), backend: 'file', warning }
+      resolved = { key: await fileMasterKey(vaultDir, opts), backend: 'file', warning }
     }
   } else {
-    resolved = { key: await fileMasterKey(vaultDir), backend: 'file' }
+    resolved = { key: await fileMasterKey(vaultDir, opts), backend: 'file' }
   }
+  if (!meta) await writeVaultMeta(vaultDir, resolved.backend)
   masterKeyCache.set(vaultDir, resolved)
   return resolved
 }
@@ -333,7 +429,7 @@ async function readRecordFile(vaultDir, name) {
 
 async function writeRecordFile(vaultDir, record) {
   const file = recordPath(vaultDir, record.name)
-  const tmp = `${file}.${process.pid}.tmp`
+  const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
   await writeFile(tmp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   await rename(tmp, file)
   if (process.platform !== 'win32') await chmod(file, 0o600).catch(() => {})
@@ -399,9 +495,16 @@ export async function listSecrets(options = {}) {
   for (const entry of entries) {
     if (!entry.endsWith('.json')) continue
     const name = entry.slice(0, -'.json'.length)
-    if (!isValidRecordName(name) || !envVarForRecord(name)) continue
+    const expected = envVarForRecord(name)
+    if (!isValidRecordName(name) || !expected) continue
     const record = await readRecordFile(vaultDir, name)
-    if (record) records.push({ name, envVar: record.envVar, updatedAt: record.updatedAt })
+    if (!record) continue
+    // The NAME decides the variable. A record whose stored envVar disagrees was
+    // edited or corrupted; refuse it rather than inject into an arbitrary var.
+    if (record.envVar !== expected) {
+      throw new Error(`keysafe: record "${name}" names the wrong environment variable`)
+    }
+    records.push({ name, envVar: expected, updatedAt: record.updatedAt })
   }
   return records.sort((a, b) => a.name.localeCompare(b.name))
 }

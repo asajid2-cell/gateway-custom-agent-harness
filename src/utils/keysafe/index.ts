@@ -10,6 +10,7 @@ export {
   captureSecret,
   clearMasterKeyCache,
   credentialModeMatrix,
+  defaultRun,
   defaultVaultDir,
   envVarForRecord,
   gatewayCredentialsMode,
