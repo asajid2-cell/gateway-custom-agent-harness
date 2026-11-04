@@ -40,6 +40,9 @@ const masterKeyCache = new Map()
 
 /** @param {string} name */
 export function envVarForRecord(name) {
+  // Exact-case, exact-pattern matches only. Do not widen this to a case-folding
+  // substring test: `DS` and `ds` are the same file on NTFS, so a loose match
+  // would let a future provider name collide with an existing record.
   if (OPENCODE.test(name)) return `OPENCODE_API_KEY${name.slice('opencode-go'.length)}`
   if (COMMANDCODE.test(name)) return `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}`
   switch (name) {
@@ -72,7 +75,14 @@ export function isValidRecordName(name) {
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultVaultDir(env = process.env) {
   const configDir = env.CLAUDE_CONFIG_DIR
-  const home = env.USERPROFILE || env.HOME || os.homedir()
+  let home = env.USERPROFILE || env.HOME
+  if (!home) {
+    try {
+      home = os.homedir()
+    } catch {
+      home = ''
+    }
+  }
   if (!configDir && !home) {
     throw new Error('keysafe: cannot resolve a home directory; set CLAUDE_CONFIG_DIR or HOME')
   }
@@ -131,12 +141,34 @@ export function credentialModeMatrix(env = process.env) {
 export const HELPER_TIMEOUT_MS = 15_000
 
 /**
+ * The unlock helpers need a shell's search path and a GUI session's keyring
+ * socket; nothing else from the parent environment. Handing over the whole
+ * environment would leak provider keys into a PowerShell child for no reason.
+ */
+const HELPER_ENV_KEYS = [
+  'PATH', 'Path',
+  'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC',
+  'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+  'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'DISPLAY', 'WAYLAND_DISPLAY',
+  'LANG', 'LC_ALL',
+]
+
+function helperEnv() {
+  const env = {}
+  for (const key of HELPER_ENV_KEYS) {
+    const value = process.env[key]
+    if (value !== undefined) env[key] = value
+  }
+  return env
+}
+
+/**
  * A helper that never returns is a locked keychain or a blocked D-Bus prompt,
  * not a slow vault. Bound every call and classify the timeout distinctly.
  */
 export const defaultRun = (file, args, stdin) =>
   new Promise(resolve => {
-    const child = spawn(file, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    const child = spawn(file, args, { env: helperEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     let stdout = ''
     let stderr = ''
     let settled = false
@@ -205,7 +237,23 @@ async function readVaultMeta(vaultDir) {
 }
 
 async function writeVaultMeta(vaultDir, backend) {
-  await writePrivate(path.join(vaultDir, 'vault.meta'), `${JSON.stringify({ version: 1, backend })}\n`)
+  // aclVersion records that the files passed the DACL pass in this process, so
+  // the next process does not repeat one icacls spawn per record.
+  const aclVersion = process.platform === 'win32' && hardenedFiles.has(vaultDir) ? 1 : 0
+  await writePrivate(
+    path.join(vaultDir, 'vault.meta'),
+    `${JSON.stringify({ version: 1, backend, aclVersion })}\n`,
+  )
+}
+
+/** Persist a field into an existing meta; a no-op before the meta is created. */
+async function updateVaultMeta(vaultDir, patch) {
+  const meta = await readVaultMeta(vaultDir).catch(() => null)
+  if (!meta) return
+  await writePrivate(
+    path.join(vaultDir, 'vault.meta'),
+    `${JSON.stringify({ ...meta, ...patch })}\n`,
+  )
 }
 
 const DPAPI_PROTECT = [
@@ -226,13 +274,29 @@ const DPAPI_UNPROTECT = [
 
 function requireSuccess(result, what) {
   if (result.code !== 0) {
-    throw new Error(`keysafe: ${what} failed (exit ${result.code}): ${String(result.stderr).trim().slice(0, 300)}`)
+    const error = new Error(
+      `keysafe: ${what} failed (exit ${result.code}): ${String(result.stderr).trim().slice(0, 300)}`,
+    )
+    // A hung helper is not a locked store: it must not be reported as LOCKED,
+    // which would send the operator looking for the wrong problem.
+    error.code = result.code === 124 ? 'KEYSAFE_HELPER_TIMEOUT' : 'KEYSAFE_HELPER_FAILED'
+    throw error
   }
   return String(result.stdout).trim()
 }
 
 const hardenedDirs = new Set()
 const hardenedFiles = new Set()
+
+/** Test-only seam; ignored in a production run so it cannot disable hardening. */
+function aclSkip() {
+  return process.env.KEYSAFE_SKIP_ACL === '1' && process.env.NODE_ENV === 'test'
+}
+
+// Well-known SIDs: `SYSTEM` and `BUILTIN\Administrators` are localized on a
+// non-English Windows, while the SID form always resolves.
+const ACL_SYSTEM = '*S-1-5-18'
+const ACL_ADMINISTRATORS = '*S-1-5-32-544'
 
 function windowsPrincipal() {
   const user = process.env.USERNAME || os.userInfo().username
@@ -247,7 +311,7 @@ function windowsPrincipal() {
  * New files created inside inherit these ACEs; chmod(0600) is not enough here.
  */
 async function hardenWindowsAcl(dir, run = defaultRun) {
-  if (process.platform !== 'win32' || hardenedDirs.has(dir) || process.env.KEYSAFE_SKIP_ACL === '1') {
+  if (process.platform !== 'win32' || hardenedDirs.has(dir) || aclSkip()) {
     return
   }
   const principal = windowsPrincipal()
@@ -259,9 +323,9 @@ async function hardenWindowsAcl(dir, run = defaultRun) {
       '/grant:r',
       `${principal}:(OI)(CI)F`,
       '/grant:r',
-      'SYSTEM:(OI)(CI)F',
+      `${ACL_SYSTEM}:(OI)(CI)F`,
       '/grant:r',
-      'BUILTIN\\Administrators:(OI)(CI)F',
+      `${ACL_ADMINISTRATORS}:(OI)(CI)F`,
     ],
     '',
   )
@@ -276,14 +340,16 @@ async function hardenWindowsAcl(dir, run = defaultRun) {
 
 /**
  * A vault that predates the DACL fix keeps inherited ACEs on its files even
- * after the directory is protected. Harden the existing files once per process.
+ * after the directory is protected. Run the file pass once, then record it in
+ * vault.meta so later processes do not shell out per record.
  */
 async function hardenWindowsFiles(dir, run) {
-  if (
-    process.platform !== 'win32' ||
-    hardenedFiles.has(dir) ||
-    process.env.KEYSAFE_SKIP_ACL === '1'
-  ) {
+  if (process.platform !== 'win32' || hardenedFiles.has(dir) || aclSkip()) {
+    return
+  }
+  const meta = await readVaultMeta(dir).catch(() => null)
+  if (meta?.aclVersion === 1) {
+    hardenedFiles.add(dir)
     return
   }
   let entries
@@ -293,6 +359,7 @@ async function hardenWindowsFiles(dir, run) {
     return
   }
   const principal = windowsPrincipal()
+  let failure = null
   for (const entry of entries) {
     if (entry.endsWith('.tmp')) continue
     const result = await run(
@@ -303,20 +370,24 @@ async function hardenWindowsFiles(dir, run) {
         '/grant:r',
         `${principal}:(F)`,
         '/grant:r',
-        'SYSTEM:(F)',
+        `${ACL_SYSTEM}:(F)`,
         '/grant:r',
-        'BUILTIN\\Administrators:(F)',
+        `${ACL_ADMINISTRATORS}:(F)`,
       ],
       '',
     )
-    if (result.code !== 0) {
-      throw new Error(
+    if (result.code !== 0 && !failure) {
+      // Keep hardening the rest; report the first failure at the end so one
+      // locked file does not leave every later record unprotected too.
+      failure = new Error(
         `keysafe: could not protect ${entry} (exit ${result.code}): ` +
           `${String(result.stderr).trim().slice(0, 200)}`,
       )
     }
   }
+  if (failure) throw failure
   hardenedFiles.add(dir)
+  await updateVaultMeta(dir, { aclVersion: 1 })
 }
 
 async function ensureDir(dir, run = defaultRun) {
@@ -359,6 +430,18 @@ async function writePrivateExclusive(file, contents) {
   } catch (error) {
     await rm(tmp, { force: true }).catch(() => {})
     if (error?.code === 'EEXIST') return false
+    // Filesystems without hard links (SMB, exFAT). `wx` is still an atomic
+    // exclusive create, so only one process can win and the loser adopts.
+    if (['EPERM', 'EACCES', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV'].includes(error?.code)) {
+      try {
+        await writeFile(file, contents, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+        if (process.platform !== 'win32') await chmod(file, 0o600).catch(() => {})
+        return true
+      } catch (fallback) {
+        if (fallback?.code === 'EEXIST') return false
+        throw fallback
+      }
+    }
     throw error
   }
   await rm(tmp, { force: true }).catch(() => {})
@@ -381,6 +464,8 @@ async function dpapiMasterKey(vaultDir, run, { create = true } = {}) {
         'unsealing the DPAPI master key',
       )
     } catch (error) {
+      // A hung helper is its own fault, not a locked store.
+      if (error?.code === 'KEYSAFE_HELPER_TIMEOUT') throw error
       // Profile moved/changed, DPAPI reset, corrupt blob: a typed, actionable
       // state, never a raw PowerShell error and never a silent re-key.
       throw lockedError('the DPAPI master key', (error)?.message ?? String(error))

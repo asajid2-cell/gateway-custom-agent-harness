@@ -1,5 +1,8 @@
 // Most rows are about the vault, not the host ACL; keep them environment-
-// independent. The ACL row below unsets this deliberately.
+// independent. The ACL row below unsets this deliberately. KEYSAFE_SKIP_ACL is
+// honored only while NODE_ENV=test, so this cannot disable hardening in a
+// production process by accident.
+process.env.NODE_ENV = 'test'
 process.env.KEYSAFE_SKIP_ACL = '1'
 
 import assert from 'node:assert/strict'
@@ -314,6 +317,9 @@ test('the Windows vault directory has a protected DACL', { skip: process.platfor
     assert.match(out, /BUILTIN\\Administrators/)
     assert.match(out, /NT AUTHORITY\\SYSTEM/)
     assert.doesNotMatch(out, /CodexSandboxUsers/i)
+    // The file pass is recorded so later processes do not re-run it per record.
+    const meta = JSON.parse(await readFile(path.join(dir, 'vault.meta'), 'utf8'))
+    assert.equal(meta.aclVersion, 1)
   } finally {
     process.env.KEYSAFE_SKIP_ACL = '1'
     await rm(dir, { recursive: true, force: true })
