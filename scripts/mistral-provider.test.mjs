@@ -144,9 +144,12 @@ test('Mistral records map to numbered environment slots', () => {
   assert.equal(envVarForRecord('mistral9'), 'MISTRAL_API_KEY9')
   assert.equal(envVarForRecord('mistral1'), null)
   // Vibe plan keys are a separate credential type, not a Mistral API slot.
+  // `mistralvibe` is the console spelling; the hyphenated form also resolves.
+  assert.equal(envVarForRecord('mistralvibe'), 'MISTRAL_VIBE_KEY')
+  assert.equal(envVarForRecord('mistralvibe3'), 'MISTRAL_VIBE_KEY3')
   assert.equal(envVarForRecord('mistral-vibe'), 'MISTRAL_VIBE_KEY')
   assert.equal(envVarForRecord('mistral-vibe3'), 'MISTRAL_VIBE_KEY3')
-  assert.equal(envVarForRecord('mistral-vibe1'), null)
+  assert.equal(envVarForRecord('mistralvibe1'), null)
 })
 
 test('Vibe keys are spent before Studio keys and never revisited after failure', () => {
@@ -201,8 +204,9 @@ test('the keysafe chain injects every Mistral record', async () => {
   const vault = join(home, '.keysafe')
   await mkdir(vault)
   for (const name of [
+    'mistralvibe.cred',
+    'mistralvibe2.cred',
     'mistral-vibe.cred',
-    'mistral-vibe2.cred',
     'mistral.cred',
     'mistral2.cred',
     'mistral3.cred',
@@ -211,11 +215,12 @@ test('the keysafe chain injects every Mistral record', async () => {
     await writeFile(join(vault, name), '')
   }
   const providers = listKeysafeProviders(home).filter(entry => entry.envVar.startsWith('MISTRAL'))
-  // Vibe records are injected before Studio records; the gateway's pool order
-  // is independent of this list, but keeping it stable makes the chain readable.
+  // Vibe records are injected before Studio records. The hyphenated duplicate
+  // of slot 1 collapses onto the canonical record rather than injecting
+  // MISTRAL_VIBE_KEY twice.
   assert.deepEqual(providers, [
-    { credential: 'mistral-vibe', envVar: 'MISTRAL_VIBE_KEY' },
-    { credential: 'mistral-vibe2', envVar: 'MISTRAL_VIBE_KEY2' },
+    { credential: 'mistralvibe', envVar: 'MISTRAL_VIBE_KEY' },
+    { credential: 'mistralvibe2', envVar: 'MISTRAL_VIBE_KEY2' },
     { credential: 'mistral', envVar: 'MISTRAL_API_KEY' },
     { credential: 'mistral2', envVar: 'MISTRAL_API_KEY2' },
     { credential: 'mistral3', envVar: 'MISTRAL_API_KEY3' },

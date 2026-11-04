@@ -66,7 +66,7 @@ export const mistralLogin = command(
 export const mistralVibeLogin = command(
   'mistralvibelogin',
   'Add, replace, inspect, or remove the Mistral Vibe plan key',
-  'mistral-vibe',
+  'mistralvibe',
 )
 
 // Compatibility aliases for the original command registry names.

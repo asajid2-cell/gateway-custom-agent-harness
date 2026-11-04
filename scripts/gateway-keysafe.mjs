@@ -72,6 +72,10 @@ function mistralNumber(name) {
   return Number(name.slice('mistral'.length) || 1)
 }
 
+function mistralVibeNumber(name) {
+  return Number(name.replace(/^mistral-?vibe/, '') || 1)
+}
+
 /**
  * The provider records for this machine's vault: numbered OpenCode records,
  * then amd-ds, then numbered commandcode and mistral records, then openrouter,
@@ -101,10 +105,21 @@ export function listKeysafeProviders(home = keysafeHome()) {
     .sort((a, b) => commandCodeNumber(a) - commandCodeNumber(b))) {
     providers.push({ credential: name, envVar: `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}` })
   }
-  for (const name of [...names]
-    .filter(name => /^mistral-vibe([2-9]|[1-9][0-9]+)?$/.test(name))
-    .sort((a, b) => mistralNumber(a.replace('mistral-vibe', 'mistral')) - mistralNumber(b.replace('mistral-vibe', 'mistral')))) {
-    providers.push({ credential: name, envVar: `MISTRAL_VIBE_KEY${name.slice('mistral-vibe'.length)}` })
+  // `mistralvibe` is the console's spelling; the hyphenated form is accepted
+  // too. Both address the same Vibe pool, so the first record for an env slot
+  // wins and a duplicate spelling cannot inject the variable twice.
+  const vibeRecords = [
+    [...names].filter(name => /^mistralvibe([2-9]|[1-9][0-9]+)?$/.test(name)),
+    [...names].filter(name => /^mistral-vibe([2-9]|[1-9][0-9]+)?$/.test(name)),
+  ]
+    .flat()
+    .sort((a, b) => mistralVibeNumber(a) - mistralVibeNumber(b))
+  const seenVibeEnv = new Set()
+  for (const name of vibeRecords) {
+    const envVar = `MISTRAL_VIBE_KEY${name.replace(/^mistral-?vibe/, '')}`
+    if (seenVibeEnv.has(envVar)) continue
+    seenVibeEnv.add(envVar)
+    providers.push({ credential: name, envVar })
   }
   for (const name of [...names]
     .filter(name => /^mistral([2-9]|[1-9][0-9]+)?$/.test(name))

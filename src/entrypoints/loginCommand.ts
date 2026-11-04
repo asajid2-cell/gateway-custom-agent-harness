@@ -18,18 +18,19 @@ const PROVIDERS: Record<string, string> = {
   opencode: 'opencode-go',
   commandcode: 'commandcode',
   mistral: 'mistral',
-  'mistral-vibe': 'mistral-vibe',
+  mistralvibe: 'mistralvibe',
+  'mistral-vibe': 'mistralvibe',
   deepseek: 'ds',
   openrouter: 'openrouter',
 }
 
 // Only the multi-account providers take a slot; `--slot 1` is the base record.
-const NUMBERED = new Set(['opencode', 'commandcode', 'mistral', 'mistral-vibe'])
+const NUMBERED = new Set(['opencode', 'commandcode', 'mistral', 'mistralvibe', 'mistral-vibe'])
 
 const OAUTH_PROVIDERS = new Set(['anthropic', 'claude', 'chatgpt', 'codex', 'openai'])
 
 const USAGE = `Usage:
-  cc login --provider <opencode|commandcode|mistral|mistral-vibe|deepseek|openrouter> --key-stdin [--slot N]
+  cc login --provider <opencode|commandcode|mistral|mistralvibe|deepseek|openrouter> --key-stdin [--slot N]
   cc login --provider <...> --remove
   cc login --status
 

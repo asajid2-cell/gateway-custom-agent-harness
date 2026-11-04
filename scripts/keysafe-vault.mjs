@@ -36,6 +36,9 @@ const SERVICE = 'gateway-keysafe'
 const OPENCODE = /^opencode-go([2-9]|[1-9][0-9]+)?$/
 const COMMANDCODE = /^commandcode([2-9]|[1-9][0-9]+)?$/
 const MISTRAL = /^mistral([2-9]|[1-9][0-9]+)?$/
+// The console names the record "mistralvibe"; the hyphenated spelling is kept
+// for anyone who typed it that way. Both address the same Vibe pool.
+const MISTRALVIBE = /^mistralvibe([2-9]|[1-9][0-9]+)?$/
 const MISTRAL_VIBE = /^mistral-vibe([2-9]|[1-9][0-9]+)?$/
 
 const masterKeyCache = new Map()
@@ -47,6 +50,7 @@ export function envVarForRecord(name) {
   // would let a future provider name collide with an existing record.
   if (OPENCODE.test(name)) return `OPENCODE_API_KEY${name.slice('opencode-go'.length)}`
   if (COMMANDCODE.test(name)) return `COMMANDCODE_API_KEY${name.slice('commandcode'.length)}`
+  if (MISTRALVIBE.test(name)) return `MISTRAL_VIBE_KEY${name.slice('mistralvibe'.length)}`
   if (MISTRAL_VIBE.test(name)) return `MISTRAL_VIBE_KEY${name.slice('mistral-vibe'.length)}`
   if (MISTRAL.test(name)) return `MISTRAL_API_KEY${name.slice('mistral'.length)}`
   switch (name) {
