@@ -49,3 +49,31 @@ test('gateway login commands are included in the built-in command registry', () 
   assert.match(commandsSource, /\bmodel,\s*[\r\n]\s*openCodeLoginCommand/)
   assert.match(commandsSource, /\bopenCodeLoginCommand,\s*[\r\n]\s*commandCodeLogin/)
 })
+
+test('gateway mode registers the provider-key login, off-gateway keeps OAuth login', () => {
+  // Exactly one `login` in either mode: the OAuth command off gateway, the
+  // provider-key command under gateway/3P. Never both, never none.
+  assert.match(
+    commandsSource,
+    /isUsing3PServices\(\)\s*\?\s*\[gatewayLogin\]\s*:\s*\[logout, login\(\)\]/,
+  )
+  assert.match(loginSource, /name: 'login'/)
+  assert.match(loginSource, /gateway provider key \(opencode, commandcode, deepseek, openrouter\)/)
+})
+
+test('the gateway login command reaches the picker and the per-provider UI', async () => {
+  const unifiedSource = await readFile(
+    new URL('../src/commands/gateway-login/unified.tsx', import.meta.url),
+    'utf8',
+  )
+  const planSource = await readFile(
+    new URL('../src/commands/gateway-login/unified-plan.ts', import.meta.url),
+    'utf8',
+  )
+  // No-argument /login renders the picker component, which dispatches into the
+  // existing per-provider dialog with the bound credential name.
+  assert.match(unifiedSource, /<ProviderPicker action=\{plan\.action\}/)
+  assert.match(unifiedSource, /import \{ call as providerLogin \} from '\.\/login\.js'/)
+  assert.match(unifiedSource, /PROVIDER_CREDENTIALS\[props\.provider\]/)
+  assert.match(planSource, /opencode: 'opencode-go',\s*\n\s*commandcode: 'commandcode',\s*\n\s*deepseek: 'ds',\s*\n\s*openrouter: 'openrouter'/)
+})

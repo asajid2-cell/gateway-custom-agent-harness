@@ -11,9 +11,16 @@ const command = (name: string, description: string, keyName: string) =>
         : '[status|remove]',
     load: async () => {
       const module = await import('./login.js')
+      // login.tsx takes the bound credential as a fourth argument; its exported
+      // type is the generic three-argument command shape.
+      const call = module.call as unknown as (
+        onDone: Parameters<typeof module.call>[0],
+        context: Parameters<typeof module.call>[1],
+        args: string,
+        boundKeyName?: string,
+      ) => ReturnType<typeof module.call>
       return {
-        call: (onDone, context, args) =>
-          module.call(onDone, context, args, keyName),
+        call: (onDone, context, args) => call(onDone, context, args, keyName),
       }
     },
   }) satisfies Command
@@ -23,6 +30,25 @@ export const openCodeLogin = command(
   'Add, replace, inspect, or remove the OpenCode Go API key',
   'opencode-go',
 )
+
+/**
+ * `/login` in gateway mode: the picker-backed entry point to the provider key
+ * UI. The per-provider commands stay registered; this is the one an operator
+ * who types `/login` gets.
+ */
+export const gatewayLogin: Command = {
+  type: 'local-jsx',
+  name: 'login',
+  description:
+    'Add, replace, inspect, or remove a gateway provider key (opencode, commandcode, deepseek, openrouter)',
+  argumentHint: '[provider|status|remove]',
+  load: async () => {
+    const module = await import('./unified.js')
+    return {
+      call: (onDone, context, args) => module.call(onDone, context, args),
+    }
+  },
+}
 
 // Re-read the Keysafe vault into the running gateway without restarting cc.
 export const refreshLogin: Command = {

@@ -13,7 +13,6 @@ import { Dialog } from '../../components/design-system/Dialog.js'
 import { useTerminalSize } from '../../hooks/useTerminalSize.js'
 import { getSessionId } from '../../bootstrap/state.js'
 import {
-  captureSecret,
   hasSecret,
   keysafeMode,
   listSecrets,
@@ -24,6 +23,7 @@ import {
   describeCredentialStore,
   externalGatewayEnvPath,
 } from '../../utils/gatewayCredentials.js'
+import { saveProviderKey } from './unified-save.js'
 
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
 
@@ -78,29 +78,6 @@ async function storedNames(): Promise<string[]> {
 async function storeHas(name: string): Promise<boolean> {
   if (keysafeMode() === 'bundled') return hasSecret(name)
   return (await storedNames()).includes(name)
-}
-
-async function storeCapture(
-  name: string,
-  value: string,
-): Promise<{ ok: boolean; source: string; reason?: string; backend?: string; warning?: string }> {
-  if (keysafeMode() === 'bundled') {
-    try {
-      const stored = await captureSecret(name, value)
-      return { ok: true, source: 'bundled vault', backend: stored.backend, warning: stored.warning }
-    } catch (error) {
-      return { ok: false, source: 'bundled vault', reason: (error as Error).message.slice(0, 300) }
-    }
-  }
-  if (process.platform !== 'win32') {
-    return {
-      ok: false,
-      source: 'external gateway.env',
-      reason: 'external mode on this platform is read-only; the launcher owns gateway.env',
-    }
-  }
-  const result = await runKeysafe(name, 'capture', value)
-  return { ok: result.ok, source: 'external keysafe', reason: result.output }
 }
 
 async function storeRemove(
@@ -318,7 +295,22 @@ export const call: LocalJSXCommandCall = async (
     return null
   }
 
-  return <GatewayLoginDialog keyName={keyName} onDone={onDone} />
+  // A save from any entry point reloads the running gateway, so a key entered
+  // in-session is usable without /refreshlogin or a restart.
+  return (
+    <GatewayLoginDialog
+      keyName={keyName}
+      onDone={onDone}
+      reload
+      accountKind={accountKindFor(keyName)}
+    />
+  )
+}
+
+function accountKindFor(keyName: string): 'opencode' | 'commandcode' | undefined {
+  if (keyName.startsWith('commandcode')) return 'commandcode'
+  if (keyName.startsWith('opencode-go')) return 'opencode'
+  return undefined
 }
 
 function GatewayLoginDialog(props: {
@@ -344,7 +336,11 @@ function GatewayLoginDialog(props: {
     }
     setBusy(true)
     setError(null)
-    const result = await storeCapture(props.keyName, value.trim())
+    const result = await saveProviderKey(
+      props.keyName,
+      value.trim(),
+      props.reload ? reloadGatewayKeys : undefined,
+    )
     if (!result.ok) {
       setBusy(false)
       setError(result.reason || `The ${result.source} could not store the key.`)
@@ -356,13 +352,22 @@ function GatewayLoginDialog(props: {
     const backendNote = result.backend ? ` (backend ${result.backend})` : ''
     const warningNote = result.warning ? `\n${result.warning}` : ''
     if (props.reload) {
-      const reload = await reloadGatewayKeys()
-      const accounts = reload.ok ? await waitForAccounts(accountsPath) : null
+      // Only the account providers have a numbered list to read back.
+      const accounts = props.accountKind && result.reloaded
+        ? await waitForAccounts(accountsPath)
+        : null
       setBusy(false)
+      if (result.reloadError) {
+        props.onDone(
+          `${label} key saved in the ${result.source}${backendNote}, but the gateway reload failed: ${result.reloadError} Run /refreshlogin to retry.${warningNote}`,
+        )
+        return
+      }
+      const accountsNote = props.accountKind
+        ? `; ${accountsName} accounts now: ${(accounts ?? []).join(', ') || 'none'}`
+        : ''
       props.onDone(
-        reload.ok
-          ? `${label} key saved in the ${result.source}${backendNote}. Gateway reloaded; ${accountsName} accounts now: ${(accounts ?? reload.available ?? []).join(', ') || 'none'}.${warningNote}`
-          : `${label} key saved in the ${result.source}${backendNote}, but the gateway reload failed: ${reload.error} Run /refreshlogin to retry.${warningNote}`,
+        `${label} key saved in the ${result.source}${backendNote}. Gateway reloaded${accountsNote}.${warningNote}`,
       )
       return
     }
