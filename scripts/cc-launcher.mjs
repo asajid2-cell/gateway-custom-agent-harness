@@ -696,7 +696,9 @@ try {
   const attempts = isResume || mintedSessionId ? 1 : 0
   process.stderr.write('cc: launching the session...\n')
   for (let attempt = 0; attempt <= attempts; attempt++) {
-    const result = spawnSync(ClaudeRunner, [ClaudeScript, ...(attempt === 0 ? finalArgs : retryArgs)], {
+    // --no-install must precede the script path; Bun silently ignores it after
+    // it. A missing external then fails clearly instead of fetching latest.
+    const result = spawnSync(ClaudeRunner, ['--no-install', ClaudeScript, ...(attempt === 0 ? finalArgs : retryArgs)], {
       cwd: LaunchDirectory,
       stdio: 'inherit',
       env: harnessEnv,

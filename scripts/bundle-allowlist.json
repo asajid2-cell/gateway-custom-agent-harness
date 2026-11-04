@@ -1,0 +1,38 @@
+{
+  "note": "Everything not listed here is inlined into dist/cli.js. builtins: Node modules. nativePackages: real npm packages with a .node binary, installed into the archive stage. buildGeneratedExternals: names the build materializes into node_modules itself, kept external but never installed into the stage. lazyOptional: imports that may legitimately be absent at build time (the OTLP exporters are optional and uninstalled; their core packages are imported statically and stay bundled).",
+  "builtins": [
+    "node:*",
+    "fs",
+    "fs/promises",
+    "path",
+    "crypto",
+    "os",
+    "util",
+    "url",
+    "http",
+    "https",
+    "net",
+    "tls",
+    "dns",
+    "stream",
+    "events",
+    "buffer",
+    "child_process",
+    "process",
+    "readline",
+    "tty",
+    "v8",
+    "zlib",
+    "async_hooks",
+    "perf_hooks"
+  ],
+  "nativePackages": [
+    "sharp"
+  ],
+  "buildGeneratedExternals": [
+    "modifiers-napi"
+  ],
+  "lazyOptional": [
+    "@opentelemetry/exporter-*"
+  ]
+}

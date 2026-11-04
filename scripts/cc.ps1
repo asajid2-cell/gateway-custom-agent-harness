@@ -1256,7 +1256,10 @@ try {
     for ($attempt = 0; $attempt -le $AutoRestartAttempts; $attempt++) {
       Write-LaunchDiagnostic 'harness-start' @{ attempt = $attempt; port = $Port }
       $AttemptArgs = if ($attempt -eq 0) { $ClaudeArgs } else { $RetryArgs }
-      & $ClaudeRunner $ClaudeScript @AttemptArgs
+      # --no-install must precede the script path; Bun silently ignores it after
+      # it. With the dependency drift measured on a bare tree this turns a
+      # missing module into a clear error instead of a registry fetch of latest.
+      & $ClaudeRunner --no-install $ClaudeScript @AttemptArgs
       $ExitCode = $LASTEXITCODE
       Write-LaunchDiagnostic 'harness-exit' @{ attempt = $attempt; exitCode = $ExitCode }
       if ($ExitCode -ne 0 -and $ExitCode -ne 130) {

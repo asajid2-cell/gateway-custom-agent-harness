@@ -15,6 +15,24 @@ test('build stages the bundle and validates with Bun rather than Node', async ()
   assert.doesNotMatch(build, /\['node', '--check'/)
 })
 
+test('both launchers disable Bun auto-install ahead of the script path', async () => {
+  const script = await readFile(new URL('./cc.ps1', import.meta.url), 'utf8')
+  const launcher = await readFile(new URL('./cc-launcher.mjs', import.meta.url), 'utf8')
+  // After the script path Bun silently ignores the flag, so anchor on the order.
+  assert.match(script, /& \$ClaudeRunner --no-install \$ClaudeScript/)
+  assert.match(launcher, /spawnSync\(ClaudeRunner, \['--no-install', ClaudeScript,/)
+})
+
+test('the external allowlist is one data file shared with the stage', async () => {
+  const build = await readFile(new URL('./build.ts', import.meta.url), 'utf8')
+  const allowlist = JSON.parse(await readFile(new URL('./bundle-allowlist.json', import.meta.url), 'utf8'))
+  assert.match(build, /bundle-allowlist\.json/)
+  // modifiers-napi is a build-generated stub, not a package the stage installs.
+  assert.deepEqual(allowlist.nativePackages, ['sharp'])
+  assert.deepEqual(allowlist.buildGeneratedExternals, ['modifiers-napi'])
+  assert.deepEqual(allowlist.lazyOptional, ['@opentelemetry/exporter-*'])
+})
+
 test('settings compatibility is guarded generally, in both directions', async () => {
   const types = await readFile(new URL('../src/utils/settings/types.ts', import.meta.url), 'utf8')
   const validation = await readFile(new URL('../src/utils/settings/validation.ts', import.meta.url), 'utf8')
