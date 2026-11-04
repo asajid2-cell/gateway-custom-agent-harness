@@ -36,10 +36,13 @@ async function vault(proposals: Proposal[], extra = {}) {
   return root
 }
 
-test('the FTS expression quotes terms and cannot inject syntax', () => {
-  assert.equal(ftsExpression('relay "onion" OR *'), '"relay" OR "onion" OR "or"')
+test('the FTS expression quotes significant terms and cannot inject syntax', () => {
+  assert.equal(ftsExpression('relay "onion" OR *'), '"relay" OR "onion"')
   assert.equal(ftsExpression('   '), '')
   assert.equal(ftsExpression('a'), '')
+  // The question's grammar must not build the match set: "the" and "is" are
+  // stopwords, so they never reach FTS.
+  assert.equal(ftsExpression('what is the relay'), '"relay"')
 })
 
 test('a decision is returned as current with the fields the gate checks', async () => {
@@ -195,6 +198,28 @@ test('a term match that does not answer the question lands in candidates, not cu
     assert.deepEqual(packet.current, [], 'an unanswerable question must not put anything in current')
     assert.equal(packet.nothing_recorded, true)
     assert.deepEqual(packet.candidates.map(item => item.event_id), ['r1'], 'the weak match is still shown, as a candidate')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a superseded weak match is a candidate, never history', async () => {
+  const root = await vault([
+    proposal({ event_id: 'old-route', summary: 'the opencode route key expired during the migration', topic_id: 'ops' }),
+    proposal({
+      event_id: 'new-route',
+      kind: 'correction',
+      summary: 'route migration completed',
+      topic_id: 'ops',
+      recorded_at: '2026-11-04T12:00:00.000Z',
+      relations: [{ type: 'supersedes', target_event_id: 'old-route' }],
+    }),
+  ])
+  try {
+    const packet = await recall({ vaultRoot: root, familyId: FAMILY, query: 'what is the p99 relay latency' })
+    assert.deepEqual(packet.current, [])
+    assert.deepEqual(packet.history, [], 'a superseded event that does not answer must not fill history')
+    assert.equal(packet.nothing_recorded, true)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

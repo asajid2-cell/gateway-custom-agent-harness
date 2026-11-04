@@ -123,12 +123,13 @@ function text(record: Record<string, unknown>, name: string): string | null {
  * quotes doubled, so a query can never inject into the expression.
  */
 export function ftsExpression(query: string): string {
-  const terms = query
-    .toLowerCase()
-    .match(/[a-z0-9_.:/-]+/g)
-    ?.filter(term => term.length >= 2)
-  if (!terms || terms.length === 0) return ''
-  return [...new Set(terms)].map(term => `"${term.replace(/"/g, '""')}"`).join(' OR ')
+  // Significant terms only: "the" OR "is" OR "what" makes the result set
+  // near-global and lets BM25 rank on the question's grammar. Coverage is the
+  // gate that separates answers from candidates; the expression only has to
+  // build a sane candidate set.
+  const terms = significantTerms(query)
+  if (terms.length === 0) return ''
+  return terms.map(term => `"${term.replace(/"/g, '""')}"`).join(' OR ')
 }
 
 function identifiersIn(query: string): string[] {
@@ -425,6 +426,14 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
       const record = entry.entry.record
       const isSuperseded = superseded.has(String(record.event_id ?? entry.entry.row.event_id))
       const isExpired = expired(record, asOf)
+      // The answer test comes first: an event that does not answer the question
+      // is a candidate, never history. Otherwise a weak term match that happens
+      // to be superseded enters history and makes an unanswerable question look
+      // like it has an answer.
+      if (!entry.answers) {
+        if (candidates.length < limit) candidates.push(toItem(familyId, entry.entry.row, null))
+        continue
+      }
       if (isSuperseded) {
         const item = toItem(familyId, entry.entry.row, null)
         const by = supersededBy.get(item.event_id)
@@ -434,10 +443,6 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
       }
       if (isExpired) {
         history.push(toItem(familyId, entry.entry.row, 'expired'))
-        continue
-      }
-      if (!entry.answers) {
-        if (candidates.length < limit) candidates.push(toItem(familyId, entry.entry.row, null))
         continue
       }
       if (current.length >= limit) continue
