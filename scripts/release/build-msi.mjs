@@ -134,7 +134,12 @@ const wxs = `<?xml version="1.0" encoding="UTF-8"?>
   <Package Name="Gateway" Manufacturer="${escape(manufacturer)}" Version="${msiVersion}"
            UpgradeCode="${upgradeCode}" ProductCode="${productCode}" Scope="perUser" Compressed="yes">
     <SummaryInformation Description="Gateway (Claude Code) command line and model gateway" Manufacturer="${escape(manufacturer)}" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Gateway is already installed." />
+    <!-- Every rebuild of the same version gets a fresh ProductCode (it is
+         derived from the source SHA), so the same-version upgrade path has to
+         be allowed explicitly. Without it Windows treats the second build of
+         1.0.0 as an already-installed product: files land, registration does
+         not, and the MSI cannot uninstall what it just installed. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Gateway is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">

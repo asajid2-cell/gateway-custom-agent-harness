@@ -61,7 +61,10 @@ if (report.platform !== platform || report.arch !== arch) {
   fail(`stage-report is ${report.platform}-${report.arch}, not ${platform}-${arch}`)
 }
 
-const BUN_VERSION = process.env.GATEWAY_BUN_VERSION ?? '1.4.0'
+// This is the download pin, not a claim about what was embedded: `--runtime`
+// can supply any binary. The version that reaches the manifest is read back
+// from the binary itself.
+const BUN_DOWNLOAD_VERSION = process.env.GATEWAY_BUN_VERSION ?? '1.4.0'
 const BUN_ASSETS = {
   'win32-x64': { asset: 'bun-windows-x64.zip', binary: 'bun.exe' },
   'win32-arm64': { asset: 'bun-windows-aarch64.zip', binary: 'bun.exe' },
@@ -137,7 +140,7 @@ if (wantRuntime) {
     await mkdir(cache, { recursive: true })
     const archive = path.join(cache, spec.asset)
     if (!existsSync(archive)) {
-      const url = arg('runtime-url') ?? `https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${spec.asset}`
+      const url = arg('runtime-url') ?? `https://github.com/oven-sh/bun/releases/download/bun-v${BUN_DOWNLOAD_VERSION}/${spec.asset}`
       process.stderr.write(`package-release: downloading ${url}\n`)
       const response = await fetch(url, { redirect: 'follow' })
       if (!response.ok) fail(`bun download failed: HTTP ${response.status}`)
@@ -167,7 +170,17 @@ if (wantRuntime) {
     if (platform !== 'win32') await chmod(destination, 0o755)
   }
   const info = await stat(destination)
-  runtime = { version: BUN_VERSION, binary: `runtime/${spec.binary}`, bytes: info.size, sha256: await sha256(destination) }
+  // Read the version back from the binary. A literal default here once made
+  // the manifest claim 1.4.0 while `--runtime` had embedded 1.4.3, and both
+  // numbers appeared in the same object.
+  const bunVersion = spawnSync(destination, ['--version'], { encoding: 'utf8' })
+  if (bunVersion.status !== 0) fail(`bundled runtime failed --version: ${bunVersion.stderr || bunVersion.stdout}`)
+  runtime = {
+    version: bunVersion.stdout.trim(),
+    binary: `runtime/${spec.binary}`,
+    bytes: info.size,
+    sha256: await sha256(destination),
+  }
 
   // Prove the branch that matters: on a PATH with no bun anywhere, the
   // packaged launcher must still reach the harness. `login --status` goes
@@ -175,8 +188,6 @@ if (wantRuntime) {
   const bare = { ...process.env, PATH: platform === 'win32' ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32') : '/usr/bin:/bin' }
   delete bare.CC_CLAUDE_RUNNER_OVERRIDE
   delete bare.CC_CLAUDE_SCRIPT_OVERRIDE
-  const bunVersion = spawnSync(destination, ['--version'], { encoding: 'utf8' })
-  if (bunVersion.status !== 0) fail(`bundled runtime failed --version: ${bunVersion.stderr || bunVersion.stdout}`)
   const launcher = path.join(tree, 'scripts', 'cc-launcher.mjs')
   const launched = spawnSync(process.execPath, [launcher, 'login', '--status'], { cwd: tree, encoding: 'utf8', timeout: 120_000, env: bare })
   if (launched.status !== 0) fail(`bundled-runtime launcher failed: ${launched.stderr || launched.stdout}`)
