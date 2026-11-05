@@ -8,8 +8,6 @@ import { Box, Text } from '../../ink.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
 import { Select } from '../../components/CustomSelect/index.js'
 import { call as anthropicLogin } from '../login/anthropic.js'
-import { anthropicState } from '../login/login.js'
-import { performLogout } from '../logout/logout.js'
 import { call as providerLogin } from './login.js'
 import { CodexDeviceLogin } from './codex-login.js'
 import {
@@ -20,6 +18,13 @@ import {
   removeCodexAccount,
   selectCodexAccount,
 } from './codex-accounts.js'
+import {
+  anthropicAccounts,
+  anthropicStatusMessage,
+  registerCurrentClaudeLogin,
+  removeClaudeAccount,
+  selectAnthropicAccount,
+} from './anthropic-accounts.js'
 import {
   PICKER_LABELS,
   PROVIDERS,
@@ -98,26 +103,55 @@ async function renderProvider(
   context: LocalJSXCommandContext,
 ): Promise<ReactNode> {
   if (plan.provider === 'claude') {
-    if (plan.action === 'save' || plan.action === 'new') {
-      return anthropicLogin(onDone, context)
-    }
     if (plan.action === 'status') {
-      const state = await anthropicState()
-      onDone(
-        state.present
-          ? `Claude Code is signed in (${state.source}${state.oauth ? ', oauth' : ''}). The gateway reads the credential file it wrote.`
-          : 'Claude Code is not signed in. Run /login claude to sign in, or set ANTHROPIC_API_KEY for the gateway.',
-      )
+      onDone(await anthropicStatusMessage())
       return null
     }
-    await performLogout({})
-    const envNote = process.env.ANTHROPIC_API_KEY?.trim()
-      ? ' ANTHROPIC_API_KEY is still set in this environment and takes precedence.'
-      : ''
-    onDone(
-      `Claude Code signed out: credentials cleared and the gateway reads the same file, so no restart is needed.${envNote}`,
-    )
-    return null
+    if (plan.action === 'switch') {
+      if (!plan.target) {
+        onDone('Name the Claude account to switch to: /login claude switch <number|name|email> [session|global].')
+        return null
+      }
+      onDone((await selectAnthropicAccount(plan.target, plan.scope ?? 'session')).message)
+      return null
+    }
+    if (plan.action === 'remove') {
+      if (!plan.target) {
+        onDone('Name the Claude account to remove: /login claude remove <number|name|email>.')
+        return null
+      }
+      onDone((await removeClaudeAccount(plan.target)).message)
+      return null
+    }
+    // save or new: sign in, then store the credential as its own account.
+    if (plan.target) {
+      const existing = (await anthropicAccounts()).find(
+        (account: { name: string }) => account.name === plan.target,
+      )
+      if (existing) {
+        onDone(
+          `Claude account ${plan.target} is already stored (${existing.email ?? existing.name}). ` +
+            'Use /login claude switch to select it, or pick another name.',
+        )
+        return null
+      }
+    }
+    return anthropicLogin(async result => {
+      if (result !== 'Login successful') {
+        onDone(result)
+        return
+      }
+      const registered = await registerCurrentClaudeLogin(plan.target)
+      if (!registered.ok) {
+        onDone(`Claude Code signed in, but the account was not stored: ${registered.reason}.`)
+        return
+      }
+      const account = registered.account
+      onDone(
+        `Claude account ${account.number} (${account.email ?? account.name}) stored. ` +
+          `Use /login claude switch ${account.number} [session|global] to select it.`,
+      )
+    }, context)
   }
 
   if (plan.provider === 'codex') return renderCodex(plan, onDone)

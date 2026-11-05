@@ -43,6 +43,15 @@ import {
   setCurrentCodexAccount,
 } from './codex-accounts.mjs'
 import {
+  anthropicAccounts,
+  anthropicCredentialPath as anthropicAccountCredentialPath,
+  currentAnthropicAccountName,
+  findAnthropicAccount,
+  readAnthropicAccount,
+  setCurrentAnthropicAccount,
+  writeAnthropicAccount,
+} from './anthropic-accounts.mjs'
+import {
   COMMANDCODE_MODEL_IDS,
   COMMANDCODE_ROUTES,
   commandCodeEffortLevels,
@@ -4760,7 +4769,10 @@ function apiKeyHeaders(req, apiKey, stream = false) {
   return headers
 }
 
-function anthropicCredentialsPath() {
+function anthropicCredentialsPath(home = null) {
+  // An account home holds `credentials.json`; the legacy single sign-in lives
+  // at the CLI's `.credentials.json`.
+  if (home) return anthropicAccountCredentialPath(home)
   const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude')
   return path.join(configDir, '.credentials.json')
 }
@@ -4772,9 +4784,9 @@ function anthropicExpiresAt(oauth) {
 // The subscription credential, read from the same file the CLI maintains. Null
 // means nothing usable is stored, so the caller refuses rather than forwarding
 // an unauthenticated request.
-async function readAnthropicCredential() {
+async function readAnthropicCredential(filePath = anthropicCredentialsPath()) {
   try {
-    const stored = JSON.parse(await fs.readFile(anthropicCredentialsPath(), 'utf8'))
+    const stored = JSON.parse(await fs.readFile(filePath, 'utf8'))
     const oauth = stored?.claudeAiOauth
     if (
       !oauth ||
@@ -4789,10 +4801,11 @@ async function readAnthropicCredential() {
   }
 }
 
-// Exactly one refresh may be in flight: the provider's refresh tokens are
-// single-use, so concurrent turns that each exchanged one would invalidate the
-// other's result.
-let anthropicRefreshInFlight = null
+// Exactly one refresh may be in flight *per credential file*: the provider's
+// refresh tokens are single-use, so concurrent turns that each exchanged one
+// would invalidate the other's result. Keyed by file because each account home
+// is an independent grant.
+const anthropicRefreshesInFlight = new Map()
 
 function mergeAnthropicBetas(existing, required) {
   const values = []
@@ -4805,7 +4818,7 @@ function mergeAnthropicBetas(existing, required) {
   return values.join(',')
 }
 
-async function refreshAnthropicCredential(credential) {
+async function refreshAnthropicCredential(credential, filePath = anthropicCredentialsPath()) {
   const { oauth } = credential
   let response
   try {
@@ -4865,7 +4878,7 @@ async function refreshAnthropicCredential(credential) {
         ? Date.now() + tokens.expires_in * 1000
         : Date.now() + 3_600_000,
   }
-  await persistAnthropicCredential(credential, refreshed)
+  await persistAnthropicCredential(credential, refreshed, filePath)
   return refreshed.accessToken
 }
 
@@ -4873,9 +4886,9 @@ async function refreshAnthropicCredential(credential) {
 // through a same-directory temp file, so a reader never sees a partial
 // credential. A refresh token that changed on disk meanwhile came from another
 // writer that already rotated the pair, and is left alone.
-async function persistAnthropicCredential(credential, refreshed) {
-  const target = anthropicCredentialsPath()
-  const current = await readAnthropicCredential()
+async function persistAnthropicCredential(credential, refreshed, filePath = anthropicCredentialsPath()) {
+  const target = filePath
+  const current = await readAnthropicCredential(filePath)
   if (!current || current.oauth.refreshToken !== credential.oauth.refreshToken) return
   current.stored.claudeAiOauth = {
     ...current.stored.claudeAiOauth,
@@ -4902,8 +4915,124 @@ async function persistAnthropicCredential(credential, refreshed) {
   }
 }
 
-async function anthropicAccessToken() {
-  const credential = await readAnthropicCredential()
+// ---------------------------------------------------------------------------
+// Claude accounts: each home under ~/.claude-accounts is one Anthropic
+// subscription. Same contract as the Codex pool - stable numbers, a session pin
+// or the global current.txt, one live pool per session, and an advance past an
+// account that cannot serve. A machine with no account homes keeps reading the
+// single CLI credential file.
+// ---------------------------------------------------------------------------
+
+/** Explicit per-session pins, as set by /login claude switch … session. */
+const anthropicSessionSelections = new Map()
+/** One live pool per session, so a failover sticks for that session. */
+const anthropicPools = new Map()
+
+async function anthropicLoadedAccounts() {
+  try {
+    return await anthropicAccounts()
+  } catch {
+    return []
+  }
+}
+
+function anthropicPoolEnabled() {
+  return process.env.ANTHROPIC_ACCOUNT_POOL !== 'off'
+}
+
+function anthropicPoolSignature(accounts) {
+  return accounts.map(account => `${account.number}:${account.name}:${account.home}`).join(',')
+}
+
+function buildAnthropicPool(accounts, preferred) {
+  let selected = preferred
+  let lastServed = null
+  const at = number => accounts.findIndex(account => account.number === number)
+  const pool = {
+    get accounts() {
+      return accounts.map(account => ({
+        number: account.number,
+        name: account.name,
+        ...(account.email ? { email: account.email } : {}),
+        ...(account.displayName ? { displayName: account.displayName } : {}),
+      }))
+    },
+    get numbers() { return accounts.map(account => account.number) },
+    get size() { return accounts.length },
+    get number() {
+      const index = at(selected)
+      return index < 0 ? accounts[0].number : accounts[index].number
+    },
+    get lastServed() { return lastServed },
+    nameFor(number) { return accounts.find(account => account.number === number)?.name ?? null },
+    emailFor(number) { return accounts.find(account => account.number === number)?.email ?? null },
+    accountFor(number) { return accounts.find(account => account.number === number) ?? null },
+    pathFor(number) {
+      const account = accounts.find(candidate => candidate.number === number)
+      return account ? anthropicCredentialsPath(account.home) : null
+    },
+    advance() {
+      const index = at(selected)
+      if (index < 0) return
+      selected = accounts[(index + 1) % accounts.length].number
+    },
+    select(number) {
+      if (!accounts.some(account => account.number === number)) return false
+      selected = number
+      return true
+    },
+    markServed() { lastServed = pool.number },
+  }
+  return pool
+}
+
+export async function anthropicRequestPool(sessionId) {
+  if (!anthropicPoolEnabled()) return null
+  const accounts = await anthropicLoadedAccounts()
+  const key = sessionId || ''
+  if (accounts.length === 0) {
+    anthropicPools.delete(key)
+    return null
+  }
+  const signature = anthropicPoolSignature(accounts)
+  const cached = anthropicPools.get(key)
+  if (cached?.signature === signature) return cached.pool
+  const selectedName = await currentAnthropicAccountName()
+  const selected = accounts.find(account => account.name === selectedName)
+  const pinned = sessionId ? anthropicSessionSelections.get(sessionId) : undefined
+  const carried = cached?.pool.number
+  const preferred = Number.isSafeInteger(pinned) && accounts.some(account => account.number === pinned)
+    ? pinned
+    : accounts.some(account => account.number === carried)
+      ? carried
+      : selected?.number ?? accounts[0].number
+  const pool = buildAnthropicPool(accounts, preferred)
+  anthropicPools.set(key, { signature, pool })
+  return pool
+}
+
+/**
+ * The credential file a request outside any session should use: the global
+ * selection, or the CLI's own file when no account homes exist. Usage/quota
+ * reads use this, so the reported windows belong to the account in use.
+ */
+async function anthropicSelectedPath() {
+  if (!anthropicPoolEnabled()) return anthropicCredentialsPath()
+  const accounts = await anthropicLoadedAccounts()
+  if (accounts.length === 0) return anthropicCredentialsPath()
+  const selectedName = await currentAnthropicAccountName()
+  const selected = accounts.find(account => account.name === selectedName) ?? accounts[0]
+  return anthropicCredentialsPath(selected.home)
+}
+
+function anthropicPoolPath(pool) {
+  if (!pool) return null
+  return pool.pathFor(pool.number)
+}
+
+async function anthropicAccessToken(filePath = null) {
+  const target = filePath ?? await anthropicSelectedPath()
+  const credential = await readAnthropicCredential(target)
   if (!credential) {
     throw new PassthroughCredentialError(
       'Anthropic credentials are not configured: sign in with Claude Code, or set ANTHROPIC_API_KEY',
@@ -4911,17 +5040,21 @@ async function anthropicAccessToken() {
   }
   const { oauth } = credential
   if (anthropicExpiresAt(oauth) > Date.now() + 60_000) return oauth.accessToken
-  if (anthropicRefreshInFlight === null) {
-    anthropicRefreshInFlight = refreshAnthropicCredential(credential).finally(() => {
-      anthropicRefreshInFlight = null
-    })
-  }
-  return anthropicRefreshInFlight
+  const inFlight = anthropicRefreshesInFlight.get(target)
+  if (inFlight) return inFlight
+  const refresh = refreshAnthropicCredential(credential, target).finally(() => {
+    if (anthropicRefreshesInFlight.get(target) === refresh) {
+      anthropicRefreshesInFlight.delete(target)
+    }
+  })
+  anthropicRefreshesInFlight.set(target, refresh)
+  return refresh
 }
 
-async function anthropicHeaders(req, { stream, body }) {
+async function anthropicHeaders(req, { stream, body, pool = null }) {
   const apiKey = process.env.ANTHROPIC_API_KEY
-  const token = apiKey ? null : await anthropicAccessToken()
+  const credentialPath = anthropicPoolPath(pool)
+  const token = apiKey ? null : await anthropicAccessToken(credentialPath)
   const headers = passthroughCopyHeaders(req, stream)
   if (apiKey) {
     headers.set('x-api-key', apiKey)
@@ -5484,9 +5617,13 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
   const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: provider.backend, protocol: 'anthropic-messages' })
   const control = createRequestControl(req, res, trace)
+  // Only the first-party provider has Claude accounts; the passthrough key
+  // providers have their own pools.
+  const sessionId = upstreamSessionId(req, body)
+  const pool = providerName === 'anthropic' ? await anthropicRequestPool(sessionId) : null
   let credentials
   try {
-    credentials = await provider.headers(req, { stream: wantsStream, body })
+    credentials = await provider.headers(req, { stream: wantsStream, body, pool })
   } catch (error) {
     const status = error instanceof PassthroughCredentialError ? error.status : 502
     anthropicError(res, status, errorMessage(error))
@@ -5513,14 +5650,16 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
     upstream = await fetchWithRetry({
       provider: label,
       url: upstreamUrl,
-      options: {
-        method: 'POST',
-        headers,
-        body: rawBody,
-        signal: control.signal,
+      // Rebuilt per attempt: a credential failure advances the Claude account
+      // pool, and each account carries its own OAuth token.
+      options: async () => {
+        if (!pool) return { method: 'POST', headers, body: rawBody, signal: control.signal }
+        const fresh = await provider.headers(req, { stream: wantsStream, body, pool })
+        return { method: 'POST', headers: fresh.headers, body: rawBody, signal: control.signal }
       },
       control,
       trace,
+      credentials: pool ?? undefined,
     })
   } catch (error) {
     trace.markError(error)
@@ -5963,7 +6102,84 @@ const server = http.createServer(async (req, res) => {
       number,
       global,
       available: accounts.map(account => account.number),
-      accounts: accounts.map(account => ({ number: account.number, name: account.name })),
+      accounts: accounts.map(account => ({
+        number: account.number,
+        name: account.name,
+        ...(account.email ? { email: account.email } : {}),
+        ...(account.displayName ? { displayName: account.displayName } : {}),
+      })),
+    })
+    return
+  }
+
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/anthropic-account') {
+    if (!anthropicPoolEnabled()) {
+      json(res, 400, { error: 'No Claude account is stored. Run /login claude to sign in.' })
+      return
+    }
+    let selection
+    try { selection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid account selection' })
+      return
+    }
+    const { number, name, email, sessionId, scope } = selection ?? {}
+    if (!['session', 'global'].includes(scope) || typeof sessionId !== 'string' || !sessionId.trim()) {
+      json(res, 400, { error: 'Use an account number, name, or email and session or global scope' })
+      return
+    }
+    const accounts = await anthropicLoadedAccounts()
+    if (accounts.length === 0) {
+      json(res, 400, { error: 'No Claude account is stored. Run /login claude to sign in.' })
+      return
+    }
+    const account = Number.isSafeInteger(number) && number > 0
+      ? accounts.find(candidate => candidate.number === number)
+      : findAnthropicAccount(accounts, name ?? email)
+    if (!account) {
+      json(res, 400, {
+        error: `Claude account ${name ?? email ?? number} is not stored. Available: ${accounts.map(candidate => `${candidate.number}=${candidate.name}${candidate.email ? ` <${candidate.email}>` : ''}`).join(', ')}.`,
+      })
+      return
+    }
+    if (scope === 'global') {
+      try {
+        await setCurrentAnthropicAccount(account.name)
+      } catch {
+        json(res, 500, { error: 'Could not save the global Claude account' })
+        return
+      }
+      anthropicSessionSelections.delete(sessionId)
+      for (const [key, entry] of anthropicPools) {
+        if (!anthropicSessionSelections.has(key)) entry.pool.select(account.number)
+      }
+    } else {
+      anthropicSessionSelections.set(sessionId, account.number)
+      anthropicPools.get(sessionId)?.pool.select(account.number)
+    }
+    json(res, 200, { number: account.number, name: account.name, email: account.email, scope })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/anthropic-account') {
+    if (!anthropicPoolEnabled()) {
+      json(res, 200, { number: 1, global: 1, available: [], accounts: [] })
+      return
+    }
+    const sessionId = requestUrl.searchParams.get('sessionId')
+    const accounts = await anthropicLoadedAccounts()
+    const selectedName = await currentAnthropicAccountName()
+    const global = accounts.find(account => account.name === selectedName)?.number ?? accounts[0]?.number ?? 1
+    const number = (await anthropicRequestPool(sessionId))?.number ?? global
+    json(res, 200, {
+      number,
+      global,
+      available: accounts.map(account => account.number),
+      accounts: accounts.map(account => ({
+        number: account.number,
+        name: account.name,
+        ...(account.email ? { email: account.email } : {}),
+        ...(account.displayName ? { displayName: account.displayName } : {}),
+      })),
     })
     return
   }
@@ -5979,6 +6195,7 @@ const server = http.createServer(async (req, res) => {
     const commandCodePool = await sessionCommandCodeCredentials(sessionId)
     const mistralPool = await sessionMistralCredentials(sessionId)
     const codexLoaded = await codexLoadedAccounts()
+    const anthropicLoaded = await anthropicLoadedAccounts()
     // `available` stays the OpenCode list: the opencode CLI reads it as its own
     // accounts. CommandCode numbers travel separately and its CLI re-reads GET
     // /gateway/commandcode-account, which already returns its own `available`.
@@ -5991,6 +6208,7 @@ const server = http.createServer(async (req, res) => {
       mistralAvailable: mistralPool.numbers,
       mistralVibeAvailable: mistralVibeCredentials.numbers,
       codexAvailable: codexLoaded.map(account => account.number),
+      claudeAvailable: anthropicLoaded.map(account => account.number),
     }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })

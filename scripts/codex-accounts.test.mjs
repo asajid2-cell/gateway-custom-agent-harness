@@ -93,6 +93,38 @@ test('the next account name avoids names already on disk', async t => {
   assert.equal(await nextCodexAccountName({ root }), 'account2')
 })
 
+function fakeIdToken(claims) {
+  const encode = value => Buffer.from(JSON.stringify(value)).toString('base64url')
+  return `${encode({ alg: 'none' })}.${encode(claims)}.signature`
+}
+
+test('the account identity comes from the id_token claims and is remembered', async t => {
+  const root = await scratch(t)
+  const home = await addAccount(root, 'work', {
+    access_token: 'token-work',
+    account_id: 'acct-work',
+    id_token: fakeIdToken({ email: 'work@example.com', name: 'Work Person' }),
+  })
+  const accounts = await codexAccounts({ root })
+  assert.equal(accounts[0].email, 'work@example.com')
+  assert.equal(accounts[0].displayName, 'Work Person')
+
+  const registry = JSON.parse(await readFile(path.join(root, 'registry.json'), 'utf8'))
+  assert.deepEqual(registry.accounts, [
+    { number: 1, name: 'work', email: 'work@example.com', displayName: 'Work Person' },
+  ])
+
+  // A malformed token must not fail the listing or invent an identity.
+  const broken = await addAccount(root, 'broken', {
+    access_token: 'token-broken',
+    account_id: 'acct-broken',
+    id_token: 'not-a-jwt',
+  })
+  assert.ok(broken)
+  const again = await codexAccounts({ root })
+  assert.equal(again.find(account => account.name === 'broken').email, undefined)
+})
+
 test('auth reads only the two usable fields and refuses an incomplete login', async t => {
   const root = await scratch(t)
   const good = await addAccount(root, 'good')

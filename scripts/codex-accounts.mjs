@@ -6,29 +6,33 @@
  * keeps them under `~/.codex-accounts/<name>/` with `current.txt` naming the
  * human's selection.
  *
- * The gateway and the /login picker need a *stable number* per account so a
- * selection survives adding or removing a home, exactly like the numbered
- * OPENCODE_API_KEY/COMMANDCODE_API_KEY slots. `registry.json` is that mapping:
- * a name keeps the number it was first given, and a new name takes the lowest
- * free number. The registry is bookkeeping, not authority - an account is
- * loaded only while its `auth.json` exists.
+ * Numbers, selection, and the registry live in `account-store.mjs`. The one
+ * Codex-specific thing here is identity: `auth.json` carries the ChatGPT
+ * id_token, whose payload names the account (email and display name). Those two
+ * non-secret claims are copied into the registry so a list of accounts is
+ * readable; no token value is ever returned, logged, or displayed.
  *
- * Never read, log, or echo the contents of `auth.json` beyond the two fields the
- * request needs.
+ * Never read, log, or echo the contents of `auth.json` beyond those claims and
+ * the two request fields.
  */
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
+import {
+  ACCOUNT_NAME,
+  accountRecords,
+  accountRoot,
+  listAccountNames,
+  nextAccountName,
+  readCurrent,
+  setAccountIdentity,
+  writeCurrent,
+} from './account-store.mjs'
 
-export const CODEX_ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+export const CODEX_ACCOUNT_NAME = ACCOUNT_NAME
 
 export function codexAccountsRoot({ home = os.homedir() } = {}) {
-  // An explicit root is the test seam and the only way to keep a gateway under
-  // test from reading the operator's real account homes.
-  const override = process.env.CODEX_ACCOUNTS_HOME
-  if (override) return path.resolve(override)
-  return path.join(home, '.codex-accounts')
+  return accountRoot('CODEX_ACCOUNTS_HOME', '.codex-accounts', { home })
 }
 
 export function codexHomeFor(name, { root = codexAccountsRoot() } = {}) {
@@ -39,125 +43,72 @@ export function codexAuthPath(home) {
   return path.join(home, 'auth.json')
 }
 
-async function hasAuth(home) {
-  try {
-    await fs.access(codexAuthPath(home))
-    return true
-  } catch {
-    return false
-  }
-}
-
-/** Directory names under the accounts root that carry a login. */
 export async function listCodexAccountNames({ root = codexAccountsRoot() } = {}) {
-  let entries
+  return listAccountNames(root, 'auth.json')
+}
+
+/** The email and display name the id_token names, or null. Never throws. */
+export async function codexIdentity(home) {
   try {
-    entries = await fs.readdir(root, { withFileTypes: true })
-  } catch {
-    return []
-  }
-  const names = []
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !CODEX_ACCOUNT_NAME.test(entry.name)) continue
-    if (await hasAuth(path.join(root, entry.name))) names.push(entry.name)
-  }
-  return names.sort((a, b) => a.localeCompare(b))
-}
-
-function registryPath(root) {
-  return path.join(root, 'registry.json')
-}
-
-async function readRegistryNumbers(root) {
-  try {
-    const parsed = JSON.parse(await fs.readFile(registryPath(root), 'utf8'))
-    const records = Array.isArray(parsed?.accounts) ? parsed.accounts : []
-    const numbers = new Map()
-    for (const record of records) {
-      if (!record || !Number.isSafeInteger(record.number) || record.number < 1) continue
-      if (typeof record.name !== 'string' || !CODEX_ACCOUNT_NAME.test(record.name)) continue
-      if (!numbers.has(record.name)) numbers.set(record.name, record.number)
-    }
-    return numbers
-  } catch {
-    return new Map()
-  }
-}
-
-async function writeRegistryNumbers(root, numbers) {
-  const temp = `${registryPath(root)}.${randomUUID()}.tmp`
-  const accounts = [...numbers.entries()]
-    .map(([name, number]) => ({ number, name }))
-    .sort((a, b) => a.number - b.number)
-  try {
-    await fs.mkdir(root, { recursive: true })
-    await fs.writeFile(temp, `${JSON.stringify({ accounts }, null, 2)}\n`)
-    await fs.rename(temp, registryPath(root))
-  } catch {
-    await fs.unlink(temp).catch(() => {})
-  }
-}
-
-/**
- * Every loaded account with its stable number, lowest number first. New homes
- * are added to the registry (and the registry saved) before they are returned,
- * so the number a caller sees is the number a later caller sees.
- */
-export async function codexAccounts({ root = codexAccountsRoot() } = {}) {
-  const names = await listCodexAccountNames({ root })
-  if (names.length === 0) return []
-  const numbers = await readRegistryNumbers(root)
-  const taken = new Set(numbers.values())
-  let changed = false
-  for (const name of names) {
-    if (numbers.has(name)) continue
-    let number = 1
-    while (taken.has(number)) number += 1
-    numbers.set(name, number)
-    taken.add(number)
-    changed = true
-  }
-  // Drop bookkeeping for homes that are gone, but never renumber a survivor.
-  const live = new Set(names)
-  for (const name of [...numbers.keys()]) {
-    if (!live.has(name)) {
-      numbers.delete(name)
-      changed = true
-    }
-  }
-  if (changed) await writeRegistryNumbers(root, numbers)
-  return names
-    .map(name => ({ number: numbers.get(name), name, home: codexHomeFor(name, { root }) }))
-    .sort((a, b) => a.number - b.number)
-}
-
-/** The human's selection, as written by `codex-acct use` and by /login. */
-export async function currentCodexAccountName({ root = codexAccountsRoot() } = {}) {
-  try {
-    const raw = await fs.readFile(path.join(root, 'current.txt'), 'utf8')
-    const name = raw.replace(/^\uFEFF/, '').trim()
-    return name && CODEX_ACCOUNT_NAME.test(name) ? name : null
+    const auth = JSON.parse(await fs.readFile(codexAuthPath(home), 'utf8'))
+    const idToken = auth?.tokens?.id_token
+    if (typeof idToken !== 'string' || idToken.split('.').length !== 3) return null
+    const payload = JSON.parse(
+      Buffer.from(
+        idToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'),
+        'base64',
+      ).toString('utf8'),
+    )
+    const email = typeof payload?.email === 'string' ? payload.email : null
+    const displayName = typeof payload?.name === 'string' ? payload.name : null
+    return email || displayName ? { email, displayName } : null
   } catch {
     return null
   }
 }
 
-export async function setCurrentCodexAccount(name, { root = codexAccountsRoot() } = {}) {
-  if (!CODEX_ACCOUNT_NAME.test(name)) throw new Error(`Invalid Codex account name: ${name}`)
-  const temp = `${path.join(root, 'current.txt')}.${randomUUID()}.tmp`
-  await fs.mkdir(root, { recursive: true })
-  await fs.writeFile(temp, `${name}\n`)
-  await fs.rename(temp, path.join(root, 'current.txt'))
+/**
+ * Every loaded account with its stable number and identity, lowest number
+ * first. New homes are numbered and recorded before they are returned. An
+ * account whose identity is not on record yet is read once and remembered.
+ */
+export async function codexAccounts({ root = codexAccountsRoot() } = {}) {
+  const names = await listAccountNames(root, 'auth.json')
+  if (names.length === 0) return []
+  const records = await accountRecords(root, names)
+  const accounts = []
+  for (const name of names) {
+    const record = records.get(name)
+    const home = codexHomeFor(name, { root })
+    if (!record.email && !record.displayName) {
+      const identity = await codexIdentity(home)
+      if (identity) {
+        await setAccountIdentity(root, name, identity)
+        record.email = identity.email ?? record.email
+        record.displayName = identity.displayName ?? record.displayName
+      }
+    }
+    accounts.push({
+      number: record.number,
+      name,
+      home,
+      ...(record.email ? { email: record.email } : {}),
+      ...(record.displayName ? { displayName: record.displayName } : {}),
+    })
+  }
+  return accounts.sort((a, b) => a.number - b.number)
 }
 
-/** The next name that is neither on disk nor reserved in the registry. */
+export async function currentCodexAccountName({ root = codexAccountsRoot() } = {}) {
+  return readCurrent(root)
+}
+
+export async function setCurrentCodexAccount(name, { root = codexAccountsRoot() } = {}) {
+  await writeCurrent(root, name)
+}
+
 export async function nextCodexAccountName({ root = codexAccountsRoot(), prefix = 'account' } = {}) {
-  const taken = new Set(await listCodexAccountNames({ root }))
-  const numbers = await readRegistryNumbers(root)
-  for (const name of numbers.keys()) taken.add(name)
-  let index = 1
-  while (taken.has(`${prefix}${index}`)) index += 1
-  return `${prefix}${index}`
+  return nextAccountName(root, { marker: 'auth.json', prefix })
 }
 
 /**

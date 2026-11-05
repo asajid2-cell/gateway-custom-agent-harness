@@ -61,7 +61,7 @@ test('gateway mode registers the credential login, off-gateway keeps OAuth login
     /isUsing3PServices\(\)\s*\?\s*\[gatewayLogin\]\s*:\s*\[logout, login\(\)\]/,
   )
   assert.match(loginSource, /name: 'login'/)
-  assert.match(loginSource, /Sign in to Claude Code, add or switch Codex accounts/)
+  assert.match(loginSource, /Sign in to Claude Code or Codex and switch between their accounts/)
   assert.match(loginSource, /switch\|remove/)
 })
 
@@ -100,9 +100,13 @@ test('the gateway picker reaches the host sign-ins, not only vault keys', async 
   assert.match(unifiedSource, /import \{ CodexDeviceLogin \} from '\.\/codex-login\.js'/)
   assert.match(unifiedSource, /selectCodexAccount/)
   assert.match(unifiedSource, /removeCodexAccount/)
-  assert.match(unifiedSource, /performLogout/)
+  // Claude sign-in is registered as its own account rather than only kept in
+  // the single CLI credential slot.
+  assert.match(unifiedSource, /registerCurrentClaudeLogin/)
+  assert.match(unifiedSource, /selectAnthropicAccount/)
+  assert.match(unifiedSource, /anthropicStatusMessage/)
   assert.match(planSource, /export const PROVIDERS: ProviderName\[\] = \['claude', 'codex', \.\.\.KEY_PROVIDERS\]/)
   assert.match(planSource, /anthropic: 'claude'/)
   assert.match(planSource, /chatgpt: 'codex'/)
-  assert.match(planSource, /export const ACCOUNT_PROVIDERS: ProviderName\[\] = \['opencode', 'commandcode', 'mistral', 'codex'\]/)
+  assert.match(planSource, /export const ACCOUNT_PROVIDERS: ProviderName\[\] = \['claude', 'codex', 'opencode', 'commandcode', 'mistral'\]/)
 })

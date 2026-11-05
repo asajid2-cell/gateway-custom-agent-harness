@@ -9,7 +9,12 @@ import {
   setCurrentCodexAccount,
 } from '../../../scripts/codex-accounts.mjs'
 
-export type CodexAccount = { number: number; name: string }
+export type CodexAccount = {
+  number: number
+  name: string
+  email?: string
+  displayName?: string
+}
 
 export { CODEX_ACCOUNT_NAME, codexAccounts, codexHomeFor, nextCodexAccountName }
 
@@ -37,9 +42,11 @@ export async function fetchCodexSelection(): Promise<CodexSelection | null> {
     return {
       number: Number(body.number) || 1,
       global: Number(body.global) || 1,
-      accounts: body.accounts.map((account: { number: number; name: string }) => ({
+      accounts: body.accounts.map((account: CodexAccount) => ({
         number: account.number,
         name: String(account.name),
+        ...(account.email ? { email: String(account.email) } : {}),
+        ...(account.displayName ? { displayName: String(account.displayName) } : {}),
       })),
     }
   } catch {
@@ -54,10 +61,26 @@ function resolve(accounts: CodexAccount[], target: string): CodexAccount | undef
   return accounts.find(account => account.name === target)
 }
 
+function accountLabel(account: CodexAccount): string {
+  return account.email || account.displayName || account.name
+}
+
 function listing(accounts: CodexAccount[], active?: number): string {
   return accounts
-    .map(account => `${account.number}=${account.name}${account.number === active ? ' (active)' : ''}`)
+    .map(
+      account =>
+        `${account.number}=${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? ' (active)' : ''}`,
+    )
     .join(', ')
+}
+
+function accountLines(accounts: CodexAccount[], active?: number): string {
+  return accounts
+    .map(
+      account =>
+        `  ${account.number}. ${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? '  <- active' : ''}`,
+    )
+    .join('\n')
 }
 
 /**
@@ -76,7 +99,7 @@ export async function codexStatusMessage(): Promise<string> {
   }
   if (selection) {
     return (
-      `Codex accounts: ${listing(selection.accounts, selection.number)}.\n` +
+      `Codex accounts (${selection.accounts.length}):\n${accountLines(selection.accounts, selection.number)}\n` +
       `Session account: ${selection.number}; global: ${selection.global}. ` +
       'A request that fails on one account retries with the next one.'
     )
@@ -85,7 +108,7 @@ export async function codexStatusMessage(): Promise<string> {
     (account: CodexAccount) => account.name === currentName,
   )
   return (
-    `Codex accounts: ${listing(accounts, current?.number)}.\n` +
+    `Codex accounts (${accounts.length}):\n${accountLines(accounts, current?.number ?? accounts[0]?.number)}\n` +
     'This gateway does not report Codex accounts, so switching is unavailable here; ' +
     'restart cc on the updated gateway to enable it. ' +
     'The account marked active is the one the global selection names.'

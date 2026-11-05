@@ -1190,6 +1190,10 @@ async function startGatewayForTest(env) {
       // A test's scratch CODEX_HOME is its only Codex account unless the test
       // opts into the multi-account pool with its own CODEX_ACCOUNTS_HOME.
       CODEX_ACCOUNT_POOL: env.CODEX_ACCOUNT_POOL ?? 'off',
+      // Same for the Claude account pool: the config-dir credential is the
+      // only account unless the test points ANTHROPIC_ACCOUNTS_HOME at a
+      // scratch store.
+      ANTHROPIC_ACCOUNT_POOL: env.ANTHROPIC_ACCOUNT_POOL ?? 'off',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -1380,6 +1384,123 @@ test('the Codex pool rotates to the next usable home and exposes the credential 
     else process.env.CODEX_ACCOUNTS_HOME = previous.accounts
     if (previous.pool === undefined) delete process.env.CODEX_ACCOUNT_POOL
     else process.env.CODEX_ACCOUNT_POOL = previous.pool
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+/** Two Claude account homes with a future-dated OAuth pair each. */
+async function claudeAccountFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'claude-selection-'))
+  for (const name of ['alpha', 'beta']) {
+    const home = path.join(root, name)
+    await mkdir(home, { recursive: true })
+    await writeFile(
+      path.join(home, 'credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: `token-${name}`,
+          refreshToken: `refresh-${name}`,
+          expiresAt: Date.now() + 3_600_000,
+        },
+      }),
+    )
+  }
+  return root
+}
+
+test('Claude account selection isolates sessions and persists the global default', async () => {
+  const root = await claudeAccountFixture()
+  const env = { ANTHROPIC_ACCOUNTS_HOME: root, ANTHROPIC_ACCOUNT_POOL: 'on' }
+  let gateway = await startGatewayForTest(env)
+  const status = async session => {
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/gateway/anthropic-account?sessionId=${session}`)
+    assert.equal(response.status, 200, 'account status route must exist')
+    const body = await response.json()
+    assert.deepEqual(body.accounts.map(account => [account.number, account.name]), [[1, 'alpha'], [2, 'beta']])
+    return body
+  }
+  const select = async (sessionId, target, scope) => fetch(`http://127.0.0.1:${gateway.port}/gateway/anthropic-account`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, ...target, scope }),
+  })
+  try {
+    assert.deepEqual((await status('a')).available, [1, 2])
+    assert.deepEqual((await status('a')).global, 1)
+    assert.equal((await select('a', { number: 2 }, 'session')).status, 200)
+    assert.equal((await status('a')).number, 2)
+    assert.equal((await status('b')).number, 1)
+    assert.equal((await select('b', { name: 'beta' }, 'global')).status, 200)
+    assert.equal((await status('c')).number, 2)
+    assert.equal((await status('c')).global, 2)
+    assert.equal((await select('a', { number: 1 }, 'session')).status, 200)
+    assert.equal((await status('a')).number, 1)
+    const rejected = await select('b', { number: 99 }, 'global')
+    assert.equal(rejected.status, 400)
+    assert.match((await rejected.json()).error, /Available: 1=alpha, 2=beta/)
+    await stopChild(gateway.child)
+    gateway = await startGatewayForTest(env)
+    assert.equal((await status('new')).number, 2, 'the global selection survives a restart')
+    assert.equal((await readFile(path.join(root, 'current.txt'), 'utf8')).trim(), 'beta')
+  } finally {
+    await stopChild(gateway.child)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a Claude request rotates to the next stored account on a credential failure', async () => {
+  const root = await claudeAccountFixture()
+  const seen = []
+  const fake = await fakeCodexServer((req, res) => {
+    seen.push(req.headers.authorization)
+    if (seen.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'expired' } }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      id: 'msg-claude-rotate',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'OK' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 2, output_tokens: 1 },
+    }))
+  })
+  const gateway = await startGatewayForTest({
+    // Empty, not absent: the OAuth path must be the one under test.
+    ANTHROPIC_API_KEY: '',
+    MODEL_GATEWAY_ANTHROPIC_URL: `http://127.0.0.1:${fake.port}/v1/messages`,
+    ANTHROPIC_ACCOUNTS_HOME: root,
+    ANTHROPIC_ACCOUNT_POOL: 'on',
+    MODEL_GATEWAY_UPSTREAM_RETRIES: '2',
+    MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
+  })
+  try {
+    const response = await postGateway(
+      gateway.port,
+      {
+        model: 'gateway-claude-opus-5-5',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      },
+      { 'x-opencode-session': 'rotate' },
+    )
+    assert.equal(response.status, 200)
+    assert.equal(seen.length, 2, 'the failed account and the retry both reached upstream')
+    assert.match(seen[0], /^Bearer token-alpha$/)
+    assert.match(seen[1], /^Bearer token-beta$/)
+
+    // The failover belongs to the session, so its reported account moves too.
+    const status = await (await fetch(`http://127.0.0.1:${gateway.port}/gateway/anthropic-account?sessionId=rotate`)).json()
+    assert.equal(status.number, 2)
+    const other = await (await fetch(`http://127.0.0.1:${gateway.port}/gateway/anthropic-account?sessionId=other`)).json()
+    assert.equal(other.number, 1)
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => fake.server.close(resolve))
     await rm(root, { recursive: true, force: true })
   }
 })

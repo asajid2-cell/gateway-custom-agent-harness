@@ -37,7 +37,7 @@ export const KEY_PROVIDERS = Object.keys(PROVIDER_CREDENTIALS) as KeyProviderNam
  * Providers with numbered accounts: the numbered key slots the gateway rotates
  * through, plus Codex account homes. Only these accept `switch`.
  */
-export const ACCOUNT_PROVIDERS: ProviderName[] = ['opencode', 'commandcode', 'mistral', 'codex']
+export const ACCOUNT_PROVIDERS: ProviderName[] = ['claude', 'codex', 'opencode', 'commandcode', 'mistral']
 
 /**
  * Picker order: the host sign-ins first, because they are the ones an operator
@@ -96,13 +96,18 @@ function providerWords(provider: ProviderName): string {
   if (provider === 'codex') {
     return 'new [name], switch <number|name> [session|global], status, or remove <number|name>'
   }
+  if (provider === 'claude') {
+    return 'new [name], switch <number|name|email> [session|global], status, or remove <number|name|email>'
+  }
   if (isAccountProvider(provider)) {
     return 'new, switch <number> [session|global], status, or remove'
   }
-  if (provider === 'claude') {
-    return 'status or remove (no argument signs in)'
-  }
   return 'new, status, or remove'
+}
+
+/** Host and Claude accounts may be named; the key providers are numbered. */
+function namedTargets(provider: ProviderName): boolean {
+  return provider === 'codex' || provider === 'claude'
 }
 
 /**
@@ -147,7 +152,7 @@ export function planLogin(args: string): LoginPlan {
     if (scopeWord && scopeWord !== 'session' && scopeWord !== 'global') {
       return error(`Switch scope is session or global, not ${scopeWord}.`)
     }
-    if (provider !== 'codex' && !/^[1-9][0-9]*$/.test(target)) {
+    if (!namedTargets(provider) && !/^[1-9][0-9]*$/.test(target)) {
       return error(`${provider} accounts are numbered; use /login ${provider} switch <number> [session|global].`)
     }
     return {
@@ -163,8 +168,8 @@ export function planLogin(args: string): LoginPlan {
   if (action === 'new') {
     if (rest.length > 2) return error(`Use /login ${provider} ${providerWords(provider)}.`)
     const name = rest[1]
-    if (name && provider !== 'codex') {
-      return error(`Only a Codex account takes a name; use /login ${provider} new.`)
+    if (name && !namedTargets(provider)) {
+      return error(`Only a Claude or Codex account takes a name; use /login ${provider} new.`)
     }
     if (name && !CODEX_ACCOUNT_NAME.test(name)) {
       return error(`Account names use letters, digits, dot, dash, or underscore: ${name}`)
@@ -181,11 +186,11 @@ export function planLogin(args: string): LoginPlan {
   if (action === 'remove') {
     if (rest.length > 2) return error(`Use /login ${provider} ${providerWords(provider)}.`)
     const target = rest[1]
-    if (target && provider !== 'codex') {
+    if (target && !namedTargets(provider)) {
       return error(`/login ${provider} remove targets the active key; it takes no account.`)
     }
-    if (provider === 'codex' && !target) {
-      return error('Name the Codex account to remove: /login codex remove <number|name>.')
+    if (namedTargets(provider) && !target) {
+      return error(`Name the ${provider} account to remove: /login ${provider} remove <number|name${provider === 'claude' ? '|email' : ''}>.`)
     }
     return {
       kind: 'provider',

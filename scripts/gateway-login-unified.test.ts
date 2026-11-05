@@ -150,7 +150,40 @@ test('bad account grammar is refused with the provider its own words', () => {
   assert.equal(planLogin('codex remove').kind, 'error')
   assert.equal(planLogin('codex new bad/name').kind, 'error')
   assert.equal(planLogin('deepseek new named').kind, 'error')
-  assert.equal(planLogin('claude remove 2').kind, 'error')
+  assert.equal(planLogin('claude remove').kind, 'error')
+})
+
+test('Claude accounts accept names and emails, and require a target when removing', () => {
+  assert.deepEqual(planLogin('claude switch work'), {
+    kind: 'provider',
+    provider: 'claude',
+    action: 'switch',
+    args: 'switch work',
+    target: 'work',
+    scope: 'session',
+  })
+  assert.deepEqual(planLogin('claude switch work@example.com global'), {
+    kind: 'provider',
+    provider: 'claude',
+    action: 'switch',
+    args: 'switch work@example.com global',
+    target: 'work@example.com',
+    scope: 'global',
+  })
+  assert.deepEqual(planLogin('claude new work'), {
+    kind: 'provider',
+    provider: 'claude',
+    action: 'new',
+    args: 'new work',
+    target: 'work',
+  })
+  assert.deepEqual(planLogin('claude remove 2'), {
+    kind: 'provider',
+    provider: 'claude',
+    action: 'remove',
+    args: 'remove 2',
+    target: '2',
+  })
 })
 
 test('unknown providers and extra words are refused with the list', () => {
