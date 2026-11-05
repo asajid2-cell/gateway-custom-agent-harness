@@ -1,0 +1,9 @@
+# Executable shell entry points must stay LF.
+#
+# Git stores them LF, but `git archive` applies core.autocrlf on export, so a
+# release staged from a Windows host shipped `scripts/cc` with a CRLF shebang.
+# The target then fails with `env: 'bash\r': No such file or directory`, which
+# says nothing about line endings. These attributes make the export LF
+# regardless of the exporting host.
+scripts/cc text eol=lf
+*.sh text eol=lf

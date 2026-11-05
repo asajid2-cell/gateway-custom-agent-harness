@@ -178,7 +178,16 @@ if (platform === 'win32') {
     '@echo off\r\npowershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0cc.ps1" %*\r\nexit /b %ERRORLEVEL%\r\n',
   )
 }
-if (platform !== 'win32') await chmod(path.join(out, 'scripts', 'cc'), 0o755)
+if (platform !== 'win32') {
+  await chmod(path.join(out, 'scripts', 'cc'), 0o755)
+  // A CRLF shebang (`#!/usr/bin/env bash\r`) does not run, and the only
+  // symptom on the target is `env: 'bash\r': No such file or directory`. An
+  // export from a core.autocrlf=true host produced exactly that; name it here.
+  const entry = await readFile(path.join(out, 'scripts', 'cc'))
+  if (entry.includes(0x0d)) {
+    fail('staged scripts/cc contains CR; a CRLF shebang does not run on the target')
+  }
+}
 
 // The runtime list is explicit, so prove it closes before anything runs it.
 const missingImports = await missingRuntimeImports(path.join(out, 'scripts'))
