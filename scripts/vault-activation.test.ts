@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -20,6 +20,7 @@ import {
   appendRotationDecision,
   readRotationRecords,
 } from '../src/utils/vault/journal.js'
+import { obligationIdFor, readObligations } from '../src/utils/vault/obligations.js'
 import { charterPath, readCharter, verifyReconstruction } from '../src/utils/vault/reconstruction.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -853,6 +854,195 @@ test('exactly at the cap is admitted, and a null cap is switched off rather than
     })
     assert.equal(off.ok, true)
     assert.equal(off.ok && off.would_refuse, null)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// --- the obligation creation seam -------------------------------------------
+
+async function obligationRows(root: string): Promise<Array<Record<string, unknown>>> {
+  const raw = await readFile(path.join(root, 'families', FAMILY, 'obligations.jsonl'), 'utf8').catch(() => '')
+  return raw
+    .split('\n')
+    .filter(line => line.trim() !== '')
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+}
+
+test('the obligation id and the invocation id come from the same preimage', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: "we're going with build 30" },
+    })
+    assert.equal(result.ok, true)
+    const invocation = result.ok ? result.invocation_id : ''
+    const expected = `ob:${createHash('sha256')
+      .update(`${FAMILY}\u0000sess-1\u0000t1`, 'utf8')
+      .digest('hex')
+      .slice(0, 32)}`
+    assert.equal(expected, obligationIdFor(FAMILY, 'sess-1', 't1'))
+    assert.equal(result.ok ? result.obligation_id : '', expected)
+    assert.equal(expected, `ob:${invocation.slice(4)}`, 'a drift between the two mints would show here')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the same turn twice is one obligation that keeps its first kind', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: "we're going with build 30" },
+    })
+    // A later, different opinion about the same turn must not add a second row.
+    const second = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: 'can you also check the docs' },
+    })
+    assert.equal(first.ok ? first.obligation_id : '', second.ok ? second.obligation_id : '')
+    const rows = await obligationRows(root)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0]?.kind, 'decision')
+    assert.match(String(rows[0]?.created_at), /^\d{4}-\d{2}-\d{2}T/)
+    assert.equal(rows[0]?.source_turn_id, undefined, 'the field is named turn_boundary')
+    assert.equal(rows[0]?.turn_boundary, 't1')
+    assert.equal(rows[0]?.driver_session_id, 'sess-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('re-evaluating a settled obligation does not resurrect it', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: "we're going with build 30" },
+    })
+    assert.ok(first.ok && first.obligation_id)
+    await writeFile(
+      path.join(root, 'families', FAMILY, 'obligations.jsonl'),
+      `${JSON.stringify({ obligation_id: first.ok ? first.obligation_id : '', state: 'satisfied', committed_event_ids: ['e1'] })}\n`,
+      { flag: 'a' },
+    )
+    await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: "we're going with build 30" },
+    })
+    const rows = await readObligations(root, FAMILY)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0]?.state, 'satisfied')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('two drivers presenting the same boundary are two obligations', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    for (const driver of ['sess-1', 'sess-2']) {
+      await conferDriverAdmission({
+        vaultRoot: root,
+        familyId: FAMILY,
+        driverSessionId: driver,
+        turnBoundary: 't1',
+        mode: 'monitor',
+        turn: { text: "we're going with build 30" },
+      })
+    }
+    const rows = await readObligations(root, FAMILY)
+    assert.equal(rows.length, 2, 'a shared boundary must not absorb one driver into another')
+    assert.deepEqual(rows.map(row => row.obligation_id).sort(), [
+      obligationIdFor(FAMILY, 'sess-1', 't1'),
+      obligationIdFor(FAMILY, 'sess-2', 't1'),
+    ].sort())
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a refused activation creates nothing, and an ineligible turn owes nothing', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    // No scribe: enforce refuses before any admission exists.
+    const refused = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'enforce',
+      turn: { text: "we're going with build 30" },
+    })
+    assert.equal(refused.ok, false)
+    assert.deepEqual(await obligationRows(root), [])
+
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const chatter = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't2',
+      mode: 'monitor',
+      turn: { text: 'thanks' },
+    })
+    assert.equal(chatter.ok, true)
+    assert.equal(chatter.ok ? chatter.obligation_id : 'x', undefined)
+    assert.deepEqual(await obligationRows(root), [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a creation failure is reported on the admission, not thrown', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    // A directory where the queue should be makes the append fail.
+    await mkdir(path.join(root, 'families', FAMILY, 'obligations.jsonl'), { recursive: true })
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: { text: "we're going with build 30" },
+    })
+    assert.equal(result.ok, true, 'the admission is durable; creation is bookkeeping')
+    assert.equal(result.ok ? result.obligation_id : 'x', undefined)
+    assert.ok((result.ok ? result.obligation_error : '')?.length, 'the failure must be reported')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -7,7 +7,8 @@ import {
   readRotationRecords,
   type RotationRecord,
 } from './journal.js'
-import { obligationBacklog, readObligations, type ObligationBacklog } from './obligations.js'
+import { eligibleActions, type EligibleActionKind } from './eligibleActions.js'
+import { obligationBacklog, readObligations, recordObligation, type ObligationBacklog } from './obligations.js'
 import { verifyReconstruction, writeCharter } from './reconstruction.js'
 
 /**
@@ -74,6 +75,12 @@ export type ActivationRequest = {
   maxPending?: number | null
   /** What counts as overdue, for the counts carried on a backlog refusal. */
   overdueHours?: number
+  /**
+   * The turn this activation belongs to. When it is supplied and the turn is an
+   * eligible action, this admission creates the obligation it owes. This is the
+   * only path that creates one, and a refused activation creates none.
+   */
+  turn?: { text: string; context?: string; sourceMessageId?: string }
 }
 
 export type ActivationAdmitted = {
@@ -94,6 +101,14 @@ export type ActivationAdmitted = {
   rotation_intent: boolean
   /** Present when the backlog gate fired: counts it would have refused on. */
   backlog?: { pending: number; overdue: number; max_pending: number | null }
+  /** The obligation this admission created; absent when the turn owed none. */
+  obligation_id?: string
+  /**
+   * A creation failure is reported, never thrown, and never un-admits: the
+   * admission is already durable, and the id is derived, so a later evaluation
+   * of the same turn retries the same record rather than losing it.
+   */
+  obligation_error?: string
   at: string
 }
 
@@ -258,6 +273,41 @@ function backlogMessage(familyId: string, backlog: ObligationBacklog): string {
  * observable without enforcing it.
  */
 export async function conferDriverAdmission(request: ActivationRequest): Promise<ActivationResult> {
+  const result = await decideAdmission(request)
+  if (!result.ok) return result
+  return recordTurnObligation(request, result)
+}
+
+/**
+ * The obligation half of an admission.
+ *
+ * Only an admitted activation reaches this: every refusal returns before it,
+ * so a family that could not start work also records nothing as owed. Monitor
+ * mode admits, so it creates too - the gate's opinion is not a veto on the
+ * evidence.
+ */
+async function recordTurnObligation(request: ActivationRequest, admitted: ActivationAdmitted): Promise<ActivationAdmitted> {
+  if (!request.turn) return admitted
+  const verdict = eligibleActions({ text: request.turn.text, context: request.turn.context })
+  if (!verdict.eligible || verdict.kind === null) return admitted
+  try {
+    const created = await recordObligation({
+      vaultRoot: request.vaultRoot,
+      familyId: request.familyId,
+      driverSessionId: request.driverSessionId,
+      turnBoundary: request.turnBoundary,
+      kind: verdict.kind as EligibleActionKind,
+      createdAt: new Date().toISOString(),
+      sourceMessageId: request.turn.sourceMessageId,
+    })
+    if (!created.ok) return { ...admitted, obligation_error: created.message }
+    return { ...admitted, obligation_id: created.obligation_id }
+  } catch (error) {
+    return { ...admitted, obligation_error: (error as Error).message }
+  }
+}
+
+async function decideAdmission(request: ActivationRequest): Promise<ActivationResult> {
   const { vaultRoot, familyId, driverSessionId } = request
   const mode = request.mode ?? 'monitor'
   const boundarySource = request.boundarySource ?? 'explicit'

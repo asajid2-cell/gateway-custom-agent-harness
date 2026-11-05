@@ -1,5 +1,8 @@
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { createHash } from 'node:crypto'
+import { mkdir, open, readFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
+import { withVaultLock } from './journal.js'
+import type { EligibleActionKind } from './eligibleActions.js'
 
 /**
  * Obligations, folded in one place.
@@ -116,6 +119,85 @@ export function summarizeObligations(
     if (ageHours !== undefined && ageHours > overdueHours) overdue.push(enriched)
   }
   return { pending, overdue }
+}
+
+/**
+ * The obligation's identity, from the same triple that identifies an
+ * admission: (family, driver, turn). It deliberately does NOT include the kind:
+ * one turn owes one thing, and a detector whose opinion changes later is a
+ * correction event, not a second obligation. If `eligibleActions` ever returns
+ * more than one kind for a turn, this preimage must gain the kind, or the first
+ * kind would swallow the second.
+ */
+export function obligationIdFor(familyId: string, driverSessionId: string, turnBoundary: string): string {
+  const digest = createHash('sha256')
+    .update(`${familyId}\u0000${driverSessionId}\u0000${turnBoundary}`, 'utf8')
+    .digest('hex')
+  return `ob:${digest.slice(0, 32)}`
+}
+
+export type ObligationCreated = { ok: true; obligation_id: string; duplicate: boolean }
+export type ObligationRefusal = { ok: false; obligation_id: string; message: string }
+
+/**
+ * Record that a turn owed something. This is the only creation writer.
+ *
+ * It never refuses for policy reasons: refusing creation would delete the
+ * evidence that something was owed, which is the one property the completeness
+ * metric rests on. `created_at` is required here even though the fold tolerates
+ * a row without it - without an age the obligation can never become overdue,
+ * and `overdueHours` would be decoration.
+ *
+ * A second call for the same turn appends nothing: the id is derived, so a
+ * crash-and-retry or a re-evaluation is idempotent, and an obligation that is
+ * already terminal keeps its state.
+ */
+export async function recordObligation(input: {
+  vaultRoot: string
+  familyId: string
+  driverSessionId: string
+  turnBoundary: string
+  kind: EligibleActionKind
+  createdAt: string
+  sourceMessageId?: string
+}): Promise<ObligationCreated | ObligationRefusal> {
+  const obligationId = obligationIdFor(input.familyId, input.driverSessionId, input.turnBoundary)
+  if (!input.createdAt.trim()) {
+    return { ok: false, obligation_id: obligationId, message: 'recordObligation needs created_at; an obligation with no age can never be overdue' }
+  }
+  return withVaultLock(join(input.vaultRoot, 'families', input.familyId), async () => {
+    if (foldObligations((await readRaw(input.vaultRoot, input.familyId)).split('\n')).has(obligationId)) {
+      return { ok: true, obligation_id: obligationId, duplicate: true }
+    }
+    const path = obligationsPath(input.vaultRoot, input.familyId)
+    await mkdir(dirname(path), { recursive: true })
+    const row = {
+      obligation_id: obligationId,
+      family_id: input.familyId,
+      kind: input.kind,
+      created_at: input.createdAt,
+      driver_session_id: input.driverSessionId,
+      turn_boundary: input.turnBoundary,
+      ...(input.sourceMessageId ? { source_message_id: input.sourceMessageId } : {}),
+    }
+    const handle = await open(path, 'a')
+    try {
+      await handle.writeFile(`${JSON.stringify(row)}\n`)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    return { ok: true, obligation_id: obligationId, duplicate: false }
+  })
+}
+
+async function readRaw(vaultRoot: string, familyId: string): Promise<string> {
+  try {
+    return await readFile(obligationsPath(vaultRoot, familyId), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ''
+    throw error
+  }
 }
 
 export type ObligationBacklog = {
