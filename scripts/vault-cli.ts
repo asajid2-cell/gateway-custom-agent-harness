@@ -285,6 +285,9 @@ async function main(): Promise<number> {
       vaultRoot,
       familyId,
       query,
+      // The packet is a function of its request, so the install's policy is
+      // handed in here rather than read from ambient settings inside recall.
+      overdueHours: policy.overdueHours,
       filters: {
         asOf: typeof args['as-of'] === 'string' ? (args['as-of'] as string) : undefined,
         limit: typeof args.limit === 'string' ? Number(args.limit) : undefined,
