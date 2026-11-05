@@ -56,11 +56,6 @@ const HANDOFF =
   /\b(route (this|it) to|tell (it|them|him|her|\w+) to|directed [\w ]{1,40} to|hand(ed|ing)? (this|it) (off|to)|take over|you (take|own|handle|pick)|assign(ed)? [\w ]{1,40} to|go (to|build|make))\b/
 const DECISION =
   /\b(going with|go with|we'?re going|let'?s go|i rule|ruled|approved|approve|settled|ship it|is fine|not needed now|go ahead|do it|build it|the call is)\b/
-// "<subject> is a <predicate>": an unhedged factual assertion that is not an
-// artifact measurement revises what the record holds. It is a correction rather
-// than new evidence because nothing external is produced by saying it.
-const BARE_ASSERTION = /^[^,;]{2,80}\s+(is|are)\s+(a|an|the)\s+\w+/
-
 export function eligibleActions(turn: EligibleActionTurn): EligibleActionVerdict {
   const raw = typeof turn.text === 'string' ? turn.text.trim() : ''
   const text = raw.toLowerCase().replace(/\s+/g, ' ')
@@ -117,8 +112,14 @@ export function eligibleActions(turn: EligibleActionTurn): EligibleActionVerdict
   if (DECISION.test(text)) {
     return { eligible: true, kind: 'decision', reason: 'it settles what happens next' }
   }
-  if (BARE_ASSERTION.test(text)) {
-    return { eligible: true, kind: 'correction', reason: 'an unhedged factual assertion revises what the record holds' }
+  // A bare "X is Y" is deliberately not eligible. It names no artifact, commits
+  // nothing, and does not say what it corrects; a correction whose target is
+  // implicit is not a correction (spec §12.4 requires it to name the event it
+  // corrects). It becomes one only when the turn says so - "actually", "not X",
+  // "was wrong", "correction:" and the rest of CORRECTION - or when the context
+  // it answers names the prior claim.
+  if (hasContext && /\b(recorded|previous|earlier|stated|claimed|we said|you said|the claim)\b/.test(turn.context!.toLowerCase())) {
+    return { eligible: true, kind: 'correction', reason: 'it revises a claim the preceding turn named' }
   }
-  return { eligible: false, kind: null, reason: 'nothing here settles, assigns, cites an artifact, or corrects a claim' }
+  return { eligible: false, kind: null, reason: 'nothing here settles, assigns, cites an artifact, or corrects a named claim' }
 }

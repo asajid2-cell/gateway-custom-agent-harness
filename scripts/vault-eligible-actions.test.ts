@@ -15,8 +15,13 @@ import { eligibleActions } from '../src/utils/vault/eligibleActions.js'
  * revised fixture arrives as a new hash rather than as a quiet retune. A row
  * that disagrees with the detector is reported to the fixture's owner; the row
  * is never edited to match the code.
+ *
+ * Revision 2 (sha256 dd4c8007...): the owner reclassified ev-04 - a bare
+ * copula is not decidable as a correction on its own - and added ev-04b, the
+ * self-contained spelling. The detector lost its copula rule rather than the
+ * row moving to meet it.
  */
-const FIXTURE_SHA256 = '670b9c69e0ef98ab6c7dde638d649c5f4af2e33ae047b6083bd34a699162eed0'
+const FIXTURE_SHA256 = 'dd4c8007d047555de7e791c045f57055f11c5ccb43f056ac8e09010ec5c6168f'
 const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'obligation-predicates.jsonl')
 
 type Row = {
@@ -42,12 +47,16 @@ test('the fixture is the one that was pinned, not a reshaped copy', async () => 
   const bytes = await readFile(FIXTURE)
   assert.equal(createHash('sha256').update(bytes).digest('hex'), FIXTURE_SHA256)
   const table = await rows()
-  assert.equal(table.length, 23)
+  assert.equal(table.length, 24)
   assert.equal(table.filter(row => row.expected_eligible).length, 15)
-  assert.equal(table.filter(row => !row.expected_eligible).length, 8)
+  assert.equal(table.filter(row => !row.expected_eligible).length, 9)
   assert.ok(
     table.some(row => row.case_id === 'no-06' && row.expected_eligible === false),
     'the negation trap must stay in the table; a suite without it has stopped testing what bites',
+  )
+  assert.ok(
+    table.some(row => row.case_id === 'ev-04' && row.expected_eligible === false),
+    'a bare copula is not a correction on its own; ev-04b is the self-contained spelling',
   )
 })
 
@@ -63,6 +72,16 @@ test('every predicate row classifies as the fixture says, with its kind', async 
     }
   }
   assert.deepEqual(failures, [], `${failures.length} row(s) disagree with the fixture`)
+})
+
+test('a copula is a correction only when the context names the claim it corrects', () => {
+  const text = 'thereal devicetest is a testflight demo build'
+  assert.equal(eligibleActions({ text }).eligible, false)
+  assert.equal(
+    eligibleActions({ text, context: 'Earlier I recorded that devicetest was the release build.' }).kind,
+    'correction',
+    'the context names the prior claim, so the correction target is no longer implicit',
+  )
 })
 
 test('a row that needs its context is not decided without it', async () => {
