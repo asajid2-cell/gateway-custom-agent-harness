@@ -236,7 +236,7 @@ await writeFile(
     {
       ...installManifest,
       runtime: runtime
-        ? { present: true, bun: runtime.version, binary: runtime.binary, bytes: runtime.bytes, sha256: runtime.sha256, proof: runtime.proof }
+        ? { present: true, version: runtime.version, binary: runtime.binary, bytes: runtime.bytes, sha256: runtime.sha256, proof: runtime.proof }
         : { present: false, note: 'this artifact requires bun on the target' },
     },
     null,

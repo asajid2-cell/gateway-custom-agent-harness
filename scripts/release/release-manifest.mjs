@@ -44,6 +44,9 @@ async function collect(base, prefix = '') {
       entries.push(...await collect(path.join(base, entry.name), relative))
       continue
     }
+    // This script's own outputs are not release payload, and hashing the
+    // checksum file into the checksum file makes the result self-referential.
+    if (entry.name === 'RELEASE.json' || entry.name === 'SHA256SUMS') continue
     const full = path.join(base, entry.name)
     const info = await stat(full)
     const extension = ['.tar.gz', '.tgz'].find(candidate => entry.name.endsWith(candidate)) ?? path.extname(entry.name)
@@ -70,12 +73,19 @@ const version = arg('version') ?? (/gateway-(\d+\.\d+\.\d+[^/]*)-/.exec(files.ma
 const trees = []
 async function addTree(name, manifestPath) {
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+  // Installer names use the numeric version while archives use the full one;
+  // record both so a reader does not have to know that.
+  const runtime = manifest.runtime
+    ? { ...manifest.runtime, version: manifest.runtime.version ?? manifest.runtime.bun ?? null }
+    : null
   trees.push({
     tree: name,
     platform: manifest.platform,
     arch: manifest.arch,
+    version: manifest.version ?? null,
+    numericVersion: manifest.numeric_version ?? null,
     sourceSha: manifest.source_sha,
-    runtime: manifest.runtime,
+    runtime,
   })
 }
 for (const entry of await readdir(directory, { withFileTypes: true })) {
