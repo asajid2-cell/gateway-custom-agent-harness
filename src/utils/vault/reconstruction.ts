@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { readJournal, readRotationRecords, verifyJournal } from './journal.js'
+import { readObligations } from './obligations.js'
 
 /**
  * The cold-reconstruction check for a rotation.
@@ -143,30 +144,15 @@ export function supersededIds(events: Record_[]): Set<string> {
   return superseded
 }
 
+/**
+ * Count of obligations still owed, folded by the one shared rule. It is the
+ * same question recall answers, so it is the same fold - a reconstruction that
+ * disagreed with recall about what is still open would report a family it had
+ * rebuilt correctly and then argue with itself about.
+ */
 async function unresolvedObligations(vaultRoot: string, familyId: string): Promise<number> {
-  let raw = ''
-  try {
-    raw = await readFile(join(vaultRoot, 'families', familyId, 'obligations.jsonl'), 'utf8')
-  } catch {
-    return 0
-  }
-  const state = new Map<string, string>()
-  for (const line of raw.split('\n')) {
-    if (line.trim() === '') continue
-    let record: Record_
-    try {
-      record = JSON.parse(line) as Record_
-    } catch {
-      continue
-    }
-    const id = typeof record.obligation_id === 'string' ? record.obligation_id : null
-    if (!id) continue
-    const next = typeof record.state === 'string' ? record.state : state.get(id) ?? 'pending'
-    state.set(id, next)
-  }
-  let pending = 0
-  for (const value of state.values()) if (value === 'pending') pending += 1
-  return pending
+  const rows = await readObligations(vaultRoot, familyId)
+  return rows.filter(row => row.state === 'pending').length
 }
 
 export async function verifyReconstruction(

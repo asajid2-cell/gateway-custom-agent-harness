@@ -759,3 +759,101 @@ test('rotation is pending only while the newest intent is unanswered', () => {
   assert.equal(rotationPending([{ kind: 'rotation_intent' }, { kind: 'rotation' }]), false)
   assert.equal(rotationPending([{ kind: 'rotation' }, { kind: 'rotation_intent' }]), true)
 })
+
+async function writeObligations(root: string, records: Array<Record<string, unknown>>): Promise<void> {
+  await writeFile(
+    path.join(root, 'families', FAMILY, 'obligations.jsonl'),
+    records.map(record => `${JSON.stringify(record)}\n`).join(''),
+  )
+}
+
+function pendingObligations(count: number, createdAt = '2026-10-01T00:00:00.000Z'): Array<Record<string, unknown>> {
+  return Array.from({ length: count }, (_value, index) => ({
+    obligation_id: `ob-${index + 1}`,
+    state: 'pending',
+    created_at: createdAt,
+  }))
+}
+
+test('a family over its pending cap is refused at activation, naming the counts', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    await writeObligations(root, pendingObligations(3))
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'enforce',
+      maxPending: 2,
+      overdueHours: 24,
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.ok === false ? result.reason : '', 'obligation-backlog')
+    assert.match(result.ok === false ? result.message : '', /3 pending \(cap 2\), 3 overdue past 24h/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('monitor mode admits an over-cap family and records the counts it would refuse on', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    await writeObligations(root, pendingObligations(3))
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      maxPending: 2,
+      overdueHours: 24,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.ok && result.would_refuse, 'obligation-backlog')
+    assert.deepEqual(result.ok ? result.backlog : null, { pending: 3, overdue: 3, max_pending: 2 })
+    const rows = await readRotationRecords(root, FAMILY)
+    const row = rows.find(record => record.kind === 'admission' && record.turn_boundary === 't1')
+    assert.equal(row?.would_refuse, 'obligation-backlog')
+    assert.deepEqual(row?.backlog, { pending: 3, overdue: 3, max_pending: 2 })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('exactly at the cap is admitted, and a null cap is switched off rather than zero', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    await writeObligations(root, pendingObligations(2))
+    const atCap = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'enforce',
+      maxPending: 2,
+    })
+    assert.equal(atCap.ok, true)
+    assert.equal(atCap.ok && atCap.would_refuse, null)
+
+    await writeObligations(root, pendingObligations(50))
+    const off = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-2',
+      turnBoundary: 't2',
+      mode: 'enforce',
+      maxPending: null,
+    })
+    assert.equal(off.ok, true)
+    assert.equal(off.ok && off.would_refuse, null)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

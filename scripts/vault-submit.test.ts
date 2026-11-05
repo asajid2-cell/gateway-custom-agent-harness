@@ -179,6 +179,85 @@ test('a proposal closes only an obligation that exists, and records which event 
   }
 })
 
+test('an id that only appears inside another record does not close that obligation', async () => {
+  // The old check was `raw.includes('"<id>"')`, which matched this id in the
+  // neighbouring record's committed_event_ids and "closed" an obligation that
+  // was never there.
+  const root = await seeded()
+  try {
+    const obligations = path.join(root, 'families', FAMILY, 'obligations.jsonl')
+    await writeFile(
+      obligations,
+      `${JSON.stringify({ obligation_id: 'ob-real', state: 'satisfied', committed_event_ids: ['ob-ghost'] })}\n`,
+    )
+    const result = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [proposal({ obligationIds: ['ob-ghost'] })],
+    })
+    assert.equal(result.committed.length, 1)
+    assert.deepEqual(result.obligationsSatisfied, [])
+    assert.deepEqual(result.obligationsNotClosable, [{ obligation_id: 'ob-ghost', reason: 'unknown' }])
+    const lines = (await readFile(obligations, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
+    assert.equal(lines.length, 1, 'nothing was appended for a ghost id')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an already closed obligation is reported, not closed a second time', async () => {
+  const root = await seeded()
+  try {
+    const obligations = path.join(root, 'families', FAMILY, 'obligations.jsonl')
+    await writeFile(
+      obligations,
+      `${JSON.stringify({ obligation_id: 'ob-1', state: 'pending' })}\n${JSON.stringify({ obligation_id: 'ob-1', state: 'satisfied' })}\n`,
+    )
+    const result = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [proposal({ obligationIds: ['ob-1'] })],
+    })
+    assert.deepEqual(result.obligationsSatisfied, [])
+    assert.deepEqual(result.obligationsNotClosable, [{ obligation_id: 'ob-1', reason: 'already-satisfied' }])
+    const lines = (await readFile(obligations, 'utf8')).trim().split('\n')
+    assert.equal(lines.length, 2, 'history is not rewritten by a second close')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('one obligation named by two events in one batch closes once and says so', async () => {
+  const root = await seeded()
+  try {
+    const obligations = path.join(root, 'families', FAMILY, 'obligations.jsonl')
+    await writeFile(obligations, `${JSON.stringify({ obligation_id: 'ob-1', state: 'pending' })}\n`)
+    const result = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [
+        proposal({ event_id: 'e1', obligationIds: ['ob-1'] }),
+        proposal({ event_id: 'e2', obligationIds: ['ob-1'] }),
+      ],
+    })
+    assert.equal(result.committed.length, 2)
+    assert.deepEqual(result.obligationsSatisfied, ['ob-1'])
+    assert.deepEqual(result.obligationsNotClosable, [{ obligation_id: 'ob-1', reason: 'closed-by-batch' }])
+    const closures = (await readFile(obligations, 'utf8'))
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line))
+      .filter(line => line.state === 'satisfied')
+    assert.equal(closures.length, 1)
+    assert.deepEqual(closures[0].committed_event_ids, ['e1'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a forged content_hash is rejected through the submit seam too', async () => {
   const root = await seeded()
   try {

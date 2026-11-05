@@ -7,6 +7,7 @@ import {
   readRotationRecords,
   type RotationRecord,
 } from './journal.js'
+import { obligationBacklog, readObligations, type ObligationBacklog } from './obligations.js'
 import { verifyReconstruction, writeCharter } from './reconstruction.js'
 
 /**
@@ -36,6 +37,8 @@ export type ActivationReason =
   | 'no-scribe'
   | 'scribe-unhealthy'
   | 'rotation-pending'
+  /** Pending obligations are past `capture.obligations.maxPending`. */
+  | 'obligation-backlog'
 
 export type ScribeRecord = {
   session_id?: string
@@ -62,6 +65,15 @@ export type ActivationRequest = {
   mode?: 'monitor' | 'enforce'
   /** Rotate after this many admitted activations. Spec §12.10 default: 5. */
   rotationEvery?: number
+  /**
+   * The cap on pending obligations. `null` or absent means the cap is off.
+   * Enforced here, at activation, because refusing at creation loses the
+   * evidence and refusing at submission is a cap that cannot be cleared by
+   * doing the work.
+   */
+  maxPending?: number | null
+  /** What counts as overdue, for the counts carried on a backlog refusal. */
+  overdueHours?: number
 }
 
 export type ActivationAdmitted = {
@@ -80,6 +92,8 @@ export type ActivationAdmitted = {
   boundary_source: 'explicit' | 'default'
   /** True when this admission was the one that wrote the rotation intent. */
   rotation_intent: boolean
+  /** Present when the backlog gate fired: counts it would have refused on. */
+  backlog?: { pending: number; overdue: number; max_pending: number | null }
   at: string
 }
 
@@ -228,6 +242,11 @@ const MESSAGES: Record<ActivationReason, (familyId: string) => string> = {
   'no-scribe': familyId => `no healthy scribe for family ${familyId}`,
   'scribe-unhealthy': familyId => `the scribe recorded for family ${familyId} is not on the active generation`,
   'rotation-pending': familyId => `family ${familyId} is mid-rotation; no new activation until it completes`,
+  'obligation-backlog': familyId => `family ${familyId} is carrying more pending obligations than capture.obligations.maxPending allows`,
+}
+
+function backlogMessage(familyId: string, backlog: ObligationBacklog): string {
+  return `${MESSAGES['obligation-backlog'](familyId)}: ${backlog.pending} pending (cap ${backlog.maxPending}), ${backlog.overdue} overdue past ${backlog.overdueHours}h`
 }
 
 /**
@@ -330,6 +349,36 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
     })
   }
 
+  // The backlog gate runs last, on a snapshot of the queue: the counts are a
+  // reason to refuse starting new work, not a proof about the next millisecond.
+  // A stale count can only make the gate more permissive, and the next
+  // activation re-reads it.
+  const maxPending = request.maxPending ?? null
+  if (maxPending !== null) {
+    const backlog = obligationBacklog(await readObligations(vaultRoot, familyId), {
+      overdueHours: request.overdueHours,
+      maxPending,
+    })
+    if (backlog.over) {
+      if (mode === 'enforce') {
+        return { ok: false, family_id: familyId, reason: 'obligation-backlog', message: backlogMessage(familyId, backlog) }
+      }
+      return admit({
+        vaultRoot,
+        familyId,
+        driverSessionId,
+        invocationId,
+        turnBoundary: request.turnBoundary,
+        boundarySource,
+        generation,
+        mode,
+        rotationEvery,
+        wouldRefuse: 'obligation-backlog',
+        backlog: { pending: backlog.pending, overdue: backlog.overdue, max_pending: backlog.maxPending },
+      })
+    }
+  }
+
   return admit({
     vaultRoot,
     familyId,
@@ -367,6 +416,7 @@ type Admitting = {
   mode: 'monitor' | 'enforce'
   rotationEvery: number
   wouldRefuse: ActivationReason | null
+  backlog?: { pending: number; overdue: number; max_pending: number | null }
 }
 
 async function admit(input: Admitting): Promise<ActivationAdmitted> {
@@ -393,6 +443,7 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
       boundary_source: input.boundarySource,
       gate: input.mode,
       ...(input.wouldRefuse ? { would_refuse: input.wouldRefuse } : {}),
+      ...(input.backlog ? { backlog: input.backlog } : {}),
     }
     // The fifth admitted activation starts a rotation. The intent is written in
     // the same critical section as the admission that triggered it: a crash
@@ -435,6 +486,7 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
     turn_boundary: input.turnBoundary,
     boundary_source: input.boundarySource,
     rotation_intent: appended.length > 1,
+    ...(input.backlog ? { backlog: input.backlog } : {}),
     at: String(row.at),
   }
 }
@@ -456,6 +508,8 @@ export async function admitDriverDesignation(input: {
   mode: 'monitor' | 'enforce'
   rootName?: string
   headSessionId?: string
+  maxPending?: number | null
+  overdueHours?: number
 }): Promise<ActivationResult | null> {
   if (!(await familyExists(input.vaultRoot, input.familyId))) {
     if (input.mode === 'monitor') return null
@@ -475,6 +529,8 @@ export async function admitDriverDesignation(input: {
     turnBoundary: `scope:${[...input.scope].sort().join(',')}`,
     boundarySource: 'explicit',
     mode: input.mode,
+    maxPending: input.maxPending ?? null,
+    overdueHours: input.overdueHours,
   })
   if (!result.ok) return result
   // The charter is written by the gate that just decided the generation was

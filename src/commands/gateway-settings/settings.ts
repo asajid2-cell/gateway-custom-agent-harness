@@ -1,6 +1,7 @@
 import type { LocalCommandModule, LocalCommandResult } from '../../types/command.js'
 import { probeVaultFilesystem } from '../../utils/vault/filesystem.js'
 import {
+  obligationPolicy,
   readGatewaySettings,
   resolveInstallPath,
   vaultRootFor,
@@ -17,7 +18,6 @@ const DEFAULTS = {
   rotationEvery: 5,
   maxAgeHours: 8,
   maxEvents: 200,
-  overdueHours: 24,
   engine: 'sqlite-fts5',
   embeddings: false,
   fsync: true,
@@ -41,7 +41,9 @@ async function show(): Promise<LocalCommandResult> {
   const every = readNumber(result.settings, ['capture', 'scribe', 'rotation', 'every'], DEFAULTS.rotationEvery)
   const maxAge = readNumber(result.settings, ['capture', 'scribe', 'rotation', 'maxAgeHours'], DEFAULTS.maxAgeHours)
   const maxEvents = readNumber(result.settings, ['capture', 'scribe', 'rotation', 'maxEvents'], DEFAULTS.maxEvents)
-  const overdue = readNumber(result.settings, ['capture', 'obligations', 'overdueHours'], DEFAULTS.overdueHours)
+  // Read through the same policy reader the recall packet and the activation
+  // gate use, so this display cannot show a number neither path reads.
+  const obligations = obligationPolicy(result.settings)
   const rotation =
     maxAge === null || maxEvents === null
       ? `${every ?? DEFAULTS.rotationEvery} admissions (literal only)`
@@ -52,7 +54,8 @@ async function show(): Promise<LocalCommandResult> {
     `vaultRoot: ${root} (${source === 'settings' ? 'from settings' : 'install default'})`,
     `capture.mode: ${mode}`,
     `rotation: ${rotation}`,
-    `obligations.overdueHours: ${overdue ?? DEFAULTS.overdueHours}`,
+    `obligations.overdueHours: ${obligations.overdueHours}`,
+    `obligations.maxPending: ${obligations.maxPending === null ? 'off' : obligations.maxPending}`,
     `retrieval: ${DEFAULTS.engine}, embeddings ${DEFAULTS.embeddings ? 'enabled' : 'disabled'}`,
     `writer.fsync: ${DEFAULTS.fsync}`,
   ]

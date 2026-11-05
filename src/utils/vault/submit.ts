@@ -10,6 +10,7 @@ import {
   type ProposedEvent,
 } from './journal.js'
 import { markCapturedBySpans } from './capture.js'
+import { obligationsPath, readObligations } from './obligations.js'
 
 /**
  * The scribe's only way in. A proposal is an opinion; the writer decides.
@@ -45,6 +46,12 @@ export type SubmitResult = {
   /** True when the idempotency key had already been committed. */
   replayed: boolean
   obligationsSatisfied: string[]
+  /**
+   * Obligations a committed event asked to close that could not be closed, with
+   * why. Reported rather than dropped: silently ignoring the request is how a
+   * proposer learns to believe an obligation was discharged.
+   */
+  obligationsNotClosable: Array<{ obligation_id: string; reason: string }>
   /** Pending captures whose span a committed event cited, marked by this call. */
   capturesMarked: number
   /** A capture-mark failure never un-commits an event; it is reported here. */
@@ -117,10 +124,6 @@ function submissionsPath(vaultRoot: string, familyId: string): string {
   return join(vaultRoot, 'families', familyId, 'submissions.jsonl')
 }
 
-function obligationsPath(vaultRoot: string, familyId: string): string {
-  return join(vaultRoot, 'families', familyId, 'obligations.jsonl')
-}
-
 type Submission = { key: string; event_ids: string[]; at: string }
 
 async function findSubmission(path: string, key: string): Promise<Submission | undefined> {
@@ -167,6 +170,7 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
     watermark: 0,
     replayed: false,
     obligationsSatisfied: [],
+    obligationsNotClosable: [],
     capturesMarked: 0,
     captureErrors: [],
   }
@@ -195,6 +199,7 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
           watermark: replay.watermark,
           replayed: true,
           obligationsSatisfied: [],
+          obligationsNotClosable: [],
           capturesMarked: 0,
           captureErrors: [] as string[],
         }
@@ -222,16 +227,35 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
     }
     const allRejected = [...rejected, ...appended.rejected]
 
+    // Closure is decided from the folded state, not from a substring of the
+    // file. `raw.includes('"<id>"')` used to match an id appearing anywhere -
+    // including inside another record's `committed_event_ids` - so a record
+    // could "close" an obligation merely by naming it.
     const satisfied: string[] = []
+    const notClosable: Array<{ obligation_id: string; reason: string }> = []
     if (appended.committed.length > 0) {
-      const raw = await readFile(obligationsPath(vaultRoot, familyId), 'utf8').catch(() => '')
+      const known = new Map((await readObligations(vaultRoot, familyId)).map(row => [row.obligation_id, row]))
+      const closedInBatch = new Set<string>()
       for (const event of appended.committed) {
         const ids = Array.isArray((event as { obligationIds?: unknown }).obligationIds)
           ? ((event as { obligationIds?: unknown[] }).obligationIds as unknown[]).map(String)
           : []
         for (const obligationId of ids) {
-          if (!raw.includes(`"${obligationId}"`)) continue
+          if (closedInBatch.has(obligationId)) {
+            notClosable.push({ obligation_id: obligationId, reason: 'closed-by-batch' })
+            continue
+          }
+          const row = known.get(obligationId)
+          if (!row) {
+            notClosable.push({ obligation_id: obligationId, reason: 'unknown' })
+            continue
+          }
+          if (row.state !== 'pending') {
+            notClosable.push({ obligation_id: obligationId, reason: `already-${row.state}` })
+            continue
+          }
           satisfied.push(obligationId)
+          closedInBatch.add(obligationId)
           await appendLine(
             obligationsPath(vaultRoot, familyId),
             `${JSON.stringify({
@@ -264,6 +288,7 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
       watermark: appended.watermark,
       replayed: false,
       obligationsSatisfied: satisfied,
+      obligationsNotClosable: notClosable,
       capturesMarked: 0,
       captureErrors: [] as string[],
     }

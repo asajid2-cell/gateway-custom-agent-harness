@@ -1,6 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { getClaudeConfigHomeDir } from '../envUtils.js'
+import { DEFAULT_OVERDUE_HOURS } from './obligations.js'
 
 /**
  * The install-owned settings file.
@@ -150,6 +151,36 @@ export function vaultRootFor(settings: GatewaySettings = {}): { root: string; so
   const configured = typeof settings.vaultRoot === 'string' ? settings.vaultRoot.trim() : ''
   if (configured) return { root: resolveInstallPath(configured), source: 'settings' }
   return { root: defaultVaultRoot(settings), source: 'default' }
+}
+
+export type ObligationPolicy = {
+  /** What counts as overdue now. One reader for recall and the activation gate. */
+  overdueHours: number
+  /** `null` means the cap is off, not a cap of zero. */
+  maxPending: number | null
+}
+
+/**
+ * The obligation policy with its defaults applied. Validated settings are
+ * already known-good, so this only fills the gaps - but a setting that is
+ * validated and then read by nothing is a claim, so the readers of this file go
+ * through here rather than re-deriving the defaults.
+ */
+export function obligationPolicy(settings: GatewaySettings = {}): ObligationPolicy {
+  const capture =
+    settings.capture && typeof settings.capture === 'object' && !Array.isArray(settings.capture)
+      ? (settings.capture as Record<string, unknown>)
+      : null
+  const obligations =
+    capture && capture.obligations && typeof capture.obligations === 'object' && !Array.isArray(capture.obligations)
+      ? (capture.obligations as Record<string, unknown>)
+      : null
+  const overdue = obligations?.overdueHours
+  const maxPending = obligations?.maxPending
+  return {
+    overdueHours: typeof overdue === 'number' && overdue >= 1 ? overdue : DEFAULT_OVERDUE_HOURS,
+    maxPending: typeof maxPending === 'number' && maxPending >= 0 ? maxPending : null,
+  }
 }
 
 export async function readGatewaySettings(env: NodeJS.ProcessEnv = process.env): Promise<SettingsRead> {

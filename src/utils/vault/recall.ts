@@ -1,6 +1,5 @@
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import type { Database } from 'bun:sqlite'
+import { readObligations, summarizeObligations, type ObligationRow } from './obligations.js'
 import {
   applyFamily,
   closeProjection,
@@ -39,14 +38,11 @@ export type RecallItem = {
   superseded_by?: string[]
 }
 
-export type ObligationRow = {
-  obligation_id: string
-  kind?: string
-  state: string
-  created_at?: string
-  age_hours?: number
-  source_message_id?: string
-}
+/**
+ * The shape of an obligation row lives with the fold that produces it, so a
+ * packet consumer and the fold cannot drift apart.
+ */
+export type { ObligationRow } from './obligations.js'
 
 export type RecallPacket = {
   query: string
@@ -256,58 +252,17 @@ function aliasMap(db: Database, familyId: string): { map: Map<string, string>; b
   return { map, blobs }
 }
 
-async function obligationsFor(
-  vaultRoot: string,
-  familyId: string,
-  asOf: number,
-): Promise<{ pending: ObligationRow[]; overdue: ObligationRow[] }> {
-  let raw = ''
-  try {
-    raw = await readFile(join(vaultRoot, 'families', familyId, 'obligations.jsonl'), 'utf8')
-  } catch {
-    return { pending: [], overdue: [] }
-  }
-  const state = new Map<string, ObligationRow>()
-  for (const line of raw.split('\n')) {
-    if (line.trim() === '') continue
-    let record: Record<string, unknown>
-    try {
-      record = JSON.parse(line)
-    } catch {
-      continue
-    }
-    const id = text(record, 'obligation_id')
-    if (!id) continue
-    const current = state.get(id)
-    const nextState = text(record, 'state')
-    if (!current || nextState === 'satisfied' || nextState === 'exempt' || nextState === 'failed') {
-      state.set(id, {
-        obligation_id: id,
-        kind: text(record, 'kind') ?? current?.kind,
-        state: nextState ?? current?.state ?? 'pending',
-        created_at: text(record, 'created_at') ?? current?.created_at,
-        source_message_id: text(record, 'source_message_id') ?? current?.source_message_id,
-      })
-    }
-  }
-  const pending: ObligationRow[] = []
-  const overdue: ObligationRow[] = []
-  for (const row of state.values()) {
-    if (row.state !== 'pending') continue
-    const created = row.created_at ? Date.parse(row.created_at) : NaN
-    const ageHours = Number.isFinite(created) ? (asOf - created) / 3_600_000 : undefined
-    const enriched = { ...row, ...(ageHours === undefined ? {} : { age_hours: Number(ageHours.toFixed(2)) }) }
-    pending.push(enriched)
-    if (ageHours !== undefined && ageHours > 24) overdue.push(enriched)
-  }
-  return { pending, overdue }
-}
-
 export type RecallRequest = {
   vaultRoot: string
   familyId: string
   query: string
   filters?: RecallFilters
+  /**
+   * The configured `capture.obligations.overdueHours`. Defaulted rather than
+   * read from ambient settings so a packet is a function of its request: the
+   * caller that knows the install policy passes it in.
+   */
+  overdueHours?: number
 }
 
 export async function recall(request: RecallRequest): Promise<RecallPacket> {
@@ -493,7 +448,10 @@ export async function recall(request: RecallRequest): Promise<RecallPacket> {
       inHistory.add(targetId)
     }
 
-    const obligations = await obligationsFor(vaultRoot, familyId, asOf)
+    const obligations = summarizeObligations(await readObligations(vaultRoot, familyId), {
+      asOf,
+      overdueHours: request.overdueHours,
+    })
     return {
       query,
       family_id: familyId,

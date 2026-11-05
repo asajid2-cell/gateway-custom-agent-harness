@@ -194,6 +194,29 @@ test('nothing recorded is said explicitly, and obligations are reported', async 
   }
 })
 
+test('overdue uses the configured window, not a hardcoded 24 hours', async () => {
+  const root = await vault(
+    [proposal({ event_id: 'd1', summary: 'relay ships', topic_id: 'release' })],
+    {
+      obligations: `${JSON.stringify({ obligation_id: 'ob-old', state: 'pending', created_at: '2026-11-01T00:00:00.000Z' })}\n`,
+    },
+  )
+  try {
+    const strict = await recall({ vaultRoot: root, familyId: FAMILY, query: 'p99 latency percentile' })
+    assert.deepEqual(strict.obligations.overdue.map(row => row.obligation_id), ['ob-old'])
+    const patient = await recall({
+      vaultRoot: root,
+      familyId: FAMILY,
+      query: 'p99 latency percentile',
+      overdueHours: 24 * 30,
+    })
+    assert.deepEqual(patient.obligations.overdue, [], 'a wider configured window must be the one applied')
+    assert.deepEqual(patient.obligations.pending.map(row => row.obligation_id), ['ob-old'])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('supersession is followed from the answering event, not from term coverage', async () => {
   const root = await vault([
     proposal({ event_id: 'old', summary: 'opencode route removed', topic_id: 'ops' }),

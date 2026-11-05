@@ -3690,13 +3690,14 @@ async function admitDesignationInVault(
   driver: { name?: string },
   scope: readonly string[],
 ): Promise<string> {
-  const { readGatewaySettings, vaultRootFor } = await import('./vault/settings.js')
+  const { readGatewaySettings, vaultRootFor, obligationPolicy } = await import('./vault/settings.js')
   const { admitDriverDesignation } = await import('./vault/activation.js')
   const read = await readGatewaySettings()
   const settings = read.ok ? read.settings : {}
   const { root: vaultRoot } = vaultRootFor(settings)
   const configured = (settings.capture as { mode?: string } | undefined)?.mode
   const mode = configured === 'enforce' ? 'enforce' : 'monitor'
+  const policy = obligationPolicy(settings)
   const result = await admitDriverDesignation({
     vaultRoot,
     familyId,
@@ -3705,6 +3706,8 @@ async function admitDesignationInVault(
     mode,
     rootName: driver.name,
     headSessionId: getLeafPatriarchSessionId(),
+    maxPending: policy.maxPending,
+    overdueHours: policy.overdueHours,
   })
   if (!result) return ''
   if (!result.ok) throw new Error(result.message)

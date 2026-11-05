@@ -32,6 +32,7 @@ import {
 import { admitDriverDesignation, completeRotation, conferDriverAdmission, registerScribe } from '../src/utils/vault/activation.js'
 import { captureCompleteness, capturePointer, captureTranscript, listCaptures, markCaptured } from '../src/utils/vault/capture.js'
 import { recall } from '../src/utils/vault/recall.js'
+import { obligationPolicy, readGatewaySettings } from '../src/utils/vault/settings.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
 type Args = Record<string, string | true>
@@ -81,6 +82,11 @@ async function familiesIn(vaultRoot: string): Promise<string[]> {
 async function main(): Promise<number> {
   const { command, args } = parseArgs(process.argv.slice(2))
   const vaultRoot = required(args, 'vault')
+  // The install's obligation policy, read once. A malformed settings file falls
+  // back to the defaults rather than failing a read of the vault: the vault is
+  // the authority, the policy is a knob.
+  const settingsRead = await readGatewaySettings()
+  const policy = obligationPolicy(settingsRead.ok ? settingsRead.settings : {})
 
   if (command === 'verify') {
     const named = typeof args.family === 'string' ? [args.family] : await familiesIn(vaultRoot)
@@ -146,6 +152,8 @@ async function main(): Promise<number> {
         mode,
         rootName: typeof args['root-name'] === 'string' ? (args['root-name'] as string) : undefined,
         headSessionId: typeof args.head === 'string' ? (args.head as string) : undefined,
+        maxPending: policy.maxPending,
+        overdueHours: policy.overdueHours,
       })
       if (!harnessResult) {
         print({
@@ -168,6 +176,8 @@ async function main(): Promise<number> {
       boundarySource: explicitTurn ? 'explicit' : 'default',
       invocationId: typeof args['invocation-id'] === 'string' ? (args['invocation-id'] as string) : undefined,
       mode,
+      maxPending: policy.maxPending,
+      overdueHours: policy.overdueHours,
     })
     print(result)
     return result.ok ? 0 : 1
@@ -279,6 +289,7 @@ async function main(): Promise<number> {
         asOf: typeof args['as-of'] === 'string' ? (args['as-of'] as string) : undefined,
         limit: typeof args.limit === 'string' ? Number(args.limit) : undefined,
       },
+      overdueHours: typeof args['overdue-hours'] === 'string' ? Number(args['overdue-hours']) : policy.overdueHours,
     })
     if (typeof args.dump === 'string') {
       await writeFile(args.dump as string, `${JSON.stringify(packet, null, 2)}\n`, 'utf8')
