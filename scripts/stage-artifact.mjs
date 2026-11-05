@@ -35,6 +35,10 @@ const out = path.resolve(arg('out') ?? path.join(os.tmpdir(), `stage-${sha.slice
 const smoke = !process.argv.includes('--no-smoke')
 const platform = process.platform
 const arch = process.arch
+// Optional: a bun binary to embed at `runtime/bun[.exe]`. Staging does not
+// download one, so an artifact cut without this is an artifact that still
+// needs bun on the target - and the report says so.
+const runtimeSource = arg('runtime')
 
 // The runtime set is explicit on purpose: cc.ps1 dot-sources
 // owned-gateway-process.ps1, which no import walk can see, and shipping the
@@ -112,8 +116,18 @@ async function missingRuntimeImports(scriptsDirectory) {
   for (const entry of await readdir(scriptsDirectory, { withFileTypes: true })) {
     if (!entry.isFile() || !/\.(mjs|js)$/.test(entry.name)) continue
     const text = await readFile(path.join(scriptsDirectory, entry.name), 'utf8')
-    for (const match of text.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)) {
-      if (!existsSync(path.join(scriptsDirectory, match[1]))) missing.add(match[1])
+    // Static re-exports, plain imports and dynamic imports are three spellings
+    // of the same dependency; a walk that knows one of them reports closure
+    // for a set that is not closed.
+    const patterns = [
+      /from\s+['"]\.\/([^'"]+)['"]/g,
+      /import\s*\(\s*['"]\.\/([^'"]+)['"]\s*\)/g,
+      /export\s+[^;]*?from\s+['"]\.\/([^'"]+)['"]/g,
+    ]
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        if (!existsSync(path.join(scriptsDirectory, match[1]))) missing.add(match[1])
+      }
     }
   }
   return [...missing].sort()
@@ -169,6 +183,27 @@ const missingImports = await missingRuntimeImports(path.join(out, 'scripts'))
 if (missingImports.length > 0) {
   fail(`runtime set is incomplete; missing: ${missingImports.join(', ')}`)
 }
+
+// --- the runtime (optional) -------------------------------------------------
+// The report says whether this artifact is self-contained, because two files
+// with the same extension and different requirements is how a release note
+// starts lying. `present: false` is a real answer, not a failure.
+const runtimeBinary = platform === 'win32' ? 'bun.exe' : 'bun'
+let runtime = { present: false, note: 'no runtime embedded; the target must provide bun' }
+if (runtimeSource) {
+  const source = path.resolve(runtimeSource)
+  if (!existsSync(source)) fail(`--runtime does not exist: ${source}`)
+  await mkdir(path.join(out, 'runtime'), { recursive: true })
+  await cp(source, path.join(out, 'runtime', runtimeBinary))
+  if (platform !== 'win32') await chmod(path.join(out, 'runtime', runtimeBinary), 0o755)
+  runtime = {
+    present: true,
+    binary: `runtime/${runtimeBinary}`,
+    bytes: (await stat(path.join(out, 'runtime', runtimeBinary))).size,
+    sha256: await digestFile(path.join(out, 'runtime', runtimeBinary)),
+  }
+}
+report.runtime = runtime
 
 // --- native dependencies, pinned to bun.lock ------------------------------
 const allowlist = JSON.parse(await readFile(path.join(ROOT, 'scripts', 'bundle-allowlist.json'), 'utf8'))
@@ -394,6 +429,41 @@ if (smoke) {
     fail(`missing dist produced the wrong error: ${missing.stderr || missing.stdout}`)
   }
   report.smoke.missingDist = 'reported'
+
+  // The runtime preference has two branches, and a row that only says
+  // "prewarm ok" proves the wrong one on a host that happens to have bun.
+  // With a bundled runtime, run the launcher on a PATH that cannot contain
+  // bun: `login --status` goes straight through ClaudeRunner and exits, so the
+  // only way to reach the harness is the bundled branch.
+  if (runtime.present) {
+    const bare = isolatedEnv(scratchConfig)
+    bare.PATH = platform === 'win32'
+      ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32')
+      : '/usr/bin:/bin'
+    delete bare.CC_CLAUDE_RUNNER_OVERRIDE
+    delete bare.CC_CLAUDE_SCRIPT_OVERRIDE
+    const bunVersion = spawnSync(path.join(out, runtime.binary), ['--version'], { encoding: 'utf8' })
+    if (bunVersion.status !== 0) fail(`bundled runtime failed --version: ${bunVersion.stderr || bunVersion.stdout}`)
+    const launched = spawnSync(process.execPath, [path.join(out, 'scripts', 'cc-launcher.mjs'), 'login', '--status'], {
+      cwd: out,
+      encoding: 'utf8',
+      timeout: 120_000,
+      env: bare,
+    })
+    if (launched.status !== 0) fail(`bundled-runtime launcher failed: ${launched.stderr || launched.stdout}`)
+    let mode
+    try {
+      mode = JSON.parse(launched.stdout).mode
+    } catch {
+      fail(`bundled-runtime launcher did not print login status: ${launched.stdout.slice(0, 300)}`)
+    }
+    report.smoke.runtimeRunner = {
+      binary: runtime.binary,
+      bun: bunVersion.stdout.trim(),
+      loginStatus: mode,
+      pathWithoutBun: true,
+    }
+  }
 
   if (platform === 'win32') {
     const ps = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(out, 'scripts', 'cc.ps1'), '--prewarm'], {
