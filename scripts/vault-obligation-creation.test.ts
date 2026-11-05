@@ -205,7 +205,10 @@ test('every creation case behaves as the fixture says', async () => {
           assert.equal(result.ok ? result.obligation_id : undefined, undefined, `${entry.case_id}: no obligation`)
         }
         if (expectResult.obligation_error_present === true) {
-          assert.ok((result.ok ? result.obligation_error : '')?.length, `${entry.case_id}: obligation_error must be reported`)
+          assert.ok(
+            result.ok && typeof result.obligation_error === 'string' && result.obligation_error.length > 0,
+            `${entry.case_id}: obligation_error must be reported`,
+          )
         }
       }
 
