@@ -8,6 +8,8 @@ import {
   admitDriverDesignation,
   completeRotation,
   conferDriverAdmission,
+  readScribe,
+  registerScribe,
   scribeHealth,
   scribePath,
   rotationPending,
@@ -680,6 +682,64 @@ test('the same scope is one designation and a changed scope is another', async (
     assert.equal(again?.ok && again.duplicate, true, 'scope order must not matter')
     assert.equal(changed?.ok && changed.duplicate, false)
     assert.equal(changed?.ok && changed.ordinal, 2)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the harness registers the scribe, and only the harness', async () => {
+  const root = await scratch()
+  try {
+    const missing = await registerScribe({ vaultRoot: root, familyId: 'nope', sessionId: 's1' })
+    assert.equal(missing.ok, false)
+    assert.equal(missing.ok === false ? missing.reason : '', 'unknown-family')
+
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(path.join(root, 'families', FAMILY), { recursive: true })
+    const noGeneration = await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 's1' })
+    assert.equal(noGeneration.ok, false)
+    assert.equal(noGeneration.ok === false ? noGeneration.reason : '', 'no-generation')
+
+    await seed(root)
+    const registered = await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 'scribe-1' })
+    assert.equal(registered.ok, true)
+    assert.equal(registered.ok && registered.generation_id, 'gen-1')
+    assert.equal(registered.ok && registered.replaced, false)
+    assert.equal((await readScribe(root, FAMILY))?.session_id, 'scribe-1')
+
+    // The gate now has what it needs.
+    const admitted = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'enforce',
+    })
+    assert.equal(admitted.ok, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a healthy scribe is not replaced by accident, and a stale one is', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 'scribe-1' })
+    const refused = await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 'scribe-2' })
+    assert.equal(refused.ok, false)
+    assert.equal(refused.ok === false ? refused.reason : '', 'scribe-healthy')
+    assert.equal((await readScribe(root, FAMILY))?.session_id, 'scribe-1')
+
+    const replaced = await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 'scribe-2', replace: true })
+    assert.equal(replaced.ok, true)
+    assert.equal((await readScribe(root, FAMILY))?.session_id, 'scribe-2')
+
+    // After a rotation the old record is stale, so a replacement needs no override.
+    await appendRotationDecision(root, FAMILY, () => ({ kind: 'rotation', generation_id: 'gen-2' }))
+    const afterRotation = await registerScribe({ vaultRoot: root, familyId: FAMILY, sessionId: 'scribe-3' })
+    assert.equal(afterRotation.ok, true)
+    assert.equal(afterRotation.ok && afterRotation.generation_id, 'gen-2')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

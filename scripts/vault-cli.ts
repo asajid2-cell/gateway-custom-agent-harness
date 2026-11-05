@@ -6,7 +6,8 @@
  *   bun scripts/vault-cli.ts repair --vault <path> --family <id>
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
- *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce]
+ *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce] [--as-harness [--scope a,b] [--root-name n] [--head sid]]
+ *   bun scripts/vault-cli.ts register-scribe --vault <path> --family <id> --session <sid> [--generation <g>] [--replace]
  *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen> [--pointer <pointer.json>]
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
@@ -24,7 +25,7 @@ import {
   repairTornTail,
   verifyJournal,
 } from '../src/utils/vault/journal.js'
-import { completeRotation, conferDriverAdmission } from '../src/utils/vault/activation.js'
+import { admitDriverDesignation, completeRotation, conferDriverAdmission, registerScribe } from '../src/utils/vault/activation.js'
 import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -125,6 +126,34 @@ async function main(): Promise<number> {
     // The same gate `conferDriver` calls, not a second implementation: a headless
     // caller must not be able to reach a weaker door than the interactive one.
     const mode = args.mode === 'enforce' ? 'enforce' : 'monitor'
+    // --as-harness drives the same function conferDriver calls, including the
+    // charter write. Without it this is the gate alone, which is what a test of
+    // the gate should use; with it, a script can prove the writer too.
+    if (args['as-harness'] === true) {
+      const scope = typeof args.scope === 'string' && args.scope.trim() !== ''
+        ? args.scope.split(',').map(entry => entry.trim()).filter(entry => entry !== '')
+        : []
+      const harnessResult = await admitDriverDesignation({
+        vaultRoot,
+        familyId: required(args, 'family'),
+        driverSessionId: required(args, 'session'),
+        scope,
+        mode,
+        rootName: typeof args['root-name'] === 'string' ? (args['root-name'] as string) : undefined,
+        headSessionId: typeof args.head === 'string' ? (args.head as string) : undefined,
+      })
+      if (!harnessResult) {
+        print({
+          ok: false,
+          family_id: required(args, 'family'),
+          reason: 'unknown-family',
+          message: 'the family is not registered in this vault; monitor mode skips it rather than refusing',
+        })
+        return 1
+      }
+      print(harnessResult)
+      return harnessResult.ok ? 0 : 1
+    }
     const explicitTurn = typeof args.turn === 'string'
     const result = await conferDriverAdmission({
       vaultRoot,
@@ -134,6 +163,19 @@ async function main(): Promise<number> {
       boundarySource: explicitTurn ? 'explicit' : 'default',
       invocationId: typeof args['invocation-id'] === 'string' ? (args['invocation-id'] as string) : undefined,
       mode,
+    })
+    print(result)
+    return result.ok ? 0 : 1
+  }
+
+  if (command === 'register-scribe') {
+    // The harness writes the registration; a scribe never registers itself.
+    const result = await registerScribe({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      sessionId: required(args, 'session'),
+      generationId: typeof args.generation === 'string' ? (args.generation as string) : undefined,
+      replace: args.replace === true,
     })
     print(result)
     return result.ok ? 0 : 1
@@ -223,7 +265,7 @@ async function main(): Promise<number> {
     return ok ? 0 : 1
   }
 
-  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|rotation-complete> --vault <path> ...')
+  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|register-scribe|rotation-complete> --vault <path> ...')
 }
 
 try {

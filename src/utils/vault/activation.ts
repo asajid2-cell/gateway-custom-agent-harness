@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { readFile, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import {
   activeGeneration,
   appendRotationDecision,
@@ -25,6 +25,10 @@ import { verifyReconstruction, writeCharter } from './reconstruction.js'
  * process is still running - and it is the property a test can construct
  * without a process table.
  */
+
+export type ScribeRegistration =
+  | { ok: true; family_id: string; session_id: string; generation_id: string; replaced: boolean }
+  | { ok: false; family_id: string; reason: 'unknown-family' | 'no-generation' | 'scribe-healthy'; message: string }
 
 export type ActivationReason =
   | 'unknown-family'
@@ -114,6 +118,70 @@ export async function readScribe(vaultRoot: string, familyId: string): Promise<S
  * generation is stale by construction - that is what rotation means - so it is
  * not a reason to admit work.
  */
+/**
+ * Record the family's scribe. This is the only writer of `scribe.json` in the
+ * harness: a scribe that wrote its own registration would be the capture path
+ * declaring itself healthy, so the file is written by whoever holds the role -
+ * the gate, at first admission, or a rotation swap - and never by the scribe.
+ *
+ * A healthy scribe is not replaced by accident: re-registering an existing one
+ * is refused unless the caller says `replace`, which is what a rotation does.
+ * A stale or retired record is replaced without ceremony, because that is the
+ * scribe the generation fence has already retired.
+ */
+export async function registerScribe(input: {
+  vaultRoot: string
+  familyId: string
+  sessionId: string
+  generationId?: string
+  replace?: boolean
+}): Promise<ScribeRegistration> {
+  if (!(await familyExists(input.vaultRoot, input.familyId))) {
+    return {
+      ok: false,
+      family_id: input.familyId,
+      reason: 'unknown-family',
+      message: `no family ${input.familyId} in this vault`,
+    }
+  }
+  const generation = input.generationId ?? (await activeGeneration(input.vaultRoot, input.familyId))
+  if (!generation) {
+    return {
+      ok: false,
+      family_id: input.familyId,
+      reason: 'no-generation',
+      message: `family ${input.familyId} has no admitted generation; a scribe has nothing to write under`,
+    }
+  }
+  const existing = await readScribe(input.vaultRoot, input.familyId)
+  const health = scribeHealth(existing, generation)
+  if (health === 'healthy' && !input.replace) {
+    return {
+      ok: false,
+      family_id: input.familyId,
+      reason: 'scribe-healthy',
+      message: `family ${input.familyId} already has a healthy scribe (${String(existing?.session_id ?? 'unknown')})`,
+    }
+  }
+  const path = scribePath(input.vaultRoot, input.familyId)
+  await mkdir(dirname(path), { recursive: true })
+  const temp = `${path}.${process.pid}.${Date.now()}.tmp`
+  const record: ScribeRecord = {
+    session_id: input.sessionId,
+    generation_id: generation,
+    started_at: new Date().toISOString(),
+  }
+  await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  await rename(temp, path)
+  return {
+    ok: true,
+    family_id: input.familyId,
+    session_id: input.sessionId,
+    generation_id: generation,
+    replaced: existing !== null,
+  }
+}
+
 export function scribeHealth(
   scribe: ScribeRecord | null,
   generation: string | null,
