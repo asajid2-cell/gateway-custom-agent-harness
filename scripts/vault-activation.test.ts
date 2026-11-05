@@ -1219,6 +1219,44 @@ test('a retry whose creation fails again appends nothing and reports the new err
   }
 })
 
+test('a base admission with no at refuses the repair instead of inventing a time', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    const obligationId = obligationIdFor(FAMILY, 'sess-1', 't1')
+    // A partially written admission row: everything except the writer's `at`.
+    await writeFile(
+      path.join(root, 'families', FAMILY, 'rotation.jsonl'),
+      `${JSON.stringify({
+        kind: 'admission',
+        generation_id: 'gen-1',
+        invocation_id: `inv:${obligationId.slice(3)}`,
+        ordinal: 1,
+        driver_session_id: 'sess-1',
+        turn_boundary: 't1',
+        boundary_source: 'explicit',
+        gate: 'monitor',
+        family_id: FAMILY,
+      })}\n`,
+    )
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok, true)
+    assert.equal(retry.ok ? retry.obligation_id : 'x', undefined)
+    assert.match(String(retry.ok ? retry.obligation_error : ''), /created_at/, 'the failure names the missing time')
+    assert.deepEqual(await obligationRows(root), [], 'no row is written with a guessed time')
+    assert.equal((await records(root)).filter(record => record.kind === 'admission_update').length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('an admission_update moves none of the three counters the rotation protocol reads', async () => {
   const root = await scratch()
   try {

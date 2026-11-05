@@ -251,6 +251,24 @@ test('every creation case behaves as the fixture says', async () => {
         if (expectRetry.duplicate_admission === true) {
           assert.equal(result.duplicate, true, `${entry.case_id}: the retry must be the same admission`)
         }
+        // The update row is stamped by the writer, never by the caller. The
+        // property is presence plus ordering: a real date, not earlier than the
+        // admission it amends. Asserting a literal retry time would only test
+        // the clock against itself.
+        const all = (await readFile(path.join(root, 'families', family, 'rotation.jsonl'), 'utf8'))
+          .split('\n')
+          .filter(line => line.trim() !== '')
+          .map(line => JSON.parse(line) as Record<string, unknown>)
+        const base = all.find(record => record.kind === 'admission' && record.invocation_id === result.invocation_id)
+        const update = all.find(record => record.kind === 'admission_update' && record.invocation_id === result.invocation_id)
+        if (update) {
+          const updateAt = Date.parse(String(update.at))
+          assert.equal(Number.isFinite(updateAt), true, `${entry.case_id}: the update's at must be a date`)
+          assert.ok(
+            updateAt >= Date.parse(String(base?.at)),
+            `${entry.case_id}: the update must not predate the admission it amends`,
+          )
+        }
       }
 
       if (entry.ids) {
