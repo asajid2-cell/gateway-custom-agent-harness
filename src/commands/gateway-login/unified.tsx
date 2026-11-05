@@ -1,7 +1,5 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
-import { rm } from 'node:fs/promises'
-import { join } from 'node:path'
 import type {
   LocalJSXCommandCall,
   LocalJSXCommandContext,
@@ -10,36 +8,41 @@ import { Box, Text } from '../../ink.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
 import { Select } from '../../components/CustomSelect/index.js'
 import { call as anthropicLogin } from '../login/anthropic.js'
-import {
-  ChatGptLogin,
-  anthropicCredentialsPath,
-  anthropicState,
-  codexHome,
-} from '../login/login.js'
+import { anthropicState } from '../login/login.js'
 import { performLogout } from '../logout/logout.js'
 import { call as providerLogin } from './login.js'
+import { CodexDeviceLogin } from './codex-login.js'
+import {
+  codexAccounts,
+  codexHomeFor,
+  codexStatusMessage,
+  nextCodexAccountName,
+  removeCodexAccount,
+  selectCodexAccount,
+} from './codex-accounts.js'
 import {
   PICKER_LABELS,
   PROVIDERS,
   PROVIDER_CREDENTIALS,
   planLogin,
-  type LoginAction,
+  type LoginPlan,
   type ProviderName,
 } from './unified-plan.js'
 
 /**
  * `/login` in gateway mode. Every credential the gateway can consume is
- * reachable here, not just the vault keys: Claude Code signs in through
- * Anthropic OAuth, Codex through its own ChatGPT login, and the provider keys
- * through the per-provider key UI. A bare `/login` opens a picker, a named
- * provider goes straight there, and `status`/`remove` work on their own or
- * after a provider name.
+ * reachable here, not just the vault keys:
  *
- * Key saves go through the same dialog as the per-provider commands, so they
- * report the backend, repeat any degraded-vault warning, and reload the gateway
- * keys. The two host sign-ins write the credential files the gateway already
- * reads, so they need no reload.
+ *   Claude Code  Anthropic OAuth; the gateway reads the file it writes.
+ *   Codex        one ChatGPT device login per account home, switchable and
+ *                rotated by the gateway on a credential failure.
+ *   keys         the per-provider key UI (backend report, vault save, reload).
+ *
+ * A bare `/login` opens a picker; a named provider goes straight there;
+ * `status`, `switch`, and `remove` work on their own or after a provider name.
  */
+
+type ProviderPlan = Extract<LoginPlan, { kind: 'provider' }>
 
 // The provider command's exported type is the generic three-argument form; the
 // fourth argument is the bound credential name.
@@ -50,42 +53,64 @@ const dispatch = providerLogin as unknown as (
   boundKeyName?: string,
 ) => Promise<ReactNode>
 
-function actionArgs(action: LoginAction): string {
-  return action === 'save' ? '' : action
-}
-
-/** Signing out of Codex is removing the auth file its login writes. */
-async function signOutCodex(): Promise<{ ok: boolean; file: string; reason?: string }> {
-  const file = join(await codexHome(), 'auth.json')
-  try {
-    await rm(file)
-    return { ok: true, file }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ok: true, file }
-    return { ok: false, file, reason: (error as Error).message }
+async function renderCodex(
+  plan: ProviderPlan,
+  onDone: (result?: string) => void,
+): Promise<ReactNode> {
+  if (plan.action === 'status') {
+    onDone(await codexStatusMessage())
+    return null
   }
+  if (plan.action === 'switch') {
+    if (!plan.target) {
+      onDone('Name the Codex account to switch to: /login codex switch <number|name> [session|global].')
+      return null
+    }
+    onDone((await selectCodexAccount(plan.target, plan.scope ?? 'session')).message)
+    return null
+  }
+  if (plan.action === 'remove') {
+    if (!plan.target) {
+      onDone('Name the Codex account to remove: /login codex remove <number|name>.')
+      return null
+    }
+    onDone((await removeCodexAccount(plan.target)).message)
+    return null
+  }
+  // save or new: one device-auth flow into a home of its own.
+  const name = plan.target ?? (await nextCodexAccountName())
+  const existing = (await codexAccounts()).find(
+    (account: { name: string }) => account.name === name,
+  )
+  if (existing) {
+    onDone(
+      `Codex account ${name} is already signed in (account ${existing.number}). ` +
+        'Use /login codex new [other-name] to add another, or /login codex switch to select it.',
+    )
+    return null
+  }
+  return <CodexDeviceLogin name={name} home={codexHomeFor(name)} onDone={onDone} />
 }
 
 async function renderProvider(
-  provider: ProviderName,
-  action: LoginAction,
+  plan: ProviderPlan,
   onDone: (result?: string) => void,
   context: LocalJSXCommandContext,
 ): Promise<ReactNode> {
-  if (provider === 'claude') {
-    if (action === 'save') return anthropicLogin(onDone, context)
-    if (action === 'status') {
+  if (plan.provider === 'claude') {
+    if (plan.action === 'save' || plan.action === 'new') {
+      return anthropicLogin(onDone, context)
+    }
+    if (plan.action === 'status') {
       const state = await anthropicState()
       onDone(
         state.present
-          ? `Claude Code is signed in (${state.source}${state.oauth ? ', oauth' : ''}). The gateway reads ${anthropicCredentialsPath()}.`
+          ? `Claude Code is signed in (${state.source}${state.oauth ? ', oauth' : ''}). The gateway reads the credential file it wrote.`
           : 'Claude Code is not signed in. Run /login claude to sign in, or set ANTHROPIC_API_KEY for the gateway.',
       )
       return null
     }
     await performLogout({})
-    // Logging out clears the file the gateway reads; an env key is a separate
-    // credential and would keep working, so say so rather than implying more.
     const envNote = process.env.ANTHROPIC_API_KEY?.trim()
       ? ' ANTHROPIC_API_KEY is still set in this environment and takes precedence.'
       : ''
@@ -95,39 +120,20 @@ async function renderProvider(
     return null
   }
 
-  if (provider === 'codex') {
-    if (action === 'remove') {
-      const result = await signOutCodex()
-      onDone(
-        result.ok
-          ? `Codex signed out: removed ${result.file}. Run /login codex to sign in again.`
-          : `Could not remove ${result.file}: ${result.reason}`,
-      )
-      return null
-    }
-    // Codex owns its device-auth login; this reports the state and, when it is
-    // missing, the exact command pinned to the home the gateway reads.
-    return <ChatGptLogin onDone={onDone} />
-  }
+  if (plan.provider === 'codex') return renderCodex(plan, onDone)
 
-  return dispatch(onDone, context, actionArgs(action), PROVIDER_CREDENTIALS[provider])
+  return dispatch(onDone, context, plan.args, PROVIDER_CREDENTIALS[plan.provider])
 }
 
 function ProviderInline(props: {
-  provider: ProviderName
-  action: LoginAction
+  plan: ProviderPlan
   onDone: (result?: string) => void
   context: LocalJSXCommandContext
 }): ReactNode {
   const [node, setNode] = useState<ReactNode>(null)
   useEffect(() => {
     void (async () => {
-      const rendered = await renderProvider(
-        props.provider,
-        props.action,
-        props.onDone,
-        props.context,
-      )
+      const rendered = await renderProvider(props.plan, props.onDone, props.context)
       setNode(rendered)
     })()
     // The picker decides the provider once; re-rendering must not re-dispatch.
@@ -145,8 +151,7 @@ function ProviderPicker(props: {
   if (chosen) {
     return (
       <ProviderInline
-        provider={chosen}
-        action={props.action}
+        plan={{ kind: 'provider', provider: chosen, action: props.action, args: props.action === 'save' ? '' : props.action }}
         onDone={props.onDone}
         context={props.context}
       />
@@ -184,5 +189,5 @@ export const call: LocalJSXCommandCall = async (onDone, context, args) => {
   if (plan.kind === 'pick') {
     return <ProviderPicker action={plan.action} onDone={onDone} context={context} />
   }
-  return renderProvider(plan.provider, plan.action, onDone, context)
+  return renderProvider(plan, onDone, context)
 }

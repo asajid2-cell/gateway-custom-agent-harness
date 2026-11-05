@@ -33,47 +33,124 @@ test('status and remove alone open the picker in that mode', () => {
 })
 
 test('a named provider goes straight to its key UI', () => {
-  assert.deepEqual(planLogin('deepseek'), { kind: 'provider', provider: 'deepseek', action: 'save' })
-  assert.deepEqual(planLogin('opencode new'), { kind: 'provider', provider: 'opencode', action: 'new' })
+  assert.deepEqual(planLogin('deepseek'), { kind: 'provider', provider: 'deepseek', action: 'save', args: '' })
+  assert.deepEqual(planLogin('opencode new'), { kind: 'provider', provider: 'opencode', action: 'new', args: 'new' })
   assert.deepEqual(planLogin('commandcode status'), {
     kind: 'provider',
     provider: 'commandcode',
     action: 'status',
+    args: 'status',
   })
   assert.deepEqual(planLogin('openrouter remove'), {
     kind: 'provider',
     provider: 'openrouter',
     action: 'remove',
+    args: 'remove',
   })
-  assert.deepEqual(planLogin('mistral'), { kind: 'provider', provider: 'mistral', action: 'save' })
+  assert.deepEqual(planLogin('mistral'), { kind: 'provider', provider: 'mistral', action: 'save', args: '' })
   assert.deepEqual(planLogin('mistralvibe status'), {
     kind: 'provider',
     provider: 'mistralvibe',
     action: 'status',
+    args: 'status',
   })
 })
 
 test('Claude Code and Codex are picker entries, with their common spellings', () => {
-  assert.deepEqual(planLogin('claude'), { kind: 'provider', provider: 'claude', action: 'save' })
-  assert.deepEqual(planLogin('anthropic'), { kind: 'provider', provider: 'claude', action: 'save' })
-  assert.deepEqual(planLogin('codex'), { kind: 'provider', provider: 'codex', action: 'save' })
+  assert.deepEqual(planLogin('claude'), { kind: 'provider', provider: 'claude', action: 'save', args: '' })
+  assert.deepEqual(planLogin('anthropic'), { kind: 'provider', provider: 'claude', action: 'save', args: '' })
+  assert.deepEqual(planLogin('codex'), { kind: 'provider', provider: 'codex', action: 'save', args: '' })
   assert.deepEqual(planLogin('chatgpt status'), {
     kind: 'provider',
     provider: 'codex',
     action: 'status',
+    args: 'status',
   })
-  assert.deepEqual(planLogin('openai remove'), {
+  // Removing a Codex account needs to name it: there can be several.
+  assert.equal(planLogin('openai remove').kind, 'error')
+  assert.deepEqual(planLogin('claude new'), {
     kind: 'provider',
-    provider: 'codex',
-    action: 'remove',
+    provider: 'claude',
+    action: 'new',
+    args: 'new',
   })
-  // Host sign-ins have no numbered account slots, so `new` means "sign in".
-  assert.deepEqual(planLogin('claude new'), { kind: 'provider', provider: 'claude', action: 'save' })
   assert.deepEqual(planLogin('mistral-vibe'), {
     kind: 'provider',
     provider: 'mistralvibe',
     action: 'save',
+    args: '',
   })
+})
+
+test('account providers carry the switch target and scope', () => {
+  assert.deepEqual(planLogin('opencode switch 2'), {
+    kind: 'provider',
+    provider: 'opencode',
+    action: 'switch',
+    args: 'switch 2',
+    target: '2',
+    scope: 'session',
+  })
+  assert.deepEqual(planLogin('commandcode switch 4 global'), {
+    kind: 'provider',
+    provider: 'commandcode',
+    action: 'switch',
+    args: 'switch 4 global',
+    target: '4',
+    scope: 'global',
+  })
+  assert.deepEqual(planLogin('mistral switch 3 session'), {
+    kind: 'provider',
+    provider: 'mistral',
+    action: 'switch',
+    args: 'switch 3 session',
+    target: '3',
+    scope: 'session',
+  })
+  // Codex accounts have names as well as numbers.
+  assert.deepEqual(planLogin('codex switch freedock global'), {
+    kind: 'provider',
+    provider: 'codex',
+    action: 'switch',
+    args: 'switch freedock global',
+    target: 'freedock',
+    scope: 'global',
+  })
+})
+
+test('Codex new takes an optional account name; remove needs a target', () => {
+  assert.deepEqual(planLogin('codex new'), {
+    kind: 'provider',
+    provider: 'codex',
+    action: 'new',
+    args: 'new',
+  })
+  assert.deepEqual(planLogin('codex new work2'), {
+    kind: 'provider',
+    provider: 'codex',
+    action: 'new',
+    args: 'new work2',
+    target: 'work2',
+  })
+  assert.deepEqual(planLogin('codex remove 2'), {
+    kind: 'provider',
+    provider: 'codex',
+    action: 'remove',
+    args: 'remove 2',
+    target: '2',
+  })
+})
+
+test('bad account grammar is refused with the provider its own words', () => {
+  assert.equal(planLogin('opencode switch').kind, 'error')
+  assert.equal(planLogin('opencode switch 0').kind, 'error')
+  assert.equal(planLogin('opencode switch 2 weekly').kind, 'error')
+  assert.equal(planLogin('deepseek switch 2').kind, 'error')
+  assert.equal(planLogin('mistralvibe switch 2').kind, 'error')
+  assert.equal(planLogin('codex remove').kind, 'error')
+  assert.equal(planLogin('codex new bad/name').kind, 'error')
+  assert.equal(planLogin('deepseek new named').kind, 'error')
+  assert.equal(planLogin('claude remove 2').kind, 'error')
 })
 
 test('unknown providers and extra words are refused with the list', () => {

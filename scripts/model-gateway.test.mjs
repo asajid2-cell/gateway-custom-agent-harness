@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -26,6 +26,7 @@ import {
   safeUpstreamResponseError,
   gatewayRequestShape,
   credentialPool,
+  codexRequestPool,
   openCodeCredentialPool,
   commandCodeCredentialPool,
   readOpenCodeSubscriptionUsage,
@@ -1186,6 +1187,9 @@ async function startGatewayForTest(env) {
       CODEX_RESPONSES_URL: env.CODEX_RESPONSES_URL,
       MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: env.MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS,
       MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: env.MODEL_GATEWAY_CONSUMER_TIMEOUT_MS,
+      // A test's scratch CODEX_HOME is its only Codex account unless the test
+      // opts into the multi-account pool with its own CODEX_ACCOUNTS_HOME.
+      CODEX_ACCOUNT_POOL: env.CODEX_ACCOUNT_POOL ?? 'off',
     },
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -1281,6 +1285,113 @@ test('CommandCode account selection isolates sessions and persists the global de
   } finally {
     await stopChild(gateway.child)
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+/** Two real-shaped Codex homes under one scratch accounts root. */
+async function codexAccountFixture() {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-selection-'))
+  for (const name of ['alpha', 'beta']) {
+    await mkdir(path.join(root, name), { recursive: true })
+    await writeFile(
+      path.join(root, name, 'auth.json'),
+      JSON.stringify({ tokens: { access_token: `token-${name}`, account_id: `acct-${name}` } }),
+    )
+  }
+  return root
+}
+
+test('Codex account selection isolates sessions, persists the global default, and reports names', async () => {
+  const root = await codexAccountFixture()
+  const env = { CODEX_ACCOUNTS_HOME: root, CODEX_ACCOUNT_POOL: 'on' }
+  let gateway = await startGatewayForTest(env)
+  const status = async session => {
+    const response = await fetch(`http://127.0.0.1:${gateway.port}/gateway/codex-account?sessionId=${session}`)
+    assert.equal(response.status, 200, 'account status route must exist')
+    const body = await response.json()
+    assert.deepEqual(body.accounts.map(account => [account.number, account.name]), [[1, 'alpha'], [2, 'beta']])
+    return body
+  }
+  const select = async (sessionId, target, scope) => fetch(`http://127.0.0.1:${gateway.port}/gateway/codex-account`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sessionId, ...target, scope }),
+  })
+  try {
+    assert.deepEqual((await status('a')).available, [1, 2])
+    assert.deepEqual((await status('a')).global, 1)
+    assert.equal((await select('a', { number: 2 }, 'session')).status, 200)
+    assert.equal((await status('a')).number, 2)
+    assert.equal((await status('b')).number, 1)
+    // A name works wherever a number does.
+    assert.equal((await select('b', { name: 'beta' }, 'global')).status, 200)
+    assert.equal((await status('c')).number, 2)
+    assert.equal((await status('c')).global, 2)
+    assert.equal((await select('a', { number: 1 }, 'session')).status, 200)
+    assert.equal((await status('a')).number, 1)
+    const rejected = await select('b', { number: 99 }, 'global')
+    assert.equal(rejected.status, 400)
+    assert.match((await rejected.json()).error, /Available: 1=alpha, 2=beta/)
+    await stopChild(gateway.child)
+    gateway = await startGatewayForTest(env)
+    assert.equal((await status('new')).number, 2, 'the global selection survives a restart')
+    const current = (await readFile(path.join(root, 'current.txt'), 'utf8')).trim()
+    assert.equal(current, 'beta', 'global selection is the file codex-acct reads')
+  } finally {
+    await stopChild(gateway.child)
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the Codex pool rotates to the next usable home and exposes the credential numbers', async () => {
+  const root = await codexAccountFixture()
+  const previous = {
+    accounts: process.env.CODEX_ACCOUNTS_HOME,
+    pool: process.env.CODEX_ACCOUNT_POOL,
+  }
+  process.env.CODEX_ACCOUNTS_HOME = root
+  delete process.env.CODEX_ACCOUNT_POOL
+  try {
+    const pool = await codexRequestPool('pool-session')
+    assert.equal(pool.size, 2)
+    assert.deepEqual(pool.numbers, [1, 2])
+    assert.equal(pool.number, 1)
+    assert.deepEqual(await pool.auth(), { accessToken: 'token-alpha', accountId: 'acct-alpha' })
+    pool.advance()
+    assert.equal(pool.number, 2)
+    assert.deepEqual(await pool.auth(), { accessToken: 'token-beta', accountId: 'acct-beta' })
+    pool.markServed()
+    assert.equal(pool.lastServed, 2)
+    pool.select(1)
+    assert.equal(pool.number, 1)
+    assert.equal(pool.select(9), false)
+
+    // A failover sticks for its own session and does not move another one.
+    const first = await codexRequestPool('sticky')
+    first.advance()
+    assert.equal((await codexRequestPool('sticky')).number, 2)
+    assert.equal((await codexRequestPool('other')).number, 1)
+
+    // A home whose login is gone is skipped rather than served.
+    await rm(path.join(root, 'alpha', 'auth.json'))
+    assert.deepEqual(await pool.auth(), { accessToken: 'token-beta', accountId: 'acct-beta' })
+  } finally {
+    if (previous.accounts === undefined) delete process.env.CODEX_ACCOUNTS_HOME
+    else process.env.CODEX_ACCOUNTS_HOME = previous.accounts
+    if (previous.pool === undefined) delete process.env.CODEX_ACCOUNT_POOL
+    else process.env.CODEX_ACCOUNT_POOL = previous.pool
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the Codex pool is off in single-home mode', async () => {
+  const previous = process.env.CODEX_ACCOUNT_POOL
+  process.env.CODEX_ACCOUNT_POOL = 'off'
+  try {
+    assert.equal(await codexRequestPool('single'), null)
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_ACCOUNT_POOL
+    else process.env.CODEX_ACCOUNT_POOL = previous
   }
 })
 

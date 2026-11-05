@@ -61,8 +61,8 @@ test('gateway mode registers the credential login, off-gateway keeps OAuth login
     /isUsing3PServices\(\)\s*\?\s*\[gatewayLogin\]\s*:\s*\[logout, login\(\)\]/,
   )
   assert.match(loginSource, /name: 'login'/)
-  assert.match(loginSource, /Claude Code or Codex/)
-  assert.match(loginSource, /mistral, mistralvibe/)
+  assert.match(loginSource, /Sign in to Claude Code, add or switch Codex accounts/)
+  assert.match(loginSource, /switch\|remove/)
 })
 
 test('the gateway login command reaches the picker and the per-provider UI', async () => {
@@ -78,7 +78,7 @@ test('the gateway login command reaches the picker and the per-provider UI', asy
   // existing per-provider dialog with the bound credential name.
   assert.match(unifiedSource, /<ProviderPicker action=\{plan\.action\}/)
   assert.match(unifiedSource, /import \{ call as providerLogin \} from '\.\/login\.js'/)
-  assert.match(unifiedSource, /PROVIDER_CREDENTIALS\[provider\]/)
+  assert.match(unifiedSource, /PROVIDER_CREDENTIALS\[plan\.provider\]/)
   assert.match(
     planSource,
     /opencode: 'opencode-go',\s*\n\s*commandcode: 'commandcode',\s*\n\s*mistral: 'mistral',\s*\n\s*mistralvibe: 'mistralvibe',\s*\n\s*deepseek: 'ds',\s*\n\s*openrouter: 'openrouter'/,
@@ -94,12 +94,15 @@ test('the gateway picker reaches the host sign-ins, not only vault keys', async 
     new URL('../src/commands/gateway-login/unified-plan.ts', import.meta.url),
     'utf8',
   )
-  // Claude Code keeps Anthropic's own OAuth flow, Codex keeps its device-auth
-  // login, and neither is turned into a vault key.
+  // Claude Code keeps Anthropic's own OAuth flow, Codex runs its device login
+  // into an isolated home, and neither is turned into a vault key.
   assert.match(unifiedSource, /import \{ call as anthropicLogin \} from '\.\.\/login\/anthropic\.js'/)
-  assert.match(unifiedSource, /import \{[\s\S]*ChatGptLogin[\s\S]*\} from '\.\.\/login\/login\.js'/)
+  assert.match(unifiedSource, /import \{ CodexDeviceLogin \} from '\.\/codex-login\.js'/)
+  assert.match(unifiedSource, /selectCodexAccount/)
+  assert.match(unifiedSource, /removeCodexAccount/)
   assert.match(unifiedSource, /performLogout/)
   assert.match(planSource, /export const PROVIDERS: ProviderName\[\] = \['claude', 'codex', \.\.\.KEY_PROVIDERS\]/)
   assert.match(planSource, /anthropic: 'claude'/)
   assert.match(planSource, /chatgpt: 'codex'/)
+  assert.match(planSource, /export const ACCOUNT_PROVIDERS: ProviderName\[\] = \['opencode', 'commandcode', 'mistral', 'codex'\]/)
 })

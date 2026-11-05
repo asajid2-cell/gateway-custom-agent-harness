@@ -1,7 +1,7 @@
 import type { GatewayCredentialName } from '../../utils/gatewayCredentials.js'
 
 /** `new` is the account-provider flow that picks the next free slot. */
-export type LoginAction = 'save' | 'new' | 'status' | 'remove'
+export type LoginAction = 'save' | 'new' | 'switch' | 'status' | 'remove'
 
 /** Providers whose credential is an API key held in the vault. */
 export type KeyProviderName =
@@ -15,8 +15,8 @@ export type KeyProviderName =
 /**
  * Providers that sign in through their own flow and keep their own credential
  * file: Claude Code (Anthropic OAuth -> credentials.json) and Codex (ChatGPT
- * login -> codex auth.json). The gateway reads both files directly, so these
- * are not vault keys.
+ * login -> one auth.json per account home). The gateway reads those files
+ * directly, so they are not vault keys.
  */
 export type HostProviderName = 'claude' | 'codex'
 
@@ -34,9 +34,14 @@ export const PROVIDER_CREDENTIALS: Record<KeyProviderName, GatewayCredentialName
 export const KEY_PROVIDERS = Object.keys(PROVIDER_CREDENTIALS) as KeyProviderName[]
 
 /**
- * Picker order: the two host sign-ins first, because they are the ones an
- * operator reaches for on a fresh machine and they were previously only
- * reachable off-gateway.
+ * Providers with numbered accounts: the numbered key slots the gateway rotates
+ * through, plus Codex account homes. Only these accept `switch`.
+ */
+export const ACCOUNT_PROVIDERS: ProviderName[] = ['opencode', 'commandcode', 'mistral', 'codex']
+
+/**
+ * Picker order: the host sign-ins first, because they are the ones an operator
+ * reaches for on a fresh machine, then the provider keys.
  */
 export const PROVIDERS: ProviderName[] = ['claude', 'codex', ...KEY_PROVIDERS]
 
@@ -48,8 +53,14 @@ const ALIASES: Record<string, ProviderName> = {
   'mistral-vibe': 'mistralvibe',
 }
 
+export const CODEX_ACCOUNT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
 export function isKeyProvider(name: ProviderName): name is KeyProviderName {
   return Object.hasOwn(PROVIDER_CREDENTIALS, name)
+}
+
+export function isAccountProvider(name: ProviderName): boolean {
+  return ACCOUNT_PROVIDERS.includes(name)
 }
 
 export const PICKER_LABELS: Record<ProviderName, string> = {
@@ -65,48 +76,130 @@ export const PICKER_LABELS: Record<ProviderName, string> = {
 
 export type LoginPlan =
   | { kind: 'pick'; action: 'save' | 'status' | 'remove' }
-  | { kind: 'provider'; provider: ProviderName; action: LoginAction }
+  | {
+      kind: 'provider'
+      provider: ProviderName
+      action: LoginAction
+      /** Exactly what the provider handler receives after the provider word. */
+      args: string
+      /** Account number or name for switch/remove, name for new. */
+      target?: string
+      scope?: 'session' | 'global'
+    }
   | { kind: 'error'; message: string }
 
+function error(message: string): LoginPlan {
+  return { kind: 'error', message }
+}
+
 function providerWords(provider: ProviderName): string {
-  return isKeyProvider(provider)
-    ? 'new, status, or remove'
-    : 'status or remove (no argument signs in)'
+  if (provider === 'codex') {
+    return 'new [name], switch <number|name> [session|global], status, or remove <number|name>'
+  }
+  if (isAccountProvider(provider)) {
+    return 'new, switch <number> [session|global], status, or remove'
+  }
+  if (provider === 'claude') {
+    return 'status or remove (no argument signs in)'
+  }
+  return 'new, status, or remove'
 }
 
 /**
  * `/login` is usable with no argument: the picker supplies the provider. A
  * provider may also be named directly with an optional action; `status` or
  * `remove` alone open the picker in that mode.
+ *
+ * Account providers accept the same `switch <number> [session|global]` grammar
+ * the gateway has always understood, and Codex accepts an account name as well
+ * because its homes are named.
  */
 export function planLogin(args: string): LoginPlan {
   const words = args.trim().split(/\s+/).filter(Boolean)
   if (words.length === 0) return { kind: 'pick', action: 'save' }
 
   const first = words[0]!.toLowerCase()
-  if (first === 'status' || first === 'remove') {
-    if (words.length > 1) return { kind: 'error', message: `/${first} takes no further argument.` }
+  if ((first === 'status' || first === 'remove') && words.length === 1) {
     return { kind: 'pick', action: first }
   }
 
   const provider = (ALIASES[first] ?? first) as ProviderName
   if (!PROVIDERS.includes(provider)) {
+    return error(`Unknown provider: ${first}. Use ${PROVIDERS.join(', ')}, or /login for a picker.`)
+  }
+
+  const rest = words.slice(1)
+  if (rest.length === 0) return { kind: 'provider', provider, action: 'save', args: '' }
+
+  const action = rest[0]!.toLowerCase()
+  const argsText = rest.join(' ')
+
+  if (action === 'switch') {
+    if (!isAccountProvider(provider)) {
+      return error(`${provider} has no accounts to switch. Use /login ${provider} to manage its key.`)
+    }
+    const target = rest[1]
+    if (!target) {
+      return error(`Use /login ${provider} ${providerWords(provider)}.`)
+    }
+    if (rest.length > 3) return error(`Use /login ${provider} ${providerWords(provider)}.`)
+    const scopeWord = rest[2]?.toLowerCase()
+    if (scopeWord && scopeWord !== 'session' && scopeWord !== 'global') {
+      return error(`Switch scope is session or global, not ${scopeWord}.`)
+    }
+    if (provider !== 'codex' && !/^[1-9][0-9]*$/.test(target)) {
+      return error(`${provider} accounts are numbered; use /login ${provider} switch <number> [session|global].`)
+    }
     return {
-      kind: 'error',
-      message: `Unknown provider: ${first}. Use ${PROVIDERS.join(', ')}, or /login for a picker.`,
+      kind: 'provider',
+      provider,
+      action: 'switch',
+      args: argsText,
+      target,
+      scope: scopeWord === 'global' ? 'global' : 'session',
     }
   }
 
-  if (words.length === 1) return { kind: 'provider', provider, action: 'save' }
-  if (words.length > 2) {
-    return { kind: 'error', message: `/${first} takes ${providerWords(provider)}.` }
+  if (action === 'new') {
+    if (rest.length > 2) return error(`Use /login ${provider} ${providerWords(provider)}.`)
+    const name = rest[1]
+    if (name && provider !== 'codex') {
+      return error(`Only a Codex account takes a name; use /login ${provider} new.`)
+    }
+    if (name && !CODEX_ACCOUNT_NAME.test(name)) {
+      return error(`Account names use letters, digits, dot, dash, or underscore: ${name}`)
+    }
+    return {
+      kind: 'provider',
+      provider,
+      action: 'new',
+      args: name ? `new ${name}` : 'new',
+      ...(name ? { target: name } : {}),
+    }
   }
 
-  const action = words[1]!
-  if (action !== 'new' && action !== 'status' && action !== 'remove') {
-    return { kind: 'error', message: `/${first} takes ${providerWords(provider)}.` }
+  if (action === 'remove') {
+    if (rest.length > 2) return error(`Use /login ${provider} ${providerWords(provider)}.`)
+    const target = rest[1]
+    if (target && provider !== 'codex') {
+      return error(`/login ${provider} remove targets the active key; it takes no account.`)
+    }
+    if (provider === 'codex' && !target) {
+      return error('Name the Codex account to remove: /login codex remove <number|name>.')
+    }
+    return {
+      kind: 'provider',
+      provider,
+      action: 'remove',
+      args: target ? `remove ${target}` : 'remove',
+      ...(target ? { target } : {}),
+    }
   }
-  // Host sign-ins have no numbered account slots; `new` is just "sign in".
-  const effective: LoginAction = !isKeyProvider(provider) && action === 'new' ? 'save' : action
-  return { kind: 'provider', provider, action: effective }
+
+  if (action === 'status') {
+    if (rest.length > 1) return error(`/login ${provider} status takes no argument.`)
+    return { kind: 'provider', provider, action: 'status', args: 'status' }
+  }
+
+  return error(`/login ${provider} takes ${providerWords(provider)}.`)
 }

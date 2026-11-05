@@ -37,6 +37,12 @@ import {
 } from './quota-cache.mjs'
 import { readCodexQuota, stopCodexQuota } from './codex-quota.mjs'
 import {
+  codexAccounts,
+  currentCodexAccountName,
+  readCodexAuth as readCodexAuthFromHome,
+  setCurrentCodexAccount,
+} from './codex-accounts.mjs'
+import {
   COMMANDCODE_MODEL_IDS,
   COMMANDCODE_ROUTES,
   commandCodeEffortLevels,
@@ -1663,6 +1669,108 @@ async function readCodexAuth() {
   return { accessToken, accountId }
 }
 
+// ---------------------------------------------------------------------------
+// Codex accounts: CODEX_HOME is one login, so several subscriptions are several
+// homes under ~/.codex-accounts. The pool mirrors the numbered key pools: a
+// stable per-account number, a session pin or the global `current.txt`
+// selection, and a rotation that moves past an account which cannot serve.
+// A machine with no multi-account homes keeps the single-home behaviour.
+// ---------------------------------------------------------------------------
+
+/** Explicit per-session pins, as set by /login codex switch … session. */
+const codexSessionSelections = new Map()
+/** One live pool per session, so a failover sticks for that session. */
+const codexPools = new Map()
+
+async function codexLoadedAccounts() {
+  try {
+    return await codexAccounts()
+  } catch {
+    return []
+  }
+}
+
+function codexPoolSignature(accounts) {
+  // The home is part of the identity: two runs can use the same account names
+  // under different roots, and a cached pool must not read the old files.
+  return accounts.map(account => `${account.number}:${account.name}:${account.home}`).join(',')
+}
+
+function buildCodexPool(accounts, preferred) {
+  let selected = preferred
+  let lastServed = null
+  const at = number => accounts.findIndex(account => account.number === number)
+  const pool = {
+    get accounts() { return accounts.map(account => ({ number: account.number, name: account.name })) },
+    get numbers() { return accounts.map(account => account.number) },
+    get size() { return accounts.length },
+    get number() {
+      const index = at(selected)
+      return index < 0 ? accounts[0].number : accounts[index].number
+    },
+    get lastServed() { return lastServed },
+    nameFor(number) { return accounts.find(account => account.number === number)?.name ?? null },
+    advance() {
+      const index = at(selected)
+      if (index < 0) return
+      selected = accounts[(index + 1) % accounts.length].number
+    },
+    select(number) {
+      if (!accounts.some(account => account.number === number)) return false
+      selected = number
+      return true
+    },
+    markServed() { lastServed = pool.number },
+    /**
+     * The login of the selected account, rotating past a home whose auth.json
+     * is missing or incomplete. Null when no loaded home is usable.
+     */
+    async auth() {
+      for (let tries = 0; tries < accounts.length; tries += 1) {
+        const account = accounts[at(pool.number)]
+        if (!account) return null
+        const auth = await readCodexAuthFromHome(account.home)
+        if (auth) return auth
+        pool.advance()
+      }
+      return null
+    },
+  }
+  return pool
+}
+
+/** Single-home mode: the test harness turns the pool off for its scratch home. */
+function codexPoolEnabled() {
+  return process.env.CODEX_ACCOUNT_POOL !== 'off'
+}
+
+export async function codexRequestPool(sessionId) {
+  if (!codexPoolEnabled()) return null
+  const accounts = await codexLoadedAccounts()
+  const key = sessionId || ''
+  if (accounts.length === 0) {
+    codexPools.delete(key)
+    return null
+  }
+  const signature = codexPoolSignature(accounts)
+  const cached = codexPools.get(key)
+  if (cached?.signature === signature) return cached.pool
+  // A pool is rebuilt only when the account set changes. Keep the position a
+  // failover reached, then the session pin, then the global selection.
+  const selectedName = await currentCodexAccountName()
+  const selected = accounts.find(account => account.name === selectedName)
+  const pinned = sessionId ? codexSessionSelections.get(sessionId) : undefined
+  const carried = cached?.pool.number
+  const preferred = Number.isSafeInteger(pinned) && accounts.some(account => account.number === pinned)
+    ? pinned
+    : accounts.some(account => account.number === carried)
+      ? carried
+      : selected?.number ?? accounts[0].number
+  const pool = buildCodexPool(accounts, preferred)
+  codexPools.set(key, { signature, pool })
+  return pool
+}
+
 function anthropicError(res, status, message) {
   json(res, status, {
     type: 'error',
@@ -2348,7 +2456,8 @@ function retryableStatus(status) {
 // still surfaced rather than retried.
 function providerHasRotatingBodyMarkers(provider) {
   const name = String(provider).toLowerCase()
-  return name.includes('opencode') || name.includes('commandcode') || name.includes('command code') || name.includes('mistral')
+  return name.includes('opencode') || name.includes('commandcode') || name.includes('command code') ||
+    name.includes('mistral') || name.includes('codex')
 }
 
 // Wording that means the key cannot serve, not that the request is wrong. Kept
@@ -3037,6 +3146,8 @@ const ROUTE_HEALTH_PROVIDERS = new Map([
   ['opencode-go', 'opencode-go'],
   ['opencode zen', 'opencode-zen'],
   ['opencode-zen', 'opencode-zen'],
+  ['codex', 'codex'],
+  ['codex chatgpt', 'codex'],
   ['deepseek', 'deepseek'],
   ['amd radeon', 'amd-radeon'],
   ['amd-radeon', 'amd-radeon'],
@@ -3183,7 +3294,10 @@ export async function fetchWithRetry({
   for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
     if (attempt > 1) control.retryUpstream?.()
     try {
-      const response = await fetch(url, typeof options === 'function' ? options() : options)
+      // A pool whose credential comes from a file (Codex homes) resolves its
+      // headers asynchronously; a synchronous option builder is unaffected.
+      const resolvedOptions = typeof options === 'function' ? await options() : options
+      const response = await fetch(url, resolvedOptions)
       trace.markUpstreamConnect()
       control.upstreamConnected()
       const failedCredential = await credentialFailure(provider, response, credentials, control)
@@ -3832,13 +3946,25 @@ async function handleCodex(body, req, res, modelName, route) {
   const control = createRequestControl(req, res, trace)
   const querySource = gatewayQuerySource(req)
   const nativeCompaction = isCompactionRequest(req)
+  const sessionId = upstreamSessionId(req, body)
+  // Null when this machine has no ~/.codex-accounts homes: one CODEX_HOME is
+  // then the only account, exactly as before.
+  const accounts = await codexRequestPool(sessionId)
   let auth
   try {
-    auth = await readCodexAuth()
+    auth = accounts ? await accounts.auth() : await readCodexAuth()
   } catch (error) {
     trace.markError(error)
     anthropicError(res, 401, error instanceof Error ? error.message : 'Codex auth unavailable')
     trace.finish('auth-error', error, 401)
+    control.cleanup()
+    return
+  }
+  if (!auth) {
+    const message = 'Codex ChatGPT auth is missing or incomplete; run /login codex first'
+    trace.markError(new Error(message))
+    anthropicError(res, 401, message)
+    trace.finish('auth-error', null, 401)
     control.cleanup()
     return
   }
@@ -3905,7 +4031,14 @@ async function handleCodex(body, req, res, modelName, route) {
           upstream = await fetchWithRetry({
             provider: 'Codex',
             url: CODEX_ENDPOINT,
-            options: {
+            // Headers are rebuilt per attempt: a credential failure advances
+            // the account pool, and each account carries its own token.
+            options: async () => {
+              if (accounts) {
+                auth = await accounts.auth()
+                if (!auth) throw new Error('Codex ChatGPT auth is missing or incomplete; run /login codex first')
+              }
+              return {
               method: 'POST',
               headers: {
                 Authorization: `Bearer ${auth.accessToken}`,
@@ -3916,9 +4049,11 @@ async function handleCodex(body, req, res, modelName, route) {
               },
               body: JSON.stringify(variant),
               signal: control.signal,
+              }
             },
             control,
             trace,
+            credentials: accounts ?? undefined,
           })
         } catch (error) {
           requestError = error
@@ -5762,6 +5897,77 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  if (req.method === 'POST' && requestUrl.pathname === '/gateway/codex-account') {
+    if (!codexPoolEnabled()) {
+      json(res, 400, { error: 'No Codex account is loaded. Run /login codex to sign in.' })
+      return
+    }
+    let selection
+    try { selection = JSON.parse((await readRawBody(req)).toString('utf8')) } catch {
+      json(res, 400, { error: 'Invalid account selection' })
+      return
+    }
+    const { number, name, sessionId, scope } = selection ?? {}
+    if (!['session', 'global'].includes(scope) || typeof sessionId !== 'string' || !sessionId.trim()) {
+      json(res, 400, { error: 'Use an account number or name and session or global scope' })
+      return
+    }
+    const accounts = await codexLoadedAccounts()
+    if (accounts.length === 0) {
+      json(res, 400, { error: 'No Codex account is loaded. Run /login codex to sign in.' })
+      return
+    }
+    const account = Number.isSafeInteger(number) && number > 0
+      ? accounts.find(candidate => candidate.number === number)
+      : accounts.find(candidate => candidate.name === name)
+    if (!account) {
+      json(res, 400, {
+        error: `Codex account ${name ?? number} is not loaded. Available: ${accounts.map(candidate => `${candidate.number}=${candidate.name}`).join(', ')}.`,
+      })
+      return
+    }
+    if (scope === 'global') {
+      try {
+        await setCurrentCodexAccount(account.name)
+      } catch {
+        json(res, 500, { error: 'Could not save the global Codex account' })
+        return
+      }
+      codexSessionSelections.delete(sessionId)
+      // Unpinned sessions follow the global default immediately; a session that
+      // pinned itself keeps its own account.
+      for (const [key, entry] of codexPools) {
+        if (!codexSessionSelections.has(key)) entry.pool.select(account.number)
+      }
+    } else {
+      codexSessionSelections.set(sessionId, account.number)
+      codexPools.get(sessionId)?.pool.select(account.number)
+    }
+    json(res, 200, { number: account.number, name: account.name, scope })
+    return
+  }
+
+  if (req.method === 'GET' && requestUrl.pathname === '/gateway/codex-account') {
+    if (!codexPoolEnabled()) {
+      json(res, 200, { number: 1, global: 1, available: [], accounts: [] })
+      return
+    }
+    const sessionId = requestUrl.searchParams.get('sessionId')
+    const accounts = await codexLoadedAccounts()
+    const selectedName = await currentCodexAccountName()
+    const global = accounts.find(account => account.name === selectedName)?.number ?? accounts[0]?.number ?? 1
+    // The live pool reports the account that would serve now, including a
+    // failover the session has already made.
+    const number = (await codexRequestPool(sessionId))?.number ?? global
+    json(res, 200, {
+      number,
+      global,
+      available: accounts.map(account => account.number),
+      accounts: accounts.map(account => ({ number: account.number, name: account.name })),
+    })
+    return
+  }
+
   // Reload the credential set from Keysafe. The gateway cannot re-read the vault
   // itself (it only ever reads env), so it answers the caller, flushes, and exits
   // with a code the supervisor recognizes as a deliberate restart; the supervisor
@@ -5772,6 +5978,7 @@ const server = http.createServer(async (req, res) => {
     const pool = await sessionOpenCodeCredentials(sessionId)
     const commandCodePool = await sessionCommandCodeCredentials(sessionId)
     const mistralPool = await sessionMistralCredentials(sessionId)
+    const codexLoaded = await codexLoadedAccounts()
     // `available` stays the OpenCode list: the opencode CLI reads it as its own
     // accounts. CommandCode numbers travel separately and its CLI re-reads GET
     // /gateway/commandcode-account, which already returns its own `available`.
@@ -5783,6 +5990,7 @@ const server = http.createServer(async (req, res) => {
       commandcodeAvailable: commandCodePool.numbers,
       mistralAvailable: mistralPool.numbers,
       mistralVibeAvailable: mistralVibeCredentials.numbers,
+      codexAvailable: codexLoaded.map(account => account.number),
     }), () => {
       setTimeout(() => process.exit(GATEWAY_RELOAD_EXIT_CODE), 25)
     })
