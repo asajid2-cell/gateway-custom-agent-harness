@@ -120,7 +120,7 @@
       "contextWindow": 450000
     },
     "gateway-mistral-vibe-deepseek-v4.1-flash": {
-      "contextWindow": 1048576
+      "contextWindow": 480000
     },
     "gateway-mistral-api-deepseek-v4.1-flash": {
       "contextWindow": 1048576
@@ -416,7 +416,7 @@
     {
       "value": "gateway-mistral-vibe-deepseek-v4.1-flash",
       "label": "Mistral Vibe DeepSeek v4.1 Flash",
-      "description": "Mistral Vibe - DeepSeek v4.1 Flash (Vibe plan key, 1M context)"
+      "description": "Mistral Vibe - DeepSeek v4.1 Flash (Vibe plan key, 480k context)"
     },
     {
       "value": "gateway-mistral-api-deepseek-v4.1-flash",
