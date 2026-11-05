@@ -122,6 +122,38 @@ describe('LaneManager', () => {
     } finally { await cleanup() }
   })
 
+  test('two lanes opening at once cannot be handed the same port', async () => {
+    // The live defect: `portFree` binds, closes, and reports, so two concurrent
+    // opens both saw 9300 free. The second Chrome could not bind it and the
+    // driver then refused to adopt the first lane's browser.
+    const { dir, cleanup } = await scratch()
+    try {
+      const envs: Record<string, string>[] = []
+      const manager = new LaneManager({
+        driverScript: join(dir, 'unused.mjs'),
+        root: join(dir, 'lanes'),
+        sourcePort: 9222,
+        basePort: basePort(),
+        maxLanes: 8,
+        idleMs: 30_000,
+        syncCookies: false,
+        spawnLane: lane => {
+          envs.push(lane.env)
+          const child = new FakeLaneChild(lane.laneId)
+          child.warmDelayMs = 250 // still opening while the second allocates
+          return child as unknown as DriverChild
+        },
+      })
+      const [a, b] = await Promise.all([manager.acquire('sender-a'), manager.acquire('sender-b')])
+      expect(a.port).not.toBe(b.port)
+      const ports = envs.map(env => env.CHATGPT_CDP_PORT)
+      expect(new Set(ports).size).toBe(ports.length)
+      manager.release('sender-a')
+      manager.release('sender-b')
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
   test('one writer cannot take its own lane twice; the second waits for release', async () => {
     const { dir, cleanup } = await scratch()
     try {

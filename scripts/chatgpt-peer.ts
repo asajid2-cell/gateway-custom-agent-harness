@@ -5994,6 +5994,37 @@ export class ChatGptHost {
    * bounces inside that one window. Host-initiated work (a scheduled wake, an
    * operator request) uses the host lane, a single window of its own.
    */
+  /** True when the master browser's debugger answers on its port. */
+  private masterBrowserAnswers(): Promise<boolean> {
+    const port = this.config.laneSourcePort ?? 9222
+    return new Promise(resolve => {
+      const socket = connect({ host: '127.0.0.1', port })
+      const done = (answer: boolean) => { socket.destroy(); resolve(answer) }
+      socket.setTimeout(1500, () => done(false))
+      socket.once('connect', () => done(true))
+      socket.once('error', () => done(false))
+    })
+  }
+
+  /**
+   * Bring the master browser back before a lane tries to branch from it.
+   *
+   * A dead master is not the lane's fault and not the message's: Chrome is
+   * killed under memory pressure, and every lane open then fails with
+   * ECONNREFUSED while the queue grows. A failed warm here is logged and
+   * swallowed - the lane's own open reports the real reason.
+   */
+  private async ensureMasterBrowser(): Promise<void> {
+    if (await this.masterBrowserAnswers()) return
+    log('master browser is down; warming it before the lane opens')
+    try {
+      const reply = await this.masterDriver.call({ op: 'warm' }, { timeoutMs: this.config.turnTimeoutMs ?? 120_000 })
+      if (reply?.ok !== true) log(`master warm before a lane failed: ${String(reply?.error ?? 'no reason')}`)
+    } catch (error) {
+      log(`master warm before a lane failed: ${(error as Error).message}`)
+    }
+  }
+
   private laneIdOf(message: { fromSessionId?: string }): string {
     return message.fromSessionId && message.fromSessionId.trim() ? message.fromSessionId : HOST_LANE
   }
@@ -6008,6 +6039,11 @@ export class ChatGptHost {
    */
   private async laneWork<T>(laneId: string, work: (lane: LaneHandle) => Promise<T>): Promise<T> {
     if (!this.lanes) return work({ laneId: HOST_LANE, driver: this.masterDriver, port: 0, profile: this.config.profile, stateDir: this.config.home })
+    // A lane branches its login from the master browser. If that browser died
+    // (Chrome is killed under memory pressure), every lane open fails with
+    // ECONNREFUSED and the queue stalls until a human restarts it. Warming the
+    // master first relaunches it with the recorded profile and markers.
+    await this.ensureMasterBrowser()
     const lane = await this.lanes.acquire(laneId, () => {
       const line = `queued for a lane (cap ${this.lanes!.max})`
       audit(this.hostState, { op: 'lane_queue', target: laneId, result: line })
@@ -6211,6 +6247,13 @@ export class ChatGptHost {
 }
 
 async function main(): Promise<void> {
+  // A lane that cannot open must never take the host with it. Chrome launch and
+  // attach failures happen under memory pressure, and an unhandled rejection in
+  // one background lane open killed the whole bridge on 2026-11-05 - every
+  // bridge went dead and every queued message lost its addressee.
+  process.on('unhandledRejection', reason => {
+    log(`unhandled rejection (host kept running): ${reason instanceof Error ? reason.message : String(reason)}`)
+  })
   const parsed = parseArgs(process.argv.slice(2))
   if (parsed.help) {
     process.stdout.write([

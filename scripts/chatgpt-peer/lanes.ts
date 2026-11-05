@@ -184,6 +184,13 @@ export class LaneManager {
   private readonly options: LaneOptions
   private readonly lanes = new Map<string, Lane>()
   private readonly waiters: Waiter[] = []
+  /**
+   * Ports handed to a lane that is still opening. A concurrent open would
+   * otherwise see the same port free - `portFree` binds, closes, and reports,
+   * which no other caller can see - and two lanes would launch Chrome on one
+   * port: the second gets a browser it does not own and refuses to attach.
+   */
+  private readonly reservedPorts = new Set<number>()
   private readonly registryPath: string
   private readonly maxLanes: number
   private readonly basePort: number
@@ -422,8 +429,9 @@ export class LaneManager {
     }
     this.opening += 1
     let lane: Lane | undefined
+    let port = 0
     try {
-      const port = await this.nextPort()
+      port = await this.nextPort()
       const stateDir = join(this.options.root, `${safeName(laneId)}-${randomUUID().slice(0, 8)}`)
       const profile = join(stateDir, 'profile')
       await mkdir(profile, { recursive: true })
@@ -466,6 +474,7 @@ export class LaneManager {
         closing: false,
       }
       this.lanes.set(laneId, lane)
+      this.reservedPorts.delete(port)
       void this.writeRegistry()
       this.emit('open', laneId, `port ${port}`)
       this.log(`lane "${laneId}": opening on port ${port}`)
@@ -490,6 +499,7 @@ export class LaneManager {
       this.log(`lane "${laneId}": open failed: ${(error as Error).message}`)
       throw error
     } finally {
+      if (port) this.reservedPorts.delete(port)
       this.opening = Math.max(0, this.opening - 1)
       this.pump()
     }
@@ -542,10 +552,13 @@ export class LaneManager {
   /** The first free lane port at or above the base, skipping live lanes. */
   private async nextPort(): Promise<number> {
     const used = new Set([...this.lanes.values()].map(lane => lane.port))
+    for (const reserved of this.reservedPorts) used.add(reserved)
     const limit = this.basePort + this.maxLanes * 4 + 16
     for (let port = this.basePort; port < limit; port++) {
       if (used.has(port)) continue
-      if (await portFree(port)) return port
+      if (!(await portFree(port))) continue
+      this.reservedPorts.add(port)
+      return port
     }
     throw new Error(`no free lane port between ${this.basePort} and ${limit}`)
   }

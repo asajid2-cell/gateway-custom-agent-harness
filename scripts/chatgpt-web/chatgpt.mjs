@@ -446,6 +446,30 @@ async function cdpUp() {
 }
 
 /**
+ * Wait until the browser has committed a page, not merely opened its port.
+ *
+ * A browser that answers /json/version while its first renderer is still
+ * booting accepts the CDP websocket and then stalls the handshake, which is a
+ * 90 s attach timeout on a browser that is seconds away from being usable.
+ * Chatting to a committed page is the condition that makes an attach cheap.
+ */
+async function waitForCommittedPage(ms = 90_000) {
+  const started = Date.now()
+  while (Date.now() - started < ms) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(1500) })
+      if (response.ok) {
+        const list = await response.json()
+        if (Array.isArray(list) && list.some(target => target?.type === 'page' && target.url)) return true
+      }
+    } catch { /* still booting */ }
+    if (!(await cdpUp())) return false
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  return false
+}
+
+/**
  * The debugger on this port, proven to be the browser this driver launched.
  *
  * This is the ONE ownership check, and EVERY connection goes through it -
@@ -496,8 +520,16 @@ async function connectOwned(ms = 0) {
   const owned = await ownedDebugger()
   if (!owned) throw new Error(`chrome is not running on port ${PORT}`)
   const { chromium } = loadPlaywright()
-  const attach = chromium.connectOverCDP(`http://127.0.0.1:${PORT}`)
-  return ms > 0 ? await cdpTimed(attach, ms) : await attach
+  // A browser launched under load answers /json/version long before its first
+  // renderer commits: the websocket opens and the handshake then stalls. That
+  // is a slow start, not a wrong browser, so the attach gets a long ceiling
+  // and one retry instead of failing the lane.
+  const attach = () => chromium.connectOverCDP(`http://127.0.0.1:${PORT}`, { timeout: 90_000 })
+  if (ms > 0) return await cdpTimed(attach(), ms)
+  return await attach().catch(async () => {
+    await new Promise(resolve => setTimeout(resolve, 2_000))
+    return attach()
+  })
 }
 
 /**
@@ -512,10 +544,20 @@ async function connectOwned(ms = 0) {
  * no-record adoption path uses. `retry` covers the window where Chrome has
  * bound the port but the process table has not caught up yet.
  */
-function launchVerdict({ served, owner, profile, port }) {
+function launchVerdict({ served, owner, profile, port, portWasFree = false }) {
   if (!served || !served.guid) return { ok: false, retry: true }
-  if (!owner) return { ok: false, retry: true }
+  // Reading a Windows process command line goes through WMI, which is slow and
+  // sometimes simply fails under load. When the port was proven free a moment
+  // before this launch, the browser that appeared on it is this launch's; an
+  // unreadable owner must not fail a lane that in fact started fine.
+  if (!owner) return portWasFree ? { ok: true, retry: false, pid: null } : { ok: false, retry: true }
   if (!ownerCarriesProfile(owner, profile)) {
+    // A LANE port was proven free immediately before this spawn, and Chrome
+    // re-execs itself - the process that ends up owning the port no longer
+    // shows the profile on its command line. For a disposable lane the browser
+    // that appeared on our free port inside our launch window is ours;
+    // refusing it wedges that lane on every attempt.
+    if (LANE_SOURCE_PORT && portWasFree) return { ok: true, retry: false, pid: Number(owner.pid) || null }
     return {
       ok: false,
       retry: false,
@@ -554,7 +596,7 @@ function exhaustedLaunchWhy({ port, served, owner, waitedMs }) {
  */
 async function masterCookies(port) {
   const { chromium } = loadPlaywright()
-  const source = await chromium.connectOverCDP(`http://127.0.0.1:${port}`)
+  const source = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 90_000 })
   try {
     const context = source.contexts()[0]
     if (!context) throw new Error(`master Chrome on port ${port} has no browser context`)
@@ -569,7 +611,7 @@ async function masterCookies(port) {
 /** Put account cookies into a browser this child owns, then prove the login. */
 async function injectCookies(port, cookies) {
   const { chromium } = loadPlaywright()
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`)
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 90_000 })
   try {
     const context = browser.contexts()[0] ?? await browser.newContext()
     await context.addCookies(cookies)
@@ -617,7 +659,7 @@ async function syncLaneCookies() {
   }
   if (cookies.length === 0) throw new Error('the lane holds no account cookies')
   const { chromium } = loadPlaywright()
-  const master = await chromium.connectOverCDP(`http://127.0.0.1:${LANE_SOURCE_PORT}`)
+  const master = await chromium.connectOverCDP(`http://127.0.0.1:${LANE_SOURCE_PORT}`, { timeout: 90_000 })
   try {
     const context = master.contexts()[0]
     if (!context) throw new Error(`master Chrome on port ${LANE_SOURCE_PORT} has no browser context`)
@@ -631,6 +673,9 @@ async function syncLaneCookies() {
 async function ensureChrome({ visible = true } = {}) {
   const owned = await ownedDebugger()
   if (owned) return { spawned: false, pid: owned.pid }
+  // Proof of prior occupancy, taken BEFORE the spawn: a browser that appears on
+  // a port nothing served a moment ago appeared because of this launch.
+  const portWasFree = !(await cdpUp())
   const exe = await chromePath()
   if (String(process.env.CHATGPT_CHROME ?? '').trim()) {
     await log(`spawning ${exe} by CHATGPT_CHROME override (a launch decision, not recorded as identity)`)
@@ -649,11 +694,13 @@ async function ensureChrome({ visible = true } = {}) {
     '--mute-audio',
     '--metrics-recording-only',
     '--disable-features=Translate,MediaRouter,OptimizationHints,AcceptCHFrame,InterestFeedContentSuggestions,CalculateNativeWinOcclusion',
-    '--window-size=900,760',
-    // A lane is headful (Cloudflare challenges headless) but parked off-screen:
-    // the writer gets a window of its own without a stack of windows on the
-    // desktop. The one-window driver keeps its old position.
-    `--window-position=${LANE_SOURCE_PORT ? '-2000,0' : '80,60'}`,
+    `--window-size=${LANE_SOURCE_PORT ? '720,620' : '900,760'}`,
+    // A lane is headful and ON SCREEN, staggered so a few can overlap without
+    // stacking exactly. Parking lanes off-screen (the old -2000,0) makes Chrome
+    // treat the page as hidden: typing then half-lands, every compose reads
+    // back the wrong text, and the turn is refused as "not-posted". The
+    // one-window driver keeps its old position.
+    `--window-position=${LANE_SOURCE_PORT ? `${40 + ((PORT - 9300) % 8) * 40},${40 + ((PORT - 9300) % 8) * 30}` : '80,60'}`,
     CHAT_URL,
   ]
   if (!visible) args.unshift('--headless=new')
@@ -683,10 +730,13 @@ async function ensureChrome({ visible = true } = {}) {
       // the failure has to name who was holding the port, or "no browser yet"
       // reads exactly like "wrong browser".
       const owner = await portOwner()
-      const verdict = launchVerdict({ served, owner, profile: PROFILE, port: PORT })
+      const verdict = launchVerdict({ served, owner, profile: PROFILE, port: PORT, portWasFree })
       if (verdict.ok) {
         await writeLaunchMarker(verdict.pid ?? child.pid, served)
         await writeInstallRecord(verdict.pid ?? child.pid, served)
+        // The port is open before the first renderer commits; attaching into
+        // that window stalls the CDP handshake for as long as the boot takes.
+        await waitForCommittedPage()
         // A lane is not usable until the branched login is proven. A failure
         // here fails the launch, so the host closes the lane instead of typing
         // into a signed-out page.
@@ -3214,6 +3264,13 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     }
   }
   if (!composer) {
+    // A lane's first paint of a thread can take tens of seconds under load, and
+    // the recovery above is bounded tightly. One last patient wait costs nothing
+    // when the page is dead (the accept deadline still governs) and saves the
+    // turn when the composer is simply late.
+    composer = await railOr(waitForComposer(page, 30_000), acceptDeadline, null).catch(() => null)
+  }
+  if (!composer) {
     const state = await railOr(pageState(page), acceptDeadline, null).catch(() => null)
     if (alreadyThere && !state?.loggedIn) {
       // A signed-out tab still gets the old sign-in diagnostic (and its wording)
@@ -3285,7 +3342,15 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // Type the text EXACTLY once and verify it before pressing send. A rejected
   // fill that had already written the prompt must never be "repaired" by
   // inserting a second copy at the caret.
-  const composed = await railed(composeExactlyOnce(page, composer, text, (label, ms) => log(`phase ${phaseName} ${label} ${ms}ms`)), acceptDeadline, sendDeadlineNotPosted)
+  // The composer is replaced by the app under a re-render, so a single pass can
+  // read back partial text that the next render then clears. Three bounded
+  // passes with a pause between them; each pass still writes at most one copy,
+  // because every attempt starts from a proven-empty or proven-matching field.
+  let composed = false
+  for (let attempt = 1; attempt <= 3 && !composed; attempt++) {
+    composed = await railed(composeExactlyOnce(page, composer, text, (label, ms) => log(`phase ${phaseName}${attempt > 1 ? ` retry${attempt}` : ''} ${label} ${ms}ms`)), acceptDeadline, sendDeadlineNotPosted)
+    if (!composed && attempt < 3) await new Promise(resolve => setTimeout(resolve, 1_000))
+  }
   await phaseMark('compose')
   if (!composed) {
     // The `not-posted:` PREFIX is load-bearing, not decoration: the host decides
@@ -3293,7 +3358,32 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // ~2274, /mid-turn|not-posted|never left the composer|ambiguous/i), and it
     // never reads `reply.reason` on this path (~1538). Without the prefix a
     // bounded compose refusal becomes a terminal failure line to the sender.
-    throw new TurnError('not-posted: the composer did not hold exactly the intended text; nothing was sent, so no reply is coming', { reason: 'not-posted' })
+    // The page's own visibility is the fact that separates "the app re-rendered"
+    // from "Chrome treats this window as hidden and drops the keystrokes".
+    const visibility = await page.evaluate(() => document.visibilityState).catch(() => 'unknown')
+    // A rate-limited account leaves the composer inert: every insert is
+    // swallowed and the turn is refused as a compose fault, which reads like a
+    // driver bug. Name the real cause so nobody debugs the wrong layer.
+    const limit = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').replace(/\s+/g, ' ')
+      const match = /(you(?:'| a)?re? (?:hitting|reached) (?:the|your) [^.]{0,40}limit|usage limit|try again (?:later|in a few minutes)|rate limit)/i.exec(text)
+      return match ? match[0].slice(0, 80) : null
+    }).catch(() => null)
+    // The banner is not always rendered; the backend status is the ground
+    // truth, and a 429 there is exactly why the composer stays inert.
+    const backendStatus = await page.evaluate(async () => {
+      const match = /\/c\/([A-Za-z0-9-]{8,})/.exec(location.pathname)
+      if (!match) return 0
+      try {
+        const response = await fetch(`/backend-api/conversation/${match[1]}`, { credentials: 'include' })
+        return response.status
+      } catch { return 0 }
+    }).catch(() => 0)
+    if (limit || backendStatus === 429) {
+      const why = limit ?? 'the conversation backend answers 429'
+      throw new TurnError(`not-posted: the account is rate limited (${why}); nothing was sent, so no reply is coming`, { reason: 'rate-limited' })
+    }
+    throw new TurnError(`not-posted: the composer did not hold exactly the intended text (page ${visibility}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
   }
   // Join the snapshot begun right after the landing check. It has been reading
   // under the composer wait, the DOM baselines and the compose, so this label is
