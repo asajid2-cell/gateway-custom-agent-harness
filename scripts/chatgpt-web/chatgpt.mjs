@@ -15,6 +15,7 @@
  * the rendered assistant text.
  */
 import { spawn } from 'node:child_process'
+import { closeSync, openSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
@@ -47,15 +48,73 @@ const PORT = Number(process.env.CHATGPT_CDP_PORT || 9222)
 const CHAT_URL = 'https://chatgpt.com/'
 const MAX_REPLY = 63_000 // bus messages cap at 64 KiB
 /**
- * Lane mode: this child owns one disposable window that branches the master
- * login instead of owning the human's Chrome. A source port of 0 means the
- * original one-window driver, and every lane behaviour is off.
+ * Lane mode: this child works one page on behalf of one writer, inside the
+ * master browser. A source port of 0 means the original one-window driver, and
+ * every lane behaviour is off.
  */
 const LANE_ID = process.env.CHATGPT_LANE_ID || ''
 const LANE_SOURCE_PORT = Number(process.env.CHATGPT_LANE_SOURCE_PORT || 0)
-const LANE_SYNC_COOKIES = process.env.CHATGPT_LANE_SYNC_COOKIES !== '0'
-/** Only the account's own cookies cross between the master and a lane. */
-const COOKIE_ORIGIN = /(^|\.)(chatgpt\.com|openai\.com)$/i
+
+/**
+ * Shared-browser lanes: a lane is a named TAB in the master browser.
+ *
+ * Copying the login into a second profile is racy by construction. The master's
+ * session token rotates while the copy is in flight, two lanes that branch the
+ * same snapshot invalidate each other, and the write-back at close races the
+ * next lane's read. One browser has one cookie jar, so the shared shape has
+ * nothing to copy, nothing to rotate and nothing to write back - there is only
+ * ever one session, and the tab is the unit of isolation.
+ */
+const LANE_SHARED = (process.env.CHATGPT_LANE_SHARED || process.env.GEMINI_LANE_SHARED || '0') === '1'
+/** The port every CDP call in this process talks to. */
+const CONNECT_PORT = LANE_SHARED && LANE_SOURCE_PORT ? LANE_SOURCE_PORT : PORT
+/** The master's profile: the browser a shared lane lives in. */
+const SHARED_PROFILE = String(process.env.CHATGPT_LANE_SOURCE_PROFILE || process.env.GEMINI_LANE_SOURCE_PROFILE || '').trim()
+/** The profile a shared lane proves the browser with; its own is never launched. */
+const OWN_PROFILE = LANE_SHARED ? (SHARED_PROFILE || PROFILE) : PROFILE
+/** The name every lane tab carries, whoever opened it. */
+const LANE_TAB_PREFIX = 'webbridge-lane:'
+/** A lane tab is named, so lanes never borrow the operator's own tab. */
+const LANE_TAB = LANE_ID ? `${LANE_TAB_PREFIX}${LANE_ID}` : ''
+const LANE_SHARED_DIR = process.env.CHATGPT_LANE_SHARED_DIR || path.dirname(STATE_DIR)
+/**
+ * One tab can be in front at a time and Playwright's typing waits for the field
+ * to take focus: two lanes typing at once race for it and one turns is refused
+ * as "not-posted". The token is held only while composing and clicking, never
+ * while waiting for an answer, so turns still overlap.
+ */
+const FOCUS_LOCK = path.join(LANE_SHARED_DIR, 'webbridge-focus.lock')
+const FOCUS_STALE_MS = 60_000
+/**
+ * One browser-level attach at a time, across every lane.
+ *
+ * Concurrent attaches are what wedges Chrome 156: two websockets open and
+ * neither handshake completes, and the browser then refuses every NEW attach
+ * while its HTTP endpoints still answer. Serialising the attach is the cheap
+ * half of the fix; `replaceOwnedBrowser` is the half for a browser that is
+ * already wedged.
+ */
+const ATTACH_LOCK = path.join(LANE_SHARED_DIR, 'webbridge-attach.lock')
+/**
+ * One LAUNCH at a time, across every child that shares this browser.
+ *
+ * Two children that both see the port down will both launch, and the second
+ * sees a browser that is still booting, decides it is an orphan, and kills it -
+ * a launch cascade that never converges (measured 2026-11-05: two launches four
+ * seconds apart, neither surviving). The lock makes the second child wait for
+ * the first launch to finish instead of racing it.
+ */
+const LAUNCH_LOCK = path.join(LANE_SHARED_DIR, 'webbridge-launch.lock')
+/**
+ * Where a lane says its tab is still wanted, and how long that word stands.
+ *
+ * The host can terminate a driver at any moment and a terminated child cannot
+ * close its tab, so a tab is swept by whoever opens a lane next: only a tab
+ * whose lease is missing or older than this window is closed. A live lane keeps
+ * its lease fresh, and a leaked tab is cleaned without a bookkeeper process.
+ */
+const LANE_LEASE_DIR = path.join(LANE_SHARED_DIR, 'lane-tabs')
+const LANE_LEASE_STALE_MS = 3 * 60_000
 
 /**
  * Is this page ChatGPT, by origin rather than by substring?
@@ -218,9 +277,9 @@ function samePath(a, b) {
 }
 
 /** The browser GUID this endpoint serves, or null when it is not a DevTools browser. */
-async function browserIdentity() {
+async function browserIdentity(port = PORT) {
   try {
-    const response = await fetch(`http://127.0.0.1:${PORT}/json/version`, { signal: AbortSignal.timeout(1500) })
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) })
     if (!response.ok) return null
     const text = await response.text()
     if (text.length > 16_384) return null
@@ -373,10 +432,10 @@ function attachVerdict({ served, marker, install, owner, port, profile }) {
  * ships Chrome paths and taskkill for Windows only). A null answer is not
  * evidence of ownership, so the caller refuses.
  */
-async function portOwner() {
+async function portOwner(port = PORT) {
   if (process.platform !== 'win32') return null
   const script = [
-    `$conn = Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    `$conn = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
     'if (-not $conn) { return }',
     `$proc = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $conn.OwningProcess)`,
     'if (-not $proc) { return }',
@@ -397,6 +456,119 @@ async function portOwner() {
   const pid = Number(lines[0])
   if (!Number.isInteger(pid) || pid <= 0 || lines.length < 2) return null
   return { pid, commandLine: lines.slice(1).join(' ') }
+}
+
+/**
+ * Stop one process, and only that one.
+ *
+ * `taskkill /T /F` aborts as soon as it meets a child it may not kill
+ * (`crashpad-handler` is one) and leaves the PARENT alive, so a "successful"
+ * kill can leave the browser exactly where it was - measured 2026-11-05, twice.
+ * A browser's children exit when the browser does; they do not need killing.
+ */
+/**
+ * Is the host that spawned this child still there?
+ *
+ * A driver is a child of the host, and every op comes over a pipe the host
+ * holds. When the host is killed, the pipe closes - but a child sitting inside
+ * a long await does not notice until the await returns. In that window it can
+ * still kill the shared browser, and with several such survivors they kill each
+ * other's windows indefinitely. Before any destructive act, the parent's
+ * existence is checked; a driver with no host exits instead of fighting.
+ */
+function parentAlive() {
+  try { process.kill(process.ppid, 0); return true } catch { return false }
+}
+
+function stopProcess(pid) {
+  return new Promise(resolve => {
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Stop-Process -Id ${Number(pid)} -Force -ErrorAction SilentlyContinue`], { stdio: 'ignore', windowsHide: true })
+    child.on('exit', resolve)
+    child.on('error', resolve)
+  })
+}
+
+/**
+ * Browser processes that carry this profile but cannot serve us.
+ *
+ * A Chrome whose DevTools endpoint has died still holds the profile's singleton
+ * lock, so the next launch hands off to it and exits without binding a port -
+ * the failure reads as "the browser did not open the port" forever, no matter
+ * how many times it is launched. Measured 2026-11-05: two browser processes on
+ * one profile, neither listening on 9222. Only a process whose command line
+ * carries this exact profile AND that is a browser (no `--type=`) is killed;
+ * renderers and utilities go with their browser.
+ */
+async function browserProcessesOnProfile(profile) {
+  if (process.platform !== 'win32') return []
+  const out = await new Promise(resolve => {
+    let text = ''
+    let settled = false
+    const finish = value => { if (!settled) { settled = true; clearTimeout(timer); resolve(value) } }
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\'" | ForEach-Object { "$($_.ProcessId)`t$([int]((Get-Date) - $_.CreationDate).TotalMilliseconds)`t$($_.CommandLine)" }'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } finish('') }, 10_000)
+    child.stdout.on('data', chunk => { text += chunk; if (text.length > 200_000) { try { child.kill() } catch { /* gone */ } finish('') } })
+    child.on('error', () => finish(''))
+    child.on('close', () => finish(text))
+  })
+  const rows = []
+  for (const line of String(out).split(/\r?\n/)) {
+    const first = line.indexOf('\t')
+    const second = first < 0 ? -1 : line.indexOf('\t', first + 1)
+    if (first <= 0 || second < 0) continue
+    const pid = Number(line.slice(0, first))
+    const ageMs = Number(line.slice(first + 1, second))
+    const commandLine = line.slice(second + 1)
+    if (!Number.isInteger(pid) || pid <= 0) continue
+    if (/--type=/.test(commandLine)) continue
+    if (!ownerCarriesProfile({ commandLine }, profile)) continue
+    rows.push({ pid, ageMs: Number.isFinite(ageMs) ? ageMs : 0 })
+  }
+  return rows
+}
+
+/**
+ * Wait for a browser that is already booting on this profile, if there is one.
+ *
+ * Returns true when the port came up, so the caller adopts instead of spawning.
+ * A browser younger than `killOrphanBrowsers`' age floor is presumed to be in
+ * the middle of its start-up.
+ */
+async function waitForBootingBrowser(profile, port, maxMs = 25_000) {
+  if (!(await browserProcessesOnProfile(profile)).some(row => row.ageMs < 45_000)) return false
+  const deadline = Date.now() + maxMs
+  while (Date.now() < deadline) {
+    if (await cdpUp(port)) return true
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+  }
+  return false
+}
+
+/**
+ * Close browsers that hold this profile and are too old to still be booting.
+ *
+ * Age is the whole point. A browser that is 5 s old may simply be starting: its
+ * port is not up yet, and killing it is how a launch turns into a cascade in
+ * which every child kills the window another child just opened. Only a browser
+ * that has had time to bind its port and still is not serving is an orphan.
+ * They must be confirmed GONE before the caller spawns, because Chrome hands
+ * off to any browser still holding the profile and exits without a port.
+ */
+async function killOrphanBrowsers(profile, minAgeMs = 45_000) {
+  if (!parentAlive()) {
+    await log('the host that spawned this driver is gone; not touching the browser')
+    process.exit(0)
+  }
+  const rows = (await browserProcessesOnProfile(profile)).filter(row => row.ageMs >= minAgeMs)
+  for (const row of rows) await stopProcess(row.pid)
+  if (rows.length === 0) return 0
+  for (let look = 0; look < 40; look++) {
+    const left = await browserProcessesOnProfile(profile)
+    if (!left.some(row => rows.some(killed => killed.pid === row.pid))) break
+    await new Promise(resolve => setTimeout(resolve, 250))
+  }
+  return rows.length
 }
 
 /**
@@ -446,9 +618,9 @@ async function flushLog() {
   } while (logDrain || LOG_QUEUE.length)
 }
 
-async function cdpUp() {
+async function cdpUp(port = PORT) {
   try {
-    const response = await fetch(`http://127.0.0.1:${PORT}/json/version`, { signal: AbortSignal.timeout(1500) })
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) })
     return response.ok
   } catch { return false }
 }
@@ -461,11 +633,11 @@ async function cdpUp() {
  * 90 s attach timeout on a browser that is seconds away from being usable.
  * Chatting to a committed page is the condition that makes an attach cheap.
  */
-async function waitForCommittedPage(ms = 90_000) {
+async function waitForCommittedPage(ms = 90_000, port = PORT) {
   const started = Date.now()
   while (Date.now() - started < ms) {
     try {
-      const response = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(1500) })
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1500) })
       if (response.ok) {
         const list = await response.json()
         if (Array.isArray(list) && list.some(target => target?.type === 'page' && target.url)) return true
@@ -489,6 +661,7 @@ async function waitForCommittedPage(ms = 90_000) {
  * the listener is not ours.
  */
 async function ownedDebugger() {
+  if (LANE_SHARED) return await sharedDebugger()
   if (!(await cdpUp())) return null
   const served = await browserIdentity()
   const marker = await readLaunchMarker()
@@ -532,20 +705,172 @@ async function ownedDebugger() {
  * pipe handles. So the defence is what this function does - prove the listener
  * is the browser this install launched, and refuse everything else.
  */
-async function connectOwned(ms = 0) {
+/**
+ * The master browser a shared lane lives in, proven before any work.
+ *
+ * This driver did not launch the master, so there is no launch marker whose
+ * GUID it could compare: the port owner's command line is the evidence - the
+ * same check a pre-record install gets. A port held by a browser that does not
+ * carry the master profile is refused rather than typed into. An unreadable
+ * owner is not proof of the contrary either, but it is also not a reason to
+ * refuse the one browser this install owns; the refusal is reserved for a
+ * browser that is provably someone else's.
+ */
+let SHARED_OWNER = null
+
+async function sharedDebugger() {
+  if (!(await cdpUp(CONNECT_PORT))) return null
+  // A browser that has bound the port but is still booting answers
+  // /json/version without a browser GUID for a moment (and a replacement window
+  // is exactly that). Give it the few seconds it needs instead of failing a
+  // lane that is racing the relaunch.
+  let served = await browserIdentity(CONNECT_PORT)
+  for (let look = 0; look < 10 && !served?.guid; look++) {
+    await new Promise(resolve => setTimeout(resolve, 500))
+    served = await browserIdentity(CONNECT_PORT)
+  }
+  if (!served?.guid) throw new Error(`port ${CONNECT_PORT} answers, but not as a Chrome DevTools browser; refusing to attach`)
+  // Reading a process command line costs a PowerShell round trip. One proven
+  // browser GUID is enough for the life of this child: a different GUID on the
+  // same port is a different browser and is proven again.
+  if (SHARED_OWNER?.guid === served.guid) return SHARED_OWNER
+  const owner = await portOwner(CONNECT_PORT)
+  if (owner && !ownerCarriesProfile(owner, OWN_PROFILE)) {
+    throw new Error(`port ${CONNECT_PORT} is held by pid ${owner.pid}, whose command line does not carry --user-data-dir=${OWN_PROFILE}; refusing to attach a lane to it`)
+  }
+  SHARED_OWNER = { pid: owner ? Number(owner.pid) || null : null, served, how: owner ? 'master profile' : 'unreadable port owner', guid: served.guid }
+  return SHARED_OWNER
+}
+
+/**
+ * The browser this driver launched, when a disposable lane owns one.
+ *
+ * See `ownedDebugger`: in shared mode the master is not this child's browser,
+ * so the launch-marker proof does not apply and `sharedDebugger` takes over.
+ */
+/**
+ * How long an attach may take, and when it counts as stalled.
+ *
+ * Two different waits, because they are two different situations. A FRESH
+ * launch answers /json/version seconds before its browser websocket finishes
+ * the handshake, and under load that gap reaches tens of seconds - so the first
+ * attach after a launch gets `ATTACH_TIMEOUT_MS`. A browser that has been up
+ * for a while and still does not answer the handshake in 15 s is wedged (its
+ * HTTP endpoints stay fast: measured 2026-11-05, /json/version 42 ms while the
+ * handshake ran out 60 s with no other client), and waiting the long bound only
+ * costs the turn.
+ */
+const ATTACH_TIMEOUT_MS = 90_000
+const ATTACH_STALL_MS = 15_000
+/** When this child last launched a browser; the long bound applies before it. */
+let LAUNCHED_AT = 0
+
+/**
+ * Kill the browser this install owns on the connect port, and open a new one.
+ *
+ * Chrome 156 accepts a browser-level CDP websocket and then never answers the
+ * handshake: measured 2026-11-05 with no other client attached, /json/version
+ * answered in 42 ms and /json/list in 21 ms while Playwright's attach sat for
+ * 60 s and timed out. Retrying is not a recovery, and the login lives in the
+ * profile, so the window is replaced. Only a process whose command line carries
+ * this install's exact profile may be killed: anything else is not ours.
+ */
+async function replaceOwnedBrowser() {
+  // Browser-wide, not page-wide: no other lane may be typing into a window that
+  // is about to be closed. Non-shared drivers have the token for free.
+  const releaseFocus = await acquireFocus()
+  try {
+    if (!parentAlive()) {
+      await log('the host that spawned this driver is gone; not replacing the browser')
+      process.exit(0)
+    }
+    const owner = await portOwner(CONNECT_PORT)
+    if (!owner || !ownerCarriesProfile(owner, OWN_PROFILE)) {
+      throw new Error(`refusing to replace the browser on port ${CONNECT_PORT}: its owner cannot be proven to carry --user-data-dir=${OWN_PROFILE}`)
+    }
+    await stopProcess(owner.pid)
+    OWNED = null
+    SHARED_OWNER = null
+    // Wait for the port to actually close: launching while the dying browser
+    // still answers hands the new window's startup to a socket that is about
+    // to disappear.
+    for (let look = 0; look < 20 && (await cdpUp(CONNECT_PORT)); look++) {
+      await new Promise(resolve => setTimeout(resolve, 250))
+    }
+    if (LANE_SHARED) await ensureMasterChrome()
+    else await ensureChrome({ visible: true })
+  } finally {
+    await releaseFocus()
+  }
+}
+
+async function attachOwned(ms = 0) {
   const owned = await ownedDebugger()
-  if (!owned) throw new Error(`chrome is not running on port ${PORT}`)
+  if (!owned) throw new Error(`chrome is not running on port ${CONNECT_PORT}`)
   const { chromium } = loadPlaywright()
-  // A browser launched under load answers /json/version long before its first
-  // renderer commits: the websocket opens and the handshake then stalls. That
-  // is a slow start, not a wrong browser, so the attach gets a long ceiling
-  // and one retry instead of failing the lane.
-  const attach = () => chromium.connectOverCDP(`http://127.0.0.1:${PORT}`, { timeout: 90_000 })
-  if (ms > 0) return await cdpTimed(attach(), ms)
-  return await attach().catch(async () => {
-    await new Promise(resolve => setTimeout(resolve, 2_000))
-    return attach()
-  })
+  const attach = timeout => chromium.connectOverCDP(`http://127.0.0.1:${CONNECT_PORT}`, { timeout })
+  // A caller that brought its own short deadline (a status probe) gets that
+  // deadline and no recovery: replacing a window is not a status-shaped act.
+  if (ms > 0) return await cdpTimed(attach(ms), ms)
+  const releaseAttach = LANE_SHARED ? await acquireLock(ATTACH_LOCK, 120_000) : async () => {}
+  try {
+    const bound = Date.now() - LAUNCHED_AT < 120_000 ? ATTACH_TIMEOUT_MS : ATTACH_STALL_MS
+    return await attach(bound)
+  } catch (error) {
+    await log(`attach on port ${CONNECT_PORT} stalled (${String(error?.message ?? error).split('\n')[0]}); replacing the window`)
+    await replaceOwnedBrowser()
+    return await attach(ATTACH_TIMEOUT_MS)
+  } finally {
+    await releaseAttach()
+  }
+}
+
+/**
+ * The connection this child keeps, and why it is kept.
+ *
+ * Every op used to attach and disconnect. Chrome 156 stalls a browser-level
+ * attach whenever another one is in flight (measured 2026-11-05: /json/version
+ * keeps answering while the handshake hangs), and with several lanes plus the
+ * master all connecting per op, attaches collided often enough that a healthy
+ * page was reported as "chrome is not running". One attach per child, reused
+ * by every op, removes the collision instead of retrying around it.
+ *
+ * A connection that dies (browser closed, renderer crash) clears itself here,
+ * so the next op proves ownership and attaches again.
+ */
+let OWNED = null
+
+async function connectOwned(ms = 0) {
+  if (OWNED && typeof OWNED.isConnected === 'function' && OWNED.isConnected()) return OWNED
+  OWNED = null
+  const browser = await attachOwned(ms)
+  OWNED = browser
+  browser.on('disconnected', () => { if (OWNED === browser) OWNED = null })
+  return browser
+}
+
+/**
+ * End-of-op: the connection is this child's for its whole life and is
+ * deliberately not closed here. Call sites keep calling this so that "this op
+ * is done with the browser" stays an explicit statement rather than a silence
+ * whose meaning has to be recovered from `connectOwned`.
+ */
+function release() {}
+
+/**
+ * Throw away the connection, without waiting for it to close.
+ *
+ * Playwright multiplexes every call over one websocket, so a call the renderer
+ * never answers blocks the whole child, not just that read. Dropping it lets
+ * the next op attach again; `browser.close()` is not awaited because a wedged
+ * socket may never acknowledge it.
+ */
+function dropOwned(why) {
+  const held = OWNED
+  OWNED = null
+  if (!held) return
+  void log(`dropping the CDP connection: ${why}`)
+  try { Promise.resolve(held.close()).catch(() => {}) } catch { /* already gone */ }
 }
 
 /**
@@ -568,12 +893,6 @@ function launchVerdict({ served, owner, profile, port, portWasFree = false }) {
   // unreadable owner must not fail a lane that in fact started fine.
   if (!owner) return portWasFree ? { ok: true, retry: false, pid: null } : { ok: false, retry: true }
   if (!ownerCarriesProfile(owner, profile)) {
-    // A LANE port was proven free immediately before this spawn, and Chrome
-    // re-execs itself - the process that ends up owning the port no longer
-    // shows the profile on its command line. For a disposable lane the browser
-    // that appeared on our free port inside our launch window is ours;
-    // refusing it wedges that lane on every attempt.
-    if (LANE_SOURCE_PORT && portWasFree) return { ok: true, retry: false, pid: Number(owner.pid) || null }
     return {
       ok: false,
       retry: false,
@@ -604,94 +923,157 @@ function exhaustedLaunchWhy({ port, served, owner, waitedMs }) {
 }
 
 /**
- * The master's account cookies, read through CDP and nothing else.
+ * Take the one browser focus token, or pass straight through when this lane has
+ * a window of its own.
  *
- * The master Chrome is a credential source, not a page this driver works in.
- * This connects, reads, and disconnects: it never navigates, types, or closes
- * the human's window. `connectOverCDP`'s close() is a disconnect.
+ * Shared lanes are tabs in one window, and only one tab is in front at a time.
+ * A lane that types into a tab that lost the front spends its whole compose
+ * budget reading back the wrong text and is refused as "not-posted", so typing
+ * and clicking are serialized. The token is released before the answer is
+ * awaited, so several turns still stream at once.
+ *
+ * The lock is a file created with O_EXCL rather than an in-process mutex: the
+ * contenders are separate driver children, one per lane. A holder that dies
+ * without releasing leaves a stale file, which the mtime check clears.
  */
-async function masterCookies(port) {
-  const { chromium } = loadPlaywright()
-  const source = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 90_000 })
-  try {
-    const context = source.contexts()[0]
-    if (!context) throw new Error(`master Chrome on port ${port} has no browser context`)
-    const kept = (await context.cookies()).filter(cookie => COOKIE_ORIGIN.test(cookie.domain || ''))
-    if (kept.length === 0) throw new Error(`master Chrome on port ${port} holds no chatgpt.com/openai.com cookies; is it signed in?`)
-    return kept
-  } finally {
-    await source.close().catch(() => {})
-  }
-}
-
-/** Put account cookies into a browser this child owns, then prove the login. */
-async function injectCookies(port, cookies) {
-  const { chromium } = loadPlaywright()
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 90_000 })
-  try {
-    const context = browser.contexts()[0] ?? await browser.newContext()
-    await context.addCookies(cookies)
-    const page = context.pages().find(candidate => isChatGPTUrl(candidate.url()))
-      ?? context.pages()[0]
-      ?? await context.newPage()
-    if (!isChatGPTUrl(page.url())) {
-      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+async function acquireLock(file, waitMs, staleMs = FOCUS_STALE_MS) {
+  await fs.mkdir(path.dirname(file), { recursive: true }).catch(() => {})
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    try {
+      const fd = openSync(file, 'wx')
+      writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`)
+      closeSync(fd)
+      return async () => { try { unlinkSync(file) } catch { /* already released */ } }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      // A holder that died without releasing leaves the file behind; its age is
+      // the only thing that can tell a crash from a slow holder.
+      try {
+        if (Date.now() - statSync(file).mtimeMs > staleMs) { unlinkSync(file); continue }
+      } catch { /* the holder released between the two calls */ }
+      if (Date.now() > deadline) throw new Error(`another lane held ${path.basename(file)} for ${Math.round(waitMs / 1000)}s`)
+      await new Promise(resolve => setTimeout(resolve, 120))
     }
-    const state = await waitForLogin(page, LOGIN_WAIT_MS)
-    if (!state?.loggedIn) throw new Error(`the lane did not accept the master login (${state?.url ?? 'page unavailable'})`)
-    return state
-  } finally {
-    await browser.close().catch(() => {})
   }
 }
 
-/** Branch this lane's login from the master before its first page turn. */
-async function branchMasterLogin() {
-  const cookies = await masterCookies(LANE_SOURCE_PORT)
-  await log(`lane ${LANE_ID || '(unnamed)'}: read ${cookies.length} cookies from master port ${LANE_SOURCE_PORT}`)
-  const state = await injectCookies(PORT, cookies)
-  await log(`lane ${LANE_ID || '(unnamed)'}: signed in (plan ${state.plan ?? 'unknown'})`)
-  return state
+async function acquireFocus() {
+  if (!LANE_SHARED) return async () => {}
+  return await acquireLock(FOCUS_LOCK, 90_000)
 }
 
 /**
- * Write this lane's rotated account cookies back to the master.
+ * Open the master browser a shared lane lives in, when it is not running.
  *
- * ChatGPT rotates session tokens; without write-back a lane's refresh would
- * leave the master holding a dead token, and the next lane would branch a dead
- * login. Failures are logged and never block the lane from closing.
+ * The login lives in the profile, so opening the window loses nothing. Two
+ * lanes can reach here at once: the first binds the port, the second's spawn
+ * hands off to the running instance, and both wait for the same port to answer.
+ * Nothing is recorded in this child's PID file - a lane must never be the
+ * process that later kills the master.
  */
-async function syncLaneCookies() {
-  if (!LANE_SOURCE_PORT) return { ok: false, reason: 'not a lane' }
-  if (!LANE_SYNC_COOKIES) return { ok: false, reason: 'write-back disabled' }
-  const lane = await connectOwned()
-  let cookies
+async function ensureMasterChrome() {
+  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 90_000, 180_000)
   try {
-    const context = lane.contexts()[0]
-    if (!context) throw new Error('the lane has no browser context')
-    cookies = (await context.cookies()).filter(cookie => COOKIE_ORIGIN.test(cookie.domain || ''))
+    return await openMasterChrome()
   } finally {
-    await lane.close().catch(() => {})
+    await releaseLaunch()
   }
-  if (cookies.length === 0) throw new Error('the lane holds no account cookies')
-  const { chromium } = loadPlaywright()
-  const master = await chromium.connectOverCDP(`http://127.0.0.1:${LANE_SOURCE_PORT}`, { timeout: 90_000 })
-  try {
-    const context = master.contexts()[0]
-    if (!context) throw new Error(`master Chrome on port ${LANE_SOURCE_PORT} has no browser context`)
-    await context.addCookies(cookies)
-  } finally {
-    await master.close().catch(() => {})
+}
+
+async function openMasterChrome() {
+  // /json/version answers in milliseconds on an idle browser, but a window with
+  // a dozen ChatGPT tabs can miss a 1.5 s timeout. Patience before deciding the
+  // master is down: a booting Chrome binds its port seconds after it starts, and
+  // killing it mid-boot is how a launch becomes a cascade.
+  for (let look = 0; look < 8; look++) {
+    if (await cdpUp(CONNECT_PORT)) {
+      const owned = await sharedDebugger()
+      return { spawned: false, pid: owned?.pid ?? null, shared: true }
+    }
+    await new Promise(resolve => setTimeout(resolve, 1_500))
   }
-  return { ok: true, cookies: cookies.length }
+  // A browser that is already booting must be waited for, never launched
+  // beside: Chrome hands the second launch off to the first and exits without a
+  // port, which reads as "the browser did not open the port".
+  if (await waitForBootingBrowser(OWN_PROFILE, CONNECT_PORT)) {
+    const owned = await sharedDebugger()
+    return { spawned: false, pid: owned?.pid ?? null, shared: true }
+  }
+  const exe = await chromePath()
+  await fs.mkdir(OWN_PROFILE, { recursive: true })
+  const args = [
+    `--remote-debugging-port=${CONNECT_PORT}`,
+    `--user-data-dir=${OWN_PROFILE}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--disable-default-apps',
+    '--disable-component-update',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--mute-audio',
+    '--metrics-recording-only',
+    '--disable-features=Translate,MediaRouter,OptimizationHints,AcceptCHFrame,InterestFeedContentSuggestions,CalculateNativeWinOcclusion',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--window-size=1100,900',
+    '--window-position=120,80',
+    CHAT_URL,
+  ]
+  if (process.env.CHATGPT_DISABLE_GPU !== '0') args.push('--disable-gpu')
+  // Two attempts. A browser on this profile that is not serving the port blocks
+  // the launch (Chrome hands off to it and exits without a DevTools endpoint),
+  // so each attempt clears the profile's browsers and confirms they are gone
+  // before spawning. One bad window must not cost the lane its turn.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const orphans = await killOrphanBrowsers(OWN_PROFILE)
+    if (orphans) await log(`shared lane ${LANE_ID || '(unnamed)'}: closed ${orphans} browser process(es) holding ${OWN_PROFILE} without serving port ${CONNECT_PORT}`)
+    await log(`shared lane ${LANE_ID || '(unnamed)'}: opening master profile ${OWN_PROFILE} on port ${CONNECT_PORT} (attempt ${attempt})`)
+    const child = spawn(exe, args, { detached: true, stdio: 'ignore' })
+    LAUNCHED_AT = Date.now()
+    child.once('error', () => {})
+    child.unref()
+    for (let i = 0; i < 60; i++) {
+      if (await cdpUp(CONNECT_PORT)) {
+        await waitForCommittedPage(90_000, CONNECT_PORT)
+        return { spawned: true, pid: child.pid, shared: true }
+      }
+      await new Promise(resolve => setTimeout(resolve, 500))
+    }
+  }
+  throw new Error(`the master browser did not open port ${CONNECT_PORT}`)
 }
 
 async function ensureChrome({ visible = true } = {}) {
+  // A shared lane is a tab in the master browser, which is not this child's to
+  // launch per lane: open it once if it is down, and never copy a login into a
+  // second profile.
+  if (LANE_SHARED) return await ensureMasterChrome()
+  // The one-window driver launches the same browser the lanes live in, so it
+  // takes the same launch lock: without it a lane and this driver can each
+  // decide the port is down and kill the other's booting window.
+  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 90_000, 180_000)
+  try {
+    return await openOwnChrome({ visible })
+  } finally {
+    await releaseLaunch()
+  }
+}
+
+async function openOwnChrome({ visible = true } = {}) {
   const owned = await ownedDebugger()
   if (owned) return { spawned: false, pid: owned.pid }
   // Proof of prior occupancy, taken BEFORE the spawn: a browser that appears on
   // a port nothing served a moment ago appeared because of this launch.
   const portWasFree = !(await cdpUp())
+  if (await waitForBootingBrowser(PROFILE, PORT)) {
+    const served = await ownedDebugger()
+    if (served) return { spawned: false, pid: served.pid }
+  }
+  // A browser on this profile that is not serving the port blocks the launch.
+  const orphans = await killOrphanBrowsers(PROFILE)
+  if (orphans) await log(`closed ${orphans} browser process(es) holding ${PROFILE} without serving port ${PORT}`)
   const exe = await chromePath()
   if (String(process.env.CHATGPT_CHROME ?? '').trim()) {
     await log(`spawning ${exe} by CHATGPT_CHROME override (a launch decision, not recorded as identity)`)
@@ -710,18 +1092,17 @@ async function ensureChrome({ visible = true } = {}) {
     '--mute-audio',
     '--metrics-recording-only',
     '--disable-features=Translate,MediaRouter,OptimizationHints,AcceptCHFrame,InterestFeedContentSuggestions,CalculateNativeWinOcclusion',
-    `--window-size=${LANE_SOURCE_PORT ? '720,620' : '900,760'}`,
-    // A lane is headful and ON SCREEN, staggered so a few can overlap without
-    // stacking exactly. Parking lanes off-screen (the old -2000,0) makes Chrome
-    // treat the page as hidden: typing then half-lands, every compose reads
-    // back the wrong text, and the turn is refused as "not-posted". The
-    // one-window driver keeps its old position.
-    `--window-position=${LANE_SOURCE_PORT ? `${40 + ((PORT - 9300) % 8) * 40},${40 + ((PORT - 9300) % 8) * 30}` : '80,60'}`,
+    '--window-size=900,760',
+    // ON SCREEN. Parking the page off-screen (the old -2000,0) makes Chrome
+    // treat it as hidden: typing then half-lands, every compose reads back the
+    // wrong text, and the turn is refused as "not-posted".
+    '--window-position=80,60',
     CHAT_URL,
   ]
   if (!visible) args.unshift('--headless=new')
   if (process.env.CHATGPT_DISABLE_GPU !== '0') args.push('--disable-gpu')
   const child = spawn(exe, args, { detached: true, stdio: 'ignore' })
+  LAUNCHED_AT = Date.now()
   // A path that exists but cannot run (ENOENT after a race, EACCES, a broken
   // install) arrives asynchronously as `error`. Without this the loop below just
   // waits out its minute and reports the wrong cause.
@@ -753,13 +1134,6 @@ async function ensureChrome({ visible = true } = {}) {
         // The port is open before the first renderer commits; attaching into
         // that window stalls the CDP handshake for as long as the boot takes.
         await waitForCommittedPage()
-        // A lane is not usable until the branched login is proven. A failure
-        // here fails the launch, so the host closes the lane instead of typing
-        // into a signed-out page.
-        if (LANE_SOURCE_PORT) {
-          const state = await branchMasterLogin()
-          return { spawned: true, pid: child.pid, lane: true, signedIn: state.loggedIn, plan: state.plan ?? null }
-        }
         return { spawned: true, pid: child.pid }
       }
       if (!verdict.retry) throw new Error(verdict.why)
@@ -779,10 +1153,129 @@ async function ensureChrome({ visible = true } = {}) {
   throw new Error('Chrome did not open the debugging port')
 }
 
+/**
+ * This lane's tab in the shared browser, created on first use.
+ *
+ * Lanes are told apart by `window.name`, not by tab order or URL: the operator's
+ * own tab is in the same window and must never receive a lane's text. A fresh
+ * tab is named only AFTER it has landed on chatgpt.com, because Chrome clears
+ * `window.name` on a cross-site navigation and the name has to survive the first
+ * load; same-site navigation and reload keep it.
+ */
+/** Keep this lane's lease fresh: a tab whose lease ages out is swept. */
+async function touchLaneLease(id) {
+  const file = path.join(LANE_LEASE_DIR, `${id}.json`)
+  const now = new Date()
+  await fs.mkdir(LANE_LEASE_DIR, { recursive: true }).catch(() => {})
+  const refreshed = await fs.utimes(file, now, now).then(() => true, () => false)
+  if (!refreshed) await fs.writeFile(file, JSON.stringify({ pid: process.pid, at: now.toISOString() })).catch(() => {})
+}
+
+let SWEPT_LANE_TABS = false
+
+/**
+ * Close lane tabs whose owners are gone.
+ *
+ * Runs once per child, at tab creation, because that is the moment a new tab is
+ * about to exist and every live lane is holding a fresh lease. A lane opens and
+ * closes rarely; a sweep on every connect would be work for nothing.
+ */
+async function sweepOrphanLaneTabs(context) {
+  if (SWEPT_LANE_TABS) return 0
+  SWEPT_LANE_TABS = true
+  // No lease directory means no lease has ever been taken, so every lane tab
+  // that exists is an orphan - not a reason to skip the sweep.
+  let names = []
+  try { names = await fs.readdir(LANE_LEASE_DIR) } catch { names = [] }
+  const live = new Set()
+  const now = Date.now()
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const file = path.join(LANE_LEASE_DIR, name)
+    const stat = await fs.stat(file).catch(() => null)
+    if (!stat) continue
+    if (now - stat.mtimeMs > LANE_LEASE_STALE_MS) { await fs.rm(file, { force: true }).catch(() => {}); continue }
+    live.add(name.slice(0, -'.json'.length))
+  }
+  let closed = 0
+  for (const page of context.pages()) {
+    const name = String(await page.evaluate(() => window.name).catch(() => '') || '')
+    if (!name.startsWith(LANE_TAB_PREFIX)) continue
+    if (live.has(name.slice(LANE_TAB_PREFIX.length))) continue
+    await page.close().catch(() => {})
+    closed += 1
+  }
+  if (closed) await log(`shared lane ${LANE_ID || '(unnamed)'}: closed ${closed} orphaned lane tab(s)`)
+  return closed
+}
+
+async function lanePage(context) {
+  // A lane without an id still gets a name of its own rather than sharing one:
+  // two lanes on the same name would type into each other's tab.
+  const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
+  await touchLaneLease(wanted.slice(LANE_TAB_PREFIX.length))
+  for (const candidate of context.pages()) {
+    const name = await candidate.evaluate(() => window.name).catch(() => '')
+    if (name === wanted) {
+      await candidate.bringToFront().catch(() => {})
+      await sweepOrphanLaneTabs(context)
+      return candidate
+    }
+  }
+  const page = await context.newPage()
+  await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+  await ensureLaneName(page, wanted)
+  await sweepOrphanLaneTabs(context)
+  return page
+}
+
+/** Re-assert the lane's tab name after a navigation that may have cleared it. */
+async function ensureLaneName(page, wanted = LANE_TAB) {
+  if (!LANE_SHARED || !wanted) return
+  if (!isChatGPTUrl(page.url())) return
+  const name = await page.evaluate(() => window.name).catch(() => '')
+  if (name === wanted) return
+  await page.evaluate(value => { window.name = value }, wanted).catch(() => {})
+}
+
+/** Close only this lane's tab. The master window, and every other lane, stays. */
+async function closeLaneTab() {
+  if (!LANE_SHARED) return { tabClosed: false }
+  const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
+  // Drop the lease first: once the tab is gone the sweep has nothing to clean,
+  // and if the close fails the stale lease lets the next lane clean it.
+  await fs.rm(path.join(LANE_LEASE_DIR, `${wanted.slice(LANE_TAB_PREFIX.length)}.json`), { force: true }).catch(() => {})
+  const browser = await connectOwned()
+  try {
+    const context = browser.contexts()[0]
+    if (!context) return { tabClosed: false }
+    for (const page of context.pages()) {
+      const name = await page.evaluate(() => window.name).catch(() => '')
+      if (name === wanted) {
+        await page.close().catch(() => {})
+        return { tabClosed: true }
+      }
+    }
+    return { tabClosed: false }
+  } finally {
+    release(browser)
+  }
+}
+
 async function connect() {
   const browser = await connectOwned()
   const context = browser.contexts()[0] ?? await browser.newContext()
-  const pages = context.pages()
+  // In a shared browser every lane is a named tab of the master window; the
+  // operator's own tab is never selected, whatever ACTIVE_THREAD says.
+  if (LANE_SHARED) return { browser, context, page: await lanePage(context) }
+  // Never adopt a lane's tab as the master's page: a master turn typed into a
+  // lane tab collides with that lane's turn. Every shared lane names its tab.
+  const pages = []
+  for (const candidate of context.pages()) {
+    const name = await candidate.evaluate(() => window.name).catch(() => '')
+    if (String(name || '').startsWith(LANE_TAB_PREFIX)) continue
+    pages.push(candidate)
+  }
   // Prefer the tab the caller adopted: a bridge can point at a thread the user
   // already has open, and sending into a different tab would post into the
   // wrong conversation. With no preference, the first ChatGPT tab wins.
@@ -1143,7 +1636,7 @@ async function cheapLiveTurn(threadId) {
     // cannot be asked - not that the page is idle.
     return { askable: false }
   } finally {
-    if (browser) await browser.close().catch(() => {})
+    if (browser) release(browser)
   }
 }
 
@@ -1259,7 +1752,10 @@ async function threadContentState(page, threadId) {
         headers: session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {},
       })
       if (response.status === 404) return 'missing'
-      if (!response.ok) return 'unknown'
+      // The status travels with the word: "unknown" alone cannot tell a rate
+      // limit (429) from a session that expired (401), and those need different
+      // answers - one waits, the other signs in.
+      if (!response.ok) return `unknown:${response.status}`
       const body = await response.json()
       const messages = Object.values(body.mapping || {}).filter(node => node && node.message).length
       return messages === 0 ? 'empty' : 'content'
@@ -2443,7 +2939,10 @@ async function waitForSendReady(page, timeoutMs = SEND_READY_TIMEOUT_MS) {
       const disabled = await send.isDisabled().catch(() => false)
         || (await send.getAttribute('aria-disabled').catch(() => null)) === 'true'
       if (!disabled) {
-        const busy = await busyState(page)
+        // A wedged page is not a ready page: report it as not-ready, so the
+        // caller keeps the turn queued instead of claiming it cannot be sent.
+        const busy = await sampleWithin(page, 8_000, 'busy').catch(() => null)
+        if (!busy) return { ready: false, send: null, reason: 'the page stopped answering' }
         const uploading = await page.evaluate(() => !!document.querySelector('[role="progressbar"]')).catch(() => false)
         if (!busy.busy && !uploading) return { ready: true, send }
         reason = 'an upload or a running turn is still in progress'
@@ -2468,6 +2967,31 @@ async function waitForSendReady(page, timeoutMs = SEND_READY_TIMEOUT_MS) {
  * is teardown information only: it never shortens an interval the guard was
  * already serving.
  */
+/**
+ * A reply sample that cannot outlive its own interval.
+ *
+ * The guard samples on a timer; a read the renderer never answers used to hang
+ * the loop (and, with a shared connection, every other op in the child) until
+ * the host gave up a minute later. A missed bound is a wedged connection, not a
+ * slow page: the connection is dropped and the turn is reported as a page fault
+ * so the host recycles the window instead of waiting out the whole budget.
+ */
+async function sampleWithin(page, ms, kind) {
+  const expired = Symbol('expired')
+  let timer
+  try {
+    const value = await Promise.race([
+      (kind === 'busy' ? busyState(page) : sampleTurn(page)).catch(() => null),
+      new Promise(resolve => { timer = setTimeout(() => resolve(expired), ms) }),
+    ])
+    if (value !== expired) return value
+  } finally {
+    clearTimeout(timer)
+  }
+  dropOwned(`a ${kind} read did not answer within ${ms} ms`)
+  throw new TurnError(`the page stopped answering during the reply (a ${kind} read missed ${ms} ms)`, { reason: 'page-load-error' })
+}
+
 async function waitForReply(page, beforeCount, beforeText = '', watch = null, sentText = '') {
   const startedAt = Date.now()
   const deadline = startedAt + SEND_TIMEOUT_MS
@@ -2623,10 +3147,10 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null, se
       const wait = firstReadAt - Date.now()
       if (wait > 0) await sleep(Math.min(wait, capAt - Date.now()))
       if (Date.now() > capAt) break
-      const snapshot = await sampleTurn(page).catch(() => null)
+      const snapshot = await sampleWithin(page, 12_000, 'turn')
       const at = Date.now()
       samples += 1
-      const busy = await busyState(page)
+      const busy = await sampleWithin(page, 8_000, 'busy')
       const got = Boolean(snapshot?.found && snapshot.text) && (snapshot.candidates > beforeCount || snapshot.text !== beforeText)
       // The payload tail check. Equality alone cannot tell a finished answer
       // from a stable prefix of one: live 2026-11-01 a 37-char prefix held for
@@ -2683,12 +3207,12 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null, se
     if (!shortened && lastIsReply && last && cleanEnd()) {
       shortened = true
       await sleep(STREAM_SETTLE_MS)
-      const again = await sampleTurn(page).catch(() => null)
+      const again = await sampleWithin(page, 12_000, 'turn')
       // The stamp is the moment the confirming read returned, on the same
       // origin as the stream end, so a later reader can recover the settle the
       // shortener actually saved.
       firstStableAt = Date.now()
-      const calm = await busyState(page)
+      const calm = await sampleWithin(page, 8_000, 'busy')
       if (again?.found && again.text && again.text === last && !calm.busy) {
         agree = 2
         await refuseProblems()
@@ -2705,9 +3229,9 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null, se
     }
     // The ANSWER node by structure, never the last assistant-message element:
     // that one is the reasoning-status header while the turn is thinking.
-    const snapshot = await sampleTurn(page).catch(() => null)
+    const snapshot = await sampleWithin(page, 12_000, 'turn')
     if (!snapshot) { await sleepOrCompletion(500); continue }
-    const busy = await busyState(page)
+    const busy = await sampleWithin(page, 8_000, 'busy')
     if (!snapshot.found || !snapshot.text) {
       // While there is no answer, ask whether the window is broken rather than
       // slow. A banner that persists is a window fault: the host recycles the
@@ -2890,7 +3414,7 @@ async function readNewestTurn(page) {
   const deadline = Date.now() + 60_000
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 900))
-    const busy = await busyState(page)
+    const busy = await sampleWithin(page, 8_000, 'busy')
     const now = await sampleTurn(page)
     if (!now.found || !now.text) { last = ''; agree = 0; continue }
     if (now.text !== last || busy.busy) { last = now.text; agree = 1; continue }
@@ -3282,7 +3806,8 @@ async function recoverComposer(page, { newChat = false, threadId = null } = {}) 
     ? !liveThread && isChatGPTUrl(live)
     : Boolean(threadId) && String(liveThread || '').toLowerCase() === String(threadId).toLowerCase()
   if (!onTarget) return { composer: null, why: 'the page is not on the requested thread', reloadMs: 0, waitMs: 0 }
-  const busy = await busyState(page)
+  const busy = await sampleWithin(page, 8_000, 'busy').catch(() => null)
+  if (!busy) return { composer: null, why: 'the page stopped answering, so it was not reloaded', reloadMs: 0, waitMs: 0 }
   if (busy.busy) return { composer: null, why: 'the page reports a live turn, so it was not reloaded', reloadMs: 0, waitMs: 0 }
   const reloadAt = Date.now()
   try {
@@ -3545,67 +4070,77 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // passes with a pause between them; each pass still writes at most one copy,
   // because every attempt starts from a proven-empty or proven-matching field.
   let composed = false
-  for (let attempt = 1; attempt <= 3 && !composed; attempt++) {
-    // Keyboard input goes to the focused window. A lane's window sits behind
-    // the master's, so without this every pass types into a window that will
-    // not take the keystrokes and the turn is refused as "not-posted".
-    await page.bringToFront().catch(() => {})
-    composed = await railed(composeExactlyOnce(page, composer, text, (label, ms) => log(`phase ${phaseName}${attempt > 1 ? ` retry${attempt}` : ''} ${label} ${ms}ms`)), acceptDeadline, sendDeadlineNotPosted)
-    if (!composed && attempt < 3) await new Promise(resolve => setTimeout(resolve, 1_000))
-  }
-  await phaseMark('compose')
-  if (!composed) {
-    // The `not-posted:` PREFIX is load-bearing, not decoration: the host decides
-    // "keep this queued" from the MESSAGE TEXT, not from `reason` (chatgpt-peer.ts
-    // ~2274, /mid-turn|not-posted|never left the composer|ambiguous/i), and it
-    // never reads `reply.reason` on this path (~1538). Without the prefix a
-    // bounded compose refusal becomes a terminal failure line to the sender.
-    // The page's own visibility is the fact that separates "the app re-rendered"
-    // from "Chrome treats this window as hidden and drops the keystrokes".
-    const visibility = await page.evaluate(() => document.visibilityState).catch(() => 'unknown')
-    // A rate-limited account leaves the composer inert: every insert is
-    // swallowed and the turn is refused as a compose fault, which reads like a
-    // driver bug. Name the real cause so nobody debugs the wrong layer.
-    const limit = await page.evaluate(() => {
-      const text = (document.body?.innerText || '').replace(/\s+/g, ' ')
-      const match = /(you(?:'| a)?re? (?:hitting|reached) (?:the|your) [^.]{0,40}limit|usage limit|try again (?:later|in a few minutes)|rate limit)/i.exec(text)
-      return match ? match[0].slice(0, 80) : null
-    }).catch(() => null)
-    // The banner is not always rendered; the backend status is the ground
-    // truth, and a 429 there is exactly why the composer stays inert.
-    const backendStatus = await page.evaluate(async () => {
-      const match = /\/c\/([A-Za-z0-9-]{8,})/.exec(location.pathname)
-      if (!match) return 0
-      try {
-        const response = await fetch(`/backend-api/conversation/${match[1]}`, { credentials: 'include' })
-        return response.status
-      } catch { return 0 }
-    }).catch(() => 0)
-    if (limit || backendStatus === 429) {
-      const why = limit ?? 'the conversation backend answers 429'
-      throw new TurnError(`not-posted: the account is rate limited (${why}); nothing was sent, so no reply is coming`, { reason: 'rate-limited' })
+  // In a shared browser every lane is a tab in ONE window, and only one tab can
+  // hold focus at a time. The token covers typing and the Send click, and is
+  // released before the reply is awaited so turns still overlap. The one-window
+  // driver passes straight through: the browser is its own.
+  const releaseFocus = await acquireFocus()
+  let submitted
+  try {
+    for (let attempt = 1; attempt <= 3 && !composed; attempt++) {
+      // Keyboard input goes to the focused TAB. A shared lane's tab sits behind
+      // the operator's, so without this every pass types into a page that will
+      // not take the keystrokes and the turn is refused as "not-posted".
+      await page.bringToFront().catch(() => {})
+      composed = await railed(composeExactlyOnce(page, composer, text, (label, ms) => log(`phase ${phaseName}${attempt > 1 ? ` retry${attempt}` : ''} ${label} ${ms}ms`)), acceptDeadline, sendDeadlineNotPosted)
+      if (!composed && attempt < 3) await new Promise(resolve => setTimeout(resolve, 1_000))
     }
-    throw new TurnError(`not-posted: the composer did not hold exactly the intended text (page ${visibility}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
+    await phaseMark('compose')
+    if (!composed) {
+      // The `not-posted:` PREFIX is load-bearing, not decoration: the host decides
+      // "keep this queued" from the MESSAGE TEXT, not from `reason` (chatgpt-peer.ts
+      // ~2274, /mid-turn|not-posted|never left the composer|ambiguous/i), and it
+      // never reads `reply.reason` on this path (~1538). Without the prefix a
+      // bounded compose refusal becomes a terminal failure line to the sender.
+      // The page's own visibility is the fact that separates "the app re-rendered"
+      // from "Chrome treats this window as hidden and drops the keystrokes".
+      const visibility = await page.evaluate(() => document.visibilityState).catch(() => 'unknown')
+      // A rate-limited account leaves the composer inert: every insert is
+      // swallowed and the turn is refused as a compose fault, which reads like a
+      // driver bug. Name the real cause so nobody debugs the wrong layer.
+      const limit = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').replace(/\s+/g, ' ')
+        const match = /(you(?:'| a)?re? (?:hitting|reached) (?:the|your) [^.]{0,40}limit|usage limit|try again (?:later|in a few minutes)|rate limit)/i.exec(text)
+        return match ? match[0].slice(0, 80) : null
+      }).catch(() => null)
+      // The banner is not always rendered; the backend status is the ground
+      // truth, and a 429 there is exactly why the composer stays inert.
+      const backendStatus = await page.evaluate(async () => {
+        const match = /\/c\/([A-Za-z0-9-]{8,})/.exec(location.pathname)
+        if (!match) return 0
+        try {
+          const response = await fetch(`/backend-api/conversation/${match[1]}`, { credentials: 'include' })
+          return response.status
+        } catch { return 0 }
+      }).catch(() => 0)
+      if (limit || backendStatus === 429) {
+        const why = limit ?? 'the conversation backend answers 429'
+        throw new TurnError(`not-posted: the account is rate limited (${why}); nothing was sent, so no reply is coming`, { reason: 'rate-limited' })
+      }
+      throw new TurnError(`not-posted: the composer did not hold exactly the intended text (page ${visibility}); nothing was sent, so no reply is coming`, { reason: 'not-posted' })
+    }
+    // Join the snapshot begun right after the landing check. It has been reading
+    // under the composer wait, the DOM baselines and the compose, so this label is
+    // normally ~0; whatever remains is the residual wait. The tree is the evidence
+    // that survives a stale DOM (the user-message selector can stop exposing new
+    // nodes after a rerender while the send itself landed), which is why it is
+    // taken before EVERY send. `readUserTreeOnPage` keeps both meanings: `null` is
+    // an unreadable backend (cannot prove anything, so the turn settles ambiguous
+    // exactly as before), an empty Map is the new-chat route (nothing was there
+    // yet). A genuine throw is still raised here, before anything is clicked.
+    const treeOutcome = await railed(treeRead, acceptDeadline, sendDeadlineNotPosted)
+    if (treeOutcome.error) throw treeOutcome.error
+    const beforeTree = treeOutcome.value
+    await phaseMark('baseline_tree')
+    const acceptanceBaseline = { users: beforeUsers, dom: beforeDom ? beforeDom.identities : null }
+    // `holdNetwork` keeps the CDP observer (and the send POST's stream-end
+    // signal) alive past acceptance and through the reply; the `finally` below is
+    // the only stop for that case, so no exit - answer, timeout, abort, throw -
+    // can leave the session or its listener behind.
+    submitted = await submitTurn(page, { baseline: acceptanceBaseline, text, treeBaseline: beforeTree, phaseLabel: phaseName, phaseStartedAt: phaseT0, deadline: acceptDeadline, holdNetwork: true })
+  } finally {
+    await releaseFocus()
   }
-  // Join the snapshot begun right after the landing check. It has been reading
-  // under the composer wait, the DOM baselines and the compose, so this label is
-  // normally ~0; whatever remains is the residual wait. The tree is the evidence
-  // that survives a stale DOM (the user-message selector can stop exposing new
-  // nodes after a rerender while the send itself landed), which is why it is
-  // taken before EVERY send. `readUserTreeOnPage` keeps both meanings: `null` is
-  // an unreadable backend (cannot prove anything, so the turn settles ambiguous
-  // exactly as before), an empty Map is the new-chat route (nothing was there
-  // yet). A genuine throw is still raised here, before anything is clicked.
-  const treeOutcome = await railed(treeRead, acceptDeadline, sendDeadlineNotPosted)
-  if (treeOutcome.error) throw treeOutcome.error
-  const beforeTree = treeOutcome.value
-  await phaseMark('baseline_tree')
-  const acceptanceBaseline = { users: beforeUsers, dom: beforeDom ? beforeDom.identities : null }
-  // `holdNetwork` keeps the CDP observer (and the send POST's stream-end
-  // signal) alive past acceptance and through the reply; the `finally` below is
-  // the only stop for that case, so no exit - answer, timeout, abort, throw -
-  // can leave the session or its listener behind.
-  const submitted = await submitTurn(page, { baseline: acceptanceBaseline, text, treeBaseline: beforeTree, phaseLabel: phaseName, phaseStartedAt: phaseT0, deadline: acceptDeadline, holdNetwork: true })
   try {
     if (onAccepted) onAccepted(threadOf(page.url()))
     // A rejection replaces this turn with its own correction, so it is decided
@@ -3665,7 +4200,7 @@ async function doCheck() {
   await new Promise(resolve => setTimeout(resolve, 6000))
   const state = await pageState(page)
   console.log(JSON.stringify({ ...state, spawned: started.spawned }, null, 2))
-  await browser.close().catch(() => {})
+  release(browser)
   if (started.spawned) await fs.rm(PID_FILE, { force: true }).catch(() => {})
 }
 
@@ -3697,14 +4232,14 @@ async function doProbe() {
   })
   console.log(JSON.stringify(info, null, 2))
   await page.screenshot({ path: path.join(BASE, 'probe.png') }).catch(error => console.log('shot failed: ' + error.message))
-  await browser.close().catch(() => {})
+  release(browser)
 }
 
 async function doStatus() {
   if (!(await cdpUp())) { console.log('Chrome not running'); return }
   const { browser, page } = await connect()
   console.log(JSON.stringify(await pageState(page), null, 2))
-  await browser.close().catch(() => {})
+  release(browser)
 }
 
 // stdout belongs to the line-JSON channel when this file runs as the host's
@@ -3724,10 +4259,7 @@ async function doQuit() {
       child.on('exit', () => resolve(out))
     })
     if (probe.includes(PROFILE)) {
-      await new Promise(resolve => {
-        const child = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
-        child.on('exit', resolve)
-      })
+      await stopProcess(pid)
       say(`Closed Chrome pid=${pid}`)
     } else {
       say('PID file does not match this profile; not killing it')
@@ -3744,7 +4276,7 @@ async function doAsk(text, newChat) {
   const result = await ask(page, text, { newChat })
   console.log(result.reply)
   console.error(`\n[url] ${result.url}\n[model] ${result.model || 'unknown'}`)
-  await browser.close().catch(() => {})
+  release(browser)
 }
 
 async function doChat() {
@@ -3753,7 +4285,7 @@ async function doChat() {
   const state = await pageState(page)
   if (!state.loggedIn) {
     console.log('Not signed in. Run: node chatgpt.mjs login')
-    await browser.close().catch(() => {})
+    release(browser)
     process.exit(2)
   }
   console.log(`Connected. model=${state.model || 'unknown'} url=${state.url}`)
@@ -3780,7 +4312,7 @@ async function doChat() {
     rl.prompt()
   }
   rl.close()
-  await browser.close().catch(() => {})
+  release(browser)
 }
 
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -3948,7 +4480,7 @@ function noteTreeRead(line) {
 async function backendGet(path, timeoutMs = 30_000) {
   if (!(await cdpUp())) return { ok: false, status: 0, error: 'chrome is not running' }
   const { browser, page } = await connect()
-  try { return await backendGetOn(page, path, timeoutMs) } finally { await browser.close().catch(() => {}) }
+  try { return await backendGetOn(page, path, timeoutMs) } finally { release(browser) }
 }
 
 /**
@@ -4095,7 +4627,7 @@ export function nodeActivityOf(body) {
 async function withPage(operation) {
   await ensureChrome({ visible: true })
   const { browser, page } = await connect()
-  try { return await operation(page) } finally { await browser.close().catch(() => {}) }
+  try { return await operation(page) } finally { release(browser) }
 }
 
 /**
@@ -4577,7 +5109,9 @@ function startEventChannel(emit, claimed = () => false) {
   const connectLoop = async () => {
     if (state.stopped) return
     let browser
-    try { browser = await connectOwned() }
+    // The observer owns its connection: it reconnects by closing it, which must
+    // not pull the connection out from under the op that is still using it.
+    try { browser = await attachOwned() }
     catch (error) {
       // Not ours (or not running): the channel waits rather than installing an
       // observer into a browser this driver does not own.
@@ -4899,7 +5433,7 @@ async function serve() {
           sha256: createHash('sha256').update(buffer).digest('hex'),
           name, fileId, mimeType: null, mimeTypeHint: String(body.mime_type ?? body.mimeType ?? ''),
         }
-      } finally { await browser.close().catch(() => {}) }
+      } finally { release(browser) }
     }
     if (op === 'reload') {
       // The operator's recovery for a turn whose page died. It only ever
@@ -4917,7 +5451,7 @@ async function serve() {
         await waitForComposer(page)
         ACTIVE_THREAD = threadId.toLowerCase()
         return { ok: true, op, threadId, url: page.url() }
-      } finally { await browser.close().catch(() => {}) }
+      } finally { release(browser) }
     }
     if (op === 'send') {
       const text = String(request.text || '')
@@ -5021,7 +5555,7 @@ async function serve() {
         }
         ACTIVE_THREAD = landed.toLowerCase()
         return { ok: true, op, threadId: landed, url: page.url(), adopted: false }
-      } finally { await browser.close().catch(() => {}) }
+      } finally { release(browser) }
     }
     if (op === 'read') {
       return opTimed(60_000, op, () => withPage(async page => {
@@ -5061,32 +5595,28 @@ async function serve() {
           await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
           state = await waitForLogin(page, LOGIN_WAIT_MS)
         }
-        return { ok: true, op, lane: LANE_ID || null, signedIn: state.loggedIn, plan: state.plan ?? null, url: state.url }
+        // A sign-in redirect is a cross-site navigation, which clears the tab
+        // name; restore it before the first turn so later ops find this tab.
+        await ensureLaneName(page)
+        return { ok: true, op, lane: LANE_ID || null, sharedBrowser: LANE_SHARED, signedIn: state.loggedIn, plan: state.plan ?? null, url: state.url }
       } finally {
-        await browser.close().catch(() => {})
+        release(browser)
       }
     }
     if (op === 'unload') {
-      let cookiesSynced = 0
-      let cookieSync = 'not a lane'
-      if (LANE_SOURCE_PORT) {
-        // A lane's cookies are newer than the master's: write them back first,
-        // so the next lane branches from a live token. Notification only; the
-        // close itself must not depend on it. The result travels in the reply
-        // because this child's log directory is deleted with the lane.
-        try {
-          const synced = await syncLaneCookies()
-          cookieSync = synced.ok ? 'ok' : (synced.reason || 'skipped')
-          cookiesSynced = synced.ok ? synced.cookies : 0
-        } catch (error) {
-          cookieSync = `failed: ${error.message}`
-        }
-        await log(`lane ${LANE_ID || '(unnamed)'}: cookie write-back ${cookieSync} (${cookiesSynced} cookies) to master port ${LANE_SOURCE_PORT}`)
-        process.stderr.write(`[lane] cookie write-back ${cookieSync} (${cookiesSynced} cookies) to master port ${LANE_SOURCE_PORT}\n`)
+      if (LANE_SHARED) {
+        // Close the tab this lane owns and nothing else. The master window is
+        // the only browser and its session is the only session, so there is no
+        // cookie write-back to do and no window to close.
+        const closed = await closeLaneTab().catch(error => ({ tabClosed: false, error: error.message }))
+        ACTIVE_THREAD = null
+        return { ok: true, op, state: 'unloaded', sharedBrowser: true, ...closed }
       }
+      // The one-window driver: close the Chrome this install launched. There is
+      // no session to hand back, because no session was ever copied out.
       await doQuit()
       ACTIVE_THREAD = null
-      return { ok: true, op, state: 'unloaded', cookiesSynced, cookieSync }
+      return { ok: true, op, state: 'unloaded', cookiesSynced: 0, cookieSync: 'not a lane' }
     }
     return { ok: false, op, error: `unknown op ${op ?? '(missing)'}` }
   }

@@ -64,6 +64,11 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     profile: join(homedir(), '.chatgpt-web', 'profile'),
     masterPort: 9222,
     laneBasePort: 9300,
+    // Copying a session into a second profile is racy: the master rotates its
+    // token while the copy is in flight, and two lanes branched from the same
+    // snapshot invalidate each other. A lane is a named tab in the master
+    // browser instead - one cookie jar, nothing to copy or write back.
+    laneSharedBrowser: true,
     driver: 'chatgpt.mjs',
     primer: 'primer.md',
     site: 'https://chatgpt.com/',

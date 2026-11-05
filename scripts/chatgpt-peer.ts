@@ -731,6 +731,8 @@ export class ChatGptHost {
    * offer the file. The lock makes collect+reserve+send per bridge serial.
    */
   private readonly deliveryLocks = new Map<string, { run<T>(work: () => Promise<T>): Promise<T> }>()
+  /** One turn at a time per conversation; see `turnStep`. */
+  private readonly turnLocks = new Map<string, { run<T>(work: () => Promise<T>): Promise<T> }>()
   private server: ReturnType<typeof createServer> | undefined
   private operatorToken = randomBytes(32).toString('hex')
   private health: { state: HealthState; reason?: string; at: string } = { state: 'unknown', reason: 'page_not_started', at: new Date().toISOString() }
@@ -836,7 +838,17 @@ export class ChatGptHost {
     this.primer = { text: '', sha: '' }
     this.files = config.files ?? { stat, readFile }
     this.maxAttachmentBytes = config.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES
-    this.masterDriver = driver ?? new DriverChild({ script: config.driverPath, profile: config.profile, log, timeoutMs: TURN_TIMEOUT_MS })
+    // The master driver launches and repairs the same browser its lanes live in,
+    // so it is told where the shared-lane coordination files are: the launch
+    // lock is the only thing that stops it and a lane from each killing the
+    // other's booting window.
+    this.masterDriver = driver ?? new DriverChild({
+      script: config.driverPath,
+      profile: config.profile,
+      log,
+      timeoutMs: TURN_TIMEOUT_MS,
+      env: { CHATGPT_LANE_SHARED_DIR: join(config.home, 'lanes') },
+    })
     // A test that injects its driver is never silently given real lane Chrome
     // processes; it opts in with `lanes: true` or its own manager.
     this.lanes = config.laneManager ?? (config.lanes === true
@@ -949,6 +961,14 @@ export class ChatGptHost {
     const key = bridge.state.sessionId
     let lock = this.deliveryLocks.get(key)
     if (!lock) { lock = this.makeLock(); this.deliveryLocks.set(key, lock) }
+    return lock
+  }
+
+  /** The one TURN lock for a bridge, created on first use. */
+  private turnLockFor(bridge: Bridge): { run<T>(work: () => Promise<T>): Promise<T> } {
+    const key = bridge.state.sessionId
+    let lock = this.turnLocks.get(key)
+    if (!lock) { lock = this.makeLock(); this.turnLocks.set(key, lock) }
     return lock
   }
 
@@ -3227,7 +3247,7 @@ export class ChatGptHost {
         const message = this.inboundMessageOf(bridge, record)
         // Settling can run command follow-up rounds, which type into a page:
         // they belong on the sender's lane, never in the master window.
-        await this.laneWork(this.laneIdOf({ fromSessionId: record.senderSessionId }), () => this.settleTurnAnswer(bridge, record, message, nodeTextOf(answer), true))
+        await this.turnStep(bridge, this.laneIdOf({ fromSessionId: record.senderSessionId }), () => this.settleTurnAnswer(bridge, record, message, nodeTextOf(answer), true))
         // R8-C: ownership was persisted above, and that alone stops the next
         // pass re-handling this delivery - `pendingHumanTurns` skips `ours`, and
         // `newPageAnswers` excludes a governing user node in `ourNodeIds`. The
@@ -3312,7 +3332,7 @@ export class ChatGptHost {
     await this.notePendingTurn(bridge, record)
     const laneId = this.laneIdOf({ fromSessionId: record.senderSessionId })
     if (this.lanes) await this.lanes.recycle(laneId, `empty assistant node ${shortId(node.id)}`)
-    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, record, 0, true))
+    const posted = await this.turnStep(bridge, laneId, () => this.postPendingTurn(bridge, record, 0, true))
     if (!posted.posted) {
       // The page was busy again after all. Nothing was typed; leave the retry
       // card unspent so the next idle transition can use it.
@@ -3326,7 +3346,7 @@ export class ChatGptHost {
       result: `re-posted once on a fresh window after an empty answer [${bridge.state.name}]`,
       messageId: record.messageId,
     })
-    await this.laneWork(laneId, () => this.settleTurnAnswer(bridge, record, message, posted.text, true))
+    await this.turnStep(bridge, laneId, () => this.settleTurnAnswer(bridge, record, message, posted.text, true))
   }
 
   /**
@@ -3381,7 +3401,7 @@ export class ChatGptHost {
       if (this.generatingLooksLive(gate)) return
     }
     const laneId = this.laneIdOf({ fromSessionId: deferred.senderSessionId })
-    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, deferred, 0, locked))
+    const posted = await this.turnStep(bridge, laneId, () => this.postPendingTurn(bridge, deferred, 0, locked))
     if (posted.posted) {
       audit(this.hostState, { op: 'turn', target: deferred.senderSessionId, result: `deferred job posted after the turn ended [${bridge.state.name}]`, messageId: deferred.messageId })
       await this.persistHostState()
@@ -3389,7 +3409,7 @@ export class ChatGptHost {
       // answer in hand, settle it here. With no text the first round reads the
       // thread, exactly as the direct path does.
       const message = this.inboundMessageOf(bridge, deferred)
-      await this.laneWork(laneId, () => this.settleTurnAnswer(bridge, deferred, message, posted.text, true))
+      await this.turnStep(bridge, laneId, () => this.settleTurnAnswer(bridge, deferred, message, posted.text, true))
     }
   }
 
@@ -3602,7 +3622,7 @@ export class ChatGptHost {
       bridge.state.answeredTurns = [...bridge.state.answeredTurns, key].slice(-ANSWERED_TURNS_MAX)
       await this.persistBridgeState(bridge, true)
       try {
-        await bridge.transport?.send(record.senderSessionId, sanitizePeerText(`the ChatGPT page could not answer: ${one(reason, 200)}`), `Re: ${record.messageId.slice(0, 8)}`.slice(0, 200), record.messageId, record.kind, false)
+        await bridge.transport?.send(record.senderSessionId, sanitizePeerText(`the ${this.provider.fallbackName} page could not answer: ${one(reason, 200)}`), `Re: ${record.messageId.slice(0, 8)}`.slice(0, 200), record.messageId, record.kind, false)
         audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `failure line: ${one(reason, 160)} [${bridge.state.name}]`, messageId: record.messageId })
       } catch (error) {
         audit(this.hostState, { op: 'reply', target: record.senderSessionId, result: `failure line could not be sent: ${one((error as Error).message, 120)}`, messageId: record.messageId })
@@ -5278,7 +5298,7 @@ export class ChatGptHost {
           }
           audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
           if (job) await this.deliverSolicitedFailure(bridge, job, line)
-          else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not answer: ${line}`)
+          else if (expects) await this.replyError(bridge, message, `the ${this.provider.fallbackName} page could not answer: ${line}`)
           await this.persistHostState()
           return
         }
@@ -5302,7 +5322,7 @@ export class ChatGptHost {
           return
         }
         if (job) await this.deliverSolicitedFailure(bridge, job, reason)
-        else if (expects) await this.replyError(bridge, message, `the ChatGPT page could not complete a turn: ${reason}`)
+        else if (expects) await this.replyError(bridge, message, `the ${this.provider.fallbackName} page could not complete a turn: ${reason}`)
       } finally {
         this.attachedTurns.delete(message.id)
         this.freshTurns.delete(message.id)
@@ -5314,7 +5334,7 @@ export class ChatGptHost {
         this.scheduleIdleUnload()
       }
     }
-    await this.laneWork(this.laneIdOf(message), runTurn)
+    await this.turnStep(bridge, this.laneIdOf(message), runTurn)
   }
 
   /**
@@ -6103,6 +6123,21 @@ export class ChatGptHost {
 
   private laneIdOf(message: { fromSessionId?: string }): string {
     return message.fromSessionId && message.fromSessionId.trim() ? message.fromSessionId : HOST_LANE
+  }
+
+  /**
+   * One turn at a time per conversation.
+   *
+   * A bridge is one linear thread. Two turns posted into it at once make the
+   * app re-render under its own feet, and in a shared browser both tabs watch
+   * the other's stream: the conversation then stops loading ("the messages
+   * could not load") and one answer lands on top of the other's. Lanes still
+   * run in parallel ACROSS bridges; within one thread they queue. The bridge
+   * lock is taken BEFORE the lane, so a writer waiting its turn never holds a
+   * lane another writer needs.
+   */
+  private turnStep<T>(bridge: Bridge, laneId: string, work: (lane: LaneHandle) => Promise<T>): Promise<T> {
+    return this.turnLockFor(bridge).run(() => this.laneWork(laneId, work))
   }
 
   /**

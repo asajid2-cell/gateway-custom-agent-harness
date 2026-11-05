@@ -1,17 +1,22 @@
 /**
- * One disposable Chrome window per writer.
+ * One isolated page per writer.
  *
- * A lane is a driver child of its own: its own Chrome process, its own temporary
- * profile, its own debugging port, its own serial page chain. A local session
- * that sends gets one lane and keeps it while it is working; the lane branches
- * its login from the master Chrome's cookies (read over CDP, never typed in)
- * and is killed after it has been idle for a moment. Nothing about one writer's
- * page can then collide with another's, which is the whole point.
+ * A lane is a driver child of its own with its own serial page chain, so nothing
+ * about one writer's page collides with another's. Where that page LIVES is the
+ * provider's choice, and it is the one thing that changes between providers:
  *
- * The master Chrome (the human's window) is a credential source only. It is
- * never unloaded, never navigated and never typed into by this manager.
+ * - A disposable window: its own Chrome process, its own temporary profile and
+ *   its own debugging port. Its login is branched from the master's cookies.
+ * - A shared browser (`sharedBrowser`): a named TAB in the master window. A
+ *   provider whose session cannot be copied - Google invalidates a session seen
+ *   twice, and every copied login races the master's token rotation - gets this
+ *   shape, where there is exactly one cookie jar and nothing to copy or sync.
  *
- * Cap and queue are deliberate: at most `maxLanes` windows exist, and a writer
+ * The master Chrome (the human's window) is never unloaded or navigated by this
+ * manager, and in shared mode it is not closed with its last lane: only the
+ * lane's own tab is.
+ *
+ * Cap and queue are deliberate: at most `maxLanes` lanes exist, and a writer
  * beyond the cap waits for one instead of failing. Order is FIFO.
  */
 import { randomUUID } from 'node:crypto'
@@ -49,7 +54,10 @@ export type LaneOptions = {
   driverScript: string
   /** Where lane state directories live. */
   root: string
-  /** The master Chrome's debugging port; cookies branch from it. */
+  /**
+   * The master Chrome's debugging port: where a shared lane's tab lives, and
+   * where a copied-login lane would read its cookies from.
+   */
   sourcePort?: number
   /** The first lane port; 0 picks 9300. */
   basePort?: number
@@ -431,7 +439,10 @@ export class LaneManager {
     let lane: Lane | undefined
     let port = 0
     try {
-      port = await this.nextPort()
+      // A shared lane has no port of its own: it is a tab in the master
+      // browser, so the master's port is the honest answer in a status row and
+      // there is nothing to reserve or collide over.
+      port = this.options.sharedBrowser ? this.sourcePort : await this.nextPort()
       const stateDir = join(this.options.root, `${safeName(laneId)}-${randomUUID().slice(0, 8)}`)
       const profile = join(stateDir, 'profile')
       await mkdir(profile, { recursive: true })
