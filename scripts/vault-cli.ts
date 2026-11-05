@@ -6,6 +6,7 @@
  *   bun scripts/vault-cli.ts repair --vault <path> --family <id>
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
+ *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce]
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
  * 2 for a usage error. A submit whose idempotency key is omitted uses the
@@ -22,6 +23,7 @@ import {
   repairTornTail,
   verifyJournal,
 } from '../src/utils/vault/journal.js'
+import { conferDriverAdmission } from '../src/utils/vault/activation.js'
 import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -118,6 +120,22 @@ async function main(): Promise<number> {
     return 0
   }
 
+  if (command === 'confer-driver') {
+    // The same gate `conferDriver` calls, not a second implementation: a headless
+    // caller must not be able to reach a weaker door than the interactive one.
+    const mode = args.mode === 'enforce' ? 'enforce' : 'monitor'
+    const result = await conferDriverAdmission({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      driverSessionId: required(args, 'session'),
+      turnBoundary: typeof args.turn === 'string' ? args.turn : 'manual',
+      invocationId: typeof args['invocation-id'] === 'string' ? (args['invocation-id'] as string) : undefined,
+      mode,
+    })
+    print(result)
+    return result.ok ? 0 : 1
+  }
+
   if (command === 'recall') {
     const familyId = required(args, 'family')
     const query = required(args, 'query')
@@ -170,7 +188,7 @@ async function main(): Promise<number> {
     return ok ? 0 : 1
   }
 
-  throw new Error('usage: vault-cli.ts <verify|repair|submit> --vault <path> ...')
+  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver> --vault <path> ...')
 }
 
 try {

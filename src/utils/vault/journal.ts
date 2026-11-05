@@ -375,6 +375,70 @@ export async function activeGeneration(vaultRoot: string, familyId: string): Pro
   return active
 }
 
+export type RotationRecord = Record<string, unknown> & { kind?: string; generation_id?: string }
+
+/**
+ * Decide and append one rotation record under the family's vault lock.
+ *
+ * The read and the append have to happen under the same lock: an admission's
+ * ordinal is "how many admissions exist", and computing it outside the lock is
+ * how two concurrent activations both receive the same ordinal and both count
+ * as the first. `decide` returns the record to append, or null to write
+ * nothing and leave the file untouched.
+ */
+export async function appendRotationDecision(
+  vaultRoot: string,
+  familyId: string,
+  decide: (records: RotationRecord[]) => Record<string, unknown> | null,
+): Promise<{ appended: Record<string, unknown> | null }> {
+  const dir = dirname(familyRotationPath(vaultRoot, familyId))
+  await mkdir(dir, { recursive: true })
+  return withVaultLock(dir, async () => {
+    const path = familyRotationPath(vaultRoot, familyId)
+    const records = await readRotationRecords(vaultRoot, familyId)
+    const decision = decide(records)
+    if (!decision) return { appended: null }
+    const record = { ...decision, family_id: familyId, at: new Date().toISOString() }
+    const line = `${JSON.stringify(record)}\n`
+    let needsNewline = false
+    try {
+      const existing = await readFile(path, 'utf8')
+      needsNewline = existing.length > 0 && !existing.endsWith('\n')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    const handle = await open(path, 'a')
+    try {
+      await handle.writeFile(`${needsNewline ? '\n' : ''}${line}`)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    return { appended: record }
+  })
+}
+
+/** Every rotation-journal record for a family, in file order. Malformed lines are skipped. */
+export async function readRotationRecords(vaultRoot: string, familyId: string): Promise<RotationRecord[]> {
+  let raw: string
+  try {
+    raw = await readFile(familyRotationPath(vaultRoot, familyId), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+  const records: RotationRecord[] = []
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue
+    try {
+      records.push(JSON.parse(line) as RotationRecord)
+    } catch {
+      continue
+    }
+  }
+  return records
+}
+
 export async function admitGeneration(
   vaultRoot: string,
   familyId: string,
@@ -390,26 +454,7 @@ export async function admitGeneration(
       throw new Error('an import_admission must not carry an invocation id; it is not an activation')
     }
   }
-  const dir = dirname(familyRotationPath(vaultRoot, familyId))
-  await mkdir(dir, { recursive: true })
-  await withVaultLock(dir, async () => {
-    const path = familyRotationPath(vaultRoot, familyId)
-    const line = `${JSON.stringify({ ...record, family_id: familyId, at: new Date().toISOString() })}\n`
-    let needsNewline = false
-    try {
-      const existing = await readFile(path, 'utf8')
-      needsNewline = existing.length > 0 && !existing.endsWith('\n')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    }
-    const handle = await open(path, 'a')
-    try {
-      await handle.writeFile(`${needsNewline ? '\n' : ''}${line}`)
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-  })
+  await appendRotationDecision(vaultRoot, familyId, () => record)
 }
 
 /**
