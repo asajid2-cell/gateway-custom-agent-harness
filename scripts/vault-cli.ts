@@ -286,13 +286,14 @@ async function main(): Promise<number> {
       familyId,
       query,
       // The packet is a function of its request, so the install's policy is
-      // handed in here rather than read from ambient settings inside recall.
-      overdueHours: policy.overdueHours,
+      // handed in here rather than read from ambient settings inside recall;
+      // `--overdue-hours` is an operator override of that policy.
+      overdueHours:
+        typeof args['overdue-hours'] === 'string' ? Number(args['overdue-hours']) : policy.overdueHours,
       filters: {
         asOf: typeof args['as-of'] === 'string' ? (args['as-of'] as string) : undefined,
         limit: typeof args.limit === 'string' ? Number(args.limit) : undefined,
       },
-      overdueHours: typeof args['overdue-hours'] === 'string' ? Number(args['overdue-hours']) : policy.overdueHours,
     })
     if (typeof args.dump === 'string') {
       await writeFile(args.dump as string, `${JSON.stringify(packet, null, 2)}\n`, 'utf8')
