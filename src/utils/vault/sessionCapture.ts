@@ -2,11 +2,13 @@
  * Which family a session's captures belong to, and the rule that a capture
  * problem never breaks a session.
  *
- * A leaf session belongs to the family whose root its pointer names. A session
- * that stands alone belongs to nothing: there is deliberately no synthetic
- * "unfiled" family, because inventing an owner is how a completeness metric
- * starts counting captures nobody owns. The consequence is meant to be visible:
- * a plain session in a repo produces no captures at all.
+ * A session captures under its family ROOT - the durable family membership
+ * every member shares (spec §12.16). A session with no family captures nothing:
+ * there is deliberately no synthetic "unfiled" family, because a shared bucket
+ * would make the transcript index the one artifact whose owner cannot be
+ * attributed. The absence is meant to be visible rather than convenient: it is
+ * reported with the completeness vocabulary (`state: 'no-captures'` plus a
+ * note), so an empty capture set is never mistaken for an empty session.
  *
  * The second rule matters more in practice. This runs during a transcript
  * write, so it must be structurally unable to throw into the caller - not a
@@ -16,16 +18,27 @@
 
 export type CaptureFamily =
   | { kind: 'family'; familyId: string }
-  | { kind: 'unfiled'; reason: string }
+  | {
+      kind: 'none'
+      reason: string
+      /**
+       * The completeness state this absence reads as. A session with no family
+       * is not a family with zero captures; carrying the state here keeps the
+       * two from being printed as the same thing.
+       */
+      state: 'no-captures'
+    }
 
 /**
  * The decision, as a pure function so it can be read and tested without a
  * session.
  *
- * `familyRootSessionId` is the root the session resolved to; `familyFileExists`
- * reports whether a family file actually exists for it. A session whose root is
- * itself and has no family file is alone, even though the resolver returns a
- * value for it.
+ * `familyRootSessionId` is the root the session resolved to - its family
+ * membership, from the live family snapshot or from the pointer it wrote on its
+ * way in. `familyFileExists` reports whether a family file actually exists for
+ * it, which is what disambiguates a root from a session that stands alone: the
+ * resolver answers with the session's own id in both cases, and only the file
+ * makes that id a family.
  */
 export function captureFamilyFor(input: {
   selfSessionId: string
@@ -36,12 +49,16 @@ export function captureFamilyFor(input: {
     return { kind: 'family', familyId: input.familyRootSessionId }
   }
   if (input.familyFileExists) return { kind: 'family', familyId: input.selfSessionId }
-  return { kind: 'unfiled', reason: 'this session belongs to no family' }
+  return {
+    kind: 'none',
+    reason: 'this session belongs to no family',
+    state: 'no-captures',
+  }
 }
 
 export type SafeCaptureOutcome =
   | { ok: true; familyId: string; result: unknown }
-  | { ok: false; reason: 'unfiled'; message: string }
+  | { ok: false; reason: 'no-family'; state: 'no-captures'; note: string }
   | { ok: false; reason: 'failed'; message: string }
 
 /**
@@ -59,7 +76,11 @@ export async function captureSessionSafely(input: {
   } catch (error) {
     return { ok: false, reason: 'failed', message: `cannot resolve the capture family: ${(error as Error).message}` }
   }
-  if (family.kind === 'unfiled') return { ok: false, reason: 'unfiled', message: family.reason }
+  if (family.kind === 'none') {
+    // Not a success with zero rows: nothing was captured because nothing owns
+    // the span, and the caller must be able to say which of those it is.
+    return { ok: false, reason: 'no-family', state: family.state, note: family.reason }
+  }
   try {
     return { ok: true, familyId: family.familyId, result: await input.run(family.familyId) }
   } catch (error) {

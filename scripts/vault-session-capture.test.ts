@@ -16,10 +16,15 @@ test('a session that owns a family files under itself', () => {
   assert.deepEqual(result, { kind: 'family', familyId: 'root-1' })
 })
 
-test('a session with no family is unfiled, never a synthetic bucket', () => {
+test('a session with no family captures nothing, and says so in the completeness vocabulary', () => {
+  // §12.16: no synthetic bucket. The resolver answers with the session's own id
+  // when it stands alone, so the absent family file is the whole discriminator.
   const result = captureFamilyFor({ selfSessionId: 'plain', familyRootSessionId: 'plain', familyFileExists: false })
-  assert.equal(result.kind, 'unfiled')
-  assert.match(result.kind === 'unfiled' ? result.reason : '', /belongs to no family/)
+  assert.equal(result.kind, 'none')
+  if (result.kind === 'none') {
+    assert.match(result.reason, /belongs to no family/)
+    assert.equal(result.state, 'no-captures', 'absence must not print as a healthy zero')
+  }
 })
 
 test('a capture failure is reported and never thrown into the caller', async () => {
@@ -31,7 +36,7 @@ test('a capture failure is reported and never thrown into the caller', async () 
   })
   assert.equal(failed.ok, false)
   assert.equal(failed.ok === false ? failed.reason : '', 'failed')
-  assert.match(failed.ok === false ? failed.message : '', /vault is on fire/)
+  assert.match(failed.ok === false && failed.reason === 'failed' ? failed.message : '', /vault is on fire/)
 
   const unresolved = await captureSessionSafely({
     resolve: async () => {
@@ -42,12 +47,17 @@ test('a capture failure is reported and never thrown into the caller', async () 
   assert.equal(unresolved.ok, false)
   assert.equal(unresolved.ok === false ? unresolved.reason : '', 'failed')
 
-  const unfiled = await captureSessionSafely({
-    resolve: async () => ({ kind: 'unfiled', reason: 'no family' }),
+  const homeless = await captureSessionSafely({
+    resolve: async () => ({ kind: 'none', reason: 'no family', state: 'no-captures' }),
     run: async () => 'unused',
   })
-  assert.equal(unfiled.ok, false)
-  assert.equal(unfiled.ok === false ? unfiled.reason : '', 'unfiled')
+  assert.equal(homeless.ok, false)
+  if (homeless.ok === false && homeless.reason === 'no-family') {
+    assert.equal(homeless.state, 'no-captures')
+    assert.match(homeless.note, /no family/)
+  } else {
+    assert.fail('a session with no family must report no-family, not a failed write')
+  }
 })
 
 test('a successful capture returns the family it wrote under', async () => {
