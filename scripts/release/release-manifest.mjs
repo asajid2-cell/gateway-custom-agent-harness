@@ -63,7 +63,14 @@ async function collect(base, prefix = '') {
 const files = await collect(directory)
 if (files.length === 0) fail(`no files under ${directory}`)
 
-const version = arg('version') ?? (/gateway-(\d+\.\d+\.\d+[^/]*)-/.exec(files.map(file => file.file).join(' '))?.[1] ?? 'unversioned')
+// The version is required rather than inferred. The names are ambiguous by
+// design: installers carry the numeric version (`gateway-1.0.0-darwin-arm64
+// .pkg`) and archives carry the full one (`gateway-1.0.0-research-linux-x64
+// .tar.gz`), so any inference silently picks whichever file sorts first. The
+// old fallback was worse than ambiguous - it joined every name into one string
+// and reported "1.0.0-research-linux-x64.tar.gz gateway-1.0.0-research-win32".
+const version = arg('version')
+if (!version) fail('--version is required (the artifact names carry two different versions: numeric and full)')
 
 // The install trees carry the only statement about whether the artifact is
 // self-contained; quote it rather than inferring from the file name.
@@ -102,10 +109,12 @@ if (existsSync(manifestsDirectory)) {
 }
 trees.sort((a, b) => `${a.platform}-${a.arch}`.localeCompare(`${b.platform}-${b.arch}`))
 
+// No timestamp: two runs over the same directory must produce the same bytes,
+// or the manifest cannot be diffed between builds and a checksum comparison
+// says nothing. Version, source SHA and the per-file hashes identify the build.
 const manifest = {
   name: 'Gateway',
   version,
-  generatedAt: new Date().toISOString(),
   files,
   trees,
 }
