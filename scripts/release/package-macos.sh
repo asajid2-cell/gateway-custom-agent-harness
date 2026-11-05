@@ -50,6 +50,9 @@ cat > "$WORK/scripts/postinstall" <<'POSTINSTALL'
 #!/bin/sh
 set -e
 chmod 0755 /usr/local/gateway/scripts/cc /usr/local/gateway/runtime/bun 2>/dev/null || true
+# /usr/local/bin is not guaranteed to exist on a fresh machine, and the links
+# belong to postinstall rather than the payload so pkgutil does not own them.
+mkdir -p /usr/local/bin
 ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc
 ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/gateway
 exit 0
