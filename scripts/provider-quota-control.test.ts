@@ -7,8 +7,15 @@ import { render, useInput } from '../src/ink.ts'
 import instances from '../src/ink/instances.ts'
 import { ProviderQuotaControl } from '../src/components/PromptInput/PromptInputFooter.tsx'
 import type { ProviderName, ProviderQuota } from '../src/utils/bottomBarUsage.ts'
+import chalk from 'chalk'
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+// The underline row reads an SGR sequence, and a runner without a TTY resolves
+// chalk to level 0, where no SGR is emitted at all - the row then fails on the
+// host's colour detection rather than on the control. Pin the level so the
+// assertion tests the renderer.
+chalk.level = 1
 
 // Ink renders on its own frame clock, and that clock slows sharply when the
 // suite runs beside other files. A fixed sleep is a race, not a wait: under load
