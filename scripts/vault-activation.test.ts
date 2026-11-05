@@ -1047,3 +1047,215 @@ test('a creation failure is reported on the admission, not thrown', async () => 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+// --- a duplicate admission that supplies the turn ---------------------------
+//
+// A duplicate is the same admission, not a closed one. If the first call named
+// no turn (or its creation failed), a later call that does name one is the
+// first evaluation of that turn and must record it. The repair is an
+// `admission_update` folded onto the base row, never a rewrite of it.
+
+const DECISION_TURN = { text: "we're going with build 30" }
+
+async function records(root: string): Promise<Array<Record<string, unknown>>> {
+  return readRotationRecords(root, FAMILY)
+}
+
+test('a duplicate that supplies the turn writes the obligation and an update, not a second admission', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+    })
+    assert.equal(first.ok, true)
+    assert.equal(first.ok ? first.obligation_id : 'x', undefined, 'no turn, nothing owed')
+    assert.deepEqual(await obligationRows(root), [])
+
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok, true)
+    assert.equal(retry.ok ? retry.duplicate : '', true, 'it is the same admission')
+    assert.equal(retry.ok ? retry.created : undefined, true, 'this call wrote the row')
+    assert.equal(retry.ok ? retry.obligation_id : '', obligationIdFor(FAMILY, 'sess-1', 't1'))
+    assert.deepEqual((await obligationRows(root)).map(row => row.obligation_id), [
+      obligationIdFor(FAMILY, 'sess-1', 't1'),
+    ])
+
+    const all = await records(root)
+    const invocationId = retry.ok ? retry.invocation_id : ''
+    const admissions = all.filter(record => record.kind === 'admission' && record.invocation_id === invocationId)
+    assert.equal(admissions.length, 1, 'the base admission is not rewritten or duplicated')
+    assert.equal(admissions[0]?.obligation_id, undefined, 'the base row keeps what was decided at admission time')
+    const updates = all.filter(record => record.kind === 'admission_update')
+    assert.equal(updates.length, 1, 'one update records the repair')
+    assert.deepEqual(
+      { invocation_id: updates[0]?.invocation_id, obligation_id: updates[0]?.obligation_id },
+      { invocation_id: retry.ok ? retry.invocation_id : '', obligation_id: obligationIdFor(FAMILY, 'sess-1', 't1') },
+      'the update names the obligation pair and nothing that would re-decide the admission',
+    )
+    assert.equal(updates[0]?.gate, undefined)
+    assert.equal(updates[0]?.generation_id, undefined)
+    assert.equal(updates[0]?.would_refuse, undefined)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a retry of an admission that already has its obligation writes no update', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(first.ok ? first.obligation_id : '', obligationIdFor(FAMILY, 'sess-1', 't1'))
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok ? retry.obligation_id : '', obligationIdFor(FAMILY, 'sess-1', 't1'))
+    assert.equal(retry.ok ? retry.created : true, undefined, 'nothing was written by the retry')
+    assert.equal((await records(root)).filter(record => record.kind === 'admission_update').length, 0)
+    assert.equal((await obligationRows(root)).length, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a retry of a stored creation error writes the row and the folded view drops the error', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const obligationId = obligationIdFor(FAMILY, 'sess-1', 't1')
+    // The failed first attempt left a durable admission carrying its error.
+    await appendRotationDecision(root, FAMILY, () => ({
+      kind: 'admission',
+      generation_id: 'gen-1',
+      invocation_id: `inv:${obligationId.slice(3)}`,
+      ordinal: 1,
+      driver_session_id: 'sess-1',
+      turn_boundary: 't1',
+      boundary_source: 'explicit',
+      gate: 'monitor',
+      obligation_error: 'the vault was read-only',
+    }))
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok, true)
+    assert.equal(retry.ok ? retry.obligation_id : '', obligationId)
+    assert.equal(retry.ok ? retry.obligation_error : 'still there', undefined, 'the pair is replaced, not merged')
+    assert.equal(retry.ok ? retry.created : undefined, true)
+    const [row] = await readObligations(root, FAMILY)
+    assert.equal(row?.obligation_id, obligationId)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a retry whose creation fails again appends nothing and reports the new error', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+    })
+    // A directory where the queue should be makes the append fail again.
+    await mkdir(path.join(root, 'families', FAMILY, 'obligations.jsonl'), { recursive: true })
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok, true)
+    assert.equal(retry.ok ? retry.obligation_id : 'x', undefined)
+    assert.ok((retry.ok ? retry.obligation_error : '')?.length)
+    assert.equal((await records(root)).filter(record => record.kind === 'admission_update').length, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an admission_update moves none of the three counters the rotation protocol reads', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+    })
+    assert.equal(first.ok ? first.ordinal : 0, 1)
+    const before = {
+      generation: await activeGeneration(root, FAMILY),
+      pending: rotationPending(await records(root)),
+      digest: await rotationDigest(root),
+    }
+
+    const retry = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't1',
+      mode: 'monitor',
+      turn: DECISION_TURN,
+    })
+    assert.equal(retry.ok ? retry.created : undefined, true)
+
+    assert.equal(await activeGeneration(root, FAMILY), before.generation, 'an update is not a generation')
+    assert.equal(rotationPending(await records(root)), before.pending, 'an update is not a rotation intent')
+    assert.notEqual(await rotationDigest(root), before.digest, 'the file did change; it just changed nothing the protocol reads')
+
+    // The ordinal is still "how many admissions exist": the next activation is
+    // the second, not the third.
+    const next = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 't2',
+      mode: 'monitor',
+    })
+    assert.equal(next.ok ? next.ordinal : 0, 2)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

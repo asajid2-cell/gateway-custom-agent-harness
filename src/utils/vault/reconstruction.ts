@@ -257,8 +257,14 @@ async function checkCharter(
     fail('charter has no root_session_id')
   }
   if (typeof charter.generation_id === 'string' && charter.generation_id !== '') {
+    // Filter before adding: a record that names no generation (a notice, an
+    // admission update) contributes nothing by construction. Relying on an
+    // absent field never equalling a present one is a coincidence of types, not
+    // an invariant, and a set should not carry a value that means "no value".
     const generations = new Set(
-      (await readRotationRecords(vaultRoot, familyId)).map(record => record.generation_id),
+      (await readRotationRecords(vaultRoot, familyId))
+        .map(record => record.generation_id)
+        .filter((id): id is string => typeof id === 'string'),
     )
     if (!generations.has(charter.generation_id)) {
       fail(`charter names generation ${charter.generation_id}, which no admission in this family recorded`)

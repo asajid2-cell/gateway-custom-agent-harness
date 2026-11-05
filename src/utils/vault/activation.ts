@@ -8,7 +8,13 @@ import {
   type RotationRecord,
 } from './journal.js'
 import { eligibleActions, type EligibleActionKind } from './eligibleActions.js'
-import { obligationBacklog, readObligations, recordObligationLocked, type ObligationBacklog } from './obligations.js'
+import {
+  obligationBacklog,
+  readObligations,
+  recordObligation,
+  recordObligationLocked,
+  type ObligationBacklog,
+} from './obligations.js'
 import { verifyReconstruction, writeCharter } from './reconstruction.js'
 
 /**
@@ -103,6 +109,12 @@ export type ActivationAdmitted = {
   backlog?: { pending: number; overdue: number; max_pending: number | null }
   /** The obligation this admission created; absent when the turn owed none. */
   obligation_id?: string
+  /**
+   * True when this call is the one that wrote the obligation record - as
+   * opposed to finding it already written, or finding a stored creation error.
+   * Absent otherwise.
+   */
+  created?: boolean
   /**
    * A creation failure is reported, never thrown, and never un-admits: the
    * admission is already durable, and the id is derived, so a later evaluation
@@ -289,6 +301,7 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
   const boundarySource = request.boundarySource ?? 'explicit'
   const rotationEvery = request.rotationEvery && request.rotationEvery > 0 ? request.rotationEvery : 5
   const obligationKind = obligationKindFor(request)
+  const obligationSourceMessageId = request.turn?.sourceMessageId
   const invocationId =
     request.invocationId?.trim() || invocationIdFor(familyId, driverSessionId, request.turnBoundary)
 
@@ -306,23 +319,17 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
   // on, and it must not count a second time.
   const existing = await findAdmission(vaultRoot, familyId, invocationId)
   if (existing) {
-    return {
-      ok: true,
-      family_id: familyId,
-      invocation_id: invocationId,
-      ordinal: Number(existing.ordinal ?? 0),
-      generation_id: String(existing.generation_id ?? ''),
-      driver_session_id: String(existing.driver_session_id ?? driverSessionId),
-      duplicate: true,
-      gate: mode,
-      would_refuse: null,
-      turn_boundary: String(existing.turn_boundary ?? request.turnBoundary),
-      boundary_source: (existing.boundary_source as 'explicit' | 'default' | undefined) ?? boundarySource,
-      rotation_intent: false,
-      ...(typeof existing.obligation_id === 'string' ? { obligation_id: existing.obligation_id } : {}),
-      ...(typeof existing.obligation_error === 'string' ? { obligation_error: existing.obligation_error } : {}),
-      at: String(existing.at ?? ''),
-    }
+    return duplicateAdmission(existing, {
+      vaultRoot,
+      familyId,
+      invocationId,
+      driverSessionId,
+      turnBoundary: request.turnBoundary,
+      boundarySource,
+      mode,
+      obligationKind,
+      sourceMessageId: request.turn?.sourceMessageId,
+    })
   }
 
   const generation = await activeGeneration(vaultRoot, familyId)
@@ -356,6 +363,7 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
       rotationEvery,
       wouldRefuse: 'rotation-pending',
       obligationKind,
+      obligationSourceMessageId,
     })
   }
 
@@ -377,6 +385,7 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
       rotationEvery,
       wouldRefuse: reason,
       obligationKind,
+      obligationSourceMessageId,
     })
   }
 
@@ -406,6 +415,7 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
         rotationEvery,
         wouldRefuse: 'obligation-backlog',
         obligationKind,
+        obligationSourceMessageId,
         backlog: { pending: backlog.pending, overdue: backlog.overdue, max_pending: backlog.maxPending },
       })
     }
@@ -423,19 +433,129 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
     rotationEvery,
     wouldRefuse: null,
     obligationKind,
+    obligationSourceMessageId,
   })
 }
 
+/**
+ * The admission a retry should answer with, including any later update.
+ *
+ * An `admission_update` carries the obligation fields a retry managed to write,
+ * and it is keyed on the base row's `invocation_id`. It is folded here rather
+ * than written back into the admission: the admission is the record of what was
+ * decided, and the update is the record of the obligation that decision later
+ * produced. The replacement is a pair - the update's obligation fields replace
+ * the base row's wholesale - so a successful retry clears a stored error; it
+ * never leaves an id and an error describing the same attempt.
+ */
 async function findAdmission(
   vaultRoot: string,
   familyId: string,
   invocationId: string,
 ): Promise<RotationRecord | null> {
   const records = await readRotationRecords(vaultRoot, familyId)
+  let base: RotationRecord | null = null
+  let update: RotationRecord | null = null
   for (const record of records) {
-    if (record.kind === 'admission' && record.invocation_id === invocationId) return record
+    if (record.invocation_id !== invocationId) continue
+    if (record.kind === 'admission') {
+      if (!base) base = record
+    } else if (record.kind === 'admission_update' && typeof record.obligation_id === 'string') {
+      update = record
+    }
   }
-  return null
+  if (!base) return null
+  if (!update) return base
+  const merged: RotationRecord = { ...base, obligation_id: update.obligation_id }
+  delete merged.obligation_error
+  return merged
+}
+
+type DuplicateContext = {
+  vaultRoot: string
+  familyId: string
+  invocationId: string
+  driverSessionId: string
+  turnBoundary: string
+  boundarySource: 'explicit' | 'default'
+  mode: 'monitor' | 'enforce'
+  obligationKind: EligibleActionKind | null
+  sourceMessageId?: string
+}
+
+/**
+ * Answer a duplicate admission, repairing a missing obligation if this call is
+ * the one that supplies the turn.
+ *
+ * A duplicate is the same admission, not a closed one: if no obligation was
+ * ever created for that turn, the retry is the first evaluation and must record
+ * it - the alternative is a turn that is admitted and never owed. The id is
+ * derived from (family, driver, turn), so the retry writes the same record the
+ * first attempt would have; it is a repair of a lost write, not a second
+ * obligation. The admission row is never rewritten: the repair is an
+ * `admission_update` keyed on its invocation id, appended only after the
+ * obligation exists, and it carries the obligation pair and nothing else.
+ */
+async function duplicateAdmission(
+  existing: RotationRecord,
+  ctx: DuplicateContext,
+): Promise<ActivationAdmitted> {
+  let obligationId = typeof existing.obligation_id === 'string' ? existing.obligation_id : undefined
+  let obligationError = typeof existing.obligation_error === 'string' ? existing.obligation_error : undefined
+  let createdNow = false
+  // A stored error is retried too: it says the write failed, not that the turn
+  // owes nothing, and the id it would have written is still derivable.
+  if (obligationId === undefined && ctx.obligationKind !== null) {
+    try {
+      const created = await recordObligation({
+        vaultRoot: ctx.vaultRoot,
+        familyId: ctx.familyId,
+        driverSessionId: ctx.driverSessionId,
+        turnBoundary: String(existing.turn_boundary ?? ctx.turnBoundary),
+        kind: ctx.obligationKind,
+        createdAt: new Date().toISOString(),
+        sourceMessageId: ctx.sourceMessageId,
+      })
+      if (created.ok) {
+        // The link is recorded whenever the obligation is known to exist, not
+        // only when this call wrote it: a crash between the two writes would
+        // otherwise leave a durable obligation that no admission ever names,
+        // and the next retry sees `duplicate` and would never repair the link.
+        await appendRotationDecision(ctx.vaultRoot, ctx.familyId, records => {
+          const already = records.some(
+            record => record.kind === 'admission_update' && record.invocation_id === ctx.invocationId,
+          )
+          if (already) return null
+          return { kind: 'admission_update', invocation_id: ctx.invocationId, obligation_id: created.obligation_id }
+        })
+        createdNow = !created.duplicate
+        obligationId = created.obligation_id
+        obligationError = undefined
+      } else {
+        obligationError = created.message
+      }
+    } catch (error) {
+      obligationError = (error as Error).message
+    }
+  }
+  return {
+    ok: true,
+    family_id: ctx.familyId,
+    invocation_id: ctx.invocationId,
+    ordinal: Number(existing.ordinal ?? 0),
+    generation_id: String(existing.generation_id ?? ''),
+    driver_session_id: String(existing.driver_session_id ?? ctx.driverSessionId),
+    duplicate: true,
+    gate: ctx.mode,
+    would_refuse: null,
+    turn_boundary: String(existing.turn_boundary ?? ctx.turnBoundary),
+    boundary_source: (existing.boundary_source as 'explicit' | 'default' | undefined) ?? ctx.boundarySource,
+    rotation_intent: false,
+    ...(obligationId !== undefined ? { obligation_id: obligationId } : {}),
+    ...(obligationError !== undefined ? { obligation_error: obligationError } : {}),
+    ...(createdNow ? { created: true } : {}),
+    at: String(existing.at ?? ''),
+  }
 }
 
 type Admitting = {
@@ -517,22 +637,33 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
   })
   if (appended.length === 0) {
     const existing = await findAdmission(input.vaultRoot, input.familyId, input.invocationId)
+    if (existing) {
+      return duplicateAdmission(existing, {
+        vaultRoot: input.vaultRoot,
+        familyId: input.familyId,
+        invocationId: input.invocationId,
+        driverSessionId: input.driverSessionId,
+        turnBoundary: input.turnBoundary,
+        boundarySource: input.boundarySource,
+        mode: input.mode,
+        obligationKind: input.obligationKind,
+        sourceMessageId: input.obligationSourceMessageId,
+      })
+    }
     return {
       ok: true,
       family_id: input.familyId,
       invocation_id: input.invocationId,
-      ordinal: Number(existing?.ordinal ?? 0),
-      generation_id: String(existing?.generation_id ?? input.generation),
-      driver_session_id: String(existing?.driver_session_id ?? input.driverSessionId),
+      ordinal: 0,
+      generation_id: input.generation,
+      driver_session_id: input.driverSessionId,
       duplicate: true,
       gate: input.mode,
       would_refuse: null,
-      turn_boundary: String(existing?.turn_boundary ?? input.turnBoundary),
-      boundary_source: (existing?.boundary_source as 'explicit' | 'default' | undefined) ?? input.boundarySource,
+      turn_boundary: input.turnBoundary,
+      boundary_source: input.boundarySource,
       rotation_intent: false,
-      ...(typeof existing?.obligation_id === 'string' ? { obligation_id: existing.obligation_id } : {}),
-      ...(typeof existing?.obligation_error === 'string' ? { obligation_error: existing.obligation_error } : {}),
-      at: String(existing?.at ?? ''),
+      at: '',
     }
   }
   const row = appended[0]!

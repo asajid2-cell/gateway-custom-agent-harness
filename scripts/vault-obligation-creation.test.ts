@@ -37,11 +37,10 @@ const FAMILY = 'fam-htv'
 /**
  * Cases whose assertions cannot pass until a named commit lands. Kept explicit
  * so the set can only shrink: the fixture-integrity test asserts this exact
- * map, so a new skip cannot be added quietly.
+ * map, so a new skip cannot be added quietly. Empty now: the retry landed in
+ * the post-cut commit and cr-13 is green.
  */
-const PENDING: Record<string, string> = {
-  'cr-13': 'the retry ruling: a duplicate admission that supplies the turn must create. Held behind the release freeze at be49df8; lands immediately after the artifact digests.',
-}
+const PENDING: Record<string, string> = {}
 
 type Call = {
   driver_session_id: string
@@ -146,7 +145,7 @@ test('the creation fixture is the one that was pinned, and the pending set is ex
   assert.equal(createHash('sha256').update(bytes).digest('hex'), FIXTURE_SHA256)
   const table = await cases()
   assert.equal(table.length, 13)
-  assert.deepEqual(Object.keys(PENDING), ['cr-13'], 'a case may only be pending for a named commit')
+  assert.deepEqual(Object.keys(PENDING), [], 'a case may only be pending for a named commit')
   assert.ok(table.some(entry => entry.case_id === 'cr-13' && entry.retry), 'the retry case must stay in the table')
 })
 
@@ -209,6 +208,28 @@ test('every creation case behaves as the fixture says', async () => {
             result.ok && typeof result.obligation_error === 'string' && result.obligation_error.length > 0,
             `${entry.case_id}: obligation_error must be reported`,
           )
+        }
+      }
+
+      if (entry.retry) {
+        // The retry is the same seam called a second time, after the first call
+        // has already recorded its admission. It runs before the file and fold
+        // assertions because its whole point is what those files then contain.
+        const result = await runSeam(root, entry.retry)
+        assert.equal(result.ok, true, `${entry.case_id}: the retry is a duplicate admission, not a refusal`)
+        const expectRetry = entry.expect.retry_result ?? {}
+        if (expectRetry.obligation_id === 'absent') {
+          assert.equal(result.obligation_id, undefined, `${entry.case_id}: the retry must not create`)
+        } else if (typeof expectRetry.obligation_id === 'string') {
+          assert.equal(result.obligation_id, expectRetry.obligation_id, `${entry.case_id}: retry obligation id`)
+        }
+        if (expectRetry.created === true) {
+          assert.equal(result.created, true, `${entry.case_id}: the retry must report it wrote the row`)
+        }
+        // The fixture calls the duplicate flag `duplicate_admission`; the seam
+        // has one duplicate notion and calls it `duplicate`.
+        if (expectRetry.duplicate_admission === true) {
+          assert.equal(result.duplicate, true, `${entry.case_id}: the retry must be the same admission`)
         }
       }
 
