@@ -3348,6 +3348,10 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // because every attempt starts from a proven-empty or proven-matching field.
   let composed = false
   for (let attempt = 1; attempt <= 3 && !composed; attempt++) {
+    // Keyboard input goes to the focused window. A lane's window sits behind
+    // the master's, so without this every pass types into a window that will
+    // not take the keystrokes and the turn is refused as "not-posted".
+    await page.bringToFront().catch(() => {})
     composed = await railed(composeExactlyOnce(page, composer, text, (label, ms) => log(`phase ${phaseName}${attempt > 1 ? ` retry${attempt}` : ''} ${label} ${ms}ms`)), acceptDeadline, sendDeadlineNotPosted)
     if (!composed && attempt < 3) await new Promise(resolve => setTimeout(resolve, 1_000))
   }
