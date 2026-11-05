@@ -1092,6 +1092,11 @@ test('a duplicate that supplies the turn writes the obligation and an update, no
     assert.deepEqual((await obligationRows(root)).map(row => row.obligation_id), [
       obligationIdFor(FAMILY, 'sess-1', 't1'),
     ])
+    assert.equal(
+      (await obligationRows(root))[0]?.created_at,
+      first.ok ? first.at : '',
+      'dated when the turn was owed, not when the write was repaired',
+    )
 
     const all = await records(root)
     const invocationId = retry.ok ? retry.invocation_id : ''
@@ -1176,6 +1181,8 @@ test('a retry of a stored creation error writes the row and the folded view drop
     assert.equal(retry.ok ? retry.created : undefined, true)
     const [row] = await readObligations(root, FAMILY)
     assert.equal(row?.obligation_id, obligationId)
+    const admission = (await records(root)).find(record => record.kind === 'admission' && record.invocation_id === `inv:${obligationId.slice(3)}`)
+    assert.equal(row?.created_at, admission?.at, 'the repair keeps the admission clock, not the retry clock')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

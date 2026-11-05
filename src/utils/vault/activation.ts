@@ -513,7 +513,12 @@ async function duplicateAdmission(
         driverSessionId: ctx.driverSessionId,
         turnBoundary: String(existing.turn_boundary ?? ctx.turnBoundary),
         kind: ctx.obligationKind,
-        createdAt: new Date().toISOString(),
+        // Dated when the turn was owed, not when the write was repaired. A
+        // lost write fixed an hour later must show that hour; stamping the
+        // retry clock would make the worst failures look the freshest, and
+        // `overdueHours` would measure the repair instead of the debt. The
+        // base row's `at` is the admission's own time and is already in hand.
+        createdAt: String(existing.at ?? ''),
         sourceMessageId: ctx.sourceMessageId,
       })
       if (created.ok) {

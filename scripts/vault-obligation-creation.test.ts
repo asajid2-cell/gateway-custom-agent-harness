@@ -13,6 +13,7 @@ import {
   obligationsPath,
   readObligations,
   recordObligation,
+  summarizeObligations,
   type ObligationCreationInput,
 } from '../src/utils/vault/obligations.js'
 
@@ -23,14 +24,13 @@ import {
  * `Z:\328\CMPUT328-A2\codexworks\301\sndo\fixtures\obligation-creation.jsonl`
  * on 2026-11-05, pinned by sha256. Rows are never edited to match the code.
  *
- * Revision 2 adds the two refusal classes (backlog with its presupposed rows,
- * unknown family with a genuinely absent file), restores exact folds now that
- * the fold carries the id's preimage fields, and adds cr-13, the retry case.
- * cr-13 needs a code change that is held behind the release freeze; see the
- * PENDING map. Nothing in this file is relaxed - a case either runs or is
- * named as pending with the commit it waits for.
+ * Revision 3 adds cr-14: a repaired obligation is dated when it was owed, not
+ * when it was repaired, so a lost write shows its lag instead of improving the
+ * metric. It runs against `createdAt` taken from the admission's own `at`.
+ * Nothing in this file is relaxed - a case either runs or is named as pending
+ * with the commit it waits for.
  */
-const FIXTURE_SHA256 = '6e00d2e7de5a8e91289503ef2edcd6ea0dffbce8b9cec33e8b479599a29913fa'
+const FIXTURE_SHA256 = '9984633f64ce0839cb1c319af7840e138772698a42b3cc296e206d877b304260'
 const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'obligation-creation.jsonl')
 const FAMILY = 'fam-htv'
 
@@ -69,6 +69,10 @@ type Case = {
   calls?: Call[]
   seam?: Seam
   retry?: Seam
+  /** Pins the admission's own time so a case is about the rule, not the wall clock. */
+  clock?: { admission_at: string; retry_at: string }
+  as_of?: string
+  overdue_hours?: number
   ids?: { family_id: string; driver_session_id: string; turn_boundary: string; obligation_id: string; invocation_id: string }
   expect: {
     calls?: Array<Record<string, unknown>>
@@ -81,6 +85,8 @@ type Case = {
     seam?: { admitted?: boolean; reason?: string; would_refuse?: string | null }
     seam_result?: Record<string, unknown>
     retry_result?: Record<string, unknown>
+    pending?: string[]
+    overdue?: string[]
     relation?: string
     record_has_family_id?: boolean
   }
@@ -144,7 +150,7 @@ test('the creation fixture is the one that was pinned, and the pending set is ex
   const bytes = await readFile(FIXTURE)
   assert.equal(createHash('sha256').update(bytes).digest('hex'), FIXTURE_SHA256)
   const table = await cases()
-  assert.equal(table.length, 13)
+  assert.equal(table.length, 14)
   assert.deepEqual(Object.keys(PENDING), [], 'a case may only be pending for a named commit')
   assert.ok(table.some(entry => entry.case_id === 'cr-13' && entry.retry), 'the retry case must stay in the table')
 })
@@ -209,6 +215,20 @@ test('every creation case behaves as the fixture says', async () => {
             `${entry.case_id}: obligation_error must be reported`,
           )
         }
+      }
+
+      if (entry.clock) {
+        // The seam stamps a real admission with the wall clock, so a case about
+        // which clock a repair reads cannot be written against it directly.
+        // Pinning the admission's own `at` is enough: the repair is supposed to
+        // take that value, and the retry's clock is never consulted.
+        const rotationPath = path.join(root, 'families', family, 'rotation.jsonl')
+        const pinned = (await readFile(rotationPath, 'utf8'))
+          .split('\n')
+          .filter(line => line.trim() !== '')
+          .map(line => JSON.parse(line) as Record<string, unknown>)
+          .map(record => (record.kind === 'admission' ? { ...record, at: entry.clock!.admission_at } : record))
+        await writeFile(rotationPath, `${pinned.map(record => JSON.stringify(record)).join('\n')}\n`)
       }
 
       if (entry.retry) {
@@ -281,6 +301,22 @@ test('every creation case behaves as the fixture says', async () => {
           entry.expect.fold_omits,
         )
         assert.deepEqual(actual, omit(entry.expect.fold, entry.expect.fold_omits), `${entry.case_id}: fold`)
+      }
+      if (entry.expect.pending || entry.expect.overdue) {
+        // The rule, not just the field: the same fold the metric reads is asked
+        // what is open at `as_of`. A repaired row dated by the retry clock can
+        // still carry the right id and read as fresh, which is the failure this
+        // assertion exists to catch.
+        const summary = summarizeObligations(await readObligations(root, family), {
+          asOf: entry.as_of,
+          overdueHours: entry.overdue_hours,
+        })
+        if (entry.expect.pending) {
+          assert.deepEqual(summary.pending.map(row => row.obligation_id), entry.expect.pending, `${entry.case_id}: pending`)
+        }
+        if (entry.expect.overdue) {
+          assert.deepEqual(summary.overdue.map(row => row.obligation_id), entry.expect.overdue, `${entry.case_id}: overdue`)
+        }
       }
     } catch (error) {
       failures.push(`${entry.case_id} (${entry.title}): ${(error as Error).message}`)
