@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { admitGeneration } from '../src/utils/vault/journal.js'
+import { submitProposals } from '../src/utils/vault/submit.js'
 import {
   captureCompleteness,
   capturePointer,
@@ -112,6 +113,46 @@ test('marking a capture that was never recorded is refused', async () => {
     const result = await markCaptured({ vaultRoot: root, familyId: FAMILY, captureId: 'cap:nope', eventId: 'evt-1' })
     assert.equal(result.ok, false)
     assert.equal(result.ok === false ? result.reason : '', 'unknown-capture')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a commit that cites a span closes the capture, naming the event', async () => {
+  const root = await vault()
+  try {
+    await capturePointer({ vaultRoot: root, familyId: FAMILY, pointer: pointer({ span_sha256: 'sha256:cited' }) })
+    await capturePointer({ vaultRoot: root, familyId: FAMILY, pointer: pointer({ span_sha256: 'sha256:notcited' }) })
+
+    const result = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [
+        {
+          event_id: 'evt-cited',
+          kind: 'decision',
+          topic_id: 'relay',
+          actor: 'sess-1',
+          authority: 'user_ruling',
+          evidence_status: 'direct',
+          summary: 'a decision that cites the recorded span',
+          recorded_at: '2026-11-05T00:00:00.000Z',
+          capture_version: 'scribe-0.1.0',
+          proposed_by: 'sess-1',
+          evidence: [{ message_id: 'msg-1', span_sha256: 'sha256:cited' }],
+        } as never,
+      ],
+    })
+    assert.equal(result.committed.length, 1)
+    assert.equal(result.capturesMarked, 1)
+
+    const entries = await listCaptures(root, FAMILY)
+    const cited = entries.find(entry => entry.span_sha256 === 'sha256:cited')!
+    const untouched = entries.find(entry => entry.span_sha256 === 'sha256:notcited')!
+    assert.equal(cited.captured_by?.event_id, 'evt-cited')
+    assert.equal(untouched.captured_by, undefined, 'an unrelated span stays pending')
+    assert.deepEqual(await captureCompleteness(root, FAMILY), { captured: 1, pending: 1 })
   } finally {
     await rm(root, { recursive: true, force: true })
   }

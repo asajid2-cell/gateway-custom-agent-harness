@@ -9,6 +9,7 @@ import {
   type JournalEvent,
   type ProposedEvent,
 } from './journal.js'
+import { markCapturedBySpans } from './capture.js'
 
 /**
  * The scribe's only way in. A proposal is an opinion; the writer decides.
@@ -44,6 +45,10 @@ export type SubmitResult = {
   /** True when the idempotency key had already been committed. */
   replayed: boolean
   obligationsSatisfied: string[]
+  /** Pending captures whose span a committed event cited, marked by this call. */
+  capturesMarked: number
+  /** A capture-mark failure never un-commits an event; it is reported here. */
+  captureErrors: string[]
 }
 
 const KINDS = new Set([
@@ -162,6 +167,8 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
     watermark: 0,
     replayed: false,
     obligationsSatisfied: [],
+    capturesMarked: 0,
+    captureErrors: [],
   }
   if (!generation) {
     // Absent at the request level is the same refusal as absent per event: a
@@ -176,7 +183,7 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
   }
 
   const key = request.idempotencyKey?.trim()
-  return withVaultLock(dir, async () => {
+  const result = await withVaultLock(dir, async () => {
     if (key) {
       const previous = await findSubmission(submissionsPath(vaultRoot, familyId), key)
       if (previous) {
@@ -188,6 +195,8 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
           watermark: replay.watermark,
           replayed: true,
           obligationsSatisfied: [],
+          capturesMarked: 0,
+          captureErrors: [] as string[],
         }
       }
     }
@@ -255,6 +264,33 @@ export async function submitProposals(request: SubmitRequest): Promise<SubmitRes
       watermark: appended.watermark,
       replayed: false,
       obligationsSatisfied: satisfied,
+      capturesMarked: 0,
+      captureErrors: [] as string[],
     }
   })
+  // The queue join runs after the vault lock is released: the commit is
+  // already durable, and a capture bookkeeping failure must not undo it.
+  if (result.committed.length > 0) {
+    try {
+      for (const event of result.committed) {
+        const evidence = Array.isArray((event as { evidence?: unknown }).evidence)
+          ? ((event as { evidence?: unknown[] }).evidence as unknown[])
+          : []
+        const spans = evidence
+          .map(entry => (entry && typeof entry === 'object' ? (entry as { span_sha256?: unknown }).span_sha256 : undefined))
+          .filter((value): value is string => typeof value === 'string' && value !== '')
+        if (spans.length === 0) continue
+        const marked = await markCapturedBySpans({
+          vaultRoot,
+          familyId,
+          eventId: event.event_id,
+          spanSha256: spans,
+        })
+        result.capturesMarked += marked.marked
+      }
+    } catch (error) {
+      result.captureErrors.push((error as Error).message)
+    }
+  }
+  return result
 }

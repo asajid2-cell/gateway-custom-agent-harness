@@ -215,6 +215,43 @@ export async function listCaptures(
   return filtered.sort((left, right) => left.capture_id.localeCompare(right.capture_id))
 }
 
+/**
+ * Close the loop after a commit: every pending capture whose span a committed
+ * event cites is marked with that event's id.
+ *
+ * Matching is by `span_sha256` only. A message id alone does not prove the span
+ * is the same one, and marking on a weaker match would make the queue claim a
+ * capture that was never verified - the queue's whole value is that its marks
+ * are true. An evidence entry with no span hash therefore marks nothing.
+ */
+export async function markCapturedBySpans(input: {
+  vaultRoot: string
+  familyId: string
+  eventId: string
+  spanSha256: readonly string[]
+}): Promise<{ marked: number }> {
+  const wanted = new Set(input.spanSha256.filter(value => value.trim() !== ''))
+  if (wanted.size === 0) return { marked: 0 }
+  return withVaultLock(join(input.vaultRoot, 'families', input.familyId), async () => {
+    const entries = foldCaptures(await readLines(input.vaultRoot, input.familyId))
+    const pending = [...entries.values()].filter(entry => !entry.captured_by && wanted.has(entry.span_sha256))
+    if (pending.length === 0) return { marked: 0 }
+    const at = new Date().toISOString()
+    await appendLines(
+      input.vaultRoot,
+      input.familyId,
+      pending.map(entry => ({
+        kind: 'captured',
+        capture_id: entry.capture_id,
+        family_id: input.familyId,
+        event_id: input.eventId,
+        at,
+      })),
+    )
+    return { marked: pending.length }
+  })
+}
+
 /** Counts a completeness report needs, without a join. */
 export async function captureCompleteness(
   vaultRoot: string,
