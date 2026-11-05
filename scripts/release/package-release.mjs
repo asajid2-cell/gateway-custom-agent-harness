@@ -145,7 +145,13 @@ if (wantRuntime) {
     }
     const extract = path.join(cache, `${key}-extract`)
     await mkdir(extract, { recursive: true })
-    run(TAR, ['-xf', archive, '-C', extract])
+    // GNU tar cannot read zip (bsdtar can, and is what Windows ships). Use
+    // unzip where it exists so the same script runs on a Linux build host.
+    if (spawnSync('unzip', ['-v'], { encoding: 'utf8' }).status === 0) {
+      run('unzip', ['-q', '-o', archive, '-d', extract])
+    } else {
+      run(TAR, ['-xf', archive, '-C', extract])
+    }
     // The archive nests the binary under a directory named for the target
     // (`bun-windows-x64/bun.exe`, `bun-linux-x64/bun`, ...). Find it rather
     // than predicting the spelling.

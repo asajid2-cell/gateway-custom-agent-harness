@@ -23,18 +23,28 @@ while [ -L "$src" ]; do
 done
 here="$(cd -P -- "$(dirname -- "$src")" && pwd)"
 
-node_bin="${CC_NODE:-}"
-if [ -z "$node_bin" ]; then
-  node_bin="$(command -v node 2>/dev/null || true)"
+# A packaged artifact carries its own runtime, and an install must work on a
+# machine with neither node nor bun on PATH. A source checkout has no runtime/
+# directory, so it resolves node exactly as before.
+runner=""
+if [ -x "$here/../runtime/bun" ]; then
+  runner="$here/../runtime/bun"
 fi
-if [ -z "$node_bin" ]; then
-  for candidate in "$HOME/.local/bin/node" /usr/local/bin/node /opt/homebrew/bin/node; do
-    if [ -x "$candidate" ]; then node_bin="$candidate"; break; fi
-  done
+if [ -z "$runner" ]; then
+  runner="${CC_NODE:-}"
+  runner="${runner:-$(command -v node 2>/dev/null || true)}"
+  if [ -z "$runner" ]; then
+    for candidate in "$HOME/.local/bin/node" /usr/local/bin/node /opt/homebrew/bin/node; do
+      if [ -x "$candidate" ]; then runner="$candidate"; break; fi
+    done
+  fi
 fi
-if [ -z "$node_bin" ]; then
-  echo "cc: node is required for the model gateway and was not found on PATH." >&2
+if [ -z "$runner" ]; then
+  runner="$(command -v bun 2>/dev/null || true)"
+fi
+if [ -z "$runner" ]; then
+  echo "cc: a JavaScript runtime is required; neither the bundled runtime, node, nor bun was found." >&2
   exit 1
 fi
 
-exec "$node_bin" "$here/cc-launcher.mjs" "$@"
+exec "$runner" "$here/cc-launcher.mjs" "$@"
