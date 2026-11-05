@@ -15,6 +15,7 @@ import {
   GATEWAY_MODEL_OPTIONS,
 } from './effort-capabilities.mjs'
 import { relayOpenCodeChatResponse } from './opencode-go.mjs'
+import { getGatewayModelContextWindow } from '../src/utils/model/gatewayModelIds.ts'
 import {
   createMistralRouteCredentials,
   mistralCredentialPool,
@@ -95,6 +96,20 @@ test('Mistral Vibe and Studio are separate picker entries', () => {
   assert.deepEqual(
     GATEWAY_MODEL_ALIAS_MAP['mistral-api/deepseek-v4-1-flash-1017'],
     api,
+  )
+})
+
+test('each Mistral route carries its own accounting window', () => {
+  // The Vibe plan is accounted at 480k; the Studio route gets the model's full
+  // 1M. Auto-compaction derives its trigger from these windows, so the two
+  // routes compact at the same default fraction as every other route.
+  assert.equal(
+    getGatewayModelContextWindow('gateway-mistral-vibe-deepseek-v4.1-flash'),
+    480_000,
+  )
+  assert.equal(
+    getGatewayModelContextWindow('gateway-mistral-api-deepseek-v4.1-flash'),
+    1_048_576,
   )
 })
 
