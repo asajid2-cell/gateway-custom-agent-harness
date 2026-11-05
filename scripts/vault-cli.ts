@@ -7,6 +7,7 @@
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce]
+ *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen> --reconstruction <check.json>
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
  * 2 for a usage error. A submit whose idempotency key is omitted uses the
@@ -23,7 +24,7 @@ import {
   repairTornTail,
   verifyJournal,
 } from '../src/utils/vault/journal.js'
-import { conferDriverAdmission } from '../src/utils/vault/activation.js'
+import { completeRotation, conferDriverAdmission } from '../src/utils/vault/activation.js'
 import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -124,16 +125,38 @@ async function main(): Promise<number> {
     // The same gate `conferDriver` calls, not a second implementation: a headless
     // caller must not be able to reach a weaker door than the interactive one.
     const mode = args.mode === 'enforce' ? 'enforce' : 'monitor'
+    const explicitTurn = typeof args.turn === 'string'
     const result = await conferDriverAdmission({
       vaultRoot,
       familyId: required(args, 'family'),
       driverSessionId: required(args, 'session'),
-      turnBoundary: typeof args.turn === 'string' ? args.turn : 'manual',
+      turnBoundary: explicitTurn ? (args.turn as string) : 'manual',
+      boundarySource: explicitTurn ? 'explicit' : 'default',
       invocationId: typeof args['invocation-id'] === 'string' ? (args['invocation-id'] as string) : undefined,
       mode,
     })
     print(result)
     return result.ok ? 0 : 1
+  }
+
+  if (command === 'rotation-complete') {
+    // The swap cannot be recorded without the reconstruction result: passing a
+    // file is the caller stating that the check ran, and its `ok:false` refuses.
+    const reconstructionPath = required(args, 'reconstruction')
+    const reconstruction = JSON.parse(await readFile(reconstructionPath, 'utf8')) as {
+      ok: boolean
+      checked: string[]
+      reasons?: string[]
+    }
+    const result = await completeRotation({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      fromGeneration: required(args, 'from'),
+      toGeneration: required(args, 'to'),
+      reconstruction,
+    })
+    print(result)
+    return 0
   }
 
   if (command === 'recall') {
@@ -188,7 +211,7 @@ async function main(): Promise<number> {
     return ok ? 0 : 1
   }
 
-  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver> --vault <path> ...')
+  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|rotation-complete> --vault <path> ...')
 }
 
 try {

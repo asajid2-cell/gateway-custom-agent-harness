@@ -45,6 +45,8 @@ export type ActivationRequest = {
   driverSessionId: string
   /** The turn boundary the admission belongs to. Same boundary, same admission. */
   turnBoundary: string
+  /** Whether the caller named that boundary or fell through to the default. */
+  boundarySource?: 'explicit' | 'default'
   /** A caller-supplied id, so a replay can be driven from a script. */
   invocationId?: string
   /**
@@ -53,6 +55,8 @@ export type ActivationRequest = {
    * flipping it to enforce is a deliberate, separate change.
    */
   mode?: 'monitor' | 'enforce'
+  /** Rotate after this many admitted activations. Spec §12.10 default: 5. */
+  rotationEvery?: number
 }
 
 export type ActivationAdmitted = {
@@ -66,6 +70,11 @@ export type ActivationAdmitted = {
   duplicate: boolean
   gate: 'monitor' | 'enforce'
   would_refuse: ActivationReason | null
+  /** The boundary this admission belongs to, and whether the caller named it. */
+  turn_boundary: string
+  boundary_source: 'explicit' | 'default'
+  /** True when this admission was the one that wrote the rotation intent. */
+  rotation_intent: boolean
   at: string
 }
 
@@ -163,6 +172,8 @@ const MESSAGES: Record<ActivationReason, (familyId: string) => string> = {
 export async function conferDriverAdmission(request: ActivationRequest): Promise<ActivationResult> {
   const { vaultRoot, familyId, driverSessionId } = request
   const mode = request.mode ?? 'monitor'
+  const boundarySource = request.boundarySource ?? 'explicit'
+  const rotationEvery = request.rotationEvery && request.rotationEvery > 0 ? request.rotationEvery : 5
   const invocationId =
     request.invocationId?.trim() || invocationIdFor(familyId, driverSessionId, request.turnBoundary)
 
@@ -190,6 +201,9 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
       duplicate: true,
       gate: mode,
       would_refuse: null,
+      turn_boundary: String(existing.turn_boundary ?? request.turnBoundary),
+      boundary_source: (existing.boundary_source as 'explicit' | 'default' | undefined) ?? boundarySource,
+      rotation_intent: false,
       at: String(existing.at ?? ''),
     }
   }
@@ -218,8 +232,11 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
       familyId,
       driverSessionId,
       invocationId,
+      turnBoundary: request.turnBoundary,
+      boundarySource,
       generation,
       mode,
+      rotationEvery,
       wouldRefuse: 'rotation-pending',
     })
   }
@@ -235,13 +252,27 @@ export async function conferDriverAdmission(request: ActivationRequest): Promise
       familyId,
       driverSessionId,
       invocationId,
+      turnBoundary: request.turnBoundary,
+      boundarySource,
       generation,
       mode,
+      rotationEvery,
       wouldRefuse: reason,
     })
   }
 
-  return admit({ vaultRoot, familyId, driverSessionId, invocationId, generation, mode, wouldRefuse: null })
+  return admit({
+    vaultRoot,
+    familyId,
+    driverSessionId,
+    invocationId,
+    turnBoundary: request.turnBoundary,
+    boundarySource,
+    generation,
+    mode,
+    rotationEvery,
+    wouldRefuse: null,
+  })
 }
 
 async function findAdmission(
@@ -261,8 +292,11 @@ type Admitting = {
   familyId: string
   driverSessionId: string
   invocationId: string
+  turnBoundary: string
+  boundarySource: 'explicit' | 'default'
   generation: string
   mode: 'monitor' | 'enforce'
+  rotationEvery: number
   wouldRefuse: ActivationReason | null
 }
 
@@ -280,17 +314,27 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
     const ordinal =
       records.filter(record => record.kind === 'admission' && typeof record.invocation_id === 'string')
         .length + 1
-    return {
+    const row = {
       kind: 'admission',
       generation_id: input.generation,
       invocation_id: input.invocationId,
       ordinal,
       driver_session_id: input.driverSessionId,
+      turn_boundary: input.turnBoundary,
+      boundary_source: input.boundarySource,
       gate: input.mode,
       ...(input.wouldRefuse ? { would_refuse: input.wouldRefuse } : {}),
     }
+    // The fifth admitted activation starts a rotation. The intent is written in
+    // the same critical section as the admission that triggered it: a crash
+    // between them would leave a counted invocation with no intent, and the
+    // counter would silently drift past the threshold.
+    if (ordinal % input.rotationEvery === 0) {
+      return [row, { kind: 'rotation_intent', generation_id: input.generation, invocation_id: input.invocationId, ordinal }]
+    }
+    return row
   })
-  if (!appended) {
+  if (appended.length === 0) {
     const existing = await findAdmission(input.vaultRoot, input.familyId, input.invocationId)
     return {
       ok: true,
@@ -302,19 +346,80 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
       duplicate: true,
       gate: input.mode,
       would_refuse: null,
+      turn_boundary: String(existing?.turn_boundary ?? input.turnBoundary),
+      boundary_source: (existing?.boundary_source as 'explicit' | 'default' | undefined) ?? input.boundarySource,
+      rotation_intent: false,
       at: String(existing?.at ?? ''),
     }
   }
+  const row = appended[0]!
   return {
     ok: true,
     family_id: input.familyId,
     invocation_id: input.invocationId,
-    ordinal: Number(appended.ordinal),
-    generation_id: String(appended.generation_id),
-    driver_session_id: String(appended.driver_session_id),
+    ordinal: Number(row.ordinal),
+    generation_id: String(row.generation_id),
+    driver_session_id: String(row.driver_session_id),
     duplicate: false,
     gate: input.mode,
     would_refuse: input.wouldRefuse,
-    at: String(appended.at),
+    turn_boundary: input.turnBoundary,
+    boundary_source: input.boundarySource,
+    rotation_intent: appended.length > 1,
+    at: String(row.at),
+  }
+}
+
+export type RotationCompletion = {
+  ok: true
+  family_id: string
+  from_generation: string
+  to_generation: string
+  at: string
+}
+
+/**
+ * Record that a rotation finished.
+ *
+ * The swap is a rotation row carrying the new generation, which is what fences
+ * the old one: the writer takes the active generation from the last admission,
+ * rotation or import_admission, so from this row onward every commit stamped
+ * with `fromGeneration` is refused. It refuses to run unless the caller passes
+ * the result of the cold-reconstruction check - a launch is not a proof, so an
+ * unverified swap cannot be expressed here.
+ */
+export async function completeRotation(input: {
+  vaultRoot: string
+  familyId: string
+  toGeneration: string
+  fromGeneration: string
+  reconstruction: { ok: boolean; checked: string[]; reasons?: string[] }
+}): Promise<RotationCompletion> {
+  if (!input.reconstruction.ok) {
+    throw new Error(
+      `rotation refused: the replacement did not reconstruct the family (${(input.reconstruction.reasons ?? []).join('; ') || 'no reason given'})`,
+    )
+  }
+  const records = await readRotationRecords(input.vaultRoot, input.familyId)
+  if (!rotationPending(records)) {
+    throw new Error('rotation refused: there is no pending rotation intent for this family')
+  }
+  const { appended } = await appendRotationDecision(input.vaultRoot, input.familyId, current => {
+    if (!rotationPending(current)) return null
+    return {
+      kind: 'rotation',
+      generation_id: input.toGeneration,
+      from_generation: input.fromGeneration,
+      reconstruction: input.reconstruction,
+    }
+  })
+  const row = appended[0]
+  if (!row) throw new Error('rotation refused: the intent was completed by another writer')
+  return {
+    ok: true,
+    family_id: input.familyId,
+    from_generation: String(row.from_generation),
+    to_generation: String(row.generation_id),
+    at: String(row.at),
   }
 }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
+  completeRotation,
   conferDriverAdmission,
   scribeHealth,
   scribePath,
@@ -299,6 +300,158 @@ test('a driverScope pointer write confers no commit authority', async () => {
     assert.equal(result.rejected.length, 1)
     assert.match(JSON.stringify(result.rejected), /generation/i)
     assert.equal(await activeGeneration(root, FAMILY), 'gen-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+async function fiveAdmissions(root: string): Promise<void> {
+  await seed(root)
+  await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+  for (let turn = 1; turn <= 5; turn += 1) {
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: `turn-${turn}`,
+      mode: 'enforce',
+    })
+    assert.equal(result.ok, true, `admission ${turn} should be admitted`)
+  }
+}
+
+test('the fifth admitted activation writes exactly one rotation intent', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    const records = await readRotationRecords(root, FAMILY)
+    const intents = records.filter(record => record.kind === 'rotation_intent')
+    assert.equal(intents.length, 1)
+    assert.equal(intents[0]?.ordinal, 5)
+    assert.equal(intents[0]?.generation_id, 'gen-1')
+    assert.equal(await activeGeneration(root, FAMILY), 'gen-1', 'the swap has not been recorded yet')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a sixth activation while the intent is unanswered is refused', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    const result = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 'turn-6',
+      mode: 'enforce',
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.ok === false ? result.reason : '', 'rotation-pending')
+    const records = await readRotationRecords(root, FAMILY)
+    assert.equal(
+      records.filter(record => record.kind === 'admission' && typeof record.invocation_id === 'string').length,
+      5,
+      'a refused activation is not counted',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a rotation cannot complete on an unverified reconstruction, and writes nothing when refused', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    const before = await rotationDigest(root)
+    await assert.rejects(
+      completeRotation({
+        vaultRoot: root,
+        familyId: FAMILY,
+        fromGeneration: 'gen-1',
+        toGeneration: 'gen-2',
+        reconstruction: { ok: false, checked: [], reasons: ['charter missing'] },
+      }),
+      /reconstruction|did not reconstruct/i,
+    )
+    assert.equal(await rotationDigest(root), before)
+    assert.equal(await activeGeneration(root, FAMILY), 'gen-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a verified rotation fences the old generation', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    const done = await completeRotation({
+      vaultRoot: root,
+      familyId: FAMILY,
+      fromGeneration: 'gen-1',
+      toGeneration: 'gen-2',
+      reconstruction: { ok: true, checked: ['charter', 'decisions', 'watermark'] },
+    })
+    assert.equal(done.to_generation, 'gen-2')
+    assert.equal(await activeGeneration(root, FAMILY), 'gen-2')
+
+    // The old generation is now fenced: a commit carrying it is refused.
+    const fenced = await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [
+        {
+          event_id: 'after-rotation',
+          kind: 'decision',
+          topic_id: 'relay',
+          actor: 'sess-1',
+          authority: 'user_ruling',
+          evidence_status: 'direct',
+          summary: 'written by a retired scribe',
+          recorded_at: '2026-11-05T00:00:00.000Z',
+          capture_version: 'scribe-0.1.0',
+          proposed_by: 'scribe-1',
+        } as never,
+      ],
+    })
+    assert.equal(fenced.committed.length, 0)
+    assert.match(JSON.stringify(fenced.rejected), /generation/i)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the boundary and its provenance are reported on the admission', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const explicit = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      turnBoundary: 'turn-1',
+      boundarySource: 'explicit',
+      mode: 'enforce',
+    })
+    assert.equal(explicit.ok, true)
+    assert.equal(explicit.ok && explicit.turn_boundary, 'turn-1')
+    assert.equal(explicit.ok && explicit.boundary_source, 'explicit')
+
+    const fallback = await conferDriverAdmission({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-2',
+      turnBoundary: 'manual',
+      boundarySource: 'default',
+      mode: 'enforce',
+    })
+    assert.equal(fallback.ok, true)
+    assert.equal(fallback.ok && fallback.boundary_source, 'default')
+    const records = await readRotationRecords(root, FAMILY)
+    const row = records.find(record => record.invocation_id === (fallback.ok ? fallback.invocation_id : ''))!
+    assert.equal(row.boundary_source, 'default')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

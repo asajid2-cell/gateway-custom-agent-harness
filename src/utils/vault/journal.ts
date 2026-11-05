@@ -389,17 +389,26 @@ export type RotationRecord = Record<string, unknown> & { kind?: string; generati
 export async function appendRotationDecision(
   vaultRoot: string,
   familyId: string,
-  decide: (records: RotationRecord[]) => Record<string, unknown> | null,
-): Promise<{ appended: Record<string, unknown> | null }> {
+  decide: (records: RotationRecord[]) => Record<string, unknown> | readonly Record<string, unknown>[] | null,
+): Promise<{ appended: RotationRecord[] }> {
   const dir = dirname(familyRotationPath(vaultRoot, familyId))
   await mkdir(dir, { recursive: true })
   return withVaultLock(dir, async () => {
     const path = familyRotationPath(vaultRoot, familyId)
     const records = await readRotationRecords(vaultRoot, familyId)
     const decision = decide(records)
-    if (!decision) return { appended: null }
-    const record = { ...decision, family_id: familyId, at: new Date().toISOString() }
-    const line = `${JSON.stringify(record)}\n`
+    if (!decision) return { appended: [] }
+    // A decision can be more than one row - the fifth admission and the rotation
+    // intent it triggers have to land in the same critical section, or a crash
+    // between them leaves a counted invocation with no intent.
+    const at = new Date().toISOString()
+    const written = (Array.isArray(decision) ? decision : [decision]).map(entry => ({
+      ...entry,
+      family_id: familyId,
+      at,
+    }))
+    if (written.length === 0) return { appended: [] }
+    const line = written.map(entry => `${JSON.stringify(entry)}\n`).join('')
     let needsNewline = false
     try {
       const existing = await readFile(path, 'utf8')
@@ -414,7 +423,7 @@ export async function appendRotationDecision(
     } finally {
       await handle.close()
     }
-    return { appended: record }
+    return { appended: written }
   })
 }
 
