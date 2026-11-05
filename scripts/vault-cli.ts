@@ -7,6 +7,9 @@
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce] [--as-harness [--scope a,b] [--root-name n] [--head sid]]
+ *   bun scripts/vault-cli.ts capture  --vault <path> --family <id> --session <sid> --message <mid> --root <name> --path <relative> --sha <sha256>
+ *   bun scripts/vault-cli.ts capture-mark --vault <path> --family <id> --capture-id <id> --event <event_id>
+ *   bun scripts/vault-cli.ts captures --vault <path> --family <id> [--pending]
  *   bun scripts/vault-cli.ts register-scribe --vault <path> --family <id> --session <sid> [--generation <g>] [--replace]
  *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen> [--pointer <pointer.json>]
  *
@@ -26,6 +29,7 @@ import {
   verifyJournal,
 } from '../src/utils/vault/journal.js'
 import { admitDriverDesignation, completeRotation, conferDriverAdmission, registerScribe } from '../src/utils/vault/activation.js'
+import { captureCompleteness, capturePointer, listCaptures, markCaptured } from '../src/utils/vault/capture.js'
 import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -168,6 +172,40 @@ async function main(): Promise<number> {
     return result.ok ? 0 : 1
   }
 
+  if (command === 'capture') {
+    const result = await capturePointer({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      pointer: {
+        session_id: required(args, 'session'),
+        message_id: required(args, 'message'),
+        transcript_root: required(args, 'root'),
+        relative_path: required(args, 'path'),
+        span_sha256: required(args, 'sha'),
+        observed_at: typeof args['observed-at'] === 'string' ? (args['observed-at'] as string) : new Date().toISOString(),
+      },
+    })
+    print(result)
+    return result.ok ? 0 : 1
+  }
+
+  if (command === 'capture-mark') {
+    const result = await markCaptured({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      captureId: required(args, 'capture-id'),
+      eventId: required(args, 'event'),
+    })
+    print(result)
+    return result.ok ? 0 : 1
+  }
+
+  if (command === 'captures') {
+    const entries = await listCaptures(vaultRoot, required(args, 'family'), { pendingOnly: args.pending === true })
+    print({ ok: true, family_id: args.family, count: entries.length, completeness: await captureCompleteness(vaultRoot, required(args, 'family')), captures: entries })
+    return 0
+  }
+
   if (command === 'register-scribe') {
     // The harness writes the registration; a scribe never registers itself.
     const result = await registerScribe({
@@ -265,7 +303,7 @@ async function main(): Promise<number> {
     return ok ? 0 : 1
   }
 
-  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|register-scribe|rotation-complete> --vault <path> ...')
+  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|capture|capture-mark|captures|register-scribe|rotation-complete> --vault <path> ...')
 }
 
 try {
