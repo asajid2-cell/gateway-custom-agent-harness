@@ -17,7 +17,7 @@ import {
   appendRotationDecision,
   readRotationRecords,
 } from '../src/utils/vault/journal.js'
-import { verifyReconstruction } from '../src/utils/vault/reconstruction.js'
+import { charterPath, verifyReconstruction } from '../src/utils/vault/reconstruction.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
 const FAMILY = 'fam-activation'
@@ -510,6 +510,85 @@ test('the boundary and its provenance are reported on the admission', async () =
     const records = await readRotationRecords(root, FAMILY)
     const row = records.find(record => record.invocation_id === (fallback.ok ? fallback.invocation_id : ''))!
     assert.equal(row.boundary_source, 'default')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+async function writeCharter(root: string, record: Record<string, unknown>): Promise<void> {
+  await writeFile(charterPath(root, FAMILY), `${JSON.stringify(record)}\n`)
+}
+
+test('a charter that agrees with the family verifies, and the rotation proceeds', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    await writeCharter(root, {
+      family_id: FAMILY,
+      root_session_id: 'root-sess',
+      root_name: 'root',
+      head_session_id: 'head-sess',
+      generation_id: 'gen-1',
+      created_at: '2026-11-04T00:00:00.000Z',
+    })
+    const check = await verifyReconstruction(root, FAMILY, {
+      pointer: { rootSessionId: 'root-sess', rootName: 'root', patriarchSessionId: 'head-sess' },
+    })
+    assert.equal(check.charter, 'verified')
+    assert.equal(check.ok, true, check.reasons.join('; '))
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a charter naming another family is a mismatch, and the rotation is refused', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    await writeCharter(root, { family_id: 'someone-else', root_session_id: 'root-sess', generation_id: 'gen-1' })
+    const before = await rotationDigest(root)
+    await assert.rejects(
+      completeRotation({ vaultRoot: root, familyId: FAMILY, fromGeneration: 'gen-1', toGeneration: 'gen-2' }),
+      /did not reconstruct/i,
+    )
+    assert.equal(await rotationDigest(root), before)
+    const check = await verifyReconstruction(root, FAMILY)
+    assert.equal(check.charter, 'mismatch')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a charter that disagrees with the pointer is refused', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    await writeCharter(root, {
+      family_id: FAMILY,
+      root_session_id: 'root-sess',
+      root_name: 'root',
+      head_session_id: 'stale-head',
+      generation_id: 'gen-1',
+    })
+    const check = await verifyReconstruction(root, FAMILY, {
+      pointer: { rootSessionId: 'root-sess', rootName: 'root', patriarchSessionId: 'the-head' },
+    })
+    assert.equal(check.charter, 'mismatch')
+    assert.equal(check.ok, false)
+    assert.match(check.reasons.join(' '), /head_session_id/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a charter naming a generation the family never admitted is refused', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    await writeCharter(root, { family_id: FAMILY, root_session_id: 'root-sess', generation_id: 'gen-invented' })
+    const check = await verifyReconstruction(root, FAMILY)
+    assert.equal(check.charter, 'mismatch')
+    assert.match(check.reasons.join(' '), /gen-invented/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

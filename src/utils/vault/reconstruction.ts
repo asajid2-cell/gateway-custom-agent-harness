@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { readJournal, verifyJournal } from './journal.js'
+import { readJournal, readRotationRecords, verifyJournal } from './journal.js'
 
 /**
  * The cold-reconstruction check for a rotation.
@@ -17,6 +17,52 @@ import { readJournal, verifyJournal } from './journal.js'
  * names it absent.
  */
 
+/**
+ * The family's charter, as the harness writes it at admission. It is vault
+ * data, not a caller's verdict: the check reads the file and compares it to the
+ * family's own admission history and, when the caller has it, to the live
+ * family pointer.
+ *
+ * Kept deliberately small. Every field here is one a fresh scribe has to be
+ * able to state before it may replace the one that recorded it.
+ */
+export type CharterRecord = {
+  family_id?: string
+  root_session_id?: string
+  root_name?: string
+  head_session_id?: string
+  /** The generation in force when the charter was written. */
+  generation_id?: string
+  created_at?: string
+}
+
+/** The subset of the leaf-family pointer the charter is compared against. */
+export type CharterPointer = {
+  rootSessionId?: string
+  rootName?: string
+  patriarchSessionId?: string
+}
+
+export function charterPath(vaultRoot: string, familyId: string): string {
+  return join(vaultRoot, 'families', familyId, 'charter.json')
+}
+
+export async function readCharter(vaultRoot: string, familyId: string): Promise<CharterRecord | null> {
+  let raw: string
+  try {
+    raw = await readFile(charterPath(vaultRoot, familyId), 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as CharterRecord) : null
+  } catch {
+    return null
+  }
+}
+
 export type ReconstructionCheck = {
   ok: boolean
   checker: 'gateway-vault/reconstruction-1'
@@ -31,8 +77,12 @@ export type ReconstructionCheck = {
   /** Topics a current decision names that no topic event creates. Fatal. */
   missing_topics: string[]
   unresolved_obligations: number
-  /** §12.4(a) needs a charter record; there is none in the vault yet. */
-  charter: 'not-recorded'
+  /**
+   * `not-recorded` stays a distinct value even once charters exist, so a family
+   * that never had one - an import - keeps the omission visible instead of
+   * passing by absence.
+   */
+  charter: 'not-recorded' | 'verified' | 'mismatch'
   checked: string[]
   reasons: string[]
   checked_at: string
@@ -98,7 +148,11 @@ async function unresolvedObligations(vaultRoot: string, familyId: string): Promi
   return pending
 }
 
-export async function verifyReconstruction(vaultRoot: string, familyId: string): Promise<ReconstructionCheck> {
+export async function verifyReconstruction(
+  vaultRoot: string,
+  familyId: string,
+  options: { pointer?: CharterPointer } = {},
+): Promise<ReconstructionCheck> {
   const reasons: string[] = []
   const checked: string[] = []
 
@@ -149,9 +203,8 @@ export async function verifyReconstruction(vaultRoot: string, familyId: string):
   const obligations = await unresolvedObligations(vaultRoot, familyId)
   checked.push('obligations')
 
-  // §12.4(a) is not checkable until a charter is recorded in the vault. Saying
-  // so is the honest option; counting it as passed would be the dishonesty.
   checked.push('charter')
+  const charter = await checkCharter(vaultRoot, familyId, options.pointer, reasons)
 
   return {
     ok: reasons.length === 0,
@@ -163,9 +216,63 @@ export async function verifyReconstruction(vaultRoot: string, familyId: string):
     decisions_without_evidence: withoutEvidence,
     missing_topics: [...missingTopics].sort(),
     unresolved_obligations: obligations,
-    charter: 'not-recorded',
+    charter,
     checked,
     reasons,
     checked_at: new Date().toISOString(),
   }
+}
+
+/**
+ * §12.4(a). The charter is vault data; the pointer is the live claim. When a
+ * charter exists it must agree with the family it sits in, name the generation
+ * it was written under, and - when the caller can supply the pointer - agree
+ * with it field for field. A missing charter is `not-recorded`, never a pass.
+ */
+async function checkCharter(
+  vaultRoot: string,
+  familyId: string,
+  pointer: CharterPointer | undefined,
+  reasons: string[],
+): Promise<'not-recorded' | 'verified' | 'mismatch'> {
+  const charter = await readCharter(vaultRoot, familyId)
+  if (!charter) return 'not-recorded'
+  let ok = true
+  const fail = (reason: string) => {
+    ok = false
+    reasons.push(reason)
+  }
+
+  if (charter.family_id !== familyId) {
+    fail(`charter names family ${String(charter.family_id)}, not ${familyId}`)
+  }
+  if (typeof charter.root_session_id !== 'string' || charter.root_session_id.trim() === '') {
+    fail('charter has no root_session_id')
+  }
+  if (typeof charter.generation_id === 'string' && charter.generation_id !== '') {
+    const generations = new Set(
+      (await readRotationRecords(vaultRoot, familyId)).map(record => record.generation_id),
+    )
+    if (!generations.has(charter.generation_id)) {
+      fail(`charter names generation ${charter.generation_id}, which no admission in this family recorded`)
+    }
+  }
+
+  if (pointer) {
+    if (pointer.rootSessionId !== undefined && charter.root_session_id !== pointer.rootSessionId) {
+      fail(`charter root_session_id ${String(charter.root_session_id)} disagrees with the pointer's ${pointer.rootSessionId}`)
+    }
+    if (pointer.rootName !== undefined && charter.root_name !== pointer.rootName) {
+      fail(`charter root_name ${String(charter.root_name)} disagrees with the pointer's ${pointer.rootName}`)
+    }
+    if (
+      pointer.patriarchSessionId !== undefined &&
+      charter.head_session_id !== undefined &&
+      charter.head_session_id !== pointer.patriarchSessionId
+    ) {
+      fail(`charter head_session_id ${String(charter.head_session_id)} disagrees with the pointer's ${pointer.patriarchSessionId}`)
+    }
+  }
+
+  return ok ? 'verified' : 'mismatch'
 }

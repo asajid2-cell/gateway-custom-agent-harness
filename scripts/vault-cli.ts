@@ -7,7 +7,7 @@
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce]
- *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen>
+ *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen> [--pointer <pointer.json>]
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
  * 2 for a usage error. A submit whose idempotency key is omitted uses the
@@ -150,11 +150,22 @@ async function main(): Promise<number> {
       })
       return 2
     }
+    // The pointer is data the caller has, not a verdict: the checker still
+    // decides. Without it the charter is checked against the vault alone.
+    const pointer =
+      typeof args.pointer === 'string'
+        ? (JSON.parse(await readFile(args.pointer as string, 'utf8')) as {
+            rootSessionId?: string
+            rootName?: string
+            patriarchSessionId?: string
+          })
+        : undefined
     const result = await completeRotation({
       vaultRoot,
       familyId: required(args, 'family'),
       fromGeneration: required(args, 'from'),
       toGeneration: required(args, 'to'),
+      pointer,
     })
     print(result)
     return 0

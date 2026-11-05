@@ -400,6 +400,8 @@ export async function completeRotation(input: {
    * which is the thing the whole rotation protocol exists to prevent.
    */
   reconstruction?: never
+  /** The live family pointer, when the caller has it, for §12.4(a). */
+  pointer?: import('./reconstruction.js').CharterPointer
 }): Promise<RotationCompletion> {
   if ('reconstruction' in input && input.reconstruction !== undefined) {
     throw new Error(
@@ -410,7 +412,9 @@ export async function completeRotation(input: {
   if (!rotationPending(records)) {
     throw new Error('rotation refused: there is no pending rotation intent for this family')
   }
-  const reconstruction = await verifyReconstruction(input.vaultRoot, input.familyId)
+  const reconstruction = await verifyReconstruction(input.vaultRoot, input.familyId, {
+    pointer: input.pointer,
+  })
   if (!reconstruction.ok) {
     throw new Error(
       `rotation refused: the replacement did not reconstruct the family (${reconstruction.reasons.join('; ') || 'no reason given'})`,
