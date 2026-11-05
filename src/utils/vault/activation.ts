@@ -7,6 +7,7 @@ import {
   readRotationRecords,
   type RotationRecord,
 } from './journal.js'
+import { verifyReconstruction } from './reconstruction.js'
 
 /**
  * The activation gate.
@@ -384,25 +385,36 @@ export type RotationCompletion = {
  * The swap is a rotation row carrying the new generation, which is what fences
  * the old one: the writer takes the active generation from the last admission,
  * rotation or import_admission, so from this row onward every commit stamped
- * with `fromGeneration` is refused. It refuses to run unless the caller passes
- * the result of the cold-reconstruction check - a launch is not a proof, so an
- * unverified swap cannot be expressed here.
+ * with `fromGeneration` is refused. It runs the cold-reconstruction check
+ * itself and refuses on a failure - a launch is not a proof, and a verdict from
+ * the caller is not one either.
  */
 export async function completeRotation(input: {
   vaultRoot: string
   familyId: string
   toGeneration: string
   fromGeneration: string
-  reconstruction: { ok: boolean; checked: string[]; reasons?: string[] }
+  /**
+   * A verdict may not be supplied. The check is computed here; accepting one
+   * from the caller would let the generation being replaced certify itself,
+   * which is the thing the whole rotation protocol exists to prevent.
+   */
+  reconstruction?: never
 }): Promise<RotationCompletion> {
-  if (!input.reconstruction.ok) {
+  if ('reconstruction' in input && input.reconstruction !== undefined) {
     throw new Error(
-      `rotation refused: the replacement did not reconstruct the family (${(input.reconstruction.reasons ?? []).join('; ') || 'no reason given'})`,
+      'rotation refused: the reconstruction verdict is computed by the checker, not supplied by the caller',
     )
   }
   const records = await readRotationRecords(input.vaultRoot, input.familyId)
   if (!rotationPending(records)) {
     throw new Error('rotation refused: there is no pending rotation intent for this family')
+  }
+  const reconstruction = await verifyReconstruction(input.vaultRoot, input.familyId)
+  if (!reconstruction.ok) {
+    throw new Error(
+      `rotation refused: the replacement did not reconstruct the family (${reconstruction.reasons.join('; ') || 'no reason given'})`,
+    )
   }
   const { appended } = await appendRotationDecision(input.vaultRoot, input.familyId, current => {
     if (!rotationPending(current)) return null
@@ -410,7 +422,7 @@ export async function completeRotation(input: {
       kind: 'rotation',
       generation_id: input.toGeneration,
       from_generation: input.fromGeneration,
-      reconstruction: input.reconstruction,
+      reconstruction,
     }
   })
   const row = appended[0]

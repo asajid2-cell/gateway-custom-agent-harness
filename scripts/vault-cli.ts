@@ -7,7 +7,7 @@
  *   bun scripts/vault-cli.ts admit  --vault <path> --family <id> --generation <g> [--import --reason <text>]
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce]
- *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen> --reconstruction <check.json>
+ *   bun scripts/vault-cli.ts rotation-complete --vault <path> --family <id> --from <gen> --to <gen>
  *
  * JSON on stdout. Exit 0 when the work succeeded, 1 when anything was refused,
  * 2 for a usage error. A submit whose idempotency key is omitted uses the
@@ -140,20 +140,21 @@ async function main(): Promise<number> {
   }
 
   if (command === 'rotation-complete') {
-    // The swap cannot be recorded without the reconstruction result: passing a
-    // file is the caller stating that the check ran, and its `ok:false` refuses.
-    const reconstructionPath = required(args, 'reconstruction')
-    const reconstruction = JSON.parse(await readFile(reconstructionPath, 'utf8')) as {
-      ok: boolean
-      checked: string[]
-      reasons?: string[]
+    // The checker computes the verdict; a caller-supplied one is refused rather
+    // than ignored, so a script that thought it was certifying a rotation is
+    // told it was not.
+    if (args.reconstruction !== undefined) {
+      print({
+        ok: false,
+        error: 'the reconstruction verdict is computed by the checker; --reconstruction is not accepted',
+      })
+      return 2
     }
     const result = await completeRotation({
       vaultRoot,
       familyId: required(args, 'family'),
       fromGeneration: required(args, 'from'),
       toGeneration: required(args, 'to'),
-      reconstruction,
     })
     print(result)
     return 0

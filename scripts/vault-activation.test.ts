@@ -17,6 +17,7 @@ import {
   appendRotationDecision,
   readRotationRecords,
 } from '../src/utils/vault/journal.js'
+import { verifyReconstruction } from '../src/utils/vault/reconstruction.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
 const FAMILY = 'fam-activation'
@@ -359,7 +360,7 @@ test('a sixth activation while the intent is unanswered is refused', async () =>
   }
 })
 
-test('a rotation cannot complete on an unverified reconstruction, and writes nothing when refused', async () => {
+test('a caller cannot supply the reconstruction verdict', async () => {
   const root = await scratch()
   try {
     await fiveAdmissions(root)
@@ -370,12 +371,70 @@ test('a rotation cannot complete on an unverified reconstruction, and writes not
         familyId: FAMILY,
         fromGeneration: 'gen-1',
         toGeneration: 'gen-2',
-        reconstruction: { ok: false, checked: [], reasons: ['charter missing'] },
+        reconstruction: { ok: true, checked: [] },
+      } as never),
+      /computed by the checker/i,
+    )
+    assert.equal(await rotationDigest(root), before, 'a refused rotation writes nothing')
+    assert.equal(await activeGeneration(root, FAMILY), 'gen-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an invariant failure refuses the rotation and writes nothing', async () => {
+  const root = await scratch()
+  try {
+    await fiveAdmissions(root)
+    // A current decision that names a topic no topic event creates: the
+    // reconstruction cannot be true of this family, however the caller feels.
+    await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [
+        {
+          event_id: 'ghost-topic-decision',
+          kind: 'decision',
+          topic_id: 'ghost-topic',
+          actor: 'sess-1',
+          authority: 'user_ruling',
+          evidence_status: 'direct',
+          summary: 'a decision under a topic that was never created',
+          recorded_at: '2026-11-05T00:00:00.000Z',
+          capture_version: 'scribe-0.1.0',
+          proposed_by: 'scribe-1',
+        } as never,
+      ],
+    })
+    const before = await rotationDigest(root)
+    await assert.rejects(
+      completeRotation({
+        vaultRoot: root,
+        familyId: FAMILY,
+        fromGeneration: 'gen-1',
+        toGeneration: 'gen-2',
       }),
-      /reconstruction|did not reconstruct/i,
+      /did not reconstruct/i,
     )
     assert.equal(await rotationDigest(root), before)
     assert.equal(await activeGeneration(root, FAMILY), 'gen-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the checker reports what it proved and what it could not', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    const check = await verifyReconstruction(root, FAMILY)
+    assert.equal(check.ok, true)
+    assert.equal(check.checker, 'gateway-vault/reconstruction-1')
+    assert.equal(check.charter, 'not-recorded', 'the charter invariant is named absent, not counted as passed')
+    assert.ok(check.checked.includes('watermark'))
+    assert.ok(check.checked.includes('journal-hash'))
+    assert.equal(check.watermark, 0, 'nothing committed under the family yet')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -390,7 +449,6 @@ test('a verified rotation fences the old generation', async () => {
       familyId: FAMILY,
       fromGeneration: 'gen-1',
       toGeneration: 'gen-2',
-      reconstruction: { ok: true, checked: ['charter', 'decisions', 'watermark'] },
     })
     assert.equal(done.to_generation, 'gen-2')
     assert.equal(await activeGeneration(root, FAMILY), 'gen-2')
