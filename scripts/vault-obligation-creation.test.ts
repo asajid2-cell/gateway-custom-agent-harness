@@ -23,25 +23,24 @@ import {
  * `Z:\328\CMPUT328-A2\codexworks\301\sndo\fixtures\obligation-creation.jsonl`
  * on 2026-11-05, pinned by sha256. Rows are never edited to match the code.
  *
- * Three assertions in the fixture cannot hold as written, and they are listed
- * in CONFLICTS below with the reason each is unsatisfiable rather than quietly
- * relaxed: an `obligation-backlog` refusal requires existing pending rows, so
- * the file cannot be absent; the `corrupt` mechanism creates the file path as a
- * directory, so the path exists; and five `fold` rows predate the widening this
- * fixture's own cr-11 requires. Everything else is compared exactly.
+ * Revision 2 adds the two refusal classes (backlog with its presupposed rows,
+ * unknown family with a genuinely absent file), restores exact folds now that
+ * the fold carries the id's preimage fields, and adds cr-13, the retry case.
+ * cr-13 needs a code change that is held behind the release freeze; see the
+ * PENDING map. Nothing in this file is relaxed - a case either runs or is
+ * named as pending with the commit it waits for.
  */
-const FIXTURE_SHA256 = '83113c93dbcbd5c69d5f9aa16bda5f2c09aeb9ad1fc7332c3178148a99d9c50f'
+const FIXTURE_SHA256 = '6e00d2e7de5a8e91289503ef2edcd6ea0dffbce8b9cec33e8b479599a29913fa'
 const FIXTURE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'obligation-creation.jsonl')
 const FAMILY = 'fam-htv'
 
-const CONFLICTS: Record<string, { skip: 'file' | 'fold' | 'file+fold'; why: string }> = {
-  'cr-01': { skip: 'fold', why: 'the fold now surfaces family_id/driver_session_id/turn_boundary (cr-11 requires it); this expected fold predates that' },
-  'cr-02': { skip: 'fold', why: 'same widening as cr-01' },
-  'cr-03': { skip: 'fold', why: 'same widening as cr-01' },
-  'cr-04': { skip: 'fold', why: 'same widening as cr-01' },
-  'cr-06': { skip: 'fold', why: 'same widening as cr-01' },
-  'cr-05': { skip: 'file+fold', why: 'an obligation-backlog refusal requires existing pending rows, so the file cannot be absent and the fold cannot be empty' },
-  'cr-08': { skip: 'file', why: 'the corrupt mechanism makes obligations.jsonl a directory, so the path exists' },
+/**
+ * Cases whose assertions cannot pass until a named commit lands. Kept explicit
+ * so the set can only shrink: the fixture-integrity test asserts this exact
+ * map, so a new skip cannot be added quietly.
+ */
+const PENDING: Record<string, string> = {
+  'cr-13': 'the retry ruling: a duplicate admission that supplies the turn must create. Held behind the release freeze at be49df8; lands immediately after the artifact digests.',
 }
 
 type Call = {
@@ -52,6 +51,16 @@ type Call = {
   source_message_id?: string
 }
 
+type Seam = {
+  mode: 'refused' | 'monitor' | 'admitted'
+  refusal?: string
+  max_pending?: number | null
+  family_id: string
+  driver_session_id: string
+  turn_boundary: string
+  turn?: { text: string; context?: string; sourceMessageId?: string }
+}
+
 type Case = {
   case_id: string
   title: string
@@ -59,27 +68,23 @@ type Case = {
   prior?: string[]
   corrupt?: string
   calls?: Call[]
-  seam?: {
-    mode: 'refused' | 'monitor' | 'admitted'
-    refusal?: string
-    family_id: string
-    driver_session_id: string
-    turn_boundary: string
-    turn: { text: string; context?: string; sourceMessageId?: string }
-  }
+  seam?: Seam
+  retry?: Seam
   ids?: { family_id: string; driver_session_id: string; turn_boundary: string; obligation_id: string; invocation_id: string }
   expect: {
     calls?: Array<Record<string, unknown>>
-    file?: 'absent'
+    file?: 'absent' | 'not-a-regular-file'
     file_rows?: Array<Record<string, unknown>>
     file_rows_count?: number
-    fold?: Array<Record<string, unknown>>
+    absent_ids?: string[]
+    fold?: Array<Record<string, unknown>> | 'unreadable'
+    fold_omits?: string[]
     seam?: { admitted?: boolean; reason?: string; would_refuse?: string | null }
     seam_result?: Record<string, unknown>
+    retry_result?: Record<string, unknown>
     relation?: string
     record_has_family_id?: boolean
   }
-  blocked_on?: string
 }
 
 async function cases(): Promise<Case[]> {
@@ -91,10 +96,10 @@ async function cases(): Promise<Case[]> {
     .map(line => JSON.parse(line) as Case)
 }
 
-async function rawRows(root: string): Promise<Array<Record<string, unknown>>> {
+async function rawRows(root: string, family: string): Promise<Array<Record<string, unknown>>> {
   let raw: string
   try {
-    raw = await readFile(obligationsPath(root, FAMILY), 'utf8')
+    raw = await readFile(obligationsPath(root, family), 'utf8')
   } catch {
     return []
   }
@@ -104,10 +109,10 @@ async function rawRows(root: string): Promise<Array<Record<string, unknown>>> {
     .map(line => JSON.parse(line) as Record<string, unknown>)
 }
 
-function input(root: string, call: Call): ObligationCreationInput {
+function input(root: string, family: string, call: Call): ObligationCreationInput {
   return {
     vaultRoot: root,
-    familyId: FAMILY,
+    familyId: family,
     driverSessionId: call.driver_session_id,
     turnBoundary: call.turn_boundary,
     kind: call.kind,
@@ -116,32 +121,52 @@ function input(root: string, call: Call): ObligationCreationInput {
   }
 }
 
-function subsetPossible(skip: string | undefined, what: 'file' | 'fold'): boolean {
-  return skip !== what && skip !== 'file+fold'
+async function runSeam(root: string, seam: Seam): Promise<Record<string, unknown> & { ok: boolean }> {
+  return conferDriverAdmission({
+    vaultRoot: root,
+    familyId: seam.family_id,
+    driverSessionId: seam.driver_session_id,
+    turnBoundary: seam.turn_boundary,
+    mode: seam.mode === 'monitor' ? 'monitor' : 'enforce',
+    maxPending: seam.max_pending ?? null,
+    turn: seam.turn,
+  }) as Promise<Record<string, unknown> & { ok: boolean }>
 }
 
-test('the creation fixture is the one that was pinned', async () => {
+function omit(rows: Array<Record<string, unknown>>, keys: readonly string[] = []): Array<Record<string, unknown>> {
+  return rows.map(row => {
+    const copy = { ...row }
+    for (const key of keys) delete copy[key]
+    return copy
+  })
+}
+
+test('the creation fixture is the one that was pinned, and the pending set is explicit', async () => {
   const bytes = await readFile(FIXTURE)
   assert.equal(createHash('sha256').update(bytes).digest('hex'), FIXTURE_SHA256)
-  assert.equal((await cases()).length, 11)
+  const table = await cases()
+  assert.equal(table.length, 13)
+  assert.deepEqual(Object.keys(PENDING), ['cr-13'], 'a case may only be pending for a named commit')
+  assert.ok(table.some(entry => entry.case_id === 'cr-13' && entry.retry), 'the retry case must stay in the table')
 })
 
 test('every creation case behaves as the fixture says', async () => {
   const failures: string[] = []
   for (const entry of await cases()) {
+    if (PENDING[entry.case_id]) continue
     const root = await mkdtemp(path.join(tmpdir(), 'vault-obligation-creation-'))
-    const conflict = CONFLICTS[entry.case_id]
+    const family = entry.seam?.family_id ?? entry.ids?.family_id ?? FAMILY
     try {
       await admitGeneration(root, FAMILY, { kind: 'admission', generation_id: 'gen-1' })
       if (entry.corrupt && entry.corrupt.includes('directory')) {
-        await mkdir(obligationsPath(root, FAMILY), { recursive: true })
+        await mkdir(obligationsPath(root, family), { recursive: true })
       } else if (entry.prior) {
-        await writeFile(obligationsPath(root, FAMILY), `${entry.prior.join('\n')}\n`)
+        await writeFile(obligationsPath(root, family), `${entry.prior.join('\n')}\n`)
       }
 
       if (entry.calls) {
         const results = []
-        for (const call of entry.calls) results.push(await recordObligation(input(root, call)))
+        for (const call of entry.calls) results.push(await recordObligation(input(root, family, call)))
         for (const [index, expected] of (entry.expect.calls ?? []).entries()) {
           const actual = results[index] as Record<string, unknown>
           if (expected.ok === false) {
@@ -156,27 +181,12 @@ test('every creation case behaves as the fixture says', async () => {
       }
 
       if (entry.seam) {
-        await writeFile(scribePath(root, FAMILY), `${JSON.stringify({ session_id: 'scribe-1', generation_id: 'gen-1' })}\n`)
-        let maxPending: number | null = null
-        if (entry.seam.refusal === 'obligation-backlog') {
-          const backlog = ['ob-b1', 'ob-b2', 'ob-b3'].map(id => ({
-            obligation_id: id,
-            kind: 'decision',
-            created_at: '2026-01-01T00:00:00.000Z',
-          }))
-          await writeFile(obligationsPath(root, FAMILY), `${backlog.map(row => JSON.stringify(row)).join('\n')}\n`)
-          maxPending = 2
+        // An unknown family has no directory to put a scribe in, and the gate
+        // refuses it before any health check.
+        if (existsSync(path.join(root, 'families', family))) {
+          await writeFile(scribePath(root, family), `${JSON.stringify({ session_id: 'scribe-1', generation_id: 'gen-1' })}\n`)
         }
-        const mode = entry.seam.mode === 'monitor' ? 'monitor' : 'enforce'
-        const result = await conferDriverAdmission({
-          vaultRoot: root,
-          familyId: FAMILY,
-          driverSessionId: entry.seam.driver_session_id,
-          turnBoundary: entry.seam.turn_boundary,
-          mode,
-          maxPending,
-          turn: entry.seam.turn,
-        })
+        const result = await runSeam(root, entry.seam)
         const expectSeam = entry.expect.seam ?? {}
         if (expectSeam.admitted !== undefined) {
           assert.equal(result.ok, expectSeam.admitted, `${entry.case_id}: admitted`)
@@ -215,31 +225,38 @@ test('every creation case behaves as the fixture says', async () => {
             kind: 'decision',
             createdAt: '2026-11-05T00:00:00.000Z',
           })
-          const written = await rawRows(root)
+          const written = await rawRows(root, entry.ids.family_id)
           assert.equal(written[0]?.family_id, entry.ids.family_id, `${entry.case_id}: the creation row carries family_id`)
         }
       }
 
-      if (entry.expect.file === 'absent' && subsetPossible(conflict?.skip, 'file')) {
-        assert.equal(existsSync(obligationsPath(root, FAMILY)), false, `${entry.case_id}: the obligations file must not exist`)
+      if (entry.expect.file === 'absent') {
+        assert.equal(existsSync(obligationsPath(root, family)), false, `${entry.case_id}: the obligations path must not exist`)
       }
-      if (entry.corrupt) {
-        // Whatever the fixture says, the mechanism must have left no regular file.
-        const info = await stat(obligationsPath(root, FAMILY)).catch(() => null)
-        assert.ok(info === null || info.isDirectory(), `${entry.case_id}: a failed creation must not leave a regular obligations file`)
+      if (entry.expect.file === 'not-a-regular-file') {
+        const info = await stat(obligationsPath(root, family)).catch(() => null)
+        assert.ok(info !== null && !info.isFile(), `${entry.case_id}: a failed creation must not leave a regular file`)
       }
       if (entry.expect.file_rows) {
-        assert.deepEqual(await rawRows(root), entry.expect.file_rows, `${entry.case_id}: file rows`)
+        assert.deepEqual(await rawRows(root, family), entry.expect.file_rows, `${entry.case_id}: file rows`)
       }
       if (entry.expect.file_rows_count !== undefined) {
-        assert.equal((await rawRows(root)).length, entry.expect.file_rows_count, `${entry.case_id}: file row count`)
+        assert.equal((await rawRows(root, family)).length, entry.expect.file_rows_count, `${entry.case_id}: file row count`)
       }
-      if (entry.expect.fold && subsetPossible(conflict?.skip, 'fold')) {
-        assert.deepEqual(
-          JSON.parse(JSON.stringify(await readObligations(root, FAMILY))),
-          entry.expect.fold,
-          `${entry.case_id}: fold`,
+      if (entry.expect.absent_ids) {
+        const present = new Set((await rawRows(root, family)).map(row => row.obligation_id))
+        for (const id of entry.expect.absent_ids) {
+          assert.equal(present.has(id), false, `${entry.case_id}: ${id} must not be in the file`)
+        }
+      }
+      if (entry.expect.fold === 'unreadable') {
+        await assert.rejects(readObligations(root, family), `${entry.case_id}: the fold must report the unreadable file`)
+      } else if (entry.expect.fold) {
+        const actual = omit(
+          JSON.parse(JSON.stringify(await readObligations(root, family))) as Array<Record<string, unknown>>,
+          entry.expect.fold_omits,
         )
+        assert.deepEqual(actual, omit(entry.expect.fold, entry.expect.fold_omits), `${entry.case_id}: fold`)
       }
     } catch (error) {
       failures.push(`${entry.case_id} (${entry.title}): ${(error as Error).message}`)
