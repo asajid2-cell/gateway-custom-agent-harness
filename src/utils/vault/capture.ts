@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, open, readFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join } from 'node:path'
-import { withVaultLock } from './journal.js'
+import { readJournal, withVaultLock } from './journal.js'
 
 /**
  * The capture queue: the scribe's inbox.
@@ -252,12 +252,60 @@ export async function markCapturedBySpans(input: {
   })
 }
 
-/** Counts a completeness report needs, without a join. */
+export type CaptureCompleteness = {
+  captured: number
+  pending: number
+  total: number
+  committed_events: number
+  /** Whether anything has ever appended a capture for this family. */
+  producer: 'connected' | 'absent'
+  /**
+   * `healthy` means captures exist, so the counts mean something. `no-captures`
+   * means the family has committed events and never captured one - a zero that
+   * must not be read as coverage. `idle` means neither exists yet.
+   */
+  state: 'healthy' | 'no-captures' | 'idle'
+  note?: string
+}
+
+/**
+ * A completeness count with its precondition attached.
+ *
+ * `captured: 0, pending: 0` is a clean bill of health on a family where nothing
+ * is being recorded, which is the most dangerous way a metric can be wrong. The
+ * family's committed events tell us which zero this is: events with no captures
+ * is a defect to surface, not an empty success.
+ */
 export async function captureCompleteness(
   vaultRoot: string,
   familyId: string,
-): Promise<{ captured: number; pending: number }> {
+): Promise<CaptureCompleteness> {
   const entries = [...foldCaptures(await readLines(vaultRoot, familyId)).values()]
   const captured = entries.filter(entry => entry.captured_by).length
-  return { captured, pending: entries.length - captured }
+  const total = entries.length
+  const journal = await readJournal(vaultRoot, familyId)
+  const committed = journal.events.length
+  const producer: CaptureCompleteness['producer'] = total > 0 ? 'connected' : 'absent'
+  if (total === 0 && committed > 0) {
+    return {
+      captured,
+      pending: 0,
+      total,
+      committed_events: committed,
+      producer,
+      state: 'no-captures',
+      note: `${committed} events committed but no capture has ever been recorded; completeness is 0 of nothing, not coverage`,
+    }
+  }
+  if (total === 0 && committed === 0) {
+    return { captured, pending: 0, total, committed_events: committed, producer, state: 'idle' }
+  }
+  return {
+    captured,
+    pending: total - captured,
+    total,
+    committed_events: committed,
+    producer,
+    state: 'healthy',
+  }
 }

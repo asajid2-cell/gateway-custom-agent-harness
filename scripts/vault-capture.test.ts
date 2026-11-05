@@ -87,7 +87,11 @@ test('marking a capture names the event that cited it, and is idempotent', async
     const captured = await capturePointer({ vaultRoot: root, familyId: FAMILY, pointer: pointer() })
     assert.ok(captured.ok)
     const captureId = captured.ok ? captured.capture_id : ''
-    assert.deepEqual(await captureCompleteness(root, FAMILY), { captured: 0, pending: 1 })
+    const before = await captureCompleteness(root, FAMILY)
+    assert.equal(before.captured, 0)
+    assert.equal(before.pending, 1)
+    assert.equal(before.state, 'healthy')
+    assert.equal(before.producer, 'connected')
 
     const marked = await markCaptured({ vaultRoot: root, familyId: FAMILY, captureId, eventId: 'evt-1' })
     assert.equal(marked.ok, true)
@@ -95,7 +99,10 @@ test('marking a capture names the event that cited it, and is idempotent', async
 
     const entries = await listCaptures(root, FAMILY)
     assert.equal(entries[0]?.captured_by?.event_id, 'evt-1', 'the event id is recorded, not just a boolean')
-    assert.deepEqual(await captureCompleteness(root, FAMILY), { captured: 1, pending: 0 })
+    const after = await captureCompleteness(root, FAMILY)
+    assert.equal(after.captured, 1)
+    assert.equal(after.pending, 0)
+    assert.equal(after.state, 'healthy')
     assert.deepEqual(await listCaptures(root, FAMILY, { pendingOnly: true }), [])
 
     const again = await markCaptured({ vaultRoot: root, familyId: FAMILY, captureId, eventId: 'evt-2' })
@@ -152,7 +159,47 @@ test('a commit that cites a span closes the capture, naming the event', async ()
     const untouched = entries.find(entry => entry.span_sha256 === 'sha256:notcited')!
     assert.equal(cited.captured_by?.event_id, 'evt-cited')
     assert.equal(untouched.captured_by, undefined, 'an unrelated span stays pending')
-    assert.deepEqual(await captureCompleteness(root, FAMILY), { captured: 1, pending: 1 })
+    const completeness = await captureCompleteness(root, FAMILY)
+    assert.equal(completeness.captured, 1)
+    assert.equal(completeness.pending, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a family that commits events with no captures says so instead of reading complete', async () => {
+  const root = await vault()
+  try {
+    const idle = await captureCompleteness(root, FAMILY)
+    assert.equal(idle.state, 'idle', 'nothing committed and nothing captured is not a defect')
+
+    await submitProposals({
+      vaultRoot: root,
+      familyId: FAMILY,
+      generation: 'gen-1',
+      proposals: [
+        {
+          event_id: 'evt-uncaptured',
+          kind: 'decision',
+          topic_id: 'relay',
+          actor: 'sess-1',
+          authority: 'user_ruling',
+          evidence_status: 'direct',
+          summary: 'an event whose span was never queued',
+          recorded_at: '2026-11-05T00:00:00.000Z',
+          capture_version: 'scribe-0.1.0',
+          proposed_by: 'sess-1',
+          evidence: [{ message_id: 'msg-x', span_sha256: 'sha256:never-queued' }],
+        } as never,
+      ],
+    })
+
+    const without = await captureCompleteness(root, FAMILY)
+    assert.equal(without.state, 'no-captures')
+    assert.equal(without.producer, 'absent')
+    assert.equal(without.committed_events, 1)
+    assert.equal(without.captured, 0)
+    assert.match(without.note ?? '', /0 of nothing/)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
