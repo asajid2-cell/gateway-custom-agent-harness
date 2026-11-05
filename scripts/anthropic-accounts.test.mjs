@@ -47,8 +47,10 @@ test('registration writes a 0600 credential and records the identity', async t =
   })
 
   const file = path.join(root, 'work', 'credentials.json')
-  const mode = (await stat(file)).mode & 0o777
-  if (process.platform !== 'win32') assert.equal(mode, 0o600)
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(file)).mode & 0o777, 0o600)
+    assert.equal((await stat(path.join(root, 'work'))).mode & 0o777, 0o700)
+  }
   assert.equal((await readAnthropicAccount(path.join(root, 'work'))).claudeAiOauth.accessToken, 'token-work')
 
   const registry = JSON.parse(await readFile(path.join(root, 'registry.json'), 'utf8'))

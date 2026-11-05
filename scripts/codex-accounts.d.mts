@@ -3,6 +3,7 @@ export declare const CODEX_ACCOUNT_NAME: RegExp
 export declare function codexAccountsRoot(options?: { home?: string }): string
 export declare function codexHomeFor(name: string, options?: { root?: string }): string
 export declare function codexAuthPath(home: string): string
+export declare function hardenCodexHome(home: string): Promise<void>
 export declare function listCodexAccountNames(options?: { root?: string }): Promise<string[]>
 
 export type CodexAccount = { number: number; name: string; home: string }

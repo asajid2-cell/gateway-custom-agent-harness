@@ -57,7 +57,8 @@ export function isGatewayKeyEnvVar(name) {
     /^OPENCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
     /^COMMANDCODE_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
     /^MISTRAL_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
-    /^MISTRAL_VIBE_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
+    /^MISTRAL_VIBE_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name) ||
+    /^DEEPSEEK_API_KEY(?:[2-9]|[1-9][0-9]+)?$/.test(name)
 }
 
 function openCodeNumber(name) {
@@ -127,7 +128,11 @@ export function listKeysafeProviders(home = keysafeHome()) {
     providers.push({ credential: name, envVar: `MISTRAL_API_KEY${name.slice('mistral'.length)}` })
   }
   if (names.has('openrouter')) providers.push({ credential: 'openrouter', envVar: 'OPENROUTER_API_KEY' })
-  if (names.has('ds')) providers.push({ credential: 'ds', envVar: 'DEEPSEEK_API_KEY' })
+  for (const name of [...names]
+    .filter(name => /^ds([2-9]|[1-9][0-9]+)?$/.test(name))
+    .sort((a, b) => Number(a.slice(2) || 1) - Number(b.slice(2) || 1))) {
+    providers.push({ credential: name, envVar: `DEEPSEEK_API_KEY${name.slice('ds'.length)}` })
+  }
   return providers
 }
 

@@ -43,6 +43,16 @@ export function codexAuthPath(home) {
   return path.join(home, 'auth.json')
 }
 
+/**
+ * The codex CLI writes its own home; tighten what it left behind. POSIX only -
+ * Windows inherits the user-profile ACL, and chmod is meaningless there.
+ */
+export async function hardenCodexHome(home) {
+  if (process.platform === 'win32') return
+  await fs.chmod(home, 0o700).catch(() => {})
+  await fs.chmod(codexAuthPath(home), 0o600).catch(() => {})
+}
+
 export async function listCodexAccountNames({ root = codexAccountsRoot() } = {}) {
   return listAccountNames(root, 'auth.json')
 }

@@ -60,18 +60,19 @@ async function storedNames(): Promise<string[]> {
         const match = /^\s*(?:export\s+)?([A-Z0-9_]+)=/.exec(line)
         if (!match) continue
         const envVar = match[1]
-        if (envVar === 'DEEPSEEK_API_KEY') names.push('ds')
-        else if (envVar === 'AMD_API_KEY') names.push('amd-ds')
+        if (envVar === 'AMD_API_KEY') names.push('amd-ds')
         else if (envVar === 'OPENROUTER_API_KEY') names.push('openrouter')
         else {
           const opencode = /^OPENCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const commandcode = /^COMMANDCODE_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const mistralVibe = /^MISTRAL_VIBE_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           const mistral = /^MISTRAL_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
+          const deepseek = /^DEEPSEEK_API_KEY([2-9]|[1-9][0-9]+)?$/.exec(envVar)
           if (opencode) names.push(`opencode-go${opencode[1] ?? ''}`)
           if (commandcode) names.push(`commandcode${commandcode[1] ?? ''}`)
           if (mistralVibe) names.push(`mistralvibe${mistralVibe[1] ?? ''}`)
           if (mistral) names.push(`mistral${mistral[1] ?? ''}`)
+          if (deepseek) names.push(`ds${deepseek[1] ?? ''}`)
         }
       }
       return names

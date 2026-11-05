@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { Box, Text } from '../../ink.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
 import { resolveBundledCodex } from '../../../scripts/codex-resource.mjs'
-import { codexAccounts, readCodexAuth } from '../../../scripts/codex-accounts.mjs'
+import { codexAccounts, hardenCodexHome, readCodexAuth } from '../../../scripts/codex-accounts.mjs'
 
 /**
  * In-session ChatGPT device-auth for a Codex account home.
@@ -126,6 +126,8 @@ export function CodexDeviceLogin(props: {
             setError(`Codex reported success but ${join(props.home, 'auth.json')} is not usable.`)
             return
           }
+          // The CLI wrote the home; tighten it on POSIX before it is listed.
+          await hardenCodexHome(props.home)
           const accounts = await codexAccounts()
           const stored = accounts.find((account: { name: string }) => account.name === props.name)
           const numberNote = stored ? ` It is account ${stored.number}.` : ''

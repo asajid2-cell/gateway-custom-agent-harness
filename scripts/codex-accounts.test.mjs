@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
   codexAccounts,
   currentCodexAccountName,
+  hardenCodexHome,
   listCodexAccountNames,
   nextCodexAccountName,
   readCodexAuth,
@@ -123,6 +124,18 @@ test('the account identity comes from the id_token claims and is remembered', as
   assert.ok(broken)
   const again = await codexAccounts({ root })
   assert.equal(again.find(account => account.name === 'broken').email, undefined)
+})
+
+test('a codex home written by the CLI is tightened on POSIX', async t => {
+  const root = await scratch(t)
+  const home = await addAccount(root, 'loose')
+  if (process.platform === 'win32') return
+  const { chmod } = await import('node:fs/promises')
+  await chmod(home, 0o755)
+  await chmod(path.join(home, 'auth.json'), 0o644)
+  await hardenCodexHome(home)
+  assert.equal(((await stat(home)).mode & 0o777), 0o700)
+  assert.equal(((await stat(path.join(home, 'auth.json'))).mode & 0o777), 0o600)
 })
 
 test('auth reads only the two usable fields and refuses an incomplete login', async t => {

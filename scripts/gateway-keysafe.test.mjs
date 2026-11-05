@@ -30,7 +30,7 @@ test('reload exit code is a distinct temp-fail code', () => {
 })
 
 test('only the numbered OpenCode and fixed provider variables count as gateway keys', () => {
-  for (const name of ['OPENCODE_API_KEY', 'OPENCODE_API_KEY2', 'OPENCODE_API_KEY12', 'DEEPSEEK_API_KEY', 'AMD_API_KEY', 'COMMANDCODE_API_KEY', 'COMMANDCODE_API_KEY2']) {
+  for (const name of ['OPENCODE_API_KEY', 'OPENCODE_API_KEY2', 'OPENCODE_API_KEY12', 'DEEPSEEK_API_KEY', 'DEEPSEEK_API_KEY2', 'DEEPSEEK_API_KEY12', 'AMD_API_KEY', 'COMMANDCODE_API_KEY', 'COMMANDCODE_API_KEY2']) {
     assert.equal(isGatewayKeyEnvVar(name), true, name)
   }
   for (const name of ['OPENCODE_API_KEY_OTHER', 'OPENCODE_API_KEY1', 'OPENCODE_API_KEY0', 'COMMANDCODE_API_KEY_OTHER', 'COMMANDCODE_API_KEY1', 'COMMANDCODE_API_KEY0', 'PATH', 'ANTHROPIC_API_KEY']) {

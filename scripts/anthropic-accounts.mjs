@@ -76,7 +76,7 @@ export async function readAnthropicAccount(home) {
 export async function writeAnthropicAccount(home, stored) {
   const target = anthropicCredentialPath(home)
   const temp = `${target}.${randomUUID()}.tmp`
-  await fs.mkdir(home, { recursive: true })
+  await fs.mkdir(home, { recursive: true, mode: 0o700 })
   try {
     const handle = await fs.open(temp, 'w', 0o600)
     try {
@@ -86,6 +86,13 @@ export async function writeAnthropicAccount(home, stored) {
       await handle.close()
     }
     await fs.rename(temp, target)
+    // `mode` on open is filtered by umask and does not apply to a replaced
+    // file, so set the final bits explicitly. No-op on Windows, where the
+    // user-profile ACL is the boundary.
+    if (process.platform !== 'win32') {
+      await fs.chmod(home, 0o700).catch(() => {})
+      await fs.chmod(target, 0o600).catch(() => {})
+    }
   } catch (error) {
     await fs.rm(temp, { force: true }).catch(() => {})
     throw error

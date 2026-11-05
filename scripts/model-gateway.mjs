@@ -3112,6 +3112,83 @@ export function mistralRouteCredentials(apiPool = mistralCredentials) {
   return createMistralRouteCredentials(mistralVibeCredentials, apiPool, mistralVibeFailed)
 }
 
+// DeepSeek runs one key per request, so several keys need the same numbering
+// as the other providers: DEEPSEEK_API_KEY, __KEY2, ... A rejected key is
+// rotated past exactly like an OpenCode or CommandCode account.
+const deepSeekPreferencePath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'deepseek-account.json')
+
+async function persistDeepSeekPromotion(record) {
+  const temp = `${deepSeekPreferencePath}.${randomUUID()}.tmp`
+  try {
+    let saved = {}
+    try { saved = JSON.parse(await fs.readFile(deepSeekPreferencePath, 'utf8')) } catch {}
+    const next = {}
+    if (Number.isSafeInteger(saved?.number) && saved.number > 0) next.number = saved.number
+    if (record && Number.isSafeInteger(record.number)) next.pendingNew = { number: record.number }
+    await fs.mkdir(path.dirname(deepSeekPreferencePath), { recursive: true })
+    await fs.writeFile(temp, JSON.stringify(next))
+    await fs.rename(temp, deepSeekPreferencePath)
+  } catch {
+    await fs.unlink(temp).catch(() => {})
+  }
+}
+
+let deepSeekGlobalNumber = 1
+const deepSeekSessionCredentials = new Map()
+
+function deepSeekPoolList() {
+  return [deepSeekCredentials, ...[...deepSeekSessionCredentials.values()].map(entry => entry.pool)]
+}
+
+function deepSeekPromotion(record) {
+  if (record) {
+    for (const pool of deepSeekPoolList()) {
+      if (pool.pending?.number !== record.number) pool.adoptPending(record)
+    }
+  }
+  void persistDeepSeekPromotion(record)
+}
+
+export function deepSeekCredentialPool(env = process.env, overlay = null, onPromote = null) {
+  return credentialPool({ env, prefix: 'DEEPSEEK_API_KEY', overlay, onPromote })
+}
+
+const deepSeekCredentials = deepSeekCredentialPool(process.env, gatewayKeyOverlay, deepSeekPromotion)
+
+// Per-session pins mirror CommandCode: a session may hold its own key while
+// every unpinned session follows the global default in deepseek-account.json.
+async function sessionDeepSeekCredentials(sessionId) {
+  let number = 1
+  let saved = null
+  try {
+    saved = JSON.parse(await fs.readFile(deepSeekPreferencePath, 'utf8'))
+    if (Number.isSafeInteger(saved.number) && saved.number > 0) number = saved.number
+  } catch {}
+  if (number !== deepSeekGlobalNumber) {
+    deepSeekGlobalNumber = number
+    deepSeekCredentials.select(number)
+    for (const entry of deepSeekSessionCredentials.values()) {
+      if (!entry.explicit) entry.pool.select(number)
+    }
+  }
+  const carried = saved?.pendingNew
+  if (carried && Number.isSafeInteger(carried.number) && number !== carried.number) {
+    for (const pool of deepSeekPoolList()) {
+      if (pool.pending?.number !== carried.number && pool.numbers.includes(carried.number)) {
+        pool.adoptPending(carried)
+      }
+    }
+  }
+  if (!sessionId) return deepSeekCredentials
+  let entry = deepSeekSessionCredentials.get(sessionId)
+  if (!entry) {
+    entry = { pool: deepSeekCredentialPool(process.env, gatewayKeyOverlay, deepSeekPromotion), explicit: false }
+    entry.pool.select(deepSeekGlobalNumber)
+    deepSeekSessionCredentials.set(sessionId, entry)
+  }
+  return entry.pool
+}
+
 // A key just landed in the overlay: touch the owning pool so the new number is
 // detected and promoted now, rather than on whichever request reads it next.
 function noteGatewayKeyInjected(name) {
@@ -3123,6 +3200,8 @@ function noteGatewayKeyInjected(name) {
     void mistralVibeCredentials.numbers
   } else if (name.startsWith('MISTRAL_API_KEY')) {
     for (const pool of mistralPoolList()) void pool.numbers
+  } else if (name.startsWith('DEEPSEEK_API_KEY')) {
+    for (const pool of deepSeekPoolList()) void pool.numbers
   }
 }
 
@@ -5030,6 +5109,59 @@ function anthropicPoolPath(pool) {
   return pool.pathFor(pool.number)
 }
 
+/**
+ * One refresher per credential file across processes.
+ *
+ * Anthropic refresh tokens are single-use, so a gateway and a CLI refreshing
+ * the same account concurrently would invalidate each other. The lock is a
+ * sibling `.lock` file created exclusively; a stale one (a crashed process) is
+ * broken after 30s, and a waiter that cannot get in within 20s proceeds anyway
+ * - the re-read inside the lock then either finds the winner's rotated token or
+ * refreshes that one, so the common case degrades to an extra refresh rather
+ * than a broken sign-in.
+ */
+export async function withAnthropicRefreshLock(filePath, work) {
+  const lockPath = `${filePath}.lock`
+  const deadline = Date.now() + 20_000
+  let handle = null
+  while (!handle) {
+    try {
+      handle = await fs.open(lockPath, 'wx', 0o600)
+    } catch (error) {
+      if (error?.code !== 'EEXIST') return work()
+      try {
+        const info = await fs.stat(lockPath)
+        if (Date.now() - info.mtimeMs > 30_000) {
+          await fs.rm(lockPath, { force: true })
+          continue
+        }
+      } catch {}
+      if (Date.now() > deadline) return work()
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+  }
+  try {
+    await handle.writeFile(`${process.pid}\n`).catch(() => {})
+    return await work()
+  } finally {
+    await handle.close().catch(() => {})
+    await fs.rm(lockPath, { force: true }).catch(() => {})
+  }
+}
+
+async function refreshAnthropicCredentialLocked(credential, filePath) {
+  return withAnthropicRefreshLock(filePath, async () => {
+    const latest = await readAnthropicCredential(filePath)
+    // Another process rotated the pair while this one waited: its token is the
+    // live one and this grant must not be exchanged a second time.
+    if (latest && latest.oauth.refreshToken !== credential.oauth.refreshToken) {
+      if (anthropicExpiresAt(latest.oauth) > Date.now() + 60_000) return latest.oauth.accessToken
+      return refreshAnthropicCredential(latest, filePath)
+    }
+    return refreshAnthropicCredential(credential, filePath)
+  })
+}
+
 async function anthropicAccessToken(filePath = null) {
   const target = filePath ?? await anthropicSelectedPath()
   const credential = await readAnthropicCredential(target)
@@ -5042,7 +5174,7 @@ async function anthropicAccessToken(filePath = null) {
   if (anthropicExpiresAt(oauth) > Date.now() + 60_000) return oauth.accessToken
   const inFlight = anthropicRefreshesInFlight.get(target)
   if (inFlight) return inFlight
-  const refresh = refreshAnthropicCredential(credential, target).finally(() => {
+  const refresh = refreshAnthropicCredentialLocked(credential, target).finally(() => {
     if (anthropicRefreshesInFlight.get(target) === refresh) {
       anthropicRefreshesInFlight.delete(target)
     }
@@ -5094,8 +5226,11 @@ const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
     label: 'DeepSeek',
     endpoint: DEEPSEEK_ENDPOINT,
     backend: 'deepseek',
-    headers: (req, { stream }) => {
-      const apiKey = process.env.DEEPSEEK_API_KEY
+    // Numbered keys rotate like every other provider: a rejected key hands the
+    // retry to the next one instead of failing the turn.
+    pool: sessionDeepSeekCredentials,
+    headers: (req, { stream, pool }) => {
+      const apiKey = pool?.key ?? process.env.DEEPSEEK_API_KEY
       if (!apiKey) {
         throw new PassthroughCredentialError('DeepSeek API key is not configured')
       }
@@ -5118,6 +5253,7 @@ const ANTHROPIC_PASSTHROUGH_PROVIDERS = {
     label: 'Anthropic',
     endpoint: ANTHROPIC_ENDPOINT,
     backend: 'anthropic',
+    pool: anthropicRequestPool,
     headers: (req, context) => anthropicHeaders(req, context),
   },
 }
@@ -5617,10 +5753,10 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
   const wantsStream = body.stream === true
   const trace = createGatewayTrace({ model: modelName, backend: provider.backend, protocol: 'anthropic-messages' })
   const control = createRequestControl(req, res, trace)
-  // Only the first-party provider has Claude accounts; the passthrough key
-  // providers have their own pools.
+  // A provider that declares a pool rotates across its credentials; one that
+  // does not (AMD) keeps the single-key behaviour.
   const sessionId = upstreamSessionId(req, body)
-  const pool = providerName === 'anthropic' ? await anthropicRequestPool(sessionId) : null
+  const pool = provider.pool ? await provider.pool(sessionId) : null
   let credentials
   try {
     credentials = await provider.headers(req, { stream: wantsStream, body, pool })

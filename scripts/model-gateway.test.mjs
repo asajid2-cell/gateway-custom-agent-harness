@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises'
 import { mkdtempSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -27,6 +27,7 @@ import {
   gatewayRequestShape,
   credentialPool,
   codexRequestPool,
+  withAnthropicRefreshLock,
   openCodeCredentialPool,
   commandCodeCredentialPool,
   readOpenCodeSubscriptionUsage,
@@ -1502,6 +1503,82 @@ test('a Claude request rotates to the next stored account on a credential failur
     await stopChild(gateway.child)
     await new Promise(resolve => fake.server.close(resolve))
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a DeepSeek request rotates to the next numbered key on a credential failure', async () => {
+  const seen = []
+  const fake = await fakeCodexServer((req, res) => {
+    seen.push(req.headers['x-api-key'])
+    if (seen.length === 1) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'bad key' } }))
+      return
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      id: 'msg-ds-rotate',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'OK' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 2, output_tokens: 1 },
+    }))
+  })
+  const gateway = await startGatewayForTest({
+    DEEPSEEK_API_KEY: 'deepseek-one',
+    DEEPSEEK_API_KEY2: 'deepseek-two',
+    DEEPSEEK_API_URL: `http://127.0.0.1:${fake.port}/v1/messages`,
+    MODEL_GATEWAY_UPSTREAM_RETRIES: '2',
+    MODEL_GATEWAY_QUOTA_CACHE_DIR: freshQuotaCacheDir(),
+  })
+  try {
+    const response = await postGateway(
+      gateway.port,
+      {
+        model: 'gateway-ds-flash',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      },
+      { 'x-opencode-session': 'ds-rotate' },
+    )
+    assert.equal(response.status, 200)
+    assert.deepEqual(seen, ['deepseek-one', 'deepseek-two'])
+  } finally {
+    await stopChild(gateway.child)
+    await new Promise(resolve => fake.server.close(resolve))
+  }
+})
+
+test('the refresh lock serializes refreshers and breaks a stale lock', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'refresh-lock-'))
+  const file = path.join(dir, 'credentials.json')
+  await writeFile(file, '{}')
+  try {
+    let active = 0
+    let maxActive = 0
+    const work = async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      active -= 1
+      return 'ok'
+    }
+    const results = await Promise.all([
+      withAnthropicRefreshLock(file, work),
+      withAnthropicRefreshLock(file, work),
+    ])
+    assert.deepEqual(results, ['ok', 'ok'])
+    assert.equal(maxActive, 1, 'two refreshers must not overlap')
+
+    // A lock left by a crashed process is broken rather than blocking forever.
+    await writeFile(`${file}.lock`, '999')
+    const old = new Date(Date.now() - 60_000)
+    await utimes(`${file}.lock`, old, old)
+    assert.equal(await withAnthropicRefreshLock(file, async () => 'ok'), 'ok')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 })
 

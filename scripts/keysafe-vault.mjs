@@ -37,6 +37,8 @@ const SERVICE = 'gateway-keysafe'
 
 const OPENCODE = /^opencode-go([2-9]|[1-9][0-9]+)?$/
 const COMMANDCODE = /^commandcode([2-9]|[1-9][0-9]+)?$/
+// DeepSeek records are numbered like the others: `ds`, `ds2`, `ds3` ...
+const DEEPSEEK_NUMBERED = /^ds([2-9]|[1-9][0-9]+)$/
 const MISTRAL = /^mistral([2-9]|[1-9][0-9]+)?$/
 // The console names the record "mistralvibe"; the hyphenated spelling is kept
 // for anyone who typed it that way. Both address the same Vibe pool.
@@ -63,7 +65,9 @@ export function envVarForRecord(name) {
     case 'openrouter':
       return 'OPENROUTER_API_KEY'
     default:
-      return null
+      return DEEPSEEK_NUMBERED.test(name)
+        ? `DEEPSEEK_API_KEY${name.slice('ds'.length)}`
+        : null
   }
 }
 
