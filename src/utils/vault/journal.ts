@@ -386,17 +386,23 @@ export type RotationRecord = Record<string, unknown> & { kind?: string; generati
  * as the first. `decide` returns the record to append, or null to write
  * nothing and leave the file untouched.
  */
+type RotationDecision = Record<string, unknown> | readonly Record<string, unknown>[] | null
+
 export async function appendRotationDecision(
   vaultRoot: string,
   familyId: string,
-  decide: (records: RotationRecord[]) => Record<string, unknown> | readonly Record<string, unknown>[] | null,
+  // Awaited so a decision can do work that belongs in the same critical
+  // section: an admission writes the obligation it owes here, and the row it
+  // returns has to be able to name that obligation or the error that stopped
+  // it. Synchronous decisions are unaffected.
+  decide: (records: RotationRecord[]) => RotationDecision | Promise<RotationDecision>,
 ): Promise<{ appended: RotationRecord[] }> {
   const dir = dirname(familyRotationPath(vaultRoot, familyId))
   await mkdir(dir, { recursive: true })
   return withVaultLock(dir, async () => {
     const path = familyRotationPath(vaultRoot, familyId)
     const records = await readRotationRecords(vaultRoot, familyId)
-    const decision = decide(records)
+    const decision = await decide(records)
     if (!decision) return { appended: [] }
     // A decision can be more than one row - the fifth admission and the rotation
     // intent it triggers have to land in the same critical section, or a crash

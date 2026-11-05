@@ -8,7 +8,7 @@ import {
   type RotationRecord,
 } from './journal.js'
 import { eligibleActions, type EligibleActionKind } from './eligibleActions.js'
-import { obligationBacklog, readObligations, recordObligation, type ObligationBacklog } from './obligations.js'
+import { obligationBacklog, readObligations, recordObligationLocked, type ObligationBacklog } from './obligations.js'
 import { verifyReconstruction, writeCharter } from './reconstruction.js'
 
 /**
@@ -272,46 +272,23 @@ function backlogMessage(familyId: string, backlog: ObligationBacklog): string {
  * admitted and the reason is recorded on the row, so the gate's opinion is
  * observable without enforcing it.
  */
-export async function conferDriverAdmission(request: ActivationRequest): Promise<ActivationResult> {
-  const result = await decideAdmission(request)
-  if (!result.ok) return result
-  return recordTurnObligation(request, result)
-}
-
 /**
- * The obligation half of an admission.
- *
- * Only an admitted activation reaches this: every refusal returns before it,
- * so a family that could not start work also records nothing as owed. Monitor
- * mode admits, so it creates too - the gate's opinion is not a veto on the
- * evidence.
+ * The obligation kind a turn owes, or null. It is decided once, before the
+ * gate, and carried into the admission's critical section so the admission row
+ * and the obligation it creates cannot disagree.
  */
-async function recordTurnObligation(request: ActivationRequest, admitted: ActivationAdmitted): Promise<ActivationAdmitted> {
-  if (!request.turn) return admitted
+function obligationKindFor(request: ActivationRequest): EligibleActionKind | null {
+  if (!request.turn) return null
   const verdict = eligibleActions({ text: request.turn.text, context: request.turn.context })
-  if (!verdict.eligible || verdict.kind === null) return admitted
-  try {
-    const created = await recordObligation({
-      vaultRoot: request.vaultRoot,
-      familyId: request.familyId,
-      driverSessionId: request.driverSessionId,
-      turnBoundary: request.turnBoundary,
-      kind: verdict.kind as EligibleActionKind,
-      createdAt: new Date().toISOString(),
-      sourceMessageId: request.turn.sourceMessageId,
-    })
-    if (!created.ok) return { ...admitted, obligation_error: created.message }
-    return { ...admitted, obligation_id: created.obligation_id }
-  } catch (error) {
-    return { ...admitted, obligation_error: (error as Error).message }
-  }
+  return verdict.eligible && verdict.kind !== null ? (verdict.kind as EligibleActionKind) : null
 }
 
-async function decideAdmission(request: ActivationRequest): Promise<ActivationResult> {
+export async function conferDriverAdmission(request: ActivationRequest): Promise<ActivationResult> {
   const { vaultRoot, familyId, driverSessionId } = request
   const mode = request.mode ?? 'monitor'
   const boundarySource = request.boundarySource ?? 'explicit'
   const rotationEvery = request.rotationEvery && request.rotationEvery > 0 ? request.rotationEvery : 5
+  const obligationKind = obligationKindFor(request)
   const invocationId =
     request.invocationId?.trim() || invocationIdFor(familyId, driverSessionId, request.turnBoundary)
 
@@ -342,6 +319,8 @@ async function decideAdmission(request: ActivationRequest): Promise<ActivationRe
       turn_boundary: String(existing.turn_boundary ?? request.turnBoundary),
       boundary_source: (existing.boundary_source as 'explicit' | 'default' | undefined) ?? boundarySource,
       rotation_intent: false,
+      ...(typeof existing.obligation_id === 'string' ? { obligation_id: existing.obligation_id } : {}),
+      ...(typeof existing.obligation_error === 'string' ? { obligation_error: existing.obligation_error } : {}),
       at: String(existing.at ?? ''),
     }
   }
@@ -376,6 +355,7 @@ async function decideAdmission(request: ActivationRequest): Promise<ActivationRe
       mode,
       rotationEvery,
       wouldRefuse: 'rotation-pending',
+      obligationKind,
     })
   }
 
@@ -396,6 +376,7 @@ async function decideAdmission(request: ActivationRequest): Promise<ActivationRe
       mode,
       rotationEvery,
       wouldRefuse: reason,
+      obligationKind,
     })
   }
 
@@ -424,6 +405,7 @@ async function decideAdmission(request: ActivationRequest): Promise<ActivationRe
         mode,
         rotationEvery,
         wouldRefuse: 'obligation-backlog',
+        obligationKind,
         backlog: { pending: backlog.pending, overdue: backlog.overdue, max_pending: backlog.maxPending },
       })
     }
@@ -440,6 +422,7 @@ async function decideAdmission(request: ActivationRequest): Promise<ActivationRe
     mode,
     rotationEvery,
     wouldRefuse: null,
+    obligationKind,
   })
 }
 
@@ -467,12 +450,15 @@ type Admitting = {
   rotationEvery: number
   wouldRefuse: ActivationReason | null
   backlog?: { pending: number; overdue: number; max_pending: number | null }
+  /** Non-null when this turn owes an obligation. */
+  obligationKind: EligibleActionKind | null
+  obligationSourceMessageId?: string
 }
 
 async function admit(input: Admitting): Promise<ActivationAdmitted> {
   // The ordinal is assigned inside the lock. Two concurrent activations must not
   // both read the same count and both call themselves the first.
-  const { appended } = await appendRotationDecision(input.vaultRoot, input.familyId, records => {
+  const { appended } = await appendRotationDecision(input.vaultRoot, input.familyId, async records => {
     const already = records.find(
       record => record.kind === 'admission' && record.invocation_id === input.invocationId,
     )
@@ -483,6 +469,29 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
     const ordinal =
       records.filter(record => record.kind === 'admission' && typeof record.invocation_id === 'string')
         .length + 1
+    // The obligation is created in the same critical section as the admission,
+    // so the row can carry its id - or the error that stopped it, which has to
+    // be durable here or a one-off failure loses the evidence permanently. A
+    // refusal never reaches this function at all.
+    let obligationId: string | undefined
+    let obligationError: string | undefined
+    if (input.obligationKind) {
+      try {
+        const created = await recordObligationLocked({
+          vaultRoot: input.vaultRoot,
+          familyId: input.familyId,
+          driverSessionId: input.driverSessionId,
+          turnBoundary: input.turnBoundary,
+          kind: input.obligationKind,
+          createdAt: new Date().toISOString(),
+          sourceMessageId: input.obligationSourceMessageId,
+        })
+        if (created.ok) obligationId = created.obligation_id
+        else obligationError = created.message
+      } catch (error) {
+        obligationError = (error as Error).message
+      }
+    }
     const row = {
       kind: 'admission',
       generation_id: input.generation,
@@ -494,6 +503,8 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
       gate: input.mode,
       ...(input.wouldRefuse ? { would_refuse: input.wouldRefuse } : {}),
       ...(input.backlog ? { backlog: input.backlog } : {}),
+      ...(obligationId ? { obligation_id: obligationId } : {}),
+      ...(obligationError ? { obligation_error: obligationError } : {}),
     }
     // The fifth admitted activation starts a rotation. The intent is written in
     // the same critical section as the admission that triggered it: a crash
@@ -519,6 +530,8 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
       turn_boundary: String(existing?.turn_boundary ?? input.turnBoundary),
       boundary_source: (existing?.boundary_source as 'explicit' | 'default' | undefined) ?? input.boundarySource,
       rotation_intent: false,
+      ...(typeof existing?.obligation_id === 'string' ? { obligation_id: existing.obligation_id } : {}),
+      ...(typeof existing?.obligation_error === 'string' ? { obligation_error: existing.obligation_error } : {}),
       at: String(existing?.at ?? ''),
     }
   }
@@ -537,6 +550,8 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
     boundary_source: input.boundarySource,
     rotation_intent: appended.length > 1,
     ...(input.backlog ? { backlog: input.backlog } : {}),
+    ...(typeof row.obligation_id === 'string' ? { obligation_id: row.obligation_id } : {}),
+    ...(typeof row.obligation_error === 'string' ? { obligation_error: row.obligation_error } : {}),
     at: String(row.at),
   }
 }

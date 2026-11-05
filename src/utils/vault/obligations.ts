@@ -27,6 +27,14 @@ export type ObligationRow = {
   state: ObligationState
   created_at?: string
   source_message_id?: string
+  /**
+   * The other two fields of the id's preimage. They are kept on the fold's row
+   * so the obligation can be attributed without re-reading the raw file, and so
+   * its id can be re-derived from what the metric actually reads.
+   */
+  family_id?: string
+  driver_session_id?: string
+  turn_boundary?: string
   /** Filled by `summarizeObligations`, so the fold itself stays time-independent. */
   age_hours?: number
 }
@@ -71,6 +79,10 @@ export function foldObligations(lines: readonly string[]): Map<string, Obligatio
       created_at: typeof record.created_at === 'string' ? record.created_at : current?.created_at,
       source_message_id:
         typeof record.source_message_id === 'string' ? record.source_message_id : current?.source_message_id,
+      family_id: typeof record.family_id === 'string' ? record.family_id : current?.family_id,
+      driver_session_id:
+        typeof record.driver_session_id === 'string' ? record.driver_session_id : current?.driver_session_id,
+      turn_boundary: typeof record.turn_boundary === 'string' ? record.turn_boundary : current?.turn_boundary,
     })
   }
   return rows
@@ -152,7 +164,7 @@ export type ObligationRefusal = { ok: false; obligation_id: string; message: str
  * crash-and-retry or a re-evaluation is idempotent, and an obligation that is
  * already terminal keeps its state.
  */
-export async function recordObligation(input: {
+export type ObligationCreationInput = {
   vaultRoot: string
   familyId: string
   driverSessionId: string
@@ -160,35 +172,49 @@ export async function recordObligation(input: {
   kind: EligibleActionKind
   createdAt: string
   sourceMessageId?: string
-}): Promise<ObligationCreated | ObligationRefusal> {
+}
+
+export async function recordObligation(input: ObligationCreationInput): Promise<ObligationCreated | ObligationRefusal> {
+  return withVaultLock(join(input.vaultRoot, 'families', input.familyId), () => recordObligationLocked(input))
+}
+
+/**
+ * The same write for a caller that already holds the family lock.
+ *
+ * The admission needs it: the admission row and the obligation it creates must
+ * be decided in one critical section, or a crash between them leaves a counted
+ * activation with no obligation (or the reverse) and the admission row cannot
+ * carry a durable `obligation_error`. `recordObligation` cannot be called from
+ * there because the lock is not reentrant, so this is the unlocked core rather
+ * than a second implementation.
+ */
+export async function recordObligationLocked(input: ObligationCreationInput): Promise<ObligationCreated | ObligationRefusal> {
   const obligationId = obligationIdFor(input.familyId, input.driverSessionId, input.turnBoundary)
   if (!input.createdAt.trim()) {
     return { ok: false, obligation_id: obligationId, message: 'recordObligation needs created_at; an obligation with no age can never be overdue' }
   }
-  return withVaultLock(join(input.vaultRoot, 'families', input.familyId), async () => {
-    if (foldObligations((await readRaw(input.vaultRoot, input.familyId)).split('\n')).has(obligationId)) {
-      return { ok: true, obligation_id: obligationId, duplicate: true }
-    }
-    const path = obligationsPath(input.vaultRoot, input.familyId)
-    await mkdir(dirname(path), { recursive: true })
-    const row = {
-      obligation_id: obligationId,
-      family_id: input.familyId,
-      kind: input.kind,
-      created_at: input.createdAt,
-      driver_session_id: input.driverSessionId,
-      turn_boundary: input.turnBoundary,
-      ...(input.sourceMessageId ? { source_message_id: input.sourceMessageId } : {}),
-    }
-    const handle = await open(path, 'a')
-    try {
-      await handle.writeFile(`${JSON.stringify(row)}\n`)
-      await handle.sync()
-    } finally {
-      await handle.close()
-    }
-    return { ok: true, obligation_id: obligationId, duplicate: false }
-  })
+  if (foldObligations((await readRaw(input.vaultRoot, input.familyId)).split('\n')).has(obligationId)) {
+    return { ok: true, obligation_id: obligationId, duplicate: true }
+  }
+  const path = obligationsPath(input.vaultRoot, input.familyId)
+  await mkdir(dirname(path), { recursive: true })
+  const row = {
+    obligation_id: obligationId,
+    family_id: input.familyId,
+    kind: input.kind,
+    created_at: input.createdAt,
+    driver_session_id: input.driverSessionId,
+    turn_boundary: input.turnBoundary,
+    ...(input.sourceMessageId ? { source_message_id: input.sourceMessageId } : {}),
+  }
+  const handle = await open(path, 'a')
+  try {
+    await handle.writeFile(`${JSON.stringify(row)}\n`)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  return { ok: true, obligation_id: obligationId, duplicate: false }
 }
 
 async function readRaw(vaultRoot: string, familyId: string): Promise<string> {
