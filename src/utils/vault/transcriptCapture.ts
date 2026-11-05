@@ -70,6 +70,11 @@ export async function captureTranscriptTurn(input: TranscriptCaptureInput): Prom
 async function captureTurn(input: TranscriptCaptureInput): Promise<SafeCaptureOutcome> {
   const configHome = input.configHome ?? getClaudeConfigHomeDir()
 
+  // Gate order is deliberate and must stay: the vault root is checked before
+  // the family. `vault-root-absent` is the stronger statement - on a machine
+  // with no vault, no family member could capture either, so reporting
+  // `no-family` here would blame the session for a machine-level fact. A later
+  // reorder has to argue with that, not just move a block.
   const settings = input.settings
     ? { ok: true as const, path: '<injected>', settings: input.settings, existed: true }
     : await readGatewaySettings()

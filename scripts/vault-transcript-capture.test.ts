@@ -66,7 +66,10 @@ test('a machine with no vault root records nothing, and the capture does not cre
   }
 })
 
-test('a session with no family records nothing and says why', async () => {
+// The resolver is injected on purpose: this process can itself be a family
+// member, and a no-family case that leaned on the ambient state would pass for
+// the wrong reason.
+test('a session with no family records nothing and says why (resolver injected)', async () => {
   const home = await scratch()
   try {
     const vaultRoot = path.join(home, 'vault')
