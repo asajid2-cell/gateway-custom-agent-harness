@@ -10,6 +10,21 @@ import type { ProviderName, ProviderQuota } from '../src/utils/bottomBarUsage.ts
 
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
+// Ink renders on its own frame clock, and that clock slows sharply when the
+// suite runs beside other files. A fixed sleep is a race, not a wait: under load
+// the frame arrived after 100ms and the assertions read an empty or stale frame.
+// Poll for the effect instead, with a ceiling so a genuinely missing frame still
+// fails the assertion rather than hanging.
+const FRAME_TIMEOUT_MS = 5_000
+async function waitFor(predicate: () => boolean, timeoutMs = FRAME_TIMEOUT_MS): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await wait(25)
+  }
+  return predicate()
+}
+
 const quota = (
   windows: ProviderQuota['windows'],
   extra: Partial<ProviderQuota> = {},
@@ -42,7 +57,7 @@ async function mountQuota(provider: ProviderName, model: string, value: Provider
   })
   const instance = instances.get(stdout as unknown as NodeJS.WriteStream)!
   instance.setAltScreenActive(true, true)
-  await wait(100)
+  await waitFor(() => output.length > 0)
   return {
     // The renderer writes changed cells and cursor moves, so assertions are made
     // against the characters that reached the terminal with escapes taken out. A
@@ -62,12 +77,12 @@ async function mountQuota(provider: ProviderName, model: string, value: Provider
     click: async () => {
       stdin.write('\x1b[<0;1;1M')
       stdin.write('\x1b[<0;1;1m')
-      await wait(100)
+      await waitFor(() => output.length > 0)
     },
     // A mouse-motion report over the control, which is what drives onMouseEnter.
     hover: async () => {
       stdin.write('\x1b[<35;2;1M')
-      await wait(100)
+      await waitFor(() => /\x1b\[4m/.test(output))
     },
     // One key per call: a chunk like ' \t' is not parsed as a Space keydown, so
     // only separate writes exercise the keyboard path a focus target would use.
@@ -79,7 +94,7 @@ async function mountQuota(provider: ProviderName, model: string, value: Provider
   }
 }
 
-test('a click cycles the Codex quota weekly then hourly and back', async () => {
+test('a click cycles the Codex quota weekly then hourly and back', { timeout: 20_000 }, async () => {
   const control = await mountQuota('Codex', 'gateway-gpt-6-sol', quota({
     W: { usedPercent: 23, resetsAt: null },
     H: { usedPercent: 0, resetsAt: null },
@@ -115,7 +130,7 @@ test('a click cycles the Codex quota weekly then hourly and back', async () => {
   }
 })
 
-test('the OpenCode quota cycles weekly, hourly, monthly and back', async () => {
+test('the OpenCode quota cycles weekly, hourly, monthly and back', { timeout: 20_000 }, async () => {
   const control = await mountQuota('OpenCode', 'gateway-opencode-deepseek-v4.1-flash', quota({
     W: { usedPercent: 10, resetsAt: null },
     H: { usedPercent: 20, resetsAt: null },
@@ -141,7 +156,7 @@ test('the OpenCode quota cycles weekly, hourly, monthly and back', async () => {
   }
 })
 
-test('a missing window is skipped rather than shown empty', async () => {
+test('a missing window is skipped rather than shown empty', { timeout: 20_000 }, async () => {
   // Weekly is absent, so the cycle is hourly -> monthly -> hourly.
   const control = await mountQuota('OpenCode', 'gateway-opencode-deepseek-v4.1-flash', quota({
     H: { usedPercent: 20, resetsAt: null },
@@ -163,7 +178,7 @@ test('a missing window is skipped rather than shown empty', async () => {
   }
 })
 
-test('a stale figure carries the marker', async () => {
+test('a stale figure carries the marker', { timeout: 20_000 }, async () => {
   const control = await mountQuota('Anthropic', 'gateway-claude-opus-5-5', quota(
     { W: { usedPercent: 12, resetsAt: null } },
     { stale: true },
@@ -175,7 +190,7 @@ test('a stale figure carries the marker', async () => {
   }
 })
 
-test('the hover underline marks only a control with a second window', async () => {
+test('the hover underline marks only a control with a second window', { timeout: 20_000 }, async () => {
   // The underline is how the control advertises that it is clickable. A single
   // window has nothing to step to, so hovering it must not underline - that
   // would advertise a dead control, which the click assertions cannot see.
@@ -197,7 +212,7 @@ test('the hover underline marks only a control with a second window', async () =
   }
 })
 
-test('a single-window quota wires no click handler', async () => {
+test('a single-window quota wires no click handler', { timeout: 20_000 }, async () => {
   // With one window there is nothing to cycle to, so the control must not be a
   // click target at all - the same shape as an unnamed session's resume control.
   const control = await mountQuota('Anthropic', 'gateway-claude-opus-5-5', quota({ W: { usedPercent: 12, resetsAt: null } }))

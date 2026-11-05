@@ -52,9 +52,11 @@ test('a sample excludes prompt processing and keeps both clocks', () => {
 })
 
 test('the sample is keyed by the canonical route, so aliases share one figure', () => {
+  // The unsuffixed id is a legacy alias of the Vibe route now that Vibe and
+  // Studio are separate models, so both spellings share the Vibe sample.
   assert.equal(
     speedKey('mistral/deepseek-v4-1-flash-1017'),
-    'gateway-mistral-deepseek-v4.1-flash',
+    'gateway-mistral-vibe-deepseek-v4.1-flash',
   )
   assert.equal(speedKey('gateway-claude-opus-4-6[1m]'), 'gateway-claude-opus-4-6')
   resetSpeedForTests()
