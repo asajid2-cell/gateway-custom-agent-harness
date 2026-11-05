@@ -16,17 +16,22 @@
  * outcome and never rejects.
  */
 
+/** Why a turn recorded nothing. Both are "not applicable", not "zero captures". */
+export type CaptureSkipReason = 'no-family' | 'vault-root-absent'
+
 export type CaptureFamily =
   | { kind: 'family'; familyId: string }
   | {
       kind: 'none'
-      reason: string
       /**
-       * The completeness state this absence reads as. A session with no family
-       * is not a family with zero captures; carrying the state here keeps the
-       * two from being printed as the same thing.
+       * The completeness state this absence reads as. A session with no family,
+       * or a machine with no vault, is not a family with zero captures; carrying
+       * the state and the reason keeps "not applicable" from being counted as
+       * "nothing recorded yet".
        */
       state: 'no-captures'
+      reason: CaptureSkipReason
+      note: string
     }
 
 /**
@@ -51,14 +56,15 @@ export function captureFamilyFor(input: {
   if (input.familyFileExists) return { kind: 'family', familyId: input.selfSessionId }
   return {
     kind: 'none',
-    reason: 'this session belongs to no family',
+    reason: 'no-family',
     state: 'no-captures',
+    note: 'this session belongs to no family',
   }
 }
 
 export type SafeCaptureOutcome =
   | { ok: true; familyId: string; result: unknown }
-  | { ok: false; reason: 'no-family'; state: 'no-captures'; note: string }
+  | { ok: false; reason: CaptureSkipReason; state: 'no-captures'; note: string }
   | { ok: false; reason: 'failed'; message: string }
 
 /**
@@ -79,7 +85,7 @@ export async function captureSessionSafely(input: {
   if (family.kind === 'none') {
     // Not a success with zero rows: nothing was captured because nothing owns
     // the span, and the caller must be able to say which of those it is.
-    return { ok: false, reason: 'no-family', state: family.state, note: family.reason }
+    return { ok: false, reason: family.reason, state: family.state, note: family.note }
   }
   try {
     return { ok: true, familyId: family.familyId, result: await input.run(family.familyId) }

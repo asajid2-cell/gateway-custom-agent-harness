@@ -340,8 +340,15 @@ export async function captureTranscript(input: {
   return { appended, duplicates, skipped }
 }
 
-/** The transcript's message text, whether content is a string or text blocks. */
-function textOf(record: Record<string, unknown>): string | null {
+/**
+ * The transcript's message text, whether content is a string or text blocks.
+ *
+ * Exported because the live hook derives a span hash from the in-memory message
+ * and the tailer derives it from the JSONL line. Two definitions of "the text"
+ * would let the same message hash differently depending on who captured it, and
+ * the pointer would stop being a verification of the span.
+ */
+export function textOf(record: Record<string, unknown>): string | null {
   const message =
     record.message && typeof record.message === 'object' ? (record.message as Record<string, unknown>) : record
   const content = message.content

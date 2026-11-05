@@ -22,7 +22,8 @@ test('a session with no family captures nothing, and says so in the completeness
   const result = captureFamilyFor({ selfSessionId: 'plain', familyRootSessionId: 'plain', familyFileExists: false })
   assert.equal(result.kind, 'none')
   if (result.kind === 'none') {
-    assert.match(result.reason, /belongs to no family/)
+    assert.equal(result.reason, 'no-family')
+    assert.match(result.note, /belongs to no family/)
     assert.equal(result.state, 'no-captures', 'absence must not print as a healthy zero')
   }
 })
@@ -48,7 +49,7 @@ test('a capture failure is reported and never thrown into the caller', async () 
   assert.equal(unresolved.ok === false ? unresolved.reason : '', 'failed')
 
   const homeless = await captureSessionSafely({
-    resolve: async () => ({ kind: 'none', reason: 'no family', state: 'no-captures' }),
+    resolve: async () => ({ kind: 'none', reason: 'no-family', state: 'no-captures', note: 'no family' }),
     run: async () => 'unused',
   })
   assert.equal(homeless.ok, false)
