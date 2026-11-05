@@ -452,6 +452,8 @@ test('a verified rotation fences the old generation', async () => {
       toGeneration: 'gen-2',
     })
     assert.equal(done.to_generation, 'gen-2')
+    assert.equal(done.reconstruction.ok, true, 'the verdict is echoed, not only written to the row')
+    assert.equal(done.reconstruction.charter, 'not-recorded')
     assert.equal(await activeGeneration(root, FAMILY), 'gen-2')
 
     // The old generation is now fenced: a commit carrying it is refused.

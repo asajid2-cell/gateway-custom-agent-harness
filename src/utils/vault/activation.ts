@@ -429,6 +429,8 @@ export type RotationCompletion = {
   family_id: string
   from_generation: string
   to_generation: string
+  /** The verdict the checker produced, echoed so a caller need not re-read the row. */
+  reconstruction: import('./reconstruction.js').ReconstructionCheck
   at: string
 }
 
@@ -489,6 +491,7 @@ export async function completeRotation(input: {
     family_id: input.familyId,
     from_generation: String(row.from_generation),
     to_generation: String(row.generation_id),
+    reconstruction,
     at: String(row.at),
   }
 }
