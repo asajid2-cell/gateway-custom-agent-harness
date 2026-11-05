@@ -90,7 +90,12 @@ ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/gateway"
 ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/cc-gateway"
 # `cc` is the C compiler on every POSIX box, and $BIN_DIR usually precedes
 # /usr/bin in PATH. Claim the short name only when it is free.
-if ! command -v cc >/dev/null 2>&1; then
+EXISTING_CC="$(command -v cc 2>/dev/null || true)"
+# Free, or already ours (an upgrade, possibly with a moved prefix) - both mean
+# the name can be (re)claimed. Anything else is somebody's compiler.
+if [ -z "$EXISTING_CC" ] \
+  || [ "$EXISTING_CC" = "$BIN_DIR/cc" ] \
+  || [ "$(readlink -f "$EXISTING_CC" 2>/dev/null)" = "$PREFIX/scripts/cc" ]; then
   ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/cc"
   CC_NOTE="  cc      -> $BIN_DIR/cc"
 else

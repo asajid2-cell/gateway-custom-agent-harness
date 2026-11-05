@@ -113,8 +113,9 @@ exit 0
 const prerm = `#!/bin/sh
 set -e
 rm -f /usr/bin/gateway /usr/bin/cc-gateway
-# Only remove \`cc\` when this package created it.
-if [ "$(readlink -f /usr/bin/cc 2>/dev/null)" = "/opt/gateway/scripts/cc" ]; then
+# Only remove \`cc\` when this package created it. readlink without -f: if the
+# target is already gone, -f yields an empty string and the link would survive.
+if [ -L /usr/bin/cc ] && [ "$(readlink /usr/bin/cc)" = "/opt/gateway/scripts/cc" ]; then
   rm -f /usr/bin/cc
 fi
 exit 0

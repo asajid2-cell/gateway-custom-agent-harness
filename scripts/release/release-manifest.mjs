@@ -64,20 +64,33 @@ const version = arg('version') ?? (/gateway-(\d+\.\d+\.\d+[^/]*)-/.exec(files.ma
 
 // The install trees carry the only statement about whether the artifact is
 // self-contained; quote it rather than inferring from the file name.
+// A release directory keeps the install trees out (they are inputs, hundreds of
+// MB each) and copies only their manifests into `manifests/`. When the trees
+// are present, read them the same way.
 const trees = []
-for (const entry of await readdir(directory, { withFileTypes: true })) {
-  if (!entry.isDirectory() || !entry.name.startsWith('gateway-')) continue
-  const manifestPath = path.join(directory, entry.name, 'install-manifest.json')
-  if (!existsSync(manifestPath)) continue
+async function addTree(name, manifestPath) {
   const manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
   trees.push({
-    tree: entry.name,
+    tree: name,
     platform: manifest.platform,
     arch: manifest.arch,
     sourceSha: manifest.source_sha,
     runtime: manifest.runtime,
   })
 }
+for (const entry of await readdir(directory, { withFileTypes: true })) {
+  if (!entry.isDirectory() || !entry.name.startsWith('gateway-')) continue
+  const manifestPath = path.join(directory, entry.name, 'install-manifest.json')
+  if (existsSync(manifestPath)) await addTree(entry.name, manifestPath)
+}
+const manifestsDirectory = path.join(directory, 'manifests')
+if (existsSync(manifestsDirectory)) {
+  for (const entry of await readdir(manifestsDirectory)) {
+    if (!entry.endsWith('.json')) continue
+    await addTree(entry.replace(/\.json$/, ''), path.join(manifestsDirectory, entry))
+  }
+}
+trees.sort((a, b) => `${a.platform}-${a.arch}`.localeCompare(`${b.platform}-${b.arch}`))
 
 const manifest = {
   name: 'Gateway',
