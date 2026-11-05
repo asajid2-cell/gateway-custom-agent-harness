@@ -154,7 +154,11 @@ export function partnerValueSpec(value: string | undefined): { model?: string; e
   return levels.includes(word) ? { effort: word } : { model: word }
 }
 
-async function run(input: z.infer<InputSchema>, context: { getAppState?: () => { mainLoopModel?: string | null; effortValue?: unknown } }): Promise<string> {
+async function run(
+  input: z.infer<InputSchema>,
+  context: { getAppState?: () => { mainLoopModel?: string | null; effortValue?: unknown } },
+  turnBoundary?: string,
+): Promise<string> {
   const workspace = await import('../../utils/leafWorkspace.js')
   const requireLeaf = (): string => {
     if (!input.leaf) throw new Error('A leaf reference is required for this action')
@@ -270,7 +274,7 @@ async function run(input: z.infer<InputSchema>, context: { getAppState?: () => {
         if (!driven) throw new Error(await workspace.leafReferenceFailure(reference))
         leafIds.push(driven.sessionId)
       }
-      return workspace.conferDriver(member.sessionId, leafIds)
+      return workspace.conferDriver(member.sessionId, leafIds, turnBoundary)
     }
     case 'checkpoints':
       return workspace.listLeafCheckpoints(input.leaf?.trim() || undefined)
@@ -343,8 +347,15 @@ export const LeafTool = buildTool({
   renderToolUseMessage() {
     return null
   },
-  async call(input, context) {
-    return { data: { result: await run(input, context as Parameters<typeof run>[1]) } }
+  async call(input, context, _canUseTool, parentMessage) {
+    // The assistant message is the turn boundary: every `/driver` call made
+    // while composing one reply is the same admission, and the same call
+    // retried on that reply cannot advance the rotation counter again.
+    return {
+      data: {
+        result: await run(input, context as Parameters<typeof run>[1], parentMessage?.uuid),
+      },
+    }
   },
   mapToolResultToToolResultBlockParam(content, toolUseID) {
     const { result } = content as Output

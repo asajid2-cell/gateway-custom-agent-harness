@@ -711,6 +711,14 @@ export async function admitDriverDesignation(input: {
   headSessionId?: string
   maxPending?: number | null
   overdueHours?: number
+  /**
+   * The boundary this designation belongs to. A harness call has one - the
+   * assistant message carrying the tool call - and passing it makes two
+   * `/driver` calls in different turns two admissions, while a retry inside one
+   * reply stays one. When the caller has no boundary, the scope is the
+   * boundary, which is what an interactive slash command has to offer.
+   */
+  turnBoundary?: string
 }): Promise<ActivationResult | null> {
   if (!(await familyExists(input.vaultRoot, input.familyId))) {
     if (input.mode === 'monitor') return null
@@ -721,13 +729,18 @@ export async function admitDriverDesignation(input: {
       message: MESSAGES['unknown-family'](input.familyId),
     }
   }
-  // The identity of a designation is the scope it sets: repeating the same
-  // scope is the same authority, changing it is a new one.
+  // The identity of a designation is the boundary it names. A harness call
+  // hands in its tool invocation id, so the counter advances once per call and
+  // a retry of that call does not advance it again. Without one, the scope is
+  // the boundary: repeating the same scope is the same authority.
+  const boundary = input.turnBoundary?.trim()
+    ? `invocation:${input.turnBoundary.trim()}`
+    : `scope:${[...input.scope].sort().join(',')}`
   const result = await conferDriverAdmission({
     vaultRoot: input.vaultRoot,
     familyId: input.familyId,
     driverSessionId: input.driverSessionId,
-    turnBoundary: `scope:${[...input.scope].sort().join(',')}`,
+    turnBoundary: boundary,
     boundarySource: 'explicit',
     mode: input.mode,
     maxPending: input.maxPending ?? null,

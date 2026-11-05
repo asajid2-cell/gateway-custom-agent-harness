@@ -154,6 +154,9 @@ async function main(): Promise<number> {
         headSessionId: typeof args.head === 'string' ? (args.head as string) : undefined,
         maxPending: policy.maxPending,
         overdueHours: policy.overdueHours,
+        // A script that means a distinct activation names its boundary; without
+        // one the scope is the boundary, as it is for the slash command.
+        ...(typeof args.turn === 'string' ? { turnBoundary: args.turn as string } : {}),
       })
       if (!harnessResult) {
         print({

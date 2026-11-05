@@ -3617,7 +3617,18 @@ export async function conferHeir(sessionId: string): Promise<string> {
  * and deliberately not the matriarch lease: which window runs the family is a
  * different question from who it answers to.
  */
-export async function conferDriver(driverSessionId: string, leafIds: readonly string[]): Promise<string> {
+export async function conferDriver(
+  driverSessionId: string,
+  leafIds: readonly string[],
+  /**
+   * The boundary this call belongs to, when the caller has one: the Leaf tool
+   * passes the assistant message that carries the call, so two `/driver` calls
+   * in different turns are two admissions and a retry of one call is still one.
+   * A caller with no boundary falls back to the scope, as the slash command
+   * does - which is right for a stable scope and only wrong for a counter.
+   */
+  turnBoundary?: string,
+): Promise<string> {
   if (isInteractiveLeaf()) return requestLeafWorkspace<string>('driver', [driverSessionId, leafIds])
   const { requireHead } = await import('./headLedger.js')
   await requireHead()
@@ -3668,7 +3679,7 @@ export async function conferDriver(driverSessionId: string, leafIds: readonly st
   // reconciliation trusts. A family the vault has never seen is not gated in
   // monitor mode: refusing every designation for an unregistered family would
   // be an outage, and registering families is step 5's job.
-  const gateNote = await admitDesignationInVault(root, driverSessionId, driver, wanted)
+  const gateNote = await admitDesignationInVault(root, driverSessionId, driver, wanted, turnBoundary)
   scope[driverSessionId] = wanted
   await writeLeafDriverDesignation(root, scope)
   await indexLeafMembers(root, members)
@@ -3689,6 +3700,7 @@ async function admitDesignationInVault(
   driverSessionId: string,
   driver: { name?: string },
   scope: readonly string[],
+  turnBoundary?: string,
 ): Promise<string> {
   const { readGatewaySettings, vaultRootFor, obligationPolicy } = await import('./vault/settings.js')
   const { admitDriverDesignation } = await import('./vault/activation.js')
@@ -3708,6 +3720,7 @@ async function admitDesignationInVault(
     headSessionId: getLeafPatriarchSessionId(),
     maxPending: policy.maxPending,
     overdueHours: policy.overdueHours,
+    ...(turnBoundary ? { turnBoundary } : {}),
   })
   if (!result) return ''
   if (!result.ok) throw new Error(result.message)
