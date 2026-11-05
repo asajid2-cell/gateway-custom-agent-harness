@@ -908,6 +908,33 @@ async function composerTextOf(composer) {
  * rather than assumed - a swallowed click leaves the caret somewhere the delete
  * never reached.
  */
+/**
+ * Edit through the page's own DOM, not the CDP keyboard.
+ *
+ * Chrome silently drops synthesized keystrokes for a window it will not give
+ * focus to (another Chrome window in front, a remote desktop, a locked screen).
+ * The composer then reads back empty after every `fill`, and the turn is
+ * refused as "not-posted" while the page itself is perfectly healthy.
+ * `execCommand` runs inside the page, so it lands wherever the field is
+ * editable, and the caller still verifies the text afterwards.
+ */
+async function editFromPage(composer, command, value = null) {
+  return composer.evaluate((el, [cmd, text]) => {
+    try {
+      el.focus()
+      if (cmd === 'clear') {
+        const selection = window.getSelection()
+        const range = document.createRange()
+        range.selectNodeContents(el)
+        selection.removeAllRanges()
+        selection.addRange(range)
+        return document.execCommand('delete') !== false
+      }
+      return document.execCommand(cmd, false, text) !== false
+    } catch { return false }
+  }, [command, value]).catch(() => false)
+}
+
 async function clearComposer(page, composer) {
   // An already-empty composer needs no click: the read is the proof, and
   // `composeExactlyOnce` focuses the field itself before inserting.
@@ -3221,6 +3248,28 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
       const landed = threadOf(page.url())
       if (!landed || landed.toLowerCase() !== String(threadId).toLowerCase()) {
         throw new TurnError(`not-posted: the page landed on ${landed ?? 'no thread'} instead of the requested thread ${threadId}; nothing was typed, so nothing was sent`, { reason: 'not-posted' })
+      }
+    }
+  }
+  if (threadId) {
+    // ChatGPT's web app intermittently serves a conversation shell that never
+    // hydrates: the composer is there, the messages never arrive, and a send
+    // into it goes nowhere (observed 2026-11-05: 0 message nodes, a 404 on the
+    // conversation API for a thread that answered minutes earlier). One reload
+    // first - that fixes a slow hydration - and if the thread is still empty,
+    // continue in a new chat, which always renders, rather than typing into a
+    // page that will silently swallow the turn.
+    const messageCount = () => page.evaluate(() => document.querySelectorAll('[data-message-author-role]').length).catch(() => -1)
+    if ((await messageCount()) === 0) {
+      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {})
+      await railed(waitForLogin(page, LOGIN_WAIT_MS), acceptDeadline, sendDeadlineNotPosted).catch(() => {})
+      await new Promise(resolve => setTimeout(resolve, 1_500))
+      if ((await messageCount()) === 0) {
+        // Not posting here at all: the host owns the thread id, and only it may
+        // start a new one. Report it so the host clears the thread and the next
+        // attempt opens a fresh chat (which always renders).
+        await log(`thread ${threadId} rendered no messages; reporting it as unreadable`)
+        throw new TurnError(`not-posted: thread ${threadId} rendered no messages and would swallow the turn; nothing was typed, so nothing was sent`, { reason: 'thread-unreadable' })
       }
     }
   }

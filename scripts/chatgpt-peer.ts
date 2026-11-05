@@ -2918,6 +2918,17 @@ export class ChatGptHost {
         await this.notePendingTurn(bridge, record)
       }
       const reason = one((error as Error).message, 160)
+      // A thread ChatGPT itself cannot render never heals by retrying that same
+      // thread: the page loads its shell, shows no messages, and swallows any
+      // send. Clear the thread so the next attempt opens a fresh chat, which
+      // renders - and say so, because the conversation continuity is gone.
+      if (/rendered no messages/i.test(reason) && bridge.state.threadId) {
+        const dead = bridge.state.threadId
+        bridge.state.threadId = null
+        bridge.state.primedThreadId = null
+        await this.persistBridgeState(bridge)
+        log(`"${bridge.state.name}": thread ${dead} renders no messages; cleared it, the next attempt starts a new chat`)
+      }
       // R10-F3: `ambiguous` is a "may have landed" state, so it is swallowed
       // like the other not-a-refusal reasons and the turn stays queued.
       if (!(error instanceof SendAmbiguous) && !/mid-turn|not-posted|never left the composer|ambiguous/i.test(reason)) throw error
