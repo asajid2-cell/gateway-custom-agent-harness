@@ -805,6 +805,9 @@ export class ChatGptHost {
    */
   private readonly settling = new Set<string>()
 
+  /** One short retry timer per bridge, armed when a window is recycled under a queued job. */
+  private readonly deferredRetries = new Map<string, NodeJS.Timeout>()
+
   /**
    * Inbound message ids THIS process began FRESH (no transcript on disk).
    *
@@ -2805,6 +2808,25 @@ export class ChatGptHost {
    * transition. When it does post, `text` is the answer the synchronous send
    * returned on the same request (null only if the driver did not carry one).
    */
+  /**
+   * Can this `generating` status still describe a live turn?
+   *
+   * A queued job must not wait on a leftover push from a page that has since
+   * been recycled. That is a real wedge, not a hypothetical: on 2026-11-05 a
+   * turn stayed unposted for seven minutes because the pushed state still said
+   * streaming after the window was replaced, and only the ten-minute signal
+   * window released it. A live turn keeps its push fresh (the event channel
+   * moves it), so an old push - or one about another thread - is not evidence.
+   * When in doubt the post is attempted: the driver refuses a genuinely
+   * mid-turn send on its own word, so the text is never steered.
+   */
+  private generatingLooksLive(gate: CheapStatus): boolean {
+    if (gate.state !== 'generating') return false
+    if (gate.matchesThread === false) return false
+    if (typeof gate.ageMs !== 'number') return true
+    return gate.ageMs <= 120_000
+  }
+
   private async postPendingTurn(bridge: Bridge, record: PendingTurn, waitMs = 30_000, locked = false): Promise<{ posted: boolean; text: string | null }> {
     const deadline = Date.now() + waitMs
     for (;;) {
@@ -2824,7 +2846,7 @@ export class ChatGptHost {
       // into it. `idle` and `unknown` both mean "no turn seen running"; the
       // driver refuses a mid-turn send on its own word anyway, which is the
       // backstop when the pushed signal is missing or stale.
-      if (gate.state !== 'generating') return await this.postRecordedTurn(bridge, record, locked)
+      if (!this.generatingLooksLive(gate)) return await this.postRecordedTurn(bridge, record, locked)
       if (Date.now() >= deadline) {
         log(`"${bridge.state.name}": the page is still mid-turn; ${shortId(record.messageId)} stays queued`)
         return { posted: false, text: null }
@@ -3313,15 +3335,53 @@ export class ChatGptHost {
    * Runs INSIDE the observation pass (the page lock is already held): one post
    * per pass, because posting starts a turn and the next job must wait for it.
    */
-  private async resumeDeferredTurns(bridge: Bridge): Promise<void> {
+  /**
+   * Re-post a deferred job shortly after a window was recycled for it.
+   *
+   * One timer per bridge, unref'd, cleared when it fires. The reconcile pass
+   * still exists; this only removes the five-minute latency from the common
+   * "the page could not load the messages" path.
+   */
+  private armDeferredRetry(bridge: Bridge, delayMs = 10_000, attempt = 1): void {
+    if (this.stopping || bridge.removed || bridge.stopping) return
+    if (attempt > 8) return
+    const key = bridge.state.sessionId
+    const existing = this.deferredRetries.get(key)
+    if (existing) clearTimeout(existing)
+    const handle = setTimeout(() => {
+      this.deferredRetries.delete(key)
+      if (this.stopping || bridge.removed || bridge.stopping) return
+      void this.resumeDeferredTurns(bridge, false).then(() => {
+        // The attempt can still find the page mid-turn (a recycle is not
+        // instant), so a single timer is not enough: re-arm on a short ladder
+        // until the job is posted or the attempts run out. The reconcile pass
+        // is the backstop after that.
+        const stillQueued = bridge.state.pendingTurns.some(record => record.postedAt === null)
+        if (stillQueued) this.armDeferredRetry(bridge, Math.min(delayMs * 2, 60_000), attempt + 1)
+      }).catch(error => {
+        log(`deferred re-post for "${bridge.state.name}" failed: ${(error as Error).message}`)
+      })
+    }, delayMs)
+    handle.unref?.()
+    this.deferredRetries.set(key, handle)
+  }
+
+  private async resumeDeferredTurns(bridge: Bridge, locked = true): Promise<void> {
     const deferred = bridge.state.pendingTurns.find(record => record.postedAt === null && !this.attachedTurns.has(record.messageId))
     if (!deferred) return
     const threadId = bridge.state.threadId
     if (!threadId) return
-    const gate = await this.cheapStatus(threadId)
-    if (gate.state === 'generating') return
+    // With lanes, the writer's own page is the only page that can receive this
+    // text, and postPendingTurn asks it inside laneWork. Asking the master here
+    // instead answers about a different page: on 2026-11-05 a stale generating
+    // status on the master skipped every retry and left a queued job for the
+    // five-minute reconcile pass.
+    if (!this.lanes) {
+      const gate = await this.cheapStatus(threadId)
+      if (this.generatingLooksLive(gate)) return
+    }
     const laneId = this.laneIdOf({ fromSessionId: deferred.senderSessionId })
-    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, deferred, 0, true))
+    const posted = await this.laneWork(laneId, () => this.postPendingTurn(bridge, deferred, 0, locked))
     if (posted.posted) {
       audit(this.hostState, { op: 'turn', target: deferred.senderSessionId, result: `deferred job posted after the turn ended [${bridge.state.name}]`, messageId: deferred.messageId })
       await this.persistHostState()
@@ -5192,6 +5252,11 @@ export class ChatGptHost {
           log(`turn ${shortId(message.id)}: ${line} [${bridge.state.name}]`)
           audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
           await this.persistHostState()
+          // Before acceptance the job is only queued, and the reconcile pass
+          // that would re-post it runs on `observeEvery` (five minutes by
+          // default) - a recycle must not cost that. Arm a short retry on the
+          // fresh window; the pass remains the safety net, not the latency.
+          if (!error.accepted) this.armDeferredRetry(bridge)
           return
         }
         if (error instanceof GeneratingTurn) {

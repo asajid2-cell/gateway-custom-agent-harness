@@ -338,9 +338,17 @@ function attachVerdict({ served, marker, install, owner, port, profile }) {
     }
     const recorded = parseBrowserUrl(marker.browserUrl)
     if (recorded) {
-      return recorded.guid === served.guid
-        ? { ok: true, pid: Number(marker.pid) || null, how: 'launch marker' }
-        : { ok: false, why: `port ${port} is served by browser ${served.guid}, but this driver launched ${recorded.guid}; refusing to attach` }
+      if (recorded.guid === served.guid) return { ok: true, pid: Number(marker.pid) || null, how: 'launch marker' }
+      // The recorded browser is gone and another one holds the port. If that
+      // browser was started with THIS profile's exact --user-data-dir it is the
+      // same install restarted (live 2026-11-05: every master relaunch made
+      // every attach refuse until the record was rewritten by hand). Adopt it
+      // and say so, so the caller can replace the stale record. A foreign
+      // browser on our port does not carry our profile and is still refused.
+      if (ownerCarriesProfile(owner, profile)) {
+        return { ok: true, pid: Number(owner?.pid) || null, how: 'port owner command line (stale launch record)', heal: true }
+      }
+      return { ok: false, why: `port ${port} is served by browser ${served.guid}, but this driver launched ${recorded.guid}; refusing to attach` }
     }
   }
   // No GUID in the marker: it predates the GUID record, or was written by hand.
@@ -488,8 +496,16 @@ async function ownedDebugger() {
   const recorded = parseBrowserUrl(marker?.browserUrl) ?? parseBrowserUrl(install?.browserUrl)
   // Reading another process's command line costs a PowerShell round trip, so
   // only an install with no GUID on record pays for it.
-  const owner = served && !recorded ? await portOwner() : null
-  const verdict = attachVerdict({ served, marker, install, owner, port: PORT, profile: PROFILE })
+  let owner = served && !recorded ? await portOwner() : null
+  let verdict = attachVerdict({ served, marker, install, owner, port: PORT, profile: PROFILE })
+  if (!verdict.ok && served && recorded) {
+    // A GUID mismatch can be a stale record after this install's browser was
+    // restarted. The port owner's command line is the one fact that separates
+    // "our browser, new GUID" from "someone else's browser on our port", so it
+    // is paid for only when the cheap evidence disagrees.
+    owner = await portOwner()
+    verdict = attachVerdict({ served, marker, install, owner, port: PORT, profile: PROFILE })
+  }
   if (!verdict.ok) throw new Error(verdict.why)
   // Rewrite the record when it changed hands or when the marker has no GUID yet
   // (a hand-written or pre-GUID marker), so the expensive evidence is needed
@@ -1022,8 +1038,17 @@ async function composeExactlyOnce(page, composer, text, onStep = null) {
 }
 
 const ASSISTANT = '[data-markdown-text-style="assistant-message"]'
-/** The person's own messages: the node a successful send adds. */
-const USER_MESSAGE = '[data-message-author-role="user"]'
+/**
+ * The person's own messages: the node a successful send adds.
+ *
+ * ChatGPT changed its conversation DOM on 2026-11-05: the old
+ * `[data-message-author-role]` attributes are gone and a turn now carries an
+ * `h4[data-conversation-role]` label plus a `[data-user-message-bubble]` bubble.
+ * Both spellings are kept so an older page and this one are both read.
+ */
+const USER_MESSAGE = '[data-user-message-bubble="true"], [data-message-author-role="user"]'
+/** Every conversation turn the page has rendered, in either UI generation. */
+const ANY_MESSAGE = `${ASSISTANT}, ${USER_MESSAGE}, [data-talvt-turn-state], [data-conversation-role]`
 
 /**
  * Is the page still working?
@@ -1172,6 +1197,77 @@ async function assistantText(page) {
 }
 
 /**
+ * What the server says about a thread, when the page renders no messages.
+ *
+ * `missing` - the conversation is gone (404). `empty` - it exists with no
+ * messages, which is what a thread the host just created looks like; the send
+ * is the first message, so it must go ahead. `content` - the server holds
+ * messages the page did not render, i.e. the hydration fault the guard exists
+ * for. `unknown` is treated like `content` (reload, then refuse) because a
+ * thread we cannot ask about must not be typed into blind.
+ */
+/**
+ * The answer as the server holds it, used when the page will not render it.
+ *
+ * ChatGPT intermittently serves a conversation the DOM never paints ("can't
+ * load conversation") while the turn itself completed - the answer is in the
+ * conversation mapping. When that happens the reply must come from the source,
+ * not from a window that failed to draw: a render fault is not a lost turn.
+ * Attribution stays strict: only the last user message may match the text this
+ * send typed (its tail), and only an assistant message after it is accepted.
+ */
+async function readServerReply(page, threadId, sentText) {
+  if (!threadId) return ''
+  const tail = String(sentText || '').replace(/\s+/g, ' ').trim().slice(-60)
+  return page.evaluate(async ([id, wantedTail]) => {
+    try {
+      const session = await (await fetch('/api/auth/session')).json()
+      const headers = session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {}
+      const response = await fetch(`/backend-api/conversation/${id}`, { credentials: 'include', headers })
+      if (!response.ok) return ''
+      const body = await response.json()
+      const norm = value => String(value || '').replace(/\s+/g, ' ').trim()
+      const textOf = message => ((message.content && message.content.parts) || [])
+        .map(part => (typeof part === 'string' ? part : ''))
+        .join(' ')
+      const messages = Object.values(body.mapping || {})
+        .map(node => node && node.message)
+        .filter(message => message && message.author && typeof message.create_time === 'number')
+        .sort((a, b) => a.create_time - b.create_time)
+      let lastUser = -1
+      for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index].author.role === 'user') { lastUser = index; break }
+      }
+      if (lastUser < 0) return ''
+      if (wantedTail && !norm(textOf(messages[lastUser])).endsWith(wantedTail)) return ''
+      for (let index = messages.length - 1; index > lastUser; index--) {
+        if (messages[index].author.role !== 'assistant') continue
+        const text = norm(textOf(messages[index]))
+        if (text) return text
+      }
+      return ''
+    } catch { return '' }
+  }, [threadId, tail]).catch(() => '')
+}
+
+async function threadContentState(page, threadId) {
+  return page.evaluate(async id => {
+    try {
+      const session = await (await fetch('/api/auth/session')).json()
+      const response = await fetch(`/backend-api/conversation/${id}`, {
+        credentials: 'include',
+        headers: session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {},
+      })
+      if (response.status === 404) return 'missing'
+      if (!response.ok) return 'unknown'
+      const body = await response.json()
+      const messages = Object.values(body.mapping || {}).filter(node => node && node.message).length
+      return messages === 0 ? 'empty' : 'content'
+    } catch { return 'unknown' }
+  }, threadId).catch(() => 'unknown')
+}
+
+/**
  * The page's user turns as (identity, text) pairs, or null when it cannot be read.
  *
  * Identity is the closest ancestor's `data-message-id` (or the node's own), so a
@@ -1187,8 +1283,12 @@ async function readDomUserTurns(page, priorUsers = 0, timeoutMs = DOM_BASELINE_T
     const nodes = [...document.querySelectorAll(selector)]
     return {
       identities: nodes.map(node => {
-        const turn = node.closest && node.closest('[data-message-id]')
-        return (turn && turn.getAttribute('data-message-id')) || node.getAttribute('data-message-id') || node.id || null
+        // The 2026-11-05 UI names its message ids differently; an identity is
+        // only used to tell an old node from the new one, so any stable id on
+        // the bubble's wrapper will do.
+        const turn = node.closest && node.closest('[data-message-id], [data-chatgpt-selection-message-id], [data-chatgpt-search-message-ids]')
+        return (turn && (turn.getAttribute('data-message-id') || turn.getAttribute('data-chatgpt-selection-message-id') || turn.getAttribute('data-chatgpt-search-message-ids')))
+          || node.getAttribute('data-message-id') || node.getAttribute('data-chatgpt-search-message-ids') || node.id || null
       }),
       texts: nodes.map((node, index) => (index >= prior ? (node.innerText || '') : null)),
     }
@@ -2368,7 +2468,7 @@ async function waitForSendReady(page, timeoutMs = SEND_READY_TIMEOUT_MS) {
  * is teardown information only: it never shortens an interval the guard was
  * already serving.
  */
-async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
+async function waitForReply(page, beforeCount, beforeText = '', watch = null, sentText = '') {
   const startedAt = Date.now()
   const deadline = startedAt + SEND_TIMEOUT_MS
   let last = ''
@@ -2476,6 +2576,9 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
     if (how === 'stream') {
       await log(`reply stream: ended at ${completion.at - startedAt}ms (${completion.end}), first stable sample at ${firstStableAt - startedAt}ms (shortener)`)
     }
+    if (how === 'server') {
+      await log(`reply server: the page did not paint the answer; read ${reply.length} chars from the conversation API`)
+    }
     if (how === 'marker') {
       const named = marker.messageId ? ` (message ${marker.messageId})` : ''
       // The corroborating marker usually arrives in the same batch but after
@@ -2555,6 +2658,11 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null) {
     }
     const named = marker.messageId ? ` (message ${marker.messageId})` : ''
     await log(`reply marker: /message/status finished at ${markerArrivedAt - startedAt}ms${named}, entered +${entryLag}ms, confirm did not settle within ${MARKER_CONFIRM_MS}ms (${samples} samples: ${trace.join(', ')}); falling back to the guard`)
+    // The stream is over and the DOM will not confirm it - the render fault.
+    // Ask the server now instead of spending the rest of the reply budget on a
+    // page that is not drawing: the answer is already in the conversation.
+    const recovered = sentText ? await readServerReply(page, threadOf(page.url()), sentText) : ''
+    if (recovered) return await finish('server', recovered)
     return null
   }
   while (Date.now() < deadline) {
@@ -3259,17 +3367,58 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // first - that fixes a slow hydration - and if the thread is still empty,
     // continue in a new chat, which always renders, rather than typing into a
     // page that will silently swallow the turn.
-    const messageCount = () => page.evaluate(() => document.querySelectorAll('[data-message-author-role]').length).catch(() => -1)
-    if ((await messageCount()) === 0) {
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {})
-      await railed(waitForLogin(page, LOGIN_WAIT_MS), acceptDeadline, sendDeadlineNotPosted).catch(() => {})
-      await new Promise(resolve => setTimeout(resolve, 1_500))
-      if ((await messageCount()) === 0) {
-        // Not posting here at all: the host owns the thread id, and only it may
-        // start a new one. Report it so the host clears the thread and the next
-        // attempt opens a fresh chat (which always renders).
-        await log(`thread ${threadId} rendered no messages; reporting it as unreadable`)
-        throw new TurnError(`not-posted: thread ${threadId} rendered no messages and would swallow the turn; nothing was typed, so nothing was sent`, { reason: 'thread-unreadable' })
+    // Any rendered turn counts as a message. ChatGPT's 2026-11-05 UI dropped
+    // `data-message-author-role`, which made every real thread read as empty
+    // while the page was visibly rendering it; ANY_MESSAGE covers both the old
+    // and the new vocabulary so the guard cannot mistake a fine page for a
+    // dead one and throw the turn away.
+    // Hydration is a race, not an instant: a conversation created a second ago
+    // by this very writer still has its message mapping in flight, and a single
+    // read taken right after the goto is zero on a thread that is about to
+    // render fine (live 2026-11-05: a freshly primed thread was declared empty
+    // and thrown away). Poll before believing zero.
+    const messageCount = async (ms) => {
+      const until = Date.now() + ms
+      let seen = -1
+      do {
+        seen = await page.evaluate(selector => document.querySelectorAll(selector).length, ANY_MESSAGE).catch(() => -1)
+        if (seen > 0) return seen
+        if (Date.now() >= until) break
+        await new Promise(resolve => setTimeout(resolve, 500))
+      } while (Date.now() < until)
+      return seen
+    }
+    if ((await messageCount(6_000)) <= 0) {
+      // Zero rendered nodes alone does not mean a broken page: a conversation
+      // the host just created (newBridge) is genuinely empty, and its first
+      // message is exactly what this send is for. Ask the server which case
+      // this is before throwing a good turn away.
+      // 'unknown' is most often a 429 on the conversation read, which says
+      // nothing about the thread. Re-ask before treating it as a page fault.
+      let content = await threadContentState(page, threadId)
+      for (let attempt = 0; attempt < 2 && content === 'unknown'; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 2_000))
+        content = await threadContentState(page, threadId)
+      }
+      if (content === 'missing') {
+        await log(`thread ${threadId} is gone on the server; reporting it as unreadable`)
+        throw new TurnError(`not-posted: thread ${threadId} is gone on the server, so nothing was typed and nothing was sent`, { reason: 'thread-unreadable' })
+      }
+      if (content === 'empty') {
+        await log(`thread ${threadId} is new and empty; posting the first message into it`)
+      } else {
+        await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {})
+        await railed(waitForLogin(page, LOGIN_WAIT_MS), acceptDeadline, sendDeadlineNotPosted).catch(() => {})
+        if ((await messageCount(8_000)) <= 0) {
+          // The server holds messages this page will not draw - the fault the
+          // user sees as "can't load conversation". Measured 2026-11-05: that
+          // shell often has no usable composer at all ("no composer appeared")
+          // or refuses the text, so typing into it just fails slower. Recycle
+          // the window and post on a fresh one; the host re-posts the queued
+          // turn (never re-sends an accepted one).
+          await log(`thread ${threadId} would not render (server says ${content}); recycling the window`)
+          throw new TurnError(`not-posted: the page could not render thread ${threadId} (server says ${content}); nothing was typed, so nothing was sent`, { reason: 'page-load-error', threadId })
+        }
       }
     }
   }
@@ -3474,7 +3623,7 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // is the reply budget running out - the same `timedOut` shape the loop returns.
     const replyStartedAt = Date.now()
     const waited = await railOr(
-      waitForReply(page, beforeCount, beforeText, submitted?.network ?? null),
+      waitForReply(page, beforeCount, beforeText, submitted?.network ?? null, text),
       acceptDeadline + SEND_TIMEOUT_MS,
       { timedOut: true, seconds: Math.round((Date.now() - replyStartedAt) / 1000) },
     )
@@ -3482,6 +3631,14 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // costs the model label and never the answer.
     const state = await railOr(pageState(page), Date.now() + SEND_TAIL_MS, { model: null })
     if (waited.timedOut) {
+      // The DOM waited as long as it may. Before calling the turn lost, ask the
+      // server: when the page fails to render ("can't load conversation") the
+      // answer is usually already there, and the turn did complete.
+      const recovered = await readServerReply(page, threadOf(page.url()), text)
+      if (recovered) {
+        await log(`reply recovered from the server after the page stopped rendering (${recovered.length} chars)`)
+        return { reply: clampReply(recovered), url: page.url(), model: state.model, attachment, source: 'server' }
+      }
       return { reply: '', url: page.url(), model: state.model, attachment, timedOut: true, seconds: waited.seconds, state: 'generating' }
     }
     return { reply: clampReply(waited.reply), url: page.url(), model: state.model, attachment }
