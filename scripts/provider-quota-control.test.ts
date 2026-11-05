@@ -80,16 +80,20 @@ async function mountQuota(provider: ProviderName, model: string, value: Provider
     // emitted (an underline is an SGR sequence, not a character).
     raw: () => output,
     clear: () => { output = '' },
-    // A press and a release on the same cell is the click.
-    click: async () => {
+    // A press and a release on the same cell is the click. A negative row has
+    // no handler to fire, so there is no frame to wait for; a short bounded
+    // absence window is enough and does not spend the full timeout.
+    click: async (expectChange = true) => {
       stdin.write('\x1b[<0;1;1M')
       stdin.write('\x1b[<0;1;1m')
-      await waitFor(() => output.length > 0)
+      if (expectChange) await waitFor(() => output.length > 0)
+      else await wait(400)
     },
     // A mouse-motion report over the control, which is what drives onMouseEnter.
-    hover: async () => {
+    hover: async (expectUnderline = true) => {
       stdin.write('\x1b[<35;2;1M')
-      await waitFor(() => /\x1b\[4m/.test(output))
+      if (expectUnderline) await waitFor(() => /\x1b\[4m/.test(output))
+      else await wait(400)
     },
     // One key per call: a chunk like ' \t' is not parsed as a Space keydown, so
     // only separate writes exercise the keyboard path a focus target would use.
@@ -211,7 +215,7 @@ test('the hover underline marks only a control with a second window', { timeout:
     await two.hover()
     assert.match(two.raw(), /\x1b\[4m/)
     one.clear()
-    await one.hover()
+    await one.hover(false)
     assert.doesNotMatch(one.raw(), /\x1b\[4m/)
   } finally {
     two.unmount()
@@ -226,7 +230,7 @@ test('a single-window quota wires no click handler', { timeout: 20_000 }, async 
   try {
     assert.match(control.rendered(), /Weekly usage: 88% left/)
     control.clear()
-    await control.click()
+    await control.click(false)
     // Nothing to step to, so the click cannot move the window off weekly.
     assert.match(control.rendered(), /Weekly usage: 88% left/)
     assert.doesNotMatch(control.rendered(), /Anthropic/)
