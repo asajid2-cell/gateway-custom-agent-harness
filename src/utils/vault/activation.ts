@@ -7,7 +7,7 @@ import {
   readRotationRecords,
   type RotationRecord,
 } from './journal.js'
-import { verifyReconstruction } from './reconstruction.js'
+import { verifyReconstruction, writeCharter } from './reconstruction.js'
 
 /**
  * The activation gate.
@@ -369,6 +369,59 @@ async function admit(input: Admitting): Promise<ActivationAdmitted> {
     rotation_intent: appended.length > 1,
     at: String(row.at),
   }
+}
+
+/**
+ * The designation seam `conferDriver` calls.
+ *
+ * A family that is not registered in the vault yet is not gated in monitor
+ * mode: refusing every designation for a family the vault has never seen is an
+ * outage, not a gate, and step 5 is what registers families. Under `enforce`
+ * the missing registration IS the refusal, so enforcement cannot be switched on
+ * before the families it governs exist.
+ */
+export async function admitDriverDesignation(input: {
+  vaultRoot: string
+  familyId: string
+  driverSessionId: string
+  scope: readonly string[]
+  mode: 'monitor' | 'enforce'
+  rootName?: string
+  headSessionId?: string
+}): Promise<ActivationResult | null> {
+  if (!(await familyExists(input.vaultRoot, input.familyId))) {
+    if (input.mode === 'monitor') return null
+    return {
+      ok: false,
+      family_id: input.familyId,
+      reason: 'unknown-family',
+      message: MESSAGES['unknown-family'](input.familyId),
+    }
+  }
+  // The identity of a designation is the scope it sets: repeating the same
+  // scope is the same authority, changing it is a new one.
+  const result = await conferDriverAdmission({
+    vaultRoot: input.vaultRoot,
+    familyId: input.familyId,
+    driverSessionId: input.driverSessionId,
+    turnBoundary: `scope:${[...input.scope].sort().join(',')}`,
+    boundarySource: 'explicit',
+    mode: input.mode,
+  })
+  if (!result.ok) return result
+  // The charter is written by the gate that just decided the generation was
+  // real - never by the capture path, which would let the thing being checked
+  // produce what it is checked against.
+  const generation = await activeGeneration(input.vaultRoot, input.familyId)
+  await writeCharter(input.vaultRoot, input.familyId, {
+    family_id: input.familyId,
+    root_session_id: input.familyId,
+    ...(input.rootName ? { root_name: input.rootName } : {}),
+    ...(input.headSessionId ? { head_session_id: input.headSessionId } : {}),
+    ...(generation ? { generation_id: generation } : {}),
+    created_at: new Date().toISOString(),
+  })
+  return result
 }
 
 export type RotationCompletion = {

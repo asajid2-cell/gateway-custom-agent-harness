@@ -1,5 +1,5 @@
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import { readJournal, readRotationRecords, verifyJournal } from './journal.js'
 
 /**
@@ -45,6 +45,27 @@ export type CharterPointer = {
 
 export function charterPath(vaultRoot: string, familyId: string): string {
   return join(vaultRoot, 'families', familyId, 'charter.json')
+}
+
+/**
+ * Write the charter once. A charter describes the family's identity at the
+ * moment it was admitted; a later admission must not overwrite it, so a second
+ * write is a no-op rather than a silent rewrite of history.
+ */
+export async function writeCharter(
+  vaultRoot: string,
+  familyId: string,
+  charter: CharterRecord,
+): Promise<boolean> {
+  const path = charterPath(vaultRoot, familyId)
+  await mkdir(dirname(path), { recursive: true })
+  try {
+    await writeFile(path, `${JSON.stringify(charter, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw error
+  }
 }
 
 export async function readCharter(vaultRoot: string, familyId: string): Promise<CharterRecord | null> {

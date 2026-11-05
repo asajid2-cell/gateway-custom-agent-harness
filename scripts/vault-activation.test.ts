@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import {
+  admitDriverDesignation,
   completeRotation,
   conferDriverAdmission,
   scribeHealth,
@@ -17,7 +18,7 @@ import {
   appendRotationDecision,
   readRotationRecords,
 } from '../src/utils/vault/journal.js'
-import { charterPath, verifyReconstruction } from '../src/utils/vault/reconstruction.js'
+import { charterPath, readCharter, verifyReconstruction } from '../src/utils/vault/reconstruction.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
 const FAMILY = 'fam-activation'
@@ -589,6 +590,94 @@ test('a charter naming a generation the family never admitted is refused', async
     const check = await verifyReconstruction(root, FAMILY)
     assert.equal(check.charter, 'mismatch')
     assert.match(check.reasons.join(' '), /gen-invented/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an unregistered family is skipped in monitor and refused in enforce', async () => {
+  const root = await scratch()
+  try {
+    const monitored = await admitDriverDesignation({
+      vaultRoot: root,
+      familyId: 'not-registered',
+      driverSessionId: 'sess-1',
+      scope: ['leaf-1'],
+      mode: 'monitor',
+    })
+    assert.equal(monitored, null, 'monitor must not turn an unregistered family into an outage')
+    const enforced = await admitDriverDesignation({
+      vaultRoot: root,
+      familyId: 'not-registered',
+      driverSessionId: 'sess-1',
+      scope: ['leaf-1'],
+      mode: 'enforce',
+    })
+    assert.equal(enforced?.ok, false)
+    assert.equal(enforced && enforced.ok === false ? enforced.reason : '', 'unknown-family')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a registered family admits the designation and writes its charter once', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const result = await admitDriverDesignation({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      scope: ['leaf-1', 'leaf-2'],
+      mode: 'enforce',
+      rootName: 'root',
+      headSessionId: 'head-1',
+    })
+    assert.equal(result?.ok, true)
+
+    const charter = await readCharter(root, FAMILY)
+    assert.ok(charter)
+    assert.equal(charter.family_id, FAMILY)
+    assert.equal(charter.root_session_id, FAMILY)
+    assert.equal(charter.root_name, 'root')
+    assert.equal(charter.head_session_id, 'head-1')
+    assert.equal(charter.generation_id, 'gen-1')
+    assert.equal((await verifyReconstruction(root, FAMILY)).charter, 'verified')
+
+    // A second designation must not rewrite the charter.
+    await admitDriverDesignation({
+      vaultRoot: root,
+      familyId: FAMILY,
+      driverSessionId: 'sess-1',
+      scope: ['leaf-3'],
+      mode: 'enforce',
+      rootName: 'someone-else',
+    })
+    assert.equal((await readCharter(root, FAMILY))?.root_name, 'root')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the same scope is one designation and a changed scope is another', async () => {
+  const root = await scratch()
+  try {
+    await seed(root)
+    await writeScribe(root, { session_id: 'scribe-1', generation_id: 'gen-1' })
+    const first = await admitDriverDesignation({
+      vaultRoot: root, familyId: FAMILY, driverSessionId: 'sess-1', scope: ['b', 'a'], mode: 'enforce',
+    })
+    const again = await admitDriverDesignation({
+      vaultRoot: root, familyId: FAMILY, driverSessionId: 'sess-1', scope: ['a', 'b'], mode: 'enforce',
+    })
+    const changed = await admitDriverDesignation({
+      vaultRoot: root, familyId: FAMILY, driverSessionId: 'sess-1', scope: ['a'], mode: 'enforce',
+    })
+    assert.equal(first?.ok && first.duplicate, false)
+    assert.equal(again?.ok && again.duplicate, true, 'scope order must not matter')
+    assert.equal(changed?.ok && changed.duplicate, false)
+    assert.equal(changed?.ok && changed.ordinal, 2)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -3663,14 +3663,54 @@ export async function conferDriver(driverSessionId: string, leafIds: readonly st
     const remaining = scope[holderId]!.filter(id => id !== leafId).map(id => String(known.get(id)?.number ?? '?'))
     throw new Error(`${memberLabel(leaf)} is already driven by ${memberLabel(holder)}; move it with: /leaf driver ${holder.number}${remaining.length ? ` ${remaining.join(' ')}` : ''}`)
   }
+  // Authority is recorded before it is granted. The vault gate decides whether
+  // this designation is one the harness may admit, and its row is what a later
+  // reconciliation trusts. A family the vault has never seen is not gated in
+  // monitor mode: refusing every designation for an unregistered family would
+  // be an outage, and registering families is step 5's job.
+  const gateNote = await admitDesignationInVault(root, driverSessionId, driver, wanted)
   scope[driverSessionId] = wanted
   await writeLeafDriverDesignation(root, scope)
   await indexLeafMembers(root, members)
   await refreshDesignatedPatriarch()
   publish()
   return wanted.length
-    ? `${memberLabel(driver)} now drives ${wanted.map(id => memberLabel(known.get(id)!)).join(', ')}.`
-    : `${memberLabel(driver)} is a driver, driving no leaves yet.`
+    ? `${memberLabel(driver)} now drives ${wanted.map(id => memberLabel(known.get(id)!)).join(', ')}.${gateNote}`
+    : `${memberLabel(driver)} is a driver, driving no leaves yet.${gateNote}`
+}
+
+/**
+ * Record the designation in the vault before the pointer is written, and name
+ * what happened in the confirmation. In enforce mode a refusal throws, so the
+ * pointer is never written for an unauthorized designation.
+ */
+async function admitDesignationInVault(
+  familyId: string,
+  driverSessionId: string,
+  driver: { name?: string },
+  scope: readonly string[],
+): Promise<string> {
+  const { readGatewaySettings, vaultRootFor } = await import('./vault/settings.js')
+  const { admitDriverDesignation } = await import('./vault/activation.js')
+  const read = await readGatewaySettings()
+  const settings = read.ok ? read.settings : {}
+  const { root: vaultRoot } = vaultRootFor(settings)
+  const configured = (settings.capture as { mode?: string } | undefined)?.mode
+  const mode = configured === 'enforce' ? 'enforce' : 'monitor'
+  const result = await admitDriverDesignation({
+    vaultRoot,
+    familyId,
+    driverSessionId,
+    scope,
+    mode,
+    rootName: driver.name,
+    headSessionId: getLeafPatriarchSessionId(),
+  })
+  if (!result) return ''
+  if (!result.ok) throw new Error(result.message)
+  return result.would_refuse
+    ? ` Vault: admitted in monitor mode (would refuse: ${result.would_refuse}).`
+    : ` Vault: admitted ${result.invocation_id}.`
 }
 
 /**
