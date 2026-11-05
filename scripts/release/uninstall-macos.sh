@@ -20,9 +20,15 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-rm -f /usr/local/bin/gateway /usr/local/bin/cc-gateway
-# Remove `cc` only when it points into this install; it is clang's name
-# otherwise and must survive.
+# Remove a link only when it points into this install; a file the user put in
+# /usr/local/bin must survive, and so must clang's `cc`.
+for name in gateway cc-gateway; do
+  link="/usr/local/bin/$name"
+  if [ "$(readlink "$link" 2>/dev/null)" = "$PREFIX/scripts/cc" ] || \
+     [ "$(readlink "$link" 2>/dev/null)" = "$PREFIX/bin/$name" ]; then
+    rm -f "$link"
+  fi
+done
 if [ "$(readlink /usr/local/bin/cc 2>/dev/null)" = "$PREFIX/scripts/cc" ]; then
   rm -f /usr/local/bin/cc
 fi

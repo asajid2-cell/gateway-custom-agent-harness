@@ -51,7 +51,30 @@ internal sealed class ManagerForm : Form
     private readonly Label _health = new Label();
 
     private static string InstallDir { get { return Program.Read("InstallDir", ""); } }
-    private static string Alias { get { return Program.Read("Alias", "gateway"); } }
+
+    // The command name becomes a file name, so a value read back from the
+    // registry is validated before it is combined into a path.
+    private static bool IsValidAlias(string value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 32) return false;
+        if (value[0] == '-') return false;
+        foreach (var c in value)
+        {
+            var ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                     (c >= '0' && c <= '9') || c == '-' || c == '_';
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    private static string Alias
+    {
+        get
+        {
+            var value = Program.Read("Alias", "gateway");
+            return IsValidAlias(value) ? value : "gateway";
+        }
+    }
 
     internal ManagerForm()
     {
@@ -148,9 +171,18 @@ internal sealed class ManagerForm : Form
         var value = Prompt("Command name", "Type the command you want to use in a terminal:", Alias);
         if (value == null) return;
         value = value.Trim();
-        if (value.Length == 0 || value.Length > 32 || value.IndexOfAny(@"\/:*?""<>| ".ToCharArray()) >= 0)
+        if (!IsValidAlias(value))
         {
-            MessageBox.Show(this, "Use 1-32 characters with no spaces or path characters.", "Gateway", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            MessageBox.Show(this, "Use 1-32 letters, digits, \"-\" or \"_\", and do not start with \"-\".", "Gateway", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var lower = value.ToLowerInvariant();
+        if ((lower == "cc" || lower == "cl" || lower == "gcc" || lower == "clang") &&
+            MessageBox.Show(this, "\"" + value + "\" is also the name of a C compiler on many machines. " +
+                "Windows resolves your own command first, so a developer shell may run Gateway where it expected a compiler." +
+                Environment.NewLine + Environment.NewLine + "Use it anyway?",
+                "Gateway", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+        {
             return;
         }
         var dir = InstallDir;

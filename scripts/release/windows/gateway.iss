@@ -103,6 +103,7 @@ var
   RepairMode: Boolean;
   PreviousAlias: string;
   SilentAlias: string;
+  SilentRun: Boolean;
 
 function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: Longint;
   fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
@@ -113,6 +114,28 @@ var
   Ignored: Longint;
 begin
   SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, 0, SMTO_ABORTIFHUNG, 5000, Ignored);
+end;
+
+// The alias becomes a file name and a PATH entry name, so the value read back
+// from the registry is validated before it is ever concatenated into a path.
+function AliasIsValid(const Value: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := (Length(Value) > 0) and (Length(Value) <= 32);
+  if not Result then Exit;
+  if Value[1] = '-' then Result := False;
+  for I := 1 to Length(Value) do
+    if Pos(Value[I], 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_') = 0 then
+      Result := False;
+end;
+
+// The wizard asks before taking a compiler's name; an unattended run has no
+// one to ask, so /ALIAS=cc is refused there instead.
+function AliasIsCompiler(const Value: string): Boolean;
+begin
+  Result := (CompareText(Value, 'cc') = 0) or (CompareText(Value, 'cl') = 0) or
+            (CompareText(Value, 'gcc') = 0) or (CompareText(Value, 'clang') = 0);
 end;
 
 function InitializeSetup(): Boolean;
@@ -127,6 +150,11 @@ begin
     Arg := ParamStr(I);
     if Uppercase(Arg) = '/MODIFY' then ModifyMode := True;
     if Uppercase(Arg) = '/REPAIR' then RepairMode := True;
+    // /SUPPRESSMSGBOXES does not suppress a MsgBox written in [Code], so an
+    // unattended run must never show one: a modal box in /VERYSILENT waits
+    // forever for a click nobody is there to make.
+    if (Uppercase(Arg) = '/SILENT') or (Uppercase(Arg) = '/VERYSILENT') then
+      SilentRun := True;
     // Unattended runs have no page to type into, so the command name has to
     // be settable from the command line too.
     if Copy(Uppercase(Arg), 1, 7) = '/ALIAS=' then
@@ -140,12 +168,23 @@ begin
         Ok := False;
     if not Ok then
     begin
-      MsgBox('/ALIAS must be 1-32 letters, digits, "-" or "_", and must not start with "-".', mbError, MB_OK);
+      if not SilentRun then
+        MsgBox('/ALIAS must be 1-32 letters, digits, "-" or "_", and must not start with "-".', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if AliasIsCompiler(SilentAlias) then
+    begin
+      if not SilentRun then
+        MsgBox('"' + SilentAlias + '" is the name of a C compiler; /ALIAS cannot take it unattended. Choose another name.', mbError, MB_OK);
       Result := False;
       Exit;
     end;
   end;
-  RegQueryStringValue(HKCU, 'Software\Gateway', 'Alias', PreviousAlias);
+  if not RegQueryStringValue(HKCU, 'Software\Gateway', 'Alias', PreviousAlias) then
+    PreviousAlias := '';
+  if not AliasIsValid(PreviousAlias) then
+    PreviousAlias := '';
 end;
 
 procedure InitializeWizard;
@@ -170,18 +209,6 @@ begin
     Result := Trim(AliasPage.Values[0])
   else
     Result := 'gateway';
-end;
-
-function AliasIsValid(const Value: string): Boolean;
-var
-  I: Integer;
-begin
-  Result := (Length(Value) > 0) and (Length(Value) <= 32);
-  if not Result then Exit;
-  if Value[1] = '-' then Result := False;
-  for I := 1 to Length(Value) do
-    if Pos(Value[I], 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_') = 0 then
-      Result := False;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -256,11 +283,14 @@ var
 begin
   Dir := ExpandConstant('{app}\bin');
   if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then Exit;
-  Lower := Lowercase(Path);
   Needle := Lowercase(Dir);
-  P := Pos(';' + Needle + ';', ';' + Lower + ';');
-  if P = 0 then Exit;
-  Delete(Path, P, Length(Dir) + 1);
+  // A PATH can hold the same folder more than once; remove every copy.
+  repeat
+    Lower := Lowercase(Path);
+    P := Pos(';' + Needle + ';', ';' + Lower + ';');
+    if P = 0 then Break;
+    Delete(Path, P, Length(Dir) + 1);
+  until False;
   RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Path);
   BroadcastEnvironmentChange;
 end;
@@ -272,11 +302,12 @@ begin
   if CurStep = ssPostInstall then
   begin
     ForceDirectories(ExpandConstant('{app}\bin'));
-    Alias := GetAlias('');
+    Alias := Trim(GetAlias(''));
+    if not AliasIsValid(Alias) then Alias := 'gateway';
     WriteShim('gateway');
     if CompareText(Alias, 'gateway') <> 0 then
       WriteShim(Alias);
-    if (PreviousAlias <> '') and (CompareText(PreviousAlias, Alias) <> 0)
+    if AliasIsValid(PreviousAlias) and (CompareText(PreviousAlias, Alias) <> 0)
        and (CompareText(PreviousAlias, 'gateway') <> 0) then
       DeleteFile(ExpandConstant('{app}\bin\') + PreviousAlias + '.cmd');
     if WizardIsTaskSelected('addtopath') then
