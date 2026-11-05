@@ -20,7 +20,12 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-rm -f /usr/local/bin/cc /usr/local/bin/gateway
+rm -f /usr/local/bin/gateway /usr/local/bin/cc-gateway
+# Remove `cc` only when it points into this install; it is clang's name
+# otherwise and must survive.
+if [ "$(readlink /usr/local/bin/cc 2>/dev/null)" = "$PREFIX/scripts/cc" ]; then
+  rm -f /usr/local/bin/cc
+fi
 rm -rf "$PREFIX"
 # A missing receipt is not a failure: the tree may have been installed by hand.
 pkgutil --forget "$IDENTIFIER" >/dev/null 2>&1 || true

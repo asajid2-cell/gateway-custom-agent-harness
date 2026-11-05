@@ -86,12 +86,21 @@ rm -rf "$PREFIX"
 mv "$PREFIX.new" "$PREFIX"
 
 mkdir -p "$BIN_DIR"
-ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/cc"
 ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/gateway"
+ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/cc-gateway"
+# `cc` is the C compiler on every POSIX box, and $BIN_DIR usually precedes
+# /usr/bin in PATH. Claim the short name only when it is free.
+if ! command -v cc >/dev/null 2>&1; then
+  ln -sf "$PREFIX/scripts/cc" "$BIN_DIR/cc"
+  CC_NOTE="  cc      -> $BIN_DIR/cc"
+else
+  CC_NOTE="  (cc is the system C compiler here; use cc-gateway)"
+fi
 
 echo "Gateway $VERSION installed to $PREFIX"
-echo "  cc      -> $BIN_DIR/cc"
 echo "  gateway -> $BIN_DIR/gateway"
+echo "  cc-gateway -> $BIN_DIR/cc-gateway"
+[ -n "${CC_NOTE:-}" ] && echo "$CC_NOTE"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo "Add $BIN_DIR to PATH to run it from any shell." ;;

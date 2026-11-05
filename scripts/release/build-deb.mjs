@@ -95,16 +95,28 @@ Description: Gateway (Claude Code) CLI and model gateway
  install has no external runtime dependency.
 `
 
+// /usr/bin/cc is the system C-compiler alternative. Taking that name would
+// replace the compiler on install and delete it on uninstall, which is a
+// toolchain break no one would attribute to a gateway. `gateway` is the
+// command; `cc-gateway` is the short one; bare `cc` is claimed only when
+// nothing else owns it.
 const postinst = `#!/bin/sh
 set -e
 chmod 0755 /opt/gateway/scripts/cc /opt/gateway/runtime/bun 2>/dev/null || true
-ln -sf /opt/gateway/scripts/cc /usr/bin/cc
 ln -sf /opt/gateway/scripts/cc /usr/bin/gateway
+ln -sf /opt/gateway/scripts/cc /usr/bin/cc-gateway
+if [ ! -e /usr/bin/cc ] && [ ! -L /usr/bin/cc ]; then
+  ln -sf /opt/gateway/scripts/cc /usr/bin/cc
+fi
 exit 0
 `
 const prerm = `#!/bin/sh
 set -e
-rm -f /usr/bin/cc /usr/bin/gateway
+rm -f /usr/bin/gateway /usr/bin/cc-gateway
+# Only remove \`cc\` when this package created it.
+if [ "$(readlink -f /usr/bin/cc 2>/dev/null)" = "/opt/gateway/scripts/cc" ]; then
+  rm -f /usr/bin/cc
+fi
 exit 0
 `
 

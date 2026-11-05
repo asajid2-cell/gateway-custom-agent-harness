@@ -185,11 +185,37 @@ if (wantRuntime) {
   // Prove the branch that matters: on a PATH with no bun anywhere, the
   // packaged launcher must still reach the harness. `login --status` goes
   // through ClaudeRunner and exits without starting a gateway.
-  const bare = { ...process.env, PATH: platform === 'win32' ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32') : '/usr/bin:/bin' }
-  delete bare.CC_CLAUDE_RUNNER_OVERRIDE
-  delete bare.CC_CLAUDE_SCRIPT_OVERRIDE
+  //
+  // The environment must be a scratch home, not the builder's: `login --status`
+  // reads the credential store, and reading the operator's live config would
+  // make the reported mode a statement about this machine rather than the
+  // artifact (and a reachable store can be written).
+  const scratch = path.join(os.tmpdir(), `package-proof-${process.pid}`)
+  await rm(scratch, { recursive: true, force: true })
+  await mkdir(scratch, { recursive: true })
+  const bare = {
+    ...process.env,
+    HOME: scratch,
+    USERPROFILE: scratch,
+    CLAUDE_CONFIG_DIR: scratch,
+    PATH: platform === 'win32'
+      ? path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32')
+      : '/usr/bin:/bin',
+  }
+  for (const name of [
+    'CC_CLAUDE_RUNNER_OVERRIDE',
+    'CC_CLAUDE_SCRIPT_OVERRIDE',
+    'GATEWAY_CREDENTIALS_MODE',
+    'GATEWAY_KEYSAFE_MODE',
+    'GATEWAY_OAUTH_MODE',
+    'MODEL_GATEWAY_ENV_FILE',
+    'MODEL_GATEWAY_KEYSAFE_HOME',
+  ]) {
+    delete bare[name]
+  }
   const launcher = path.join(tree, 'scripts', 'cc-launcher.mjs')
   const launched = spawnSync(process.execPath, [launcher, 'login', '--status'], { cwd: tree, encoding: 'utf8', timeout: 120_000, env: bare })
+  await rm(scratch, { recursive: true, force: true })
   if (launched.status !== 0) fail(`bundled-runtime launcher failed: ${launched.stderr || launched.stdout}`)
   let mode
   try {
@@ -197,7 +223,8 @@ if (wantRuntime) {
   } catch {
     fail(`bundled-runtime launcher did not print login status: ${launched.stdout.slice(0, 300)}`)
   }
-  runtime.proof = { bun: bunVersion.stdout.trim(), loginStatus: mode, pathWithoutBun: true }
+  if (mode !== 'bundled') fail(`a clean home resolved credential mode "${mode}", expected bundled`)
+  runtime.proof = { bun: bunVersion.stdout.trim(), loginStatus: mode, pathWithoutBun: true, cleanHome: true }
 }
 
 // `present` is the answer to "does this artifact need bun on the target?"; a

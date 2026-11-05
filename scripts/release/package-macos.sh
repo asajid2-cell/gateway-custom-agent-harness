@@ -53,8 +53,13 @@ chmod 0755 /usr/local/gateway/scripts/cc /usr/local/gateway/runtime/bun 2>/dev/n
 # /usr/local/bin is not guaranteed to exist on a fresh machine, and the links
 # belong to postinstall rather than the payload so pkgutil does not own them.
 mkdir -p /usr/local/bin
-ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc
 ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/gateway
+ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc-gateway
+# `cc` is clang's name on macOS and /usr/local/bin precedes /usr/bin, so take
+# it only when this path is free.
+if [ ! -e /usr/local/bin/cc ] && [ ! -L /usr/local/bin/cc ]; then
+  ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc
+fi
 exit 0
 POSTINSTALL
 chmod 0755 "$WORK/scripts/postinstall"

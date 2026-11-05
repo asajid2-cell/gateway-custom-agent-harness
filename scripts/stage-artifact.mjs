@@ -137,7 +137,9 @@ const report = {
   sha,
   platform,
   arch,
-  out,
+  // The report ships inside the artifact, so it records the directory's name
+  // rather than the builder's absolute path.
+  outName: path.basename(out),
   createdAt: new Date().toISOString(),
   bytes: 0,
   files: 0,
