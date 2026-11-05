@@ -186,6 +186,16 @@ check_link() {
 }
 check_link "$ALIAS"
 [ "$ALIAS" = gateway ] || check_link gateway
+
+# A reinstall under a different name replaces the tree, so the old alias link
+# would dangle forever (the new install.json only remembers the new name).
+# Remember it now: install.json is about to be deleted with the old tree.
+OLD_ALIAS=""
+OLD_BIN=""
+if prefix_is_ours "$PREFIX"; then
+  OLD_ALIAS="$(sed -n 's/.*"alias": *"\([^"]*\)".*/\1/p' "$PREFIX/install.json" 2>/dev/null || true)"
+  OLD_BIN="$(sed -n 's/.*"bin": *"\([^"]*\)".*/\1/p' "$PREFIX/install.json" 2>/dev/null || true)"
+fi
 if [ "$SKIP_CC" -eq 0 ]; then
   EXISTING_CC="$(command -v cc 2>/dev/null || true)"
   if [ -n "$EXISTING_CC" ] && [ "$EXISTING_CC" != "$BIN_DIR/cc" ] && ! link_is_ours "$BIN_DIR/cc"; then
@@ -323,6 +333,25 @@ if [ "$SKIP_CC" -eq 0 ]; then
   CC_NOTE="  cc           -> $BIN_DIR/cc"
 else
   CC_NOTE="  (cc is the system C compiler here; not replaced)"
+fi
+
+# Never remove `gateway`: it is always written above (a custom install keeps
+# both names), so on a default -> custom reinstall the old alias IS the
+# `gateway` link that was just created here.
+if [ -n "$OLD_ALIAS" ] && [ "$OLD_ALIAS" != "$ALIAS" ] && [ "$OLD_ALIAS" != gateway ]; then
+  case "$OLD_ALIAS" in
+    *[!A-Za-z0-9._-]*) ;;
+    *)
+      old_bin="$BIN_DIR"
+      if [ -n "$OLD_BIN" ]; then old_bin="$OLD_BIN"; fi
+      old_link="$old_bin/$OLD_ALIAS"
+      if [ -L "$old_link" ]; then
+        case "$(readlink "$old_link" 2>/dev/null || true)" in
+          "$PREFIX"/*) rm -f "$old_link"; echo "Removed the old $old_link" ;;
+        esac
+      fi
+      ;;
+  esac
 fi
 
 # --- PATH ------------------------------------------------------------------

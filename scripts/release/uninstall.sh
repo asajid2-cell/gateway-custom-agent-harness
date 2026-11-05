@@ -70,41 +70,64 @@ for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc";
     if ! grep -q '^# <<< gateway <<<$' "$rc" 2>/dev/null; then
       die "$rc has \`# >>> gateway >>>\` without \`# <<< gateway <<<\`; refusing to edit it (and nothing was removed). Delete the block by hand, then re-run."
     fi
-    RCS="$RCS $rc"
+    RCS="$RCS$rc
+"
   fi
 done
 
 # The install records where its links went; fall back to the usual places.
 META_BIN="$(sed -n 's/.*"bin": *"\([^"]*\)".*/\1/p' "$PREFIX/install.json" 2>/dev/null || true)"
 META_ALIAS="$(sed -n 's/.*"alias": *"\([^"]*\)".*/\1/p' "$PREFIX/install.json" 2>/dev/null || true)"
-BIN_DIRS="$META_BIN /usr/local/bin $HOME/.local/bin $HOME/bin /usr/bin"
-NAMES="gateway cc-gateway cc"
+# One per line, so a home directory containing a space is still one entry.
+BIN_DIRS="$META_BIN
+/usr/local/bin
+$HOME/.local/bin
+$HOME/bin
+/usr/bin"
+NAMES="gateway
+cc-gateway
+cc"
 case "$META_ALIAS" in
   ''|*[!A-Za-z0-9._-]*) ;;
   cc|cl|gcc|clang) ;;
-  *) [ "$META_ALIAS" = gateway ] || NAMES="$NAMES $META_ALIAS" ;;
+  *) if [ "$META_ALIAS" != gateway ]; then NAMES="$NAMES
+$META_ALIAS"; fi ;;
 esac
 
-for bin in $BIN_DIRS; do
-  [ -d "$bin" ] || continue
-  for name in $NAMES; do
+remove_links_in() {
+  bin="$1"
+  [ -d "$bin" ] || return 0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
     link="$bin/$name"
     [ -L "$link" ] || continue
     target="$(readlink "$link" 2>/dev/null || true)"
     case "$target" in
       "$PREFIX"/*) rm -f "$link"; echo "Removed $link" ;;
     esac
-  done
-done
+  done <<EOF
+$NAMES
+EOF
+}
+
+while IFS= read -r bin; do
+  [ -n "$bin" ] || continue
+  remove_links_in "$bin"
+done <<EOF
+$BIN_DIRS
+EOF
 
 # Our PATH block, identified by the markers install.sh writes.
-for rc in $RCS; do
+while IFS= read -r rc; do
+  [ -n "$rc" ] || continue
   tmp="$(mktemp)"
   awk 'BEGIN { skip = 0 } /^# >>> gateway >>>$/ { skip = 1; next } /^# <<< gateway <<<$/ { skip = 0; next } skip != 1 { print }' "$rc" > "$tmp"
   cat "$tmp" > "$rc"
   rm -f "$tmp"
   echo "Removed the PATH entry from $rc"
-done
+done <<EOF
+$RCS
+EOF
 
 rm -rf "$PREFIX"
 echo "Gateway removed. ~/.claude (settings, accounts, vault) was not touched."
