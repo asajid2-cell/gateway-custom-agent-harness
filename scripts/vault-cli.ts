@@ -8,6 +8,7 @@
  *   bun scripts/vault-cli.ts submit --vault <path> --family <id> --generation <g> --file <proposals.jsonl> [--idempotency-key <k>]
  *   bun scripts/vault-cli.ts confer-driver --vault <path> --family <id> --session <sid> [--turn <t>] [--invocation-id <id>] [--mode monitor|enforce] [--as-harness [--scope a,b] [--root-name n] [--head sid]]
  *   bun scripts/vault-cli.ts capture  --vault <path> --family <id> --session <sid> --message <mid> --root <name> --path <relative> --sha <sha256>
+ *   bun scripts/vault-cli.ts capture-transcript --vault <path> --family <id> --session <sid> --root <name> --path <relative> --file <transcript.jsonl>
  *   bun scripts/vault-cli.ts capture-mark --vault <path> --family <id> --capture-id <id> --event <event_id>
  *   bun scripts/vault-cli.ts captures --vault <path> --family <id> [--pending]
  *   bun scripts/vault-cli.ts register-scribe --vault <path> --family <id> --session <sid> [--generation <g>] [--replace]
@@ -29,7 +30,7 @@ import {
   verifyJournal,
 } from '../src/utils/vault/journal.js'
 import { admitDriverDesignation, completeRotation, conferDriverAdmission, registerScribe } from '../src/utils/vault/activation.js'
-import { captureCompleteness, capturePointer, listCaptures, markCaptured } from '../src/utils/vault/capture.js'
+import { captureCompleteness, capturePointer, captureTranscript, listCaptures, markCaptured } from '../src/utils/vault/capture.js'
 import { recall } from '../src/utils/vault/recall.js'
 import { submitProposals } from '../src/utils/vault/submit.js'
 
@@ -189,6 +190,22 @@ async function main(): Promise<number> {
     return result.ok ? 0 : 1
   }
 
+  if (command === 'capture-transcript') {
+    // The producer, driven the way a tailer would: read the file, append what is
+    // not already queued. Running it twice is the restart case, and appends
+    // nothing the second time.
+    const result = await captureTranscript({
+      vaultRoot,
+      familyId: required(args, 'family'),
+      sessionId: required(args, 'session'),
+      transcriptRoot: required(args, 'root'),
+      relativePath: required(args, 'path'),
+      transcriptPath: required(args, 'file'),
+    })
+    print({ ok: true, family_id: required(args, 'family'), ...result })
+    return 0
+  }
+
   if (command === 'capture-mark') {
     const result = await markCaptured({
       vaultRoot,
@@ -303,7 +320,7 @@ async function main(): Promise<number> {
     return ok ? 0 : 1
   }
 
-  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|capture|capture-mark|captures|register-scribe|rotation-complete> --vault <path> ...')
+  throw new Error('usage: vault-cli.ts <verify|repair|admit|submit|recall|confer-driver|capture|capture-transcript|capture-mark|captures|register-scribe|rotation-complete> --vault <path> ...')
 }
 
 try {

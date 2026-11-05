@@ -31,6 +31,8 @@ export type CapturePointer = {
   relative_path: string
   span_sha256: string
   observed_at: string
+  /** Who appended it: absent when a caller recorded it by hand. */
+  by?: string
 }
 
 export type CaptureEntry = CapturePointer & {
@@ -47,6 +49,9 @@ export type CaptureRefusal =
 export type CaptureAccepted = { ok: true; capture_id: string; duplicate: boolean; family_id: string }
 
 type Line = Record<string, unknown> & { kind?: string; capture_id?: string }
+
+/** The identity a capture carries when the harness produced it without a caller. */
+export const HOOK_IDENTITY = 'capture-hook'
 
 export function captureIdFor(familyId: string, pointer: CapturePointer): string {
   const digest = createHash('sha256')
@@ -269,6 +274,89 @@ export type CaptureCompleteness = {
 }
 
 /**
+ * The producer: read a session transcript and append a capture for every
+ * message that is not already queued.
+ *
+ * Idempotent by construction - the capture id is derived from the span - which
+ * matters because a tailer that crashes and restarts must not duplicate a span,
+ * and the queue is append-only with no update to fall back on.
+ *
+ * It does not decide which family a session belongs to. That mapping is the
+ * caller's, and it is the one part of the pipeline a library cannot guess.
+ */
+export async function captureTranscript(input: {
+  vaultRoot: string
+  familyId: string
+  /** The configured root's NAME, as stored on every pointer. */
+  transcriptRoot: string
+  /** Where the file is now, for reading only - never stored. */
+  transcriptPath: string
+  /** The same file relative to that root - this is what is stored. */
+  relativePath: string
+  sessionId: string
+}): Promise<{ appended: number; duplicates: number; skipped: number }> {
+  let raw: string
+  try {
+    raw = await readFile(input.transcriptPath, 'utf8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { appended: 0, duplicates: 0, skipped: 0 }
+    throw error
+  }
+  let appended = 0
+  let duplicates = 0
+  let skipped = 0
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue
+    let record: Record<string, unknown>
+    try {
+      record = JSON.parse(line) as Record<string, unknown>
+    } catch {
+      skipped += 1
+      continue
+    }
+    const uuid = typeof record.uuid === 'string' ? record.uuid : null
+    const text = textOf(record)
+    if (!uuid || !text) {
+      skipped += 1
+      continue
+    }
+    const pointer: CapturePointer = {
+      session_id: input.sessionId,
+      message_id: uuid,
+      transcript_root: input.transcriptRoot,
+      relative_path: input.relativePath,
+      span_sha256: `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`,
+      observed_at: typeof record.timestamp === 'string' ? record.timestamp : new Date().toISOString(),
+      by: HOOK_IDENTITY,
+    }
+    const result = await capturePointer({ vaultRoot: input.vaultRoot, familyId: input.familyId, pointer })
+    if (!result.ok) {
+      skipped += 1
+      continue
+    }
+    if (result.duplicate) duplicates += 1
+    else appended += 1
+  }
+  return { appended, duplicates, skipped }
+}
+
+/** The transcript's message text, whether content is a string or text blocks. */
+function textOf(record: Record<string, unknown>): string | null {
+  const message =
+    record.message && typeof record.message === 'object' ? (record.message as Record<string, unknown>) : record
+  const content = message.content
+  if (typeof content === 'string') return content.trim() === '' ? null : content
+  if (Array.isArray(content)) {
+    const parts = content
+      .map(block => (block && typeof block === 'object' ? (block as { text?: unknown }).text : undefined))
+      .filter((text): text is string => typeof text === 'string')
+    const joined = parts.join('\n')
+    return joined.trim() === '' ? null : joined
+  }
+  return null
+}
+
+/**
  * A completeness count with its precondition attached.
  *
  * `captured: 0, pending: 0` is a clean bill of health on a family where nothing
@@ -285,7 +373,11 @@ export async function captureCompleteness(
   const total = entries.length
   const journal = await readJournal(vaultRoot, familyId)
   const committed = journal.events.length
-  const producer: CaptureCompleteness['producer'] = total > 0 ? 'connected' : 'absent'
+  // `connected` means the hook has appended, not merely that something exists:
+  // a hand-recorded capture proves the queue accepts writes, not that anything
+  // is producing them.
+  const producer: CaptureCompleteness['producer'] =
+    entries.some(entry => entry.by === HOOK_IDENTITY) ? 'connected' : 'absent'
   if (total === 0 && committed > 0) {
     return {
       captured,

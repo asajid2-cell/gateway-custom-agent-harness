@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -8,6 +8,7 @@ import { submitProposals } from '../src/utils/vault/submit.js'
 import {
   captureCompleteness,
   capturePointer,
+  captureTranscript,
   listCaptures,
   markCaptured,
   type CapturePointer,
@@ -91,7 +92,7 @@ test('marking a capture names the event that cited it, and is idempotent', async
     assert.equal(before.captured, 0)
     assert.equal(before.pending, 1)
     assert.equal(before.state, 'healthy')
-    assert.equal(before.producer, 'connected')
+    assert.equal(before.producer, 'absent', 'a hand-recorded span does not mean the hook is running')
 
     const marked = await markCaptured({ vaultRoot: root, familyId: FAMILY, captureId, eventId: 'evt-1' })
     assert.equal(marked.ok, true)
@@ -200,6 +201,66 @@ test('a family that commits events with no captures says so instead of reading c
     assert.equal(without.committed_events, 1)
     assert.equal(without.captured, 0)
     assert.match(without.note ?? '', /0 of nothing/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the producer reads a transcript once, and a restart appends nothing twice', async () => {
+  const root = await vault()
+  const scratch = await mkdtemp(path.join(tmpdir(), 'transcript-'))
+  try {
+    const transcript = path.join(scratch, 'session.jsonl')
+    const lines = [
+      { type: 'user', uuid: 'm1', timestamp: '2026-11-05T00:00:00.000Z', message: { role: 'user', content: 'ship build 30' } },
+      {
+        type: 'assistant',
+        uuid: 'm2',
+        timestamp: '2026-11-05T00:01:00.000Z',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'the relay moves' }] },
+      },
+      { type: 'progress', note: 'no uuid and no text' },
+    ]
+    await writeFile(transcript, `${lines.map(line => JSON.stringify(line)).join('\n')}\n`)
+
+    const first = await captureTranscript({
+      vaultRoot: root,
+      familyId: FAMILY,
+      transcriptRoot: 'claude-projects',
+      transcriptPath: transcript,
+      relativePath: 'C--Users-Ahmed/session.jsonl',
+      sessionId: 'sess-1',
+    })
+    assert.deepEqual(first, { appended: 2, duplicates: 0, skipped: 1 })
+
+    const entries = await listCaptures(root, FAMILY)
+    assert.equal(entries.length, 2)
+    assert.ok(entries.every(entry => entry.by === 'capture-hook'), 'the hook is named on the record')
+    const completeness = await captureCompleteness(root, FAMILY)
+    assert.equal(completeness.producer, 'connected', 'connected means the hook appended, not that something exists')
+    assert.equal(completeness.pending, 2)
+
+    const again = await captureTranscript({
+      vaultRoot: root,
+      familyId: FAMILY,
+      transcriptRoot: 'claude-projects',
+      transcriptPath: transcript,
+      relativePath: 'C--Users-Ahmed/session.jsonl',
+      sessionId: 'sess-1',
+    })
+    assert.deepEqual(again, { appended: 0, duplicates: 2, skipped: 1 }, 'a restart appends nothing twice')
+    assert.equal((await listCaptures(root, FAMILY)).length, 2)
+  } finally {
+    await rm(scratch, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('a hand-recorded capture does not make the producer look connected', async () => {
+  const root = await vault()
+  try {
+    await capturePointer({ vaultRoot: root, familyId: FAMILY, pointer: pointer() })
+    assert.equal((await captureCompleteness(root, FAMILY)).producer, 'absent')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
