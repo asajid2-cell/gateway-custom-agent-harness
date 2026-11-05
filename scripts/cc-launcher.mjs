@@ -311,7 +311,14 @@ if (PrintRequested && !hasPositionalArgument(ClaudeArgs) && process.stdin.isTTY)
 // Harness artifact: rebuild when the source is newer than the bundle.
 // ---------------------------------------------------------------------------
 
-const ClaudeRunner = process.env.CC_CLAUDE_RUNNER_OVERRIDE || which('bun') || which('bun.exe')
+// A packaged artifact carries its own runtime so a machine with no bun works
+// out of the box; PATH is only a fallback for a source checkout.
+const BundledRuntime = join(Root, 'runtime', POSIX ? 'bun' : 'bun.exe')
+const ClaudeRunner =
+  process.env.CC_CLAUDE_RUNNER_OVERRIDE ||
+  (existsSync(BundledRuntime) ? BundledRuntime : null) ||
+  which('bun') ||
+  which('bun.exe')
 const ClaudeScript = process.env.CC_CLAUDE_SCRIPT_OVERRIDE
   ? resolve(process.env.CC_CLAUDE_SCRIPT_OVERRIDE)
   : join(Root, 'dist', 'cli.js')

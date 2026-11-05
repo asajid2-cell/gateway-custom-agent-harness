@@ -72,6 +72,9 @@ $TandemCodexHome = if ($env:TANDEM_GATEWAY_CODEX_HOME) {
 }
 $ClaudeRunner = if ($env:CC_CLAUDE_RUNNER_OVERRIDE) {
   $env:CC_CLAUDE_RUNNER_OVERRIDE
+} elseif (Test-Path -LiteralPath (Join-Path $Root 'runtime\bun.exe') -PathType Leaf) {
+  # A packaged artifact carries its own runtime, so an install needs no bun.
+  Join-Path $Root 'runtime\bun.exe'
 } else {
   (Get-Command bun.exe -ErrorAction Stop).Source
 }

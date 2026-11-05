@@ -50,6 +50,10 @@ const RUNTIME_COMMON = [
   'keysafe-vault.mjs',
   'codex-quota.mjs',
   'codex-resource.mjs',
+  'account-store.mjs',
+  'codex-accounts.mjs',
+  'anthropic-accounts.mjs',
+  'mistral.mjs',
   'commandcode.mjs',
   'effort-capabilities.mjs',
   'effort-capabilities.json',
@@ -92,6 +96,27 @@ async function treeDigest(directory) {
     hash.update('\n')
   }
   return hash.digest('hex')
+}
+
+/**
+ * Every relative import in the staged scripts must resolve inside the artifact.
+ *
+ * RUNTIME_COMMON is a hand list, and the account modules were added to the
+ * gateway without being added to it: staging succeeded, and the supervisor
+ * failed at import with a port-shaped error. The health smoke caught it, but
+ * only as "did not serve /health". Naming the missing file here makes the
+ * failure say what it is.
+ */
+async function missingRuntimeImports(scriptsDirectory) {
+  const missing = new Set()
+  for (const entry of await readdir(scriptsDirectory, { withFileTypes: true })) {
+    if (!entry.isFile() || !/\.(mjs|js)$/.test(entry.name)) continue
+    const text = await readFile(path.join(scriptsDirectory, entry.name), 'utf8')
+    for (const match of text.matchAll(/from\s+['"]\.\/([^'"]+)['"]/g)) {
+      if (!existsSync(path.join(scriptsDirectory, match[1]))) missing.add(match[1])
+    }
+  }
+  return [...missing].sort()
 }
 
 const report = {
@@ -138,6 +163,12 @@ if (platform === 'win32') {
   )
 }
 if (platform !== 'win32') await chmod(path.join(out, 'scripts', 'cc'), 0o755)
+
+// The runtime list is explicit, so prove it closes before anything runs it.
+const missingImports = await missingRuntimeImports(path.join(out, 'scripts'))
+if (missingImports.length > 0) {
+  fail(`runtime set is incomplete; missing: ${missingImports.join(', ')}`)
+}
 
 // --- native dependencies, pinned to bun.lock ------------------------------
 const allowlist = JSON.parse(await readFile(path.join(ROOT, 'scripts', 'bundle-allowlist.json'), 'utf8'))
