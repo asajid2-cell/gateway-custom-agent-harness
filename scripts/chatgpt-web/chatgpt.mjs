@@ -1816,7 +1816,15 @@ async function readServerReply(page, threadId, sentText) {
 async function threadContentState(page, threadId) {
   return page.evaluate(async id => {
     try {
-      const session = await (await fetch('/api/auth/session')).json()
+      const sessionResponse = await fetch('/api/auth/session').catch(() => null)
+      // If the session read is itself refused (429 during a limit window, 401
+      // when signed out), there is no token below and the conversation read
+      // answers 404 for EVERY thread - which this function would report as
+      // 'missing' and the host as a dead thread. Carry the session's status
+      // instead so a rate limit stays a rate limit and never a lost thread.
+      if (!sessionResponse) return 'unknown'
+      if (!sessionResponse.ok) return `unknown:${sessionResponse.status}`
+      const session = await sessionResponse.json().catch(() => null)
       const response = await fetch(`/backend-api/conversation/${id}`, {
         credentials: 'include',
         headers: session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {},
@@ -4197,7 +4205,12 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
         const match = /\/c\/([A-Za-z0-9-]{8,})/.exec(location.pathname)
         if (!match) return 0
         try {
-          const session = await (await fetch('/api/auth/session')).json().catch(() => null)
+          const sessionResponse = await fetch('/api/auth/session').catch(() => null)
+          // The session read is the first thing a rate-limited backend refuses;
+          // without this the probe sends no bearer, gets 404, and misses the
+          // limit in exactly the window it exists for.
+          if (sessionResponse && sessionResponse.status === 429) return 429
+          const session = sessionResponse ? await sessionResponse.json().catch(() => null) : null
           // The conversation read needs the session bearer: without it the backend
           // answers 404 for every thread (measured 2026-11-06), so a 429 could never
           // be seen and a live thread could be called missing.
