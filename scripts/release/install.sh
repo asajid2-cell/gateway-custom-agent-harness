@@ -47,6 +47,7 @@ if [ -n "${GATEWAY_ALIAS:-}" ]; then ALIAS_EXPLICIT=1; fi
 if [ "$(id -u)" -eq 0 ]; then ASSUME_ROOT=1; fi
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -296,14 +297,28 @@ fetch_url() {
 }
 
 fetch_file() {
-  if command -v curl >/dev/null 2>&1; then
-    if [ -n "$HTTP_PASS" ]; then curl -fsSL -u "$HTTP_USER:$HTTP_PASS" "$1" -o "$2"
-    else curl -fsSL "$1" -o "$2"; fi
-  elif command -v wget >/dev/null 2>&1; then
-    if [ -n "$HTTP_PASS" ]; then wget -q --user="$HTTP_USER" --password="$HTTP_PASS" "$1" -O "$2"
-    else wget -q "$1" -O "$2"; fi
+  # fetch_file URL OUT [quiet] - the archive shows a progress bar, the small
+  # checksum file does not.
+  if [ "${3:-}" = quiet ]; then
+    if command -v curl >/dev/null 2>&1; then
+      if [ -n "$HTTP_PASS" ]; then curl -fsSL -u "$HTTP_USER:$HTTP_PASS" "$1" -o "$2"
+      else curl -fsSL "$1" -o "$2"; fi
+    elif command -v wget >/dev/null 2>&1; then
+      if [ -n "$HTTP_PASS" ]; then wget -q --user="$HTTP_USER" --password="$HTTP_PASS" "$1" -O "$2"
+      else wget -q "$1" -O "$2"; fi
+    else
+      die "curl or wget is required"
+    fi
   else
-    die "curl or wget is required"
+    if command -v curl >/dev/null 2>&1; then
+      if [ -n "$HTTP_PASS" ]; then curl -fL --progress-bar -u "$HTTP_USER:$HTTP_PASS" "$1" -o "$2"
+      else curl -fL --progress-bar "$1" -o "$2"; fi
+    elif command -v wget >/dev/null 2>&1; then
+      if [ -n "$HTTP_PASS" ]; then wget -q --show-progress --user="$HTTP_USER" --password="$HTTP_PASS" "$1" -O "$2"
+      else wget -q --show-progress "$1" -O "$2"; fi
+    else
+      die "curl or wget is required"
+    fi
   fi
 }
 
@@ -328,12 +343,14 @@ if [ -z "$ARCHIVE" ]; then
   if [ -z "$VERSION" ]; then
     if [ -n "$BASE" ]; then
       # A mirror publishes the version it is serving next to the artifacts.
+      say "Reading $(display_url "$BASE")/version"
       VERSION="$(fetch_url "$BASE/version" 2>/dev/null | head -n 1 | tr -d '\r')"
     else
       VERSION="$(fetch_url "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
     fi
     [ -n "$VERSION" ] || die "could not resolve the release version; set GATEWAY_VERSION or GATEWAY_BASE_URL"
+    say "Version: $VERSION"
   fi
   NAME="gateway-$VERSION-$OS-$ARCH.tar.gz"
   ARCHIVE="$TMP/$NAME"
@@ -342,7 +359,7 @@ if [ -z "$ARCHIVE" ]; then
   else
     URL="https://github.com/$REPO/releases/download/v$VERSION/$NAME"
   fi
-  echo "Downloading $(display_url "$URL")"
+  say "Downloading $(display_url "$URL")"
   fetch_file "$URL" "$ARCHIVE"
 fi
 [ -f "$ARCHIVE" ] || die "archive not found: $ARCHIVE"
@@ -377,10 +394,11 @@ if [ -z "$EXPECTED" ] && [ -n "$URL" ]; then
   else
     SUMS_URL="https://github.com/$REPO/releases/download/v$VERSION/SHA256SUMS"
   fi
-  fetch_file "$SUMS_URL" "$TMP/SHA256SUMS" 2>/dev/null || true
+  fetch_file "$SUMS_URL" "$TMP/SHA256SUMS" quiet 2>/dev/null || true
   if [ -f "$TMP/SHA256SUMS" ]; then EXPECTED="$(sums_lookup "$TMP/SHA256SUMS")"; fi
 fi
 if [ -n "$EXPECTED" ]; then
+  say "Verifying checksum..."
   if command -v sha256sum >/dev/null 2>&1; then
     ACTUAL="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
   else
@@ -399,12 +417,14 @@ else
 fi
 
 # --- install ---------------------------------------------------------------
+say "Extracting $(basename "$ARCHIVE")..."
 mkdir -p "$TMP/tree"
 tar -xzf "$ARCHIVE" -C "$TMP/tree"
 [ -f "$TMP/tree/scripts/cc" ] || die "the archive does not contain scripts/cc"
 
 # The chosen folder's parent need not exist yet (~/apps/gateway is the common
 # case); mv cannot create it.
+say "Copying files into $PREFIX..."
 mkdir -p "$(dirname -- "$PREFIX")"
 rm -rf "$PREFIX.new"
 mv "$TMP/tree" "$PREFIX.new"
@@ -422,10 +442,12 @@ exec "$PREFIX/scripts/cc" "\$@"
 EOF
   chmod 0755 "$PREFIX/bin/$1"
 }
+say "Writing the $ALIAS command..."
 write_shim "$ALIAS"
 [ "$ALIAS" = gateway ] || write_shim gateway
 
 # --- link into a PATH directory -------------------------------------------
+say "Linking into $BIN_DIR..."
 mkdir -p "$BIN_DIR"
 ln -sf "$PREFIX/bin/$ALIAS" "$BIN_DIR/$ALIAS"
 [ "$ALIAS" = gateway ] || ln -sf "$PREFIX/bin/gateway" "$BIN_DIR/gateway"
@@ -486,13 +508,14 @@ if [ "$ON_PATH" -eq 0 ] && [ "$ADD_PATH" != "no" ]; then
           printf '# <<< gateway <<<\n'
         } >> "$RC"
         ADDED_PATH=1
-        echo "Added $BIN_DIR to PATH in $RC (open a new terminal)."
+        say "Added $BIN_DIR to PATH in $RC (open a new terminal)."
       fi
     fi
   fi
 fi
 
 # What was installed and where the links went, so uninstall does not guess.
+say "Writing install.json and install.env..."
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 cat > "$PREFIX/install.json" <<EOF
 {
