@@ -933,8 +933,11 @@ function Stop-OwnedGateway {
   }
 }
 
-if (-not (Get-Command node.exe -ErrorAction SilentlyContinue)) {
-  throw 'Node.js is required for the model gateway.'
+# The gateway is launched with the same runner as the harness: a packaged copy
+# carries runtime\bun.exe, and a source checkout resolved bun above. Node is
+# not required anywhere in this launcher.
+if (-not (Test-Path -LiteralPath $ClaudeRunner -PathType Leaf)) {
+  throw "The runtime is missing: $ClaudeRunner"
 }
 if (-not (Test-Path -LiteralPath $GatewayScript)) {
   throw "Model gateway is missing: $GatewayScript"
@@ -1167,7 +1170,7 @@ try {
   # child: optional providers are included only when their vault record exists,
   # and no value ever becomes an argument or file. In bundled mode there is no
   # external store to read; the supervisor injects the bundled vault itself.
-  $GatewayCommand = 'node "' + $GatewaySupervisor + '" --port ' + [string]$Port
+  $GatewayCommand = '& "' + $ClaudeRunner + '" "' + $GatewaySupervisor + '" --port ' + [string]$Port
   if ($env:GATEWAY_CREDENTIALS_MODE -eq 'bundled') {
     # Cleanroom: one plain supervisor spawn, no keysafe wrapper.
     $GatewayArgumentList = @(
