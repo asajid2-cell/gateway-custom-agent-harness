@@ -234,6 +234,9 @@ begin
       ExistingDir := Loc;
       if (ExistingDir = '') and DirLooksLikeGateway(ExpandConstant('{localappdata}\Programs\Gateway')) then
         ExistingDir := ExpandConstant('{localappdata}\Programs\Gateway');
+      // Record it too, so the choice page follows the folder: an MSI in a
+      // non-default folder must not be mistaken for "install alongside".
+      if ExistingDir <> '' then AddRecord(ExistingDir, 'gateway');
     end;
     ExistingNotes := ExistingNotes + 'MSI ' + Ver + ' (product ' + Names[I] + ')' + #13#10;
   end;
@@ -597,17 +600,33 @@ end;
 // A stable directory name for this install's own vault. The install folder is
 // the identity, so renaming the command keeps the same credentials and two
 // copies never share a store.
+// Four hex digits of the low 16 bits. Pascal Script has no IntToHex.
+function Hex4(Value: Int64): string;
+var
+  N: Integer;
+  D: string;
+begin
+  D := '0123456789ABCDEF';
+  N := Integer(Value) and $FFFF;
+  Result := D[((N shr 12) and 15) + 1] + D[((N shr 8) and 15) + 1] +
+            D[((N shr 4) and 15) + 1] + D[(N and 15) + 1];
+end;
+
 function VaultId: string;
 var
   S, R: string;
   I: Integer;
   C: Char;
+  H: Int64;
 begin
   S := ExpandConstant('{app}');
   R := '';
-  for I := 1 to Length(S) do
+  H := 2166136261; // FNV-1a: two folders that differ only in punctuation
+  for I := 1 to Length(S) do // must still get different vaults.
   begin
     C := S[I];
+    H := H xor Ord(C);
+    H := (H * 16777619) and $FFFFFFFF;
     if ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z')) or
        ((C >= '0') and (C <= '9')) or (C = '_') or (C = '-') then
       R := R + C
@@ -615,7 +634,7 @@ begin
       R := R + '-';
   end;
   if R = '' then R := 'default';
-  Result := R;
+  Result := R + '-' + Hex4(H);
 end;
 
 // The installed copy runs on the bundled vault, and that vault lives in a
