@@ -89,7 +89,7 @@ async function renderCodex(
   )
   if (existing) {
     onDone(
-      `Codex account ${name} is already signed in (account ${existing.number}). ` +
+      `Codex account ${name} is already signed in (account openai${existing.number}). ` +
         'Use /login codex new [other-name] to add another, or /login codex switch to select it.',
     )
     return null
@@ -130,7 +130,7 @@ async function renderProvider(
       )
       if (existing) {
         onDone(
-          `Claude account ${plan.target} is already stored (${existing.email ?? existing.name}). ` +
+          `Claude account claude${existing.number} is already stored (${existing.email ?? existing.name}). ` +
             'Use /login claude switch to select it, or pick another name.',
         )
         return null
@@ -148,7 +148,7 @@ async function renderProvider(
       }
       const account = registered.account
       onDone(
-        `Claude account ${account.number} (${account.email ?? account.name}) stored. ` +
+        `Claude account claude${account.number} (${account.email ?? account.name}) stored. ` +
           `Use /login claude switch ${account.number} [session|global] to select it.`,
       )
     }, context)

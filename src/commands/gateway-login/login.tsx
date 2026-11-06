@@ -28,22 +28,21 @@ import { saveProviderKey } from './unified-save.js'
 const KEYSAFE_RELATIVE_PATH = '.claude/skills/keysafe/scripts/keysafe.ps1'
 
 function keyLabel(keyName: string): string {
-  if (keyName === 'ds') return 'DeepSeek'
-  if (keyName === 'openrouter') return 'OpenRouter'
+  // provider + slot, always numbered from 1 (opencode1, opencode2, mistral1).
+  // The vault keeps its historical record spelling underneath; this is what a
+  // person types, reads back, and sees announced when a key is saved.
+  const slot = (suffix: string) => suffix || '1'
+  if (keyName === 'ds') return 'deepseek1'
+  if (/^ds([2-9]|[1-9][0-9]+)$/.test(keyName)) return `deepseek${keyName.slice(2)}`
+  if (keyName === 'openrouter') return 'openrouter1'
   if (keyName.startsWith('commandcode')) {
-    const suffix = keyName.slice('commandcode'.length)
-    return suffix ? `Command Code ${suffix}` : 'Command Code'
+    return `commandcode${slot(keyName.slice('commandcode'.length))}`
   }
   if (keyName.startsWith('mistralvibe') || keyName.startsWith('mistral-vibe')) {
-    const suffix = keyName.replace(/^mistral-?vibe/, '')
-    return suffix ? `Mistral Vibe ${suffix}` : 'Mistral Vibe'
+    return `mistralvibe${slot(keyName.replace(/^mistral-?vibe/, ''))}`
   }
-  if (keyName.startsWith('mistral')) {
-    const suffix = keyName.slice('mistral'.length)
-    return suffix ? `Mistral ${suffix}` : 'Mistral'
-  }
-  const suffix = keyName.slice('opencode-go'.length)
-  return suffix ? `OpenCode Go ${suffix}` : 'OpenCode Go'
+  if (keyName.startsWith('mistral')) return `mistral${slot(keyName.slice('mistral'.length))}`
+  return `opencode${slot(keyName.slice('opencode-go'.length))}`
 }
 
 /**
@@ -381,10 +380,10 @@ function GatewayLoginDialog(props: {
         return
       }
       const accountsNote = props.accountKind
-        ? `; ${accountsName} accounts now: ${(accounts ?? []).join(', ') || 'none'}`
+        ? `; ${accountsName} accounts now: ${(accounts ?? []).map(n => `${props.accountKind}${n}`).join(', ') || 'none'}`
         : ''
       props.onDone(
-        `${label} key saved in the ${result.source}${backendNote}. Gateway reloaded${accountsNote}.${warningNote}`,
+        `Saved as ${label} in the ${result.source}${backendNote}. Gateway reloaded${accountsNote}.${warningNote}`,
       )
       return
     }
@@ -395,7 +394,7 @@ function GatewayLoginDialog(props: {
       ? ' The gateway has no OpenRouter route yet; the key is stored for when it does.'
       : ''
     props.onDone(
-      `${label} key saved in the ${result.source}${backendNote}. Run /refreshlogin to load it without restarting cc.${routeNote}${warningNote}`,
+      `Saved as ${label} in the ${result.source}${backendNote}. Run /refreshlogin to load it without restarting cc.${routeNote}${warningNote}`,
     )
   }
 

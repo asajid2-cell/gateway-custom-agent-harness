@@ -31,11 +31,17 @@ function accountLabel(account: ClaudeAccount): string {
   return account.email || account.displayName || account.name
 }
 
+// The name a person reads and types: claude1, claude2, ... The email stays
+// alongside it as the identity, so the number and the account agree.
+function accountName(account: ClaudeAccount): string {
+  return `claude${account.number}`
+}
+
 function listing(accounts: ClaudeAccount[], active?: number): string {
   return accounts
     .map(
       account =>
-        `${account.number}=${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? ' (active)' : ''}`,
+        `${accountName(account)}=${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? ' (active)' : ''}`,
     )
     .join(', ')
 }
@@ -164,9 +170,9 @@ export async function anthropicStatusMessage(): Promise<string> {
     selection?.number ??
     accounts.find(account => account.name === currentName)?.number ??
     accounts[0]?.number
-  const lines = accounts.map(account => `  ${account.number}. ${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? '  <- active' : ''}`)
+  const lines = accounts.map(account => `  ${accountName(account)}  ${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? '  <- active' : ''}`)
   const adoptedNote = adopted
-    ? `\nAdopted the existing Claude sign-in as account ${adopted.number} (${accountLabel(adopted)}).`
+    ? `\nAdopted the existing Claude sign-in as account ${accountName(adopted)} (${accountLabel(adopted)}).`
     : ''
   return (
     `Claude accounts (${accounts.length}):\n${lines.join('\n')}` +

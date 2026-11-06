@@ -60,6 +60,13 @@ ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc-gateway
 if [ ! -e /usr/local/bin/cc ] && [ ! -L /usr/local/bin/cc ]; then
   ln -sf /usr/local/gateway/scripts/cc /usr/local/bin/cc
 fi
+# The installed gateway runs on the bundled vault, kept apart from any
+# development session's ~/.claude/keysafe (per user: keysafe-gateway).
+cat > /usr/local/gateway/install.env <<'GATEWAYENV'
+# Written by the Gateway package.
+GATEWAY_CREDENTIALS_MODE=bundled
+GATEWAY_KEYSAFE_ID=gateway
+GATEWAYENV
 exit 0
 POSTINSTALL
 chmod 0755 "$WORK/scripts/postinstall"

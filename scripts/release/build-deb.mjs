@@ -108,11 +108,19 @@ ln -sf /opt/gateway/scripts/cc /usr/bin/cc-gateway
 if [ ! -e /usr/bin/cc ] && [ ! -L /usr/bin/cc ]; then
   ln -sf /opt/gateway/scripts/cc /usr/bin/cc
 fi
+# The installed gateway runs on the bundled vault, kept apart from any
+# development session's ~/.claude/keysafe. A system install cannot name one
+# user's path, so it names a suffix and each user gets ~/.claude/keysafe-gateway.
+cat > /opt/gateway/install.env <<'GATEWAYENV'
+# Written by the Gateway package.
+GATEWAY_CREDENTIALS_MODE=bundled
+GATEWAY_KEYSAFE_ID=gateway
+GATEWAYENV
 exit 0
 `
 const prerm = `#!/bin/sh
 set -e
-rm -f /usr/bin/gateway /usr/bin/cc-gateway
+rm -f /usr/bin/gateway /usr/bin/cc-gateway /opt/gateway/install.env
 # Only remove \`cc\` when this package created it. readlink without -f: if the
 # target is already gone, -f yields an empty string and the link would survive.
 if [ -L /usr/bin/cc ] && [ "$(readlink /usr/bin/cc)" = "/opt/gateway/scripts/cc" ]; then

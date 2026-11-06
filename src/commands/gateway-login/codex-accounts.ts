@@ -65,11 +65,17 @@ function accountLabel(account: CodexAccount): string {
   return account.email || account.displayName || account.name
 }
 
+// The name a person reads and types: openai1, openai2, ... The account's own
+// label stays alongside it.
+function accountName(account: CodexAccount): string {
+  return `openai${account.number}`
+}
+
 function listing(accounts: CodexAccount[], active?: number): string {
   return accounts
     .map(
       account =>
-        `${account.number}=${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? ' (active)' : ''}`,
+        `${accountName(account)}=${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? ' (active)' : ''}`,
     )
     .join(', ')
 }
@@ -78,7 +84,7 @@ function accountLines(accounts: CodexAccount[], active?: number): string {
   return accounts
     .map(
       account =>
-        `  ${account.number}. ${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? '  <- active' : ''}`,
+        `  ${accountName(account)}  ${accountLabel(account)}${account.name !== accountLabel(account) ? ` (${account.name})` : ''}${account.number === active ? '  <- active' : ''}`,
     )
     .join('\n')
 }
@@ -159,7 +165,7 @@ export async function selectCodexAccount(
     return {
       ok: true,
       message:
-        `Codex account ${account.number} (${account.name}) selected ` +
+        `Codex account ${accountName(account)} (${account.name}) selected ` +
         `${scope === 'global' ? 'globally' : 'for this session'}. ` +
         'A request that fails on it retries with the next loaded account.',
     }

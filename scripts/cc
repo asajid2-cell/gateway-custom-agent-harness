@@ -23,6 +23,29 @@ while [ -L "$src" ]; do
 done
 here="$(cd -P -- "$(dirname -- "$src")" && pwd)"
 
+# An installed copy ships its own environment in install.env: the bundled vault
+# and a vault directory that belongs to this copy. Apply it before the runtime
+# resolution so an install never inherits another session's credentials.
+if [ -f "$here/../install.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      *=*)
+        name="${line%%=*}"
+        value="${line#*=}"
+        case "$name" in
+          [A-Za-z_]*)
+            case "$name" in
+              *[!A-Za-z0-9_]*) ;;
+              *) export "$name=$value" ;;
+            esac
+            ;;
+        esac
+        ;;
+    esac
+  done < "$here/../install.env"
+fi
+
 # A packaged artifact carries its own runtime, and an install must work on a
 # machine with neither node nor bun on PATH. A source checkout has no runtime/
 # directory, so it resolves node exactly as before.

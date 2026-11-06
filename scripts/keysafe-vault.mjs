@@ -88,6 +88,15 @@ export function isValidRecordName(name) {
 
 /** @param {NodeJS.ProcessEnv} [env] */
 export function defaultVaultDir(env = process.env) {
+  // An installed copy names its vault explicitly (install.env), so its
+  // credentials are not the ones this machine's development session already
+  // has under ~/.claude or the legacy ~/.keysafe.
+  const explicit = env.GATEWAY_KEYSAFE_DIR
+  if (typeof explicit === 'string' && explicit.trim() !== '') return path.resolve(explicit)
+  // A system-wide install cannot name one user's absolute path, so it names a
+  // suffix instead and the vault lands beside that user's config, separate
+  // from the keys a development checkout already has.
+  const suffix = env.GATEWAY_KEYSAFE_ID
   const configDir = env.CLAUDE_CONFIG_DIR
   let home = env.USERPROFILE || env.HOME
   if (!home) {
@@ -100,7 +109,11 @@ export function defaultVaultDir(env = process.env) {
   if (!configDir && !home) {
     throw new Error('keysafe: cannot resolve a home directory; set CLAUDE_CONFIG_DIR or HOME')
   }
-  return path.join(configDir || path.join(home, '.claude'), 'keysafe')
+  const base = configDir || path.join(home, '.claude')
+  if (typeof suffix === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(suffix)) {
+    return path.join(base, `keysafe-${suffix}`)
+  }
+  return path.join(base, 'keysafe')
 }
 
 export function clearMasterKeyCache() {

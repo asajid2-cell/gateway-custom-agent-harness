@@ -2,6 +2,25 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $PSScriptRoot
 
+# An installed copy ships its own environment in install.env: the bundled vault
+# and a vault directory that belongs to this copy. It is applied before the
+# mode logic below, so an install never inherits the machine's legacy ~/.keysafe
+# or another copy's credentials. Plain NAME=VALUE, no expansion.
+$InstallEnv = Join-Path $Root 'install.env'
+if (Test-Path -LiteralPath $InstallEnv) {
+  foreach ($line in [IO.File]::ReadAllLines($InstallEnv)) {
+    $trimmed = $line.Trim()
+    if ($trimmed.Length -eq 0 -or $trimmed.StartsWith('#')) { continue }
+    $eq = $trimmed.IndexOf('=')
+    if ($eq -lt 1) { continue }
+    $name = $trimmed.Substring(0, $eq).Trim()
+    $value = $trimmed.Substring($eq + 1).Trim().Trim('"')
+    if ($name -match '^[A-Za-z_][A-Za-z0-9_]*$') {
+      [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+    }
+  }
+}
+
 # The code default is the cleanroom bundled vault. A machine that already has
 # the legacy keysafe store keeps using it: this launcher sets the explicit
 # external flag itself, so an existing setup is unchanged while a fresh machine

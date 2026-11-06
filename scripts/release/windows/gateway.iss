@@ -46,7 +46,9 @@ WizardStyle=modern
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\scripts\cc.cmd
 SetupLogging=yes
-UsePreviousAppDir=yes
+; Our own detection decides the default folder. Inno's remembered folder would
+; otherwise outrank GetDefaultInstallDir and point at whichever copy ran last.
+UsePreviousAppDir=no
 UsePreviousTasks=yes
 ChangesEnvironment=yes
 CloseApplications=no
@@ -80,6 +82,7 @@ Name: "{autodesktop}\Gateway{code:GetShortcutSuffix}"; Filename: "{app}\scripts\
 ; bin/ holds shims written after the file copy, so the uninstaller does not
 ; know about them; without this, "uninstall" leaves an empty folder behind.
 Type: filesandordirs; Name: "{app}\bin"
+Type: files; Name: "{app}\install.env"
 Type: dirifempty; Name: "{app}"
 
 [Run]
@@ -110,6 +113,10 @@ var
   ExistingRoot: Integer;
   ExistingNotes: string;
   ExistingChoice: Integer;
+  ExistingDirs: TArrayOfString;
+  ExistingAliases: TArrayOfString;
+  ExistingRecordCount: Integer;
+  AliasDefault: string;
 
 function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: Longint;
   fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
@@ -178,6 +185,31 @@ begin
   FindClose(FindRec);
 end;
 
+// Every recorded install, so the folder the user picks decides what happens:
+// the same folder is an update, any other folder is a second copy.
+procedure AddRecord(const Dir, Alias: string);
+begin
+  SetArrayLength(ExistingDirs, ExistingRecordCount + 1);
+  SetArrayLength(ExistingAliases, ExistingRecordCount + 1);
+  ExistingDirs[ExistingRecordCount] := TrimDir(Dir);
+  ExistingAliases[ExistingRecordCount] := Alias;
+  ExistingRecordCount := ExistingRecordCount + 1;
+end;
+
+function RecordForDir(const Dir: string; var Alias: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to ExistingRecordCount - 1 do
+    if CompareText(TrimDir(Dir), ExistingDirs[I]) = 0 then
+    begin
+      Alias := ExistingAliases[I];
+      Result := True;
+      Exit;
+    end;
+end;
+
 procedure DetectMsiIn(const Root: Integer; const Base: string);
 var
   Names: TArrayOfString;
@@ -221,6 +253,9 @@ begin
   ExistingNotes := '';
   ExistingChoice := 0;
   ExistingRoot := HKCU;
+  ExistingRecordCount := 0;
+  SetArrayLength(ExistingDirs, 0);
+  SetArrayLength(ExistingAliases, 0);
 
   if RegQueryStringValue(HKCU, 'Software\Gateway', 'InstallDir', Dir) and DirLooksLikeGateway(Dir) then
   begin
@@ -232,6 +267,7 @@ begin
     ExistingAlias := Alias;
     ExistingNotes := ExistingNotes + 'Gateway ' + Ver + ' at ' + Dir +
       ' (command "' + Alias + '")' + #13#10;
+    AddRecord(Dir, Alias);
   end;
 
   // Copies installed beside the first one.
@@ -252,6 +288,7 @@ begin
         end;
         ExistingNotes := ExistingNotes + 'Gateway ' + Ver + ' at ' + Dir +
           ' (command "' + Alias + '")' + #13#10;
+        AddRecord(Dir, Alias);
       end;
     end;
 
@@ -270,6 +307,7 @@ begin
       ExistingVersion := '?';
     end;
     ExistingNotes := ExistingNotes + 'Gateway files at ' + Dir + #13#10;
+    AddRecord(Dir, 'gateway');
   end;
 end;
 
@@ -378,6 +416,7 @@ begin
     AliasPage.Values[0] := PreviousAlias
   else
     AliasPage.Values[0] := 'gateway';
+  AliasDefault := Trim(AliasPage.Values[0]);
 end;
 
 function GetAlias(Param: string): string;
@@ -406,6 +445,24 @@ begin
   // box in /VERYSILENT waits forever for a click. The install-time logic
   // (ChoosingAlongside, PrepareToInstall) already handles both choices.
   if SilentRun then Exit;
+  // The folder decides whether this is an update: picking a recorded copy's
+  // folder makes that copy the target and offers its command name, rather than
+  // leaving the page pointing at whichever copy happened to be detected first.
+  if CurPageID = wpSelectDir then
+  begin
+    if RecordForDir(WizardForm.DirEdit.Text, Value) then
+    begin
+      ExistingKind := 'wizard';
+      ExistingDir := TrimDir(WizardForm.DirEdit.Text);
+      ExistingAlias := Value;
+      if Assigned(AliasPage) and
+         ((Trim(AliasPage.Values[0]) = '') or (CompareText(Trim(AliasPage.Values[0]), AliasDefault) = 0)) then
+      begin
+        AliasPage.Values[0] := Value;
+        AliasDefault := Value;
+      end;
+    end;
+  end;
   if Assigned(ExistingPage) and (CurPageID = ExistingPage.ID) then
   begin
     if ExistingPage.Values[0] then ExistingChoice := 0 else ExistingChoice := 1;
@@ -474,6 +531,21 @@ begin
     Result := True;
 end;
 
+// Keep the radio honest as the folder changes: a recorded folder is an update,
+// anything else is a second copy.
+procedure CurPageChanged(CurPageID: Integer);
+var
+  Found: string;
+begin
+  if Assigned(ExistingPage) and (CurPageID = ExistingPage.ID) then
+  begin
+    if RecordForDir(WizardForm.DirEdit.Text, Found) then
+      ExistingPage.Values[0] := True
+    else
+      ExistingPage.Values[1] := True;
+  end;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code, I: Integer;
@@ -522,6 +594,43 @@ end;
 // The first copy owns HKCU\Software\Gateway. A copy installed beside it gets
 // HKCU\Software\Gateway\Installs\<command> instead, so uninstalling one copy
 // cannot delete the other's record, and detection can list both.
+// A stable directory name for this install's own vault. The install folder is
+// the identity, so renaming the command keeps the same credentials and two
+// copies never share a store.
+function VaultId: string;
+var
+  S, R: string;
+  I: Integer;
+  C: Char;
+begin
+  S := ExpandConstant('{app}');
+  R := '';
+  for I := 1 to Length(S) do
+  begin
+    C := S[I];
+    if ((C >= 'a') and (C <= 'z')) or ((C >= 'A') and (C <= 'Z')) or
+       ((C >= '0') and (C <= '9')) or (C = '_') or (C = '-') then
+      R := R + C
+    else
+      R := R + '-';
+  end;
+  if R = '' then R := 'default';
+  Result := R;
+end;
+
+// The installed copy runs on the bundled vault, and that vault lives in a
+// directory of its own. Without this it would inherit whatever ~/.keysafe or
+// ~/.claude/keysafe the machine already had.
+procedure WriteInstallEnv;
+var
+  Text: string;
+begin
+  Text := '# Written by the Gateway installer.' + #13#10 +
+          'GATEWAY_CREDENTIALS_MODE=bundled' + #13#10 +
+          'GATEWAY_KEYSAFE_DIR=' + ExpandConstant('{localappdata}\Gateway\keysafe\') + VaultId + #13#10;
+  SaveStringToFile(ExpandConstant('{app}\install.env'), Text, False);
+end;
+
 procedure WriteInstallRecord(Alias: string);
 var
   Dir, Primary: string;
@@ -654,6 +763,7 @@ begin
        and (CompareText(PreviousAlias, 'gateway') <> 0) then
       DeleteFile(ExpandConstant('{app}\bin\') + PreviousAlias + '.cmd');
     WriteInstallRecord(Alias);
+    WriteInstallEnv;
     if WizardIsTaskSelected('addtopath') then
       AddPathEntry
     else

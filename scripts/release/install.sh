@@ -403,6 +403,17 @@ cat > "$PREFIX/install.json" <<EOF
 }
 EOF
 
+# This copy runs on the bundled vault, in a directory of its own. Without it the
+# installed gateway would read whatever ~/.keysafe or ~/.claude/keysafe the
+# machine already has (for example a development session's keys).
+VAULT_ID="$(printf '%s' "$PREFIX" | sed -e 's/[^A-Za-z0-9_-]/-/g')"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+cat > "$PREFIX/install.env" <<EOF
+# Written by the Gateway installer.
+GATEWAY_CREDENTIALS_MODE=bundled
+GATEWAY_KEYSAFE_DIR=$DATA_HOME/gateway/keysafe/$VAULT_ID
+EOF
+
 printf '\nGateway installed in %s\n' "$PREFIX"
 printf '  %s -> %s/%s\n' "$ALIAS" "$BIN_DIR" "$ALIAS"
 if [ "$ALIAS" != "gateway" ]; then printf '  gateway -> %s/gateway\n' "$BIN_DIR"; fi

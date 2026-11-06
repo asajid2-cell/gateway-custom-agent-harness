@@ -476,6 +476,27 @@ test('defaultVaultDir honors CLAUDE_CONFIG_DIR', async () => {
   assert.equal(defaultVaultDir({ USERPROFILE: 'C:/u' }), path.join('C:/u', '.claude', 'keysafe'))
 })
 
+test('an installed copy names its own vault, outranking the shared config', async () => {
+  const { defaultVaultDir } = await import('./keysafe-vault.mjs')
+  // The installer writes GATEWAY_KEYSAFE_DIR; it must win over both the
+  // machine's config dir and any development vault living under it.
+  assert.equal(
+    defaultVaultDir({ GATEWAY_KEYSAFE_DIR: 'C:/data/gw-keysafe', CLAUDE_CONFIG_DIR: 'C:/tmp/cfg', USERPROFILE: 'C:/u' }),
+    path.resolve('C:/data/gw-keysafe'),
+  )
+  // A system-wide install cannot name one user's path, so it names a suffix
+  // and each user gets a directory beside their config.
+  assert.equal(
+    defaultVaultDir({ GATEWAY_KEYSAFE_ID: 'gateway', CLAUDE_CONFIG_DIR: 'C:/tmp/cfg', USERPROFILE: 'C:/u' }),
+    path.join('C:/tmp/cfg', 'keysafe-gateway'),
+  )
+  // An unusable suffix is ignored rather than becoming a path component.
+  assert.equal(
+    defaultVaultDir({ GATEWAY_KEYSAFE_ID: '../escape', USERPROFILE: 'C:/u' }),
+    path.join('C:/u', '.claude', 'keysafe'),
+  )
+})
+
 test('reserved and non-canonical record names are refused', async () => {
   const { isValidRecordName } = await import('./keysafe-vault.mjs')
   assert.equal(isValidRecordName('ds'), true)
