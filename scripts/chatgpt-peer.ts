@@ -733,6 +733,15 @@ export class ChatGptHost {
   private readonly deliveryLocks = new Map<string, { run<T>(work: () => Promise<T>): Promise<T> }>()
   /** One turn at a time per conversation; see `turnStep`. */
   private readonly turnLocks = new Map<string, { run<T>(work: () => Promise<T>): Promise<T> }>()
+  /**
+   * Consecutive pre-acceptance page-load faults, per thread.
+   *
+   * One fault on a fresh window is the window's luck. The same thread failing
+   * to render again after the lane was recycled is a property of the
+   * conversation, and re-posting into it loops forever. Counting here lets the
+   * retry roll over to a new conversation instead of never converging.
+   */
+  private readonly pageFaultStreak = new Map<string, number>()
   private server: ReturnType<typeof createServer> | undefined
   private operatorToken = randomBytes(32).toString('hex')
   private health: { state: HealthState; reason?: string; at: string } = { state: 'unknown', reason: 'page_not_started', at: new Date().toISOString() }
@@ -2058,6 +2067,7 @@ export class ChatGptHost {
     }
     const page = { model: bridge.state.model, effort: bridge.state.effort }
     this.absorbPage(bridge, reply)
+    this.clearPageFault(bridge, reply.threadId)
     if (page.model !== bridge.state.model || page.effort !== bridge.state.effort) await this.advertise(bridge)
     this.health = { state: 'serving', at: now() }
     return typeof reply.text === 'string' ? reply.text : ''
@@ -2130,6 +2140,7 @@ export class ChatGptHost {
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
     }
     this.absorbPage(bridge, reply)
+    this.clearPageFault(bridge, reply.threadId)
     this.health = { state: 'serving', at: now() }
     const landed = typeof reply.threadId === 'string' && reply.threadId ? reply.threadId : bridge.state.threadId
     const answerText = wait && typeof reply.text === 'string' ? reply.text : null
@@ -2958,18 +2969,32 @@ export class ChatGptHost {
         record.queuedSince ??= now()
         record.queuedReason = one((error as Error).message, 200)
         await this.notePendingTurn(bridge, record)
+        // The five-minute reconcile pass was the ONLY retry for a turn that was
+        // never posted (the pending watch covers posted turns only), which is
+        // how a page that could not take the text became a silent multi-minute
+        // wait. Run the same short ladder the page-load path uses.
+        this.armDeferredRetry(bridge)
       }
       const reason = one((error as Error).message, 160)
-      // A thread ChatGPT itself cannot render never heals by retrying that same
-      // thread: the page loads its shell, shows no messages, and swallows any
-      // send. Clear the thread so the next attempt opens a fresh chat, which
-      // renders - and say so, because the conversation continuity is gone.
-      if (/rendered no messages/i.test(reason) && bridge.state.threadId) {
-        const dead = bridge.state.threadId
-        bridge.state.threadId = null
-        bridge.state.primedThreadId = null
-        await this.persistBridgeState(bridge)
-        log(`"${bridge.state.name}": thread ${dead} renders no messages; cleared it, the next attempt starts a new chat`)
+      // A rate limit or a signed-out session is NOT a page fault: re-posting
+      // inside the same limit only deepens it, and nothing was typed. Fail the
+      // turn now so the sender learns the truth instead of waiting in a silence
+      // that looks like the old hang. (Measured 2026-11-06: 429 on the
+      // conversation read, turn swallowed as "queued", sender got no reply.)
+      if (!posted && !accepted && /rate limited|not signed in/i.test(reason)
+        && !bridge.removed && !bridge.stopping) throw error
+      // A thread ChatGPT itself cannot render never heals by re-posting into
+      // it: the page loads its shell, shows no messages, and swallows sends.
+      // (The old test here looked for "rendered no messages", a phrase no
+      // driver has ever emitted, so the rollover never fired.) Count real page
+      // faults and, once the same thread has failed twice on fresh windows,
+      // clear it: the next attempt opens a new chat, which renders. Say so,
+      // because the conversation continuity is gone.
+      if (error instanceof PageLoadFault && !accepted && bridge.state.threadId) {
+        await this.rollOverDeadThread(bridge, bridge.state.threadId)
+        // The job is unposted, and the lane just faulted: without a short
+        // retry the five-minute observation pass is its only rescue.
+        this.armDeferredRetry(bridge)
       }
       // R10-F3: `ambiguous` is a "may have landed" state, so it is swallowed
       // like the other not-a-refusal reasons and the turn stays queued.
@@ -3389,14 +3414,15 @@ export class ChatGptHost {
   private async resumeDeferredTurns(bridge: Bridge, locked = true): Promise<void> {
     const deferred = bridge.state.pendingTurns.find(record => record.postedAt === null && !this.attachedTurns.has(record.messageId))
     if (!deferred) return
+    // No thread is a real state, not a reason to give up: a rollover after a
+    // dead conversation clears it precisely so this post starts a new chat.
     const threadId = bridge.state.threadId
-    if (!threadId) return
     // With lanes, the writer's own page is the only page that can receive this
     // text, and postPendingTurn asks it inside laneWork. Asking the master here
     // instead answers about a different page: on 2026-11-05 a stale generating
     // status on the master skipped every retry and left a queued job for the
     // five-minute reconcile pass.
-    if (!this.lanes) {
+    if (!this.lanes && threadId) {
       const gate = await this.cheapStatus(threadId)
       if (this.generatingLooksLive(gate)) return
     }
@@ -4270,6 +4296,35 @@ export class ChatGptHost {
       if (bridge.state.threadId && bridge.state.threadId.toLowerCase() === id) return bridge
     }
     return undefined
+  }
+
+  /**
+   * Give a thread that will not render two fresh windows before abandoning it.
+   *
+   * One pre-acceptance page-load fault is the window's luck; the lane is
+   * recycled and the job retried. The SAME thread faulting again after that
+   * recycle is a property of the conversation - the page shell loads, no
+   * messages draw, and every send is swallowed - so re-posting can never
+   * converge. Clearing the thread makes the next attempt start a new chat.
+   */
+  private async rollOverDeadThread(bridge: Bridge, threadId: string): Promise<void> {
+    const streak = (this.pageFaultStreak.get(threadId) ?? 0) + 1
+    if (streak < 2 || bridge.state.threadId !== threadId) {
+      this.pageFaultStreak.set(threadId, streak)
+      return
+    }
+    this.pageFaultStreak.delete(threadId)
+    this.setThread(bridge, null)
+    await this.persistBridgeState(bridge)
+    const note = `thread ${shortId(threadId)} would not render twice on fresh windows; rolling this bridge over to a new conversation`
+    log(`"${bridge.state.name}": ${note}`)
+    audit(this.hostState, { op: 'turn', target: bridge.state.name, result: note })
+  }
+
+  /** A turn that rendered on `threadId` proves the fault is gone. */
+  private clearPageFault(bridge: Bridge, threadId: unknown): void {
+    const id = typeof threadId === 'string' && threadId ? threadId : bridge.state.threadId
+    if (id) this.pageFaultStreak.delete(id)
   }
 
   /**
@@ -5189,9 +5244,25 @@ export class ChatGptHost {
           // Deferred, never refused: nothing was typed, and the next idle
           // transition posts the job (this pass or the observation pass).
           acknowledge()
-          const line = 'queued: the page is mid-turn; it will be posted when the turn ends'
+          // Say WHY it is queued when the post recorded a reason: "the page is
+          // mid-turn" was printed for a rate limit too, which sent the reader
+          // looking at the wrong thing (live 2026-11-06).
+          const queuedRecord = bridge.state.pendingTurns.find(record => record.messageId === job.messageId)
+          const queuedWhy = queuedRecord?.queuedReason
+          const line = queuedWhy
+            ? `queued: ${one(queuedWhy, 160)}; it stays queued`
+            : 'queued: the page is mid-turn; it will be posted when the turn ends'
           audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
           log(`turn ${shortId(message.id)}: ${line}`)
+          // A queued turn is covered by no pending watch (that watch only sees
+          // POSTED turns), so without this the sender heard nothing until the
+          // five-minute reconcile pass. Give it the one queued notice at the
+          // same bounded threshold a posted turn gets, and keep retrying via
+          // the deferred ladder; `queuedNoticeAt` makes the notice once-only.
+          const noticeDelay = (this.config.pendingWatchGapsMs ?? PENDING_WATCH_GAPS_MS)
+            .reduce((total, gap) => total + gap, 0)
+          const notice = setTimeout(() => { void this.noticeQueuedTurns(bridge).catch(() => {}) }, noticeDelay)
+          notice.unref?.()
           return
         }
         // The seed WAS round 1's page turn, and with `wait:true` the driver
@@ -5272,11 +5343,19 @@ export class ChatGptHost {
           log(`turn ${shortId(message.id)}: ${line} [${bridge.state.name}]`)
           audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
           await this.persistHostState()
-          // Before acceptance the job is only queued, and the reconcile pass
-          // that would re-post it runs on `observeEvery` (five minutes by
-          // default) - a recycle must not cost that. Arm a short retry on the
-          // fresh window; the pass remains the safety net, not the latency.
-          if (!error.accepted) this.armDeferredRetry(bridge)
+          if (!error.accepted) {
+            // A second pre-acceptance fault on the same thread, after the lane
+            // was already recycled, means the conversation itself will not
+            // render. Re-posting there never converges, so roll over: the
+            // queued job is posted into a NEW conversation and the sender
+            // still gets its answer.
+            if (error.threadId) await this.rollOverDeadThread(bridge, error.threadId)
+            // Before acceptance the job is only queued, and the reconcile pass
+            // that would re-post it runs on `observeEvery` (five minutes by
+            // default) - a recycle must not cost that. Arm a short retry on the
+            // fresh window; the pass remains the safety net, not the latency.
+            this.armDeferredRetry(bridge)
+          }
           return
         }
         if (error instanceof GeneratingTurn) {

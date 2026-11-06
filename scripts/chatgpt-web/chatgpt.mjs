@@ -946,7 +946,11 @@ async function acquireLock(file, waitMs, staleMs = FOCUS_STALE_MS) {
       closeSync(fd)
       return async () => { try { unlinkSync(file) } catch { /* already released */ } }
     } catch (error) {
-      if (error?.code !== 'EEXIST') throw error
+      // Windows reports an existing lock it cannot open as EPERM (and, under a
+      // sharing violation, EACCES) rather than EEXIST; observed live 2026-11-05
+      // as "did not warm: EPERM ... webbridge-attach.lock". All three mean
+      // "someone holds it", which is exactly the case this loop exists for.
+      if (error?.code !== 'EEXIST' && error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
       // A holder that died without releasing leaves the file behind; its age is
       // the only thing that can tell a crash from a slow holder.
       try {
@@ -973,7 +977,7 @@ async function acquireFocus() {
  * process that later kills the master.
  */
 async function ensureMasterChrome() {
-  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 90_000, 180_000)
+  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 150_000, 120_000)
   try {
     return await openMasterChrome()
   } finally {
@@ -1053,7 +1057,7 @@ async function ensureChrome({ visible = true } = {}) {
   // The one-window driver launches the same browser the lanes live in, so it
   // takes the same launch lock: without it a lane and this driver can each
   // decide the port is down and kill the other's booting window.
-  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 90_000, 180_000)
+  const releaseLaunch = await acquireLock(LAUNCH_LOCK, 150_000, 120_000)
   try {
     return await openOwnChrome({ visible })
   } finally {
@@ -3963,7 +3967,9 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
       // 'unknown' is most often a 429 on the conversation read, which says
       // nothing about the thread. Re-ask before treating it as a page fault.
       let content = await threadContentState(page, threadId)
-      for (let attempt = 0; attempt < 2 && content === 'unknown'; attempt++) {
+      // Retry any inconclusive answer, including a 429: a short burst clears,
+      // and asking again costs one fetch while a wrong verdict costs a window.
+      for (let attempt = 0; attempt < 2 && /^unknown/.test(content); attempt++) {
         await new Promise(resolve => setTimeout(resolve, 2_000))
         content = await threadContentState(page, threadId)
       }
@@ -3971,7 +3977,23 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
         await log(`thread ${threadId} is gone on the server; reporting it as unreadable`)
         throw new TurnError(`not-posted: thread ${threadId} is gone on the server, so nothing was typed and nothing was sent`, { reason: 'thread-unreadable' })
       }
-      if (content === 'empty') {
+      // An account state is not a page fault. Recycling the window on a 429
+      // (observed live 2026-11-05: "would not render (server says unknown:429);
+      // recycling the window", over and over) throws away a fine browser and
+      // immediately posts again into the same limit, so the lane churns
+      // windows while the account backs off.
+      const status = /^unknown:(\d{3})$/.exec(content)?.[1]
+      if (status === '429') {
+        // A rate-limited READ says nothing about the WRITE: a brand-new thread
+        // is legitimately empty (exactly what this guard exists to let
+        // through) and can still post. Do not reload or recycle - fall through
+        // and let the send decide; the send path reports a 429 as the account
+        // limit, which is the honest answer.
+        await log(`thread ${threadId} answered 429 on the conversation read; attempting the send, which decides`)
+      } else if (status === '401' || status === '403') {
+        await log(`thread ${threadId} answered ${status} on the conversation read; the session is not signed in`)
+        throw new TurnError(`not-posted: the session is not signed in (the conversation read answers ${status}); nothing was typed`, { reason: 'signed-out', threadId })
+      } else if (content === 'empty') {
         await log(`thread ${threadId} is new and empty; posting the first message into it`)
       } else {
         await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {})
@@ -4686,7 +4708,8 @@ async function withPage(operation) {
 const OBSERVER_SCRIPT = `(() => {
   if (window.top !== window) return 'not-top'
   if (window.__gwObserver) return 'already'
-  window.__gwObserver = true
+  // Set only once the observer is actually running (at the end): an install that
+  // throws must be retryable, or that document stays permanently blind.
   // One mark per document, so the channel can tell a reload from a repeated
   // load event on the document it already knows.
   window.__gwObserverDoc = (self.crypto && self.crypto.randomUUID ? self.crypto.randomUUID() : Date.now() + '-' + Math.random())
@@ -4802,7 +4825,12 @@ const OBSERVER_SCRIPT = `(() => {
     if (now - lastSampleAt >= 250) { lastSampleAt = now; sample() }
     schedule()
   })
-  observer.observe(document.documentElement, {
+  // Observe the Document, not document.documentElement: at document_start (the
+  // addScriptToEvaluateOnNewDocument path) the root element does not exist yet
+  // and observing null throws "parameter 1 is not of type 'Node'". With
+  // subtree:true on the Document the same mutations are delivered, and it is
+  // valid however early the script runs.
+  observer.observe(document, {
     subtree: true,
     childList: true,
     attributes: true,
@@ -4820,6 +4848,7 @@ const OBSERVER_SCRIPT = `(() => {
     }
   }
   window.addEventListener('popstate', schedule)
+  window.__gwObserver = true
   schedule()
   return 'installed'
 })()`
