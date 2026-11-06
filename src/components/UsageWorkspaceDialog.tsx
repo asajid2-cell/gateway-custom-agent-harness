@@ -279,9 +279,16 @@ export function UsageMenu({ onDone, initialPeriod = 'all' }: { onDone: (result?:
   const empty = report.lifetime.requests === 0 && report.excluded.replay === 0
 
   // Escape backs out one level before leaving, so a mis-click on a sub-screen
-  // does not close the whole thing.
+  // does not close the whole thing. At home it closes the report: the empty
+  // ledger renders no Select, so without this there was no way out at all on a
+  // machine that had not recorded a turn yet.
   useInput((_input, key) => {
-    if (key.escape && screen !== 'home') setScreen('home')
+    if (!key.escape) return
+    if (screen !== 'home') {
+      setScreen('home')
+      return
+    }
+    onDone()
   })
 
   const width = Math.max(40, columns - 4)
@@ -290,6 +297,7 @@ export function UsageMenu({ onDone, initialPeriod = 'all' }: { onDone: (result?:
     return (
       <Box flexDirection="column" paddingX={2}>
         <EmptyLedger directory={directory} />
+        <Text dimColor>Esc closes this report.</Text>
       </Box>
     )
   }
@@ -435,7 +443,6 @@ export function UsageMenu({ onDone, initialPeriod = 'all' }: { onDone: (result?:
       <Select
         options={options}
         visibleOptionCount={12}
-        onCancel={() => onDone()}
         onChange={(value: string) => {
           if (value === 'exit') { onDone(); return }
           if (value.startsWith('period:')) {
