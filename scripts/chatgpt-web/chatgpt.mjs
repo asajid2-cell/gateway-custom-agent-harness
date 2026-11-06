@@ -23,6 +23,7 @@ import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import readline from 'node:readline'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 const HOME = os.homedir()
 const BASE = path.join(HOME, '.chatgpt-web')
@@ -77,6 +78,16 @@ const LANE_TAB_PREFIX = 'webbridge-lane:'
 /** A lane tab is named, so lanes never borrow the operator's own tab. */
 const LANE_TAB = LANE_ID ? `${LANE_TAB_PREFIX}${LANE_ID}` : ''
 const LANE_SHARED_DIR = process.env.CHATGPT_LANE_SHARED_DIR || path.dirname(STATE_DIR)
+/**
+ * The lane this request is for, when one process serves several tabs.
+ *
+ * The host used to give every writer its own driver process, so the lane was a
+ * process-wide env var. It now runs ONE child per browser and puts `lane` on
+ * each request; everything that used to read LANE_ID reads this instead, so a
+ * single process can own one tab per inputter without them colliding.
+ */
+const LANE_CTX = new AsyncLocalStorage()
+const laneOf = () => LANE_CTX.getStore() || LANE_ID
 /**
  * One tab can be in front at a time and Playwright's typing waits for the field
  * to take focus: two lanes typing at once race for it and one turns is refused
@@ -139,7 +150,9 @@ function isChatGPTUrl(raw) {
  * fall back to the first ChatGPT page, which is what one-tab use has always
  * done.
  */
-let ACTIVE_THREAD = null
+const ACTIVE_THREADS = new Map()
+const activeThread = () => ACTIVE_THREADS.get(laneOf() || '') || null
+const setActiveThread = value => { const key = laneOf() || ''; if (value) ACTIVE_THREADS.set(key, value); else ACTIVE_THREADS.delete(key) }
 
 /**
  * Cap a reply by its UTF-8 length, not its JavaScript length.
@@ -606,7 +619,10 @@ function drainLog() {
   return logDrain
 }
 function log(line) {
-  LOG_QUEUE.push(`${new Date().toISOString()} ${line}\n`)
+  // One process serves every inputter now, so a line without its lane is
+  // unattributable once two writers are working.
+  const lane = laneOf()
+  LOG_QUEUE.push(`${new Date().toISOString()} ${lane ? `[${lane}] ` : ''}${line}\n`)
   drainLog().catch(() => {})
   return Promise.resolve()
 }
@@ -1214,9 +1230,12 @@ async function sweepOrphanLaneTabs(context) {
 }
 
 async function lanePage(context) {
+  // The lane comes from the REQUEST when one process serves several inputters,
+  // and from the env for the one-lane-per-process shape.
+  const lane = laneOf()
   // A lane without an id still gets a name of its own rather than sharing one:
   // two lanes on the same name would type into each other's tab.
-  const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
+  const wanted = lane ? `${LANE_TAB_PREFIX}${lane}` : `${LANE_TAB_PREFIX}pid-${process.pid}`
   const leaseId = wanted.slice(LANE_TAB_PREFIX.length)
   await touchLaneLease(leaseId)
   for (const candidate of context.pages()) {
@@ -1244,8 +1263,13 @@ async function lanePage(context) {
  * window. Any other lane opening in that time therefore swept this lane's tab
  * out from under a running turn. Refresh on a timer tied to the page's life.
  */
+const LEASED = new WeakSet()
 function keepLeaseFresh(page, leaseId) {
   if (!LANE_SHARED || !leaseId) return
+  // One timer per page: connect() runs on every op, and a second interval per
+  // op would write the lease forever for a tab that is long gone.
+  if (LEASED.has(page)) return
+  LEASED.add(page)
   const timer = setInterval(() => { void touchLaneLease(leaseId) }, Math.max(15_000, Math.floor(LANE_LEASE_STALE_MS / 3)))
   timer.unref?.()
   const stop = () => clearInterval(timer)
@@ -1265,7 +1289,11 @@ async function ensureLaneName(page, wanted = LANE_TAB) {
 /** Close only this lane's tab. The master window, and every other lane, stays. */
 async function closeLaneTab() {
   if (!LANE_SHARED) return { tabClosed: false }
-  const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
+  // No lane in the request means a host-level unload: in shared mode the master
+  // browser is never closed, and there is no tab of ours to close.
+  const lane = laneOf()
+  if (!lane) return { tabClosed: false }
+  const wanted = `${LANE_TAB_PREFIX}${lane}`
   // Drop the lease first: once the tab is gone the sweep has nothing to clean,
   // and if the close fails the stale lease lets the next lane clean it.
   await fs.rm(path.join(LANE_LEASE_DIR, `${wanted.slice(LANE_TAB_PREFIX.length)}.json`), { force: true }).catch(() => {})
@@ -1326,9 +1354,11 @@ function watchPageErrors(page) {
 async function connect() {
   const browser = await connectOwned()
   const context = browser.contexts()[0] ?? await browser.newContext()
-  // In a shared browser every lane is a named tab of the master window; the
-  // operator's own tab is never selected, whatever ACTIVE_THREAD says.
-  if (LANE_SHARED) {
+  // In a shared browser a LANE request is a named tab of the master window; the
+  // operator's own tab is never selected. A request with no lane (host-level
+  // work: observation, operator ops) falls through to the master page below,
+  // even though this same child owns the lane tabs too.
+  if (LANE_SHARED && laneOf()) {
     const page = await lanePage(context)
     watchPageErrors(page)
     return { browser, context, page }
@@ -1344,8 +1374,9 @@ async function connect() {
   // Prefer the tab the caller adopted: a bridge can point at a thread the user
   // already has open, and sending into a different tab would post into the
   // wrong conversation. With no preference, the first ChatGPT tab wins.
-  let page = ACTIVE_THREAD
-    ? pages.find(p => isChatGPTUrl(p.url()) && (threadOf(p.url()) || '').toLowerCase() === ACTIVE_THREAD.toLowerCase())
+  const active = activeThread()
+  let page = active
+    ? pages.find(p => isChatGPTUrl(p.url()) && (threadOf(p.url()) || String()).toLowerCase() === active.toLowerCase())
     : null
   // Never a lookalike host: a tab that merely contains the string
   // "chatgpt.com" is a different origin and must not receive our text.
@@ -3911,8 +3942,9 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   // turn was streaming was STEERED into that turn - the two tasks merged and
   // the original answer was lost. A stale signal says nothing about now, so
   // only a recent one refuses.
-  if (PUSHED.phase === 'streaming' && PUSHED.at && Date.now() - PUSHED.at < 10 * 60_000) {
-    throw new TurnError('not-posted: the page is mid-turn; your message was not typed, so nothing was sent', { reason: 'busy', state: 'generating', threadId: PUSHED.threadId })
+  const pushedNow = pushedOf(laneOf())
+  if (pushedNow.phase === 'streaming' && pushedNow.at && Date.now() - pushedNow.at < 10 * 60_000) {
+    throw new TurnError('not-posted: the page is mid-turn; your message was not typed, so nothing was sent', { reason: 'busy', state: 'generating', threadId: pushedNow.threadId })
   }
   // Measurement only: where does the wall-clock before the Send click go? Each
   // line wraps an operation that already runs - no extra page call, no extra
@@ -4920,25 +4952,40 @@ const OBSERVER_SCRIPT = `(() => {
  * `phase` is one of `streaming`, `complete`, `failed`, or null when the page
  * shows no turn at all.
  */
-const PUSHED = { phase: null, threadId: null, at: null, problem: null }
+/** One pushed record per lane ('' is the master/operator page). */
+const PUSHED = new Map()
 
-/** Record one page push. Called only from the event channel. */
-function notePush(phase, threadId, at, problem = null) {
-  PUSHED.phase = phase === 'streaming' || phase === 'complete' || phase === 'failed' ? phase : null
-  PUSHED.threadId = typeof threadId === 'string' && threadId ? threadId.toLowerCase() : null
-  PUSHED.at = Number.isFinite(at) ? at : Date.now()
-  PUSHED.problem = problem === 'load' || problem === 'blocked' ? problem : null
+function pushedOf(lane) {
+  const key = lane || ''
+  let entry = PUSHED.get(key)
+  if (!entry) {
+    entry = { phase: null, threadId: null, at: null, problem: null }
+    PUSHED.set(key, entry)
+  }
+  return entry
 }
 
-/** The state a pushed phase implies, for one thread. */
+const anyStreaming = () => [...PUSHED.values()].some(entry => entry.phase === 'streaming')
+
+/** Record one page push. Called only from the event channel, with its lane. */
+function notePush(lane, phase, threadId, at, problem = null) {
+  const entry = pushedOf(lane)
+  entry.phase = phase === 'streaming' || phase === 'complete' || phase === 'failed' ? phase : null
+  entry.threadId = typeof threadId === 'string' && threadId ? threadId.toLowerCase() : null
+  entry.at = Number.isFinite(at) ? at : Date.now()
+  entry.problem = problem === 'load' || problem === 'blocked' ? problem : null
+}
+
+/** The state a pushed phase implies, for one thread, in the current lane. */
 function pushedState(threadId) {
-  const ageMs = PUSHED.at === null ? null : Date.now() - PUSHED.at
-  const matches = PUSHED.threadId && threadId ? PUSHED.threadId === threadId.toLowerCase() : null
-  if (PUSHED.at === null) return { state: 'unknown', phase: null, ageMs, matchesThread: matches }
+  const entry = pushedOf(laneOf())
+  const ageMs = entry.at === null ? null : Date.now() - entry.at
+  const matches = entry.threadId && threadId ? entry.threadId === threadId.toLowerCase() : null
+  if (entry.at === null) return { state: 'unknown', phase: null, ageMs, matchesThread: matches }
   if (matches === false) return { state: 'other-thread', phase: null, ageMs, matchesThread: false }
-  if (PUSHED.phase === 'failed') return { state: 'failed', phase: 'failed', problem: PUSHED.problem, ageMs, matchesThread: matches }
-  if (PUSHED.phase === 'streaming') return { state: 'generating', phase: 'streaming', ageMs, matchesThread: matches }
-  return { state: 'idle', phase: PUSHED.phase, ageMs, matchesThread: matches }
+  if (entry.phase === 'failed') return { state: 'failed', phase: 'failed', problem: entry.problem, ageMs, matchesThread: matches }
+  if (entry.phase === 'streaming') return { state: 'generating', phase: 'streaming', ageMs, matchesThread: matches }
+  return { state: 'idle', phase: entry.phase, ageMs, matchesThread: matches }
 }
 
 /**
@@ -5092,6 +5139,14 @@ function startEventChannel(emit, claimed = () => false) {
       const asked = await cdpTimed(entry.session.send('Runtime.evaluate', { expression: 'window.__gwObserverDoc || null', returnByValue: true }), 10_000)
       mark = typeof asked?.result?.value === 'string' ? asked.result.value : null
     } catch { /* mid-navigation; the next event retries */ }
+    // Which inputter's tab is this? The tab NAME is the lane: it is set once by
+    // the driver after landing and survives same-site navigation and reloads.
+    // An unnamed tab is the master/operator page (lane '').
+    try {
+      const named = await cdpTimed(entry.session.send('Runtime.evaluate', { expression: 'window.name || ""', returnByValue: true }), 5_000)
+      const name = typeof named?.result?.value === 'string' ? named.result.value : ''
+      entry.lane = name.startsWith(LANE_TAB_PREFIX) ? name.slice(LANE_TAB_PREFIX.length) : ''
+    } catch { /* keep the previous lane; the next page-ready retries */ }
     state.lastSeenAt = Date.now()
     // Ask the observer for its current state. A child that attaches to a page
     // whose observer is already installed would otherwise hear nothing until
@@ -5165,7 +5220,9 @@ function startEventChannel(emit, claimed = () => false) {
     let session
     try { session = await page.context().newCDPSession(page) } catch { return }
     if (state.stopped) { try { await session.detach() } catch {} ; return }
-    const entry = { page, session, threadId: null, announced: false, docId: null, primed: false, installChain: Promise.resolve() }
+    // `lane` names which inputter's tab this is (from window.name), so a push
+    // is recorded in its own lane's slot instead of overwriting everyone's.
+    const entry = { page, session, threadId: null, lane: '', announced: false, docId: null, primed: false, installChain: Promise.resolve() }
     state.pages.set(page, entry)
     session.on('Runtime.bindingCalled', event => {
       if (state.stopped || event.name !== '__gatewayEvent') return
@@ -5180,13 +5237,13 @@ function startEventChannel(emit, claimed = () => false) {
         const phase = message.phase === 'complete' || message.phase === 'streaming' || message.phase === 'failed' ? message.phase : null
         const at = Number.isFinite(message.at) ? message.at : Date.now()
         const problem = message.problem === 'load' || message.problem === 'blocked' ? message.problem : null
-        notePush(phase, threadId, at, problem)
-        emitSafe({ event: 'signal', threadId, phase, at })
+        notePush(entry.lane, phase, threadId, at, problem)
+        emitSafe({ event: 'signal', threadId, phase, at, lane: entry.lane || '' })
         return
       }
       if (message.event === 'navigated' && typeof message.threadId === 'string' && message.threadId) {
         entry.threadId = message.threadId
-        emitSafe({ event: 'navigated', threadId: message.threadId })
+        emitSafe({ event: 'navigated', threadId: message.threadId, lane: entry.lane || '' })
       }
     })
     try {
@@ -5201,10 +5258,13 @@ function startEventChannel(emit, claimed = () => false) {
     session.on('Page.loadEventFired', () => { state.lastSeenAt = Date.now(); void install(entry) })
     page.on('close', () => {
       state.pages.delete(page)
+      // Only this tab's slot: another inputter's page is still alive and its
+      // last pushed state must not be erased by this close.
+      const slot = pushedOf(entry.lane)
+      slot.phase = null
+      slot.at = null
       if (state.pages.size === 0) {
         note('every watched tab closed')
-        PUSHED.phase = null
-        PUSHED.at = null
         emitSafe({ event: 'page-lost' })
       }
     })
@@ -5256,9 +5316,9 @@ function startEventChannel(emit, claimed = () => false) {
       for (const entry of state.pages.values()) { try { void entry.session.detach() } catch {} }
       state.pages.clear()
       note('disconnected')
-      // The last word from the old connection is not news any more.
-      PUSHED.phase = null
-      PUSHED.at = null
+      // The last word from the old connection is not news any more: drop every
+      // lane's slot, because this connection was the only witness.
+      for (const slot of PUSHED.values()) { slot.phase = null; slot.at = null }
       emitSafe({ event: 'page-lost' })
       scheduleReconnect()
     })
@@ -5341,7 +5401,15 @@ function isConcurrentRead(request) {
  * the chain never re-runs an op, and nothing here races a second answer in.
  */
 function createDispatcher({ run, emit, isConcurrent = isConcurrentRead }) {
-  let chain = Promise.resolve()
+  // One chain per LANE, not one per process: the process serves every
+  // inputter's tab, so two writers must not wait for each other, while one
+  // writer's mutations still never interleave with their own.
+  const chains = new Map()
+  const chainFor = key => {
+    let chain = chains.get(key)
+    if (!chain) { chain = Promise.resolve(); chains.set(key, chain) }
+    return chain
+  }
   const reads = new Set()
   const pending = new Set()
   let outstanding = 0
@@ -5365,15 +5433,19 @@ function createDispatcher({ run, emit, isConcurrent = isConcurrentRead }) {
     outstanding += 1
     if (id) pending.add(id)
     const settle = () => { outstanding -= 1; if (id) pending.delete(id) }
-    const task = () => answer(request, replyId).finally(settle)
+    // Every request runs inside its OWN lane's context, so everything below
+    // (connect, the pushed state, the active thread, the lease) resolves to the
+    // right tab without threading a lane argument through every function.
+    const key = typeof request?.lane === 'string' ? request.lane : ''
+    const task = () => LANE_CTX.run(key, () => answer(request, replyId)).finally(settle)
     if (isConcurrent(request)) {
       // Started NOW, so it does not wait for whatever the chain is doing.
       const running = task()
       reads.add(running)
       running.finally(() => reads.delete(running))
     } else {
-      // Deferred: run() must not start until the chain reaches it.
-      chain = chain.then(task)
+      // Deferred behind the SAME lane's chain; other lanes run in parallel.
+      chains.set(key, chainFor(key).then(task))
     }
   }
 
@@ -5383,7 +5455,7 @@ function createDispatcher({ run, emit, isConcurrent = isConcurrentRead }) {
     get outstanding() { return outstanding },
     // Quit waits for BOTH: the mutating queue and any read that bypassed it, so
     // no answer can follow the quit frame.
-    drain: async () => { await chain; await Promise.allSettled([...reads]) },
+    drain: async () => { await Promise.allSettled([...chains.values()]); await Promise.allSettled([...reads]) },
   }
 }
 
@@ -5402,7 +5474,7 @@ async function serve() {
     // Once quit has been answered, nothing else may follow it on the wire.
     if (closing) return
     emit(value)
-  }, () => PUSHED.phase === 'streaming')
+  }, anyStreaming)
 
   const run = async request => {
     const op = request.op
@@ -5421,7 +5493,8 @@ async function serve() {
         const threadId = String(request.threadId)
         if (!THREAD_ID.test(threadId)) return { ok: false, op, error: 'threadId must be a conversation uuid' }
         const cheap = pushedState(threadId)
-        const at = PUSHED.at === null ? null : new Date(PUSHED.at).toISOString()
+        const pushedLane = pushedOf(laneOf())
+        const at = pushedLane.at === null ? null : new Date(pushedLane.at).toISOString()
         if (request.deep !== true) {
           // A pushed `failed` or `generating` needs no second opinion. Anything
           // else may simply be a signal older than the turn, so one cheap DOM
@@ -5432,7 +5505,7 @@ async function serve() {
           const problem = verdict.problem ?? live?.problem ?? cheap.problem ?? null
           return {
             ok: true, op, cost: verdict.cost, threadId,
-            pushedThreadId: PUSHED.threadId,
+            pushedThreadId: pushedLane.threadId,
             matchesThread: cheap.matchesThread,
             state: verdict.state, phase: verdict.phase, ageMs: cheap.ageMs, at,
             ...(problem ? { problem } : {}),
@@ -5575,7 +5648,7 @@ async function serve() {
         else await gotoThread(page, `https://chatgpt.com/c/${threadId}`, { onRetry })
         await waitForLogin(page, 60_000)
         await waitForComposer(page)
-        ACTIVE_THREAD = threadId.toLowerCase()
+        setActiveThread(threadId.toLowerCase())
         return { ok: true, op, threadId, url: page.url() }
       } finally { release(browser) }
     }
@@ -5605,7 +5678,7 @@ async function serve() {
           effort: typeof request.effort === 'string' && request.effort ? request.effort : null,
         })
         const sentThread = threadOf(result.url)
-        if (sentThread) ACTIVE_THREAD = sentThread
+        if (sentThread) setActiveThread(sentThread)
         // A live turn that outlasted the send timeout is still running. Saying
         // so is a state, not a failure: `failed` is reserved for evidence.
         if (result.timedOut) {
@@ -5674,7 +5747,7 @@ async function serve() {
         // draft in that tab.
         const existing = context.pages().find(p => isChatGPTUrl(p.url()) && (threadOf(p.url()) || '').toLowerCase() === target.toLowerCase())
         if (existing) {
-          ACTIVE_THREAD = target.toLowerCase()
+          setActiveThread(target.toLowerCase())
           return { ok: true, op, threadId: threadOf(existing.url()), url: existing.url(), adopted: true }
         }
         await gotoThread(page, `https://chatgpt.com/c/${target}`, { onRetry: elapsed => log(`phase use gotoRetry ${elapsed}ms`) })
@@ -5683,7 +5756,7 @@ async function serve() {
         if (!landed || landed.toLowerCase() !== target.toLowerCase()) {
           return { ok: false, op, error: `the page landed on ${landed ?? 'no thread'} instead of the requested thread ${target}` }
         }
-        ACTIVE_THREAD = landed.toLowerCase()
+        setActiveThread(landed.toLowerCase())
         return { ok: true, op, threadId: landed, url: page.url(), adopted: false }
       } finally { release(browser) }
     }
@@ -5727,8 +5800,8 @@ async function serve() {
         }
         // A sign-in redirect is a cross-site navigation, which clears the tab
         // name; restore it before the first turn so later ops find this tab.
-        await ensureLaneName(page)
-        return { ok: true, op, lane: LANE_ID || null, sharedBrowser: LANE_SHARED, signedIn: state.loggedIn, plan: state.plan ?? null, url: state.url }
+        await ensureLaneName(page, laneOf() ? LANE_TAB_PREFIX + laneOf() : '')
+        return { ok: true, op, lane: laneOf() || null, sharedBrowser: LANE_SHARED, signedIn: state.loggedIn, plan: state.plan ?? null, url: state.url }
       } finally {
         release(browser)
       }
@@ -5739,13 +5812,13 @@ async function serve() {
         // the only browser and its session is the only session, so there is no
         // cookie write-back to do and no window to close.
         const closed = await closeLaneTab().catch(error => ({ tabClosed: false, error: error.message }))
-        ACTIVE_THREAD = null
+        setActiveThread(null)
         return { ok: true, op, state: 'unloaded', sharedBrowser: true, ...closed }
       }
       // The one-window driver: close the Chrome this install launched. There is
       // no session to hand back, because no session was ever copied out.
       await doQuit()
-      ACTIVE_THREAD = null
+      setActiveThread(null)
       return { ok: true, op, state: 'unloaded', cookiesSynced: 0, cookieSync: 'not a lane' }
     }
     return { ok: false, op, error: `unknown op ${op ?? '(missing)'}` }

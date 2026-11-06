@@ -378,3 +378,53 @@ describe('LaneManager', () => {
     } finally { await cleanup() }
   })
 })
+
+/**
+ * One process, one tab per inputter.
+ *
+ * The shared child is the default for a shared browser now: a lane is a facade
+ * that stamps its id on every request, the driver owns one tab per id, and
+ * closing a lane never terminates the process the other writers are using.
+ */
+describe('LaneManager with one shared driver', () => {
+  class FakeSharedChild {
+    readonly calls: Call[] = []
+    terminated = false
+    async call(request: Call): Promise<DriverReply> {
+      this.calls.push({ ...request })
+      return { ok: true, op: String(request.op ?? '') }
+    }
+    async terminate(): Promise<void> { this.terminated = true }
+    onEvent(): () => void { return () => {} }
+  }
+
+  test('two lanes are two tabs on one process, and closing one leaves the process up', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const shared = new FakeSharedChild()
+      const { manager } = build(dir, {
+        spawnLane: undefined,
+        sharedDriver: () => shared as unknown as DriverChild,
+      })
+      const [a, b] = await Promise.all([manager.acquire('sender-a'), manager.acquire('sender-b')])
+      expect(a.laneId).toBe('sender-a')
+      expect(b.laneId).toBe('sender-b')
+      // One child: every request carries the lane it belongs to.
+      const warms = shared.calls.filter(call => call.op === 'warm')
+      expect(warms.map(call => call.lane).sort()).toEqual(['sender-a', 'sender-b'])
+      // A lane has no profile of its own in this shape.
+      await expect(readFile(join(a.stateDir, 'profile'), 'utf8')).rejects.toBeDefined()
+
+      manager.release('sender-a')
+      await manager.close('sender-a', 'test')
+      const unloads = shared.calls.filter(call => call.op === 'unload')
+      expect(unloads.map(call => call.lane)).toContain('sender-a')
+      // The process the other writer is using is untouched.
+      expect(shared.terminated).toBe(false)
+
+      manager.release('sender-b')
+      await manager.shutdown()
+      expect(shared.terminated).toBe(false)
+    } finally { await cleanup() }
+  })
+})

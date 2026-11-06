@@ -851,12 +851,25 @@ export class ChatGptHost {
     // so it is told where the shared-lane coordination files are: the launch
     // lock is the only thing that stops it and a lane from each killing the
     // other's booting window.
+    // The master child is the browser's ONLY driver process: lane requests go
+    // to it too, stamped with a lane, and it owns one tab per inputter. It is
+    // therefore started in the shared-lane shape even though host-level work
+    // uses it with no lane (the operator's own tab).
+    const sharedLaneEnv = {
+      CHATGPT_LANE_SHARED_DIR: join(config.home, 'lanes'),
+      ...(this.provider.laneSharedBrowser ? {
+        CHATGPT_LANE_SHARED: '1',
+        CHATGPT_CDP_PORT: String(this.provider.masterPort),
+        CHATGPT_LANE_SOURCE_PORT: String(this.provider.masterPort),
+        CHATGPT_LANE_SOURCE_PROFILE: config.profile,
+      } : {}),
+    }
     this.masterDriver = driver ?? new DriverChild({
       script: config.driverPath,
       profile: config.profile,
       log,
       timeoutMs: TURN_TIMEOUT_MS,
-      env: { CHATGPT_LANE_SHARED_DIR: join(config.home, 'lanes') },
+      env: sharedLaneEnv,
     })
     // A test that injects its driver is never silently given real lane Chrome
     // processes; it opts in with `lanes: true` or its own manager.
@@ -874,6 +887,8 @@ export class ChatGptHost {
           maxTurns: config.laneMaxTurns,
           maxAgeMs: config.laneMaxAgeMs,
           backoffBaseMs: config.laneBackoffBaseMs,
+          // Shared browser: one process, one tab per writer.
+          ...(this.provider.laneSharedBrowser && !driver ? { sharedDriver: () => this.masterDriver } : {}),
           log: line => log(`lanes: ${line}`),
           onEvent: (event, laneId, detail) => this.onLaneEvent(event, laneId, detail),
         })

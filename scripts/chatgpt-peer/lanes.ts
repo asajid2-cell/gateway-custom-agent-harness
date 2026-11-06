@@ -24,7 +24,23 @@ import { spawn } from 'node:child_process'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { connect as netConnect, createServer } from 'node:net'
 import { join } from 'node:path'
-import { DriverChild, type DriverReply } from './driver.ts'
+import { DriverChild, type CallOptions, type DriverReply } from './driver.ts'
+
+/**
+ * A per-lane view of the shared child.
+ *
+ * The child is one process for the whole browser; every request carries the
+ * lane it is for and the driver resolves the tab from it. `terminate` is a
+ * deliberate no-op: closing one writer's lane must never kill the process every
+ * other writer is using.
+ */
+function laneDriver(shared: DriverChild, laneId: string): DriverChild {
+  return {
+    call: (request: Record<string, unknown>, options?: number | CallOptions) =>
+      shared.call({ ...request, lane: laneId }, options),
+    terminate: async () => { /* the shared child outlives every lane */ },
+  } as unknown as DriverChild
+}
 
 export type LaneHandle = {
   laneId: string
@@ -85,6 +101,15 @@ export type LaneOptions = {
   onEvent?: (event: LaneEvent, laneId: string, detail: string) => void
   /** Test seam: build the child for one lane. */
   spawnLane?: (lane: { laneId: string; port: number; profile: string; stateDir: string; env: Record<string, string> }) => DriverChild
+  /**
+   * ONE driver child for every lane, instead of a process per writer.
+   *
+   * The driver keeps one tab per lane and routes each request by `lane`, so a
+   * browser has one Playwright connection and one process no matter how many
+   * inputters use it. Without a factory the manager keeps the old shape: one
+   * child per lane (what every existing proof injects).
+   */
+  sharedDriver?: () => DriverChild
   /** Test seam: the clock. */
   now?: () => number
   /** Test seam: timers. Returns a cancel function. */
@@ -101,6 +126,8 @@ type Lane = {
   profile: string
   stateDir: string
   driver: DriverChild
+  /** True when `driver` is a facade over the shared child (never terminated). */
+  shared: boolean
   users: number
   /** Acquired turns since open; drives `maxTurns` rotation. */
   turns: number
@@ -443,9 +470,15 @@ export class LaneManager {
       // browser, so the master's port is the honest answer in a status row and
       // there is nothing to reserve or collide over.
       port = this.options.sharedBrowser ? this.sourcePort : await this.nextPort()
+      // One process for every inputter: the shared child owns each lane's tab
+      // and this handle is a facade that stamps the lane on every request, so
+      // `destroy` closes only the tab and never the process.
+      const shared = this.options.spawnLane ? undefined : this.options.sharedDriver?.()
       const stateDir = join(this.options.root, `${safeName(laneId)}-${randomUUID().slice(0, 8)}`)
       const profile = join(stateDir, 'profile')
-      await mkdir(profile, { recursive: true })
+      // A shared lane needs no per-writer profile or state directory: its tab
+      // lives in the master browser and its log is the shared child's.
+      if (!shared) await mkdir(profile, { recursive: true })
       const env: Record<string, string> = {
         CHATGPT_CDP_PORT: String(port),
         CHATGPT_PROFILE: profile,
@@ -463,19 +496,22 @@ export class LaneManager {
       }
       const driver = this.options.spawnLane
         ? this.options.spawnLane({ laneId, port, profile, stateDir, env })
-        : new DriverChild({
-            script: this.options.driverScript,
-            profile,
-            log: this.log.bind(this),
-            timeoutMs: 20 * 60_000,
-            env,
-          })
+        : shared
+          ? laneDriver(shared, laneId)
+          : new DriverChild({
+              script: this.options.driverScript,
+              profile,
+              log: this.log.bind(this),
+              timeoutMs: 20 * 60_000,
+              env,
+            })
       lane = {
         laneId,
         port,
         profile,
         stateDir,
         driver,
+        shared: Boolean(shared),
         users: 0,
         turns: 0,
         ready: false,
@@ -546,7 +582,10 @@ export class LaneManager {
   private async destroy(lane: Lane): Promise<string> {
     let detail = ''
     try {
+      // The facade carries this lane's id, so the shared child closes THIS
+      // tab; a per-lane child has the id in its env and ignores the field.
       const reply = await lane.driver.call({ op: 'unload' }, { timeoutMs: this.closeTimeoutMs })
+      if (lane.shared) return detail
       const synced = Number((reply as { cookiesSynced?: unknown }).cookiesSynced)
       if (Number.isFinite(synced) && synced > 0) detail = `; cookies written back: ${synced}`
       else if (typeof (reply as { cookieSync?: unknown }).cookieSync === 'string') {
@@ -555,6 +594,7 @@ export class LaneManager {
     } catch (error) {
       this.log(`lane "${lane.laneId}": unload failed: ${(error as Error).message}`)
     }
+    if (lane.shared) return detail
     try { await lane.driver.terminate() } catch { /* already gone */ }
     await rm(lane.stateDir, { recursive: true, force: true }).catch(() => {})
     return detail
