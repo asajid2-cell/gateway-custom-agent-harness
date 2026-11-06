@@ -12,6 +12,9 @@ import { join } from 'node:path'
 
 export type ProviderId = 'chatgpt-web' | 'gemini-web'
 
+/** The optional driver ops a provider may lack; every driver has the rest. */
+export type DriverOp = 'conversations' | 'file' | 'reload'
+
 export type Provider = {
   id: ProviderId
   /** Host identity: operator `name`, first bridge name, default thread title. */
@@ -48,6 +51,22 @@ export type Provider = {
    * guessing or trying both.
    */
   modeOp: 'set' | 'mode'
+  /**
+   * Host ops this provider's driver does NOT implement. The host checks here
+   * before sending one, instead of learning it from an `unknown op` reply on
+   * every timer tick (live 2026-11-06: `title walk failed: unknown op
+   * conversations` on every Gemini title walk).
+   */
+  unsupportedOps?: readonly DriverOp[]
+  /**
+   * What a NEW bridge pins when the caller names no model or effort.
+   *
+   * A bridge used to inherit whatever the shared picker last held, so a fresh
+   * Gemini bridge came up on another session's Argon (measured 2026-11-06). A
+   * default is explicit, cheap, and never a premium model.
+   */
+  defaultModel: string
+  defaultEffort: string
   /** A thread id this provider hands back. */
   threadId: (value: string) => boolean
 }
@@ -81,6 +100,10 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     primer: 'primer.md',
     site: 'https://chatgpt.com/',
     modeOp: 'set',
+    // What every bridge on this host already runs: the model the picker is
+    // expected to hold, never "whatever the last turn selected".
+    defaultModel: 'GPT-6',
+    defaultEffort: 'Medium',
     threadId: value => UUID.test(value),
   },
   'gemini-web': {
@@ -99,8 +122,20 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     primer: 'primer-gemini.md',
     site: 'https://gemini.google.com/app',
     modeOp: 'mode',
+    // The fast default, never a thinking model: a probe or a new bridge must
+    // not spend Argon by inheriting the shared picker's last choice.
+    defaultModel: 'Flash',
+    defaultEffort: 'Low',
+    // The Gemini page has no account-wide list endpoint, no file download and
+    // no thread reload op; the host skips those paths instead of asking.
+    unsupportedOps: ['conversations', 'file', 'reload'],
     threadId: value => GEMINI_THREAD.test(value),
   },
+}
+
+/** Does this provider's driver implement `op`? */
+export function providerSupports(provider: Provider, op: DriverOp): boolean {
+  return !(provider.unsupportedOps ?? []).includes(op)
 }
 
 /** A provider by id, or the ChatGPT profile (the only one that predates ids). */

@@ -48,6 +48,12 @@ class Page {
   pageGoneOnSend = false
   /** The first send on this page reports the page's "couldn't load messages" banner. */
   loadErrorOnSend = false
+  /**
+   * The first send reports a page that never rendered: no composer, no
+   * messages, and therefore no model control. The driver classifies that as a
+   * page-load fault rather than a configuration refusal, which is the point.
+   */
+  pickerMissingOnSend = false
   constructor(readonly answer = 'answered on the page') {}
   private readonly trees = new Map<string, { current: string; mapping: Record<string, any> }>()
   private clock = Math.floor(Date.now() / 1000)
@@ -110,6 +116,14 @@ class Page {
       return {
         ok: false, op, reason: 'page-load-error', threadId: String(request.threadId ?? ''),
         error: 'the page could not load the messages in thread ' + String(request.threadId ?? ''),
+      }
+    }
+    if (op === 'send' && this.pickerMissingOnSend) {
+      this.pickerMissingOnSend = false
+      const threadId = String(request.threadId ?? '')
+      return {
+        ok: false, op, reason: 'page-load-error', threadId,
+        error: `the page could not render thread ${threadId}: no composer and no messages, so the model picker never appeared; nothing was typed`,
       }
     }
     if (op === 'send') {
@@ -467,6 +481,47 @@ describe('lane routing', () => {
       expect(built.spawned[0]!.calls.filter(call => call.op === 'send').length).toBe(1)
       expect(built.spawned[1]!.calls.filter(call => call.op === 'send').length).toBe(1)
       expect(built.spawned[0]).not.toBe(built.spawned[1])
+    } finally {
+      await writer.close()
+      await built.host.stop()
+      await cleanup()
+    }
+  }, 30_000)
+
+  test('a missing model picker on an unrendered page recycles once, never retries the picker on that window', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = await primedBridge('alpha', THREAD_A)
+    await seedHost(dir, [alpha])
+    let first = true
+    const master = new Page()
+    const built = await startHost(dir, [alpha], master, () => {
+      const page = new Page()
+      // The first window never rendered: no composer, no messages, no picker.
+      if (first) { page.pickerMissingOnSend = true; first = false }
+      return page
+    })
+    const writer = await busPeer(dir, 'picker-writer')
+    try {
+      const sent = await writer.send(alpha.sessionId, 'ask a dead page', 'picker', undefined, 'inquiry', true) as { id?: string }
+      // Classified as a page-load fault, so the turn goes back to the queue
+      // instead of a failure reply, and the picker is not retried on the same
+      // window - the recycle replaces the window first.
+      for (let i = 0; i < 200; i++) {
+        const state = JSON.parse(await readFile(join(dir, 'bridges', `${alpha.sessionId}.json`), 'utf8')) as BridgeState
+        const record = state.pendingTurns.find(item => item.messageId === sent.id)
+        if (record && record.postedAt === null) break
+        await delay(20)
+      }
+      expect(await replyFor(writer, sent.id!, 300)).toBeNull()
+      for (let i = 0; i < 200 && built.manager.size > 0; i++) await delay(10)
+      await built.host.pollOnce()
+      expect((await replyFor(writer, sent.id!, 5_000))?.text).toContain('answered on the page')
+      expect(built.spawned.length).toBe(2)
+      // Exactly one send (one picker attempt) per window, and the master never
+      // took a turn.
+      expect(built.spawned[0]!.calls.filter(call => call.op === 'send').length).toBe(1)
+      expect(built.spawned[1]!.calls.filter(call => call.op === 'send').length).toBe(1)
+      expect(master.calls.some(call => call.op === 'send')).toBe(false)
     } finally {
       await writer.close()
       await built.host.stop()

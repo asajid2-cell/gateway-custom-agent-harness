@@ -77,10 +77,24 @@ export type LaneOptions = {
   sourcePort?: number
   /** The first lane port; 0 picks 9300. */
   basePort?: number
-  /** Live lanes at once; 8 by default. */
+  /**
+   * Live lanes at once; 8 by default. In the shared-tab shape it is a SOFT cap:
+   * a new writer at the cap evicts the least recently used idle tab instead of
+   * queueing, and only waits when every lane is mid-turn.
+   */
   maxLanes?: number
-  /** How long an idle lane survives; 30 s by default. */
+  /**
+   * How long an idle lane survives. 30 s by default for a lane with its own
+   * Chrome window; 30 min for a shared-browser tab, because reopening a tab is a
+   * full page load against the account and an interactive back-and-forth must
+   * find its tab still on its thread.
+   */
   idleMs?: number
+  /**
+   * How often a shared lane manager tells the driver which lane tabs are live,
+   * so a tab or lease left by a dead lane is closed. 60 s by default; 0 off.
+   */
+  sweepEveryMs?: number
   /** Write a lane's rotated cookies back to the master on close. */
   syncCookies?: boolean
   /**
@@ -150,6 +164,9 @@ type Waiter = {
 const DEFAULT_BASE_PORT = 9300
 const DEFAULT_MAX_LANES = 8
 const DEFAULT_IDLE_MS = 30_000
+/** A shared tab stays warm this long: an interactive chat must find it open. */
+export const DEFAULT_SHARED_IDLE_MS = 30 * 60_000
+const DEFAULT_SWEEP_EVERY_MS = 60_000
 const DEFAULT_OPEN_TIMEOUT_MS = 120_000
 const DEFAULT_CLOSE_TIMEOUT_MS = 90_000
 const DEFAULT_MAX_TURNS = 20
@@ -236,6 +253,8 @@ export class LaneManager {
   private readonly maxTurns: number
   private readonly maxAgeMs: number
   private readonly backoffBaseMs: number
+  private readonly sweepEveryMs: number
+  private cancelSweep?: () => void
   private opening = 0
   private closed = false
 
@@ -243,12 +262,17 @@ export class LaneManager {
     this.options = options
     this.maxLanes = Math.max(1, Math.floor(options.maxLanes ?? DEFAULT_MAX_LANES))
     this.basePort = Math.max(1, Math.floor(options.basePort ?? DEFAULT_BASE_PORT))
-    this.idleMs = Math.max(0, Math.floor(options.idleMs ?? DEFAULT_IDLE_MS))
+    // A tab in the shared browser is cheap to keep and expensive to reopen (a
+    // full page load against the account), so it stays warm and is never
+    // rotated on a timer; a lane with its own Chrome window is the opposite.
+    const tabs = options.sharedBrowser === true
+    this.idleMs = Math.max(0, Math.floor(options.idleMs ?? (tabs ? DEFAULT_SHARED_IDLE_MS : DEFAULT_IDLE_MS)))
     this.sourcePort = Math.max(1, Math.floor(options.sourcePort ?? 9222))
     this.openTimeoutMs = Math.max(1_000, Math.floor(options.openTimeoutMs ?? DEFAULT_OPEN_TIMEOUT_MS))
     this.closeTimeoutMs = Math.max(1_000, Math.floor(options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS))
-    this.maxTurns = Math.max(0, Math.floor(options.maxTurns ?? DEFAULT_MAX_TURNS))
-    this.maxAgeMs = Math.max(0, Math.floor(options.maxAgeMs ?? DEFAULT_MAX_AGE_MS))
+    this.maxTurns = Math.max(0, Math.floor(options.maxTurns ?? (tabs ? 0 : DEFAULT_MAX_TURNS)))
+    this.maxAgeMs = Math.max(0, Math.floor(options.maxAgeMs ?? (tabs ? 0 : DEFAULT_MAX_AGE_MS)))
+    this.sweepEveryMs = Math.max(0, Math.floor(options.sweepEveryMs ?? DEFAULT_SWEEP_EVERY_MS))
     this.backoffBaseMs = Math.max(0, Math.floor(options.backoffBaseMs ?? DEFAULT_BACKOFF_BASE_MS))
     this.registryPath = join(options.root, 'lanes.json')
   }
@@ -296,8 +320,36 @@ export class LaneManager {
       }
       return this.wait(laneId, onQueued)
     }
+    if (this.lanes.size + this.opening >= this.maxLanes) this.evictIdle(laneId)
     if (this.lanes.size + this.opening < this.maxLanes) return this.open(laneId, onQueued)
     return this.wait(laneId, onQueued)
+  }
+
+  /** Is this writer's lane open (or opening) right now? */
+  has(laneId: string): boolean {
+    const lane = this.lanes.get(laneId)
+    return Boolean(lane && !lane.closing)
+  }
+
+  /**
+   * Free one slot for `forLaneId` by closing the least recently used IDLE lane.
+   *
+   * The cap counts live lanes, and a lane nobody is using is the cheapest one
+   * to give up: its writer pays one page load if it ever comes back, while a
+   * new writer would otherwise wait out the whole idle window. A lane that is
+   * mid-turn, still opening, or wanted by a queued writer is never evicted.
+   */
+  private evictIdle(forLaneId: string): boolean {
+    const wanted = new Set(this.waiters.map(waiter => waiter.laneId))
+    let victim: Lane | undefined
+    for (const lane of this.lanes.values()) {
+      if (lane.closing || !lane.ready || lane.users > 0 || lane.laneId === forLaneId || wanted.has(lane.laneId)) continue
+      if (!victim || lane.lastUsedAt < victim.lastUsedAt) victim = lane
+    }
+    if (!victim) return false
+    const idleFor = Math.round((this.now - victim.lastUsedAt) / 1000)
+    void this.close(victim.laneId, `evicted after ${idleFor}s idle: the cap (${this.maxLanes}) was full and another writer needed a lane`)
+    return true
   }
 
   /** Give a lane back. The idle timer starts only when nobody else is waiting. */
@@ -326,11 +378,8 @@ export class LaneManager {
       void this.close(laneId, `rotated after ${Math.round((this.now - lane.since) / 1000)}s`)
       return
     }
-    if (this.waiters.length > 0) {
-      // A queued writer must not wait out a window nobody is using.
-      void this.close(laneId, 'released for a queued writer')
-      return
-    }
+    // A queued writer that needed a slot has already had one freed by pump()
+    // above (LRU eviction), so this lane simply goes idle.
     if (lane.ready) {
       lane.cancelIdle = this.schedule(() => { void this.close(laneId, 'idle') }, this.idleMs)
     }
@@ -371,9 +420,49 @@ export class LaneManager {
     }))
   }
 
+  /**
+   * Tell the shared driver which lane tabs are live; it closes every other
+   * lane tab and lease.
+   *
+   * The cap is this manager's map, but tabs and lease files outlive it: a host
+   * restart, a crashed close, or a writer that died mid-turn leaves a named tab
+   * in the master window that nothing would ever close. The driver is the one
+   * process that owns every lane tab of this browser, so the manager's list is
+   * authoritative and the sweep can be exact rather than age-based.
+   */
+  async sweep(): Promise<number> {
+    const shared = this.options.spawnLane ? undefined : this.options.sharedDriver?.()
+    if (!shared || this.closed) return 0
+    const keep = [...this.lanes.values()].filter(lane => !lane.closing).map(lane => lane.laneId)
+    try {
+      const reply = await shared.call({ op: 'sweep-lanes', keep }, { timeoutMs: 30_000 })
+      const closed = Number((reply as { closed?: unknown }).closed) || 0
+      if (reply.ok !== true && !/unknown op/i.test(String(reply.error ?? ''))) this.log(`lane sweep failed: ${String(reply.error ?? 'no reason')}`)
+      if (closed > 0) this.log(`lane sweep closed ${closed} tab(s) no live lane owns`)
+      return closed
+    } catch (error) {
+      this.log(`lane sweep failed: ${(error as Error).message}`)
+      return 0
+    }
+  }
+
+  /** Arm the periodic sweep once a shared lane exists. */
+  private armSweep(): void {
+    if (this.cancelSweep || this.closed || this.sweepEveryMs <= 0) return
+    if (this.options.spawnLane || !this.options.sharedDriver) return
+    const tick = (): void => {
+      this.cancelSweep = this.schedule(() => {
+        void this.sweep().finally(() => { if (!this.closed) tick() })
+      }, this.sweepEveryMs)
+    }
+    tick()
+  }
+
   /** Close every lane; the host is stopping. */
   async shutdown(): Promise<void> {
     this.closed = true
+    this.cancelSweep?.()
+    this.cancelSweep = undefined
     for (const waiter of this.waiters.splice(0)) waiter.reject(new Error('lane manager is closing'))
     await Promise.allSettled([...this.lanes.keys()].map(laneId => this.close(laneId, 'shutdown')))
   }
@@ -536,6 +625,12 @@ export class LaneManager {
       lane.lastUsedAt = this.now
       this.emit('ready', laneId, `signedIn=${warm.signedIn === true} plan=${String(warm.plan ?? 'unknown')}`)
       this.log(`lane "${laneId}": ready on port ${port} (plan ${String(warm.plan ?? 'unknown')})`)
+      if (shared) {
+        this.armSweep()
+        // A new tab is the moment a leftover one costs the most (another page
+        // in the same renderer budget), so sweep now, not only on the timer.
+        void this.sweep()
+      }
       return this.handle(lane)
     } catch (error) {
       if (lane) {
@@ -567,6 +662,11 @@ export class LaneManager {
         }
         // Busy or still opening: stay queued behind this lane.
         index += 1
+        continue
+      }
+      if (this.lanes.size + this.opening >= this.maxLanes && this.evictIdle(waiter.laneId)) {
+        // The eviction may have re-entered pump() and served this waiter
+        // already; look at the same index again rather than assume.
         continue
       }
       if (this.lanes.size + this.opening < this.maxLanes) {

@@ -427,4 +427,108 @@ describe('LaneManager with one shared driver', () => {
       expect(shared.terminated).toBe(false)
     } finally { await cleanup() }
   })
+
+  test('a shared tab stays warm for 30 minutes and is never rotated by default', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const shared = new FakeSharedChild()
+      const scheduled: number[] = []
+      const { manager } = build(dir, {
+        spawnLane: undefined,
+        sharedBrowser: true,
+        sharedDriver: () => shared as unknown as DriverChild,
+        idleMs: undefined,
+        schedule: (_work, ms) => { scheduled.push(ms); return () => {} },
+      })
+      // Twenty-five turns on one lane: one warm (one tab), no rotation.
+      for (let turn = 0; turn < 25; turn++) {
+        await manager.acquire('sender-a')
+        manager.release('sender-a')
+      }
+      expect(shared.calls.filter(call => call.op === 'warm').length).toBe(1)
+      expect(shared.calls.filter(call => call.op === 'unload').length).toBe(0)
+      expect(scheduled).toContain(30 * 60_000)
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('at the cap a new writer evicts the least recently used IDLE tab instead of queueing', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const shared = new FakeSharedChild()
+      let clock = 1_000
+      const { manager, events } = build(dir, {
+        spawnLane: undefined,
+        sharedBrowser: true,
+        sharedDriver: () => shared as unknown as DriverChild,
+        maxLanes: 2,
+        now: () => clock,
+      })
+      await manager.acquire('old')
+      manager.release('old')
+      clock += 1_000
+      await manager.acquire('newer')
+      manager.release('newer')
+      clock += 1_000
+      let queued = false
+      await manager.acquire('third', () => { queued = true })
+      expect(queued).toBe(false)
+      expect(manager.has('old')).toBe(false)
+      expect(manager.has('newer')).toBe(true)
+      expect(manager.has('third')).toBe(true)
+      expect(events.some(event => event.event === 'close' && event.laneId === 'old' && /evicted/.test(event.detail))).toBe(true)
+      manager.release('third')
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('a lane that is mid-turn is never evicted; the new writer waits for it', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const shared = new FakeSharedChild()
+      const { manager } = build(dir, {
+        spawnLane: undefined,
+        sharedBrowser: true,
+        sharedDriver: () => shared as unknown as DriverChild,
+        maxLanes: 1,
+      })
+      await manager.acquire('busy')
+      let queued = false
+      const waiting = manager.acquire('next', () => { queued = true })
+      await new Promise(resolve => setTimeout(resolve, 10))
+      expect(queued).toBe(true)
+      expect(manager.has('busy')).toBe(true)
+      // The release frees the slot: the idle lane is evicted for the waiter.
+      manager.release('busy')
+      const handle = await waiting
+      expect(handle.laneId).toBe('next')
+      expect(manager.has('busy')).toBe(false)
+      manager.release('next')
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
+
+  test('the sweep tells the driver exactly which lanes are live', async () => {
+    const { dir, cleanup } = await scratch()
+    try {
+      const shared = new FakeSharedChild()
+      const { manager } = build(dir, {
+        spawnLane: undefined,
+        sharedBrowser: true,
+        sharedDriver: () => shared as unknown as DriverChild,
+      })
+      await manager.acquire('sender-a')
+      await manager.acquire('sender-b')
+      manager.release('sender-a')
+      manager.release('sender-b')
+      await manager.close('sender-a', 'test')
+      await manager.sweep()
+      const sweeps = shared.calls.filter(call => call.op === 'sweep-lanes')
+      expect(sweeps.length).toBeGreaterThan(0)
+      // A sweep carries no lane: it is browser-wide, not one writer's request.
+      expect(sweeps.at(-1)!.lane).toBeUndefined()
+      expect(sweeps.at(-1)!.keep).toEqual(['sender-b'])
+      await manager.shutdown()
+    } finally { await cleanup() }
+  })
 })

@@ -62,6 +62,10 @@ class FakeDriver {
   conversationReads = 0
   /** The page answers 429 to every conversation read. */
   rateLimited = false
+  /** What the shared picker held before any selection: a new bridge must not adopt it. */
+  pickerShows = { model: 'Argon', effort: 'Low' }
+  /** Every model/effort this page was asked to select, in order. */
+  readonly modePicks: { model: string; effort: string }[] = []
   /** When set, a `send` lands on this thread instead of the one asked for. */
   landOn: string | null = null
   /** When set, `send` fails with this error. */
@@ -241,6 +245,14 @@ class FakeDriver {
         .slice(offset, offset + limit)
         .map(thread => ({ ...thread, update_time: Object.keys(this.treeOf(thread.id).mapping).length }))
       return { ok: true, op, items }
+    }
+    if (op === 'set' || op === 'mode') {
+      // The picker answers with what it was ASKED to select. `pickerShows` is
+      // only what it held before, and the host must never record that.
+      const model = String(request.model ?? '')
+      const effort = String(request.effort ?? '')
+      this.modePicks.push({ model, effort })
+      return { ok: true, op, model: model || this.pickerShows.model, effort: effort || this.pickerShows.effort }
     }
     if (op === 'unload') { this.current = null; return { ok: true, op, state: 'unloaded' } }
     if (op === 'status') {
@@ -563,6 +575,30 @@ describe('multi-bridge host', () => {
       expect(bridge.threadId).toBe(result.body.threadId)
       expect(bridge.primedThreadId).toBe(result.body.threadId)
       expect(await exists(join(sessionsDir(dir), `${result.body.sessionId}.json`))).toBe(true)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
+  test('a new bridge pins the provider default, never the picker’s last selection', async () => {
+    const { dir, cleanup } = await scratch()
+    await seedHost(dir, [])
+    const driver = new FakeDriver()
+    // The shared picker currently shows a premium model another session chose.
+    driver.pickerShows = { model: 'Argon', effort: 'Low' }
+    const host = await startHost(dir, driver)
+    try {
+      const { token } = await credentials(dir)
+      const result = await operator(host, token, { op: 'newBridge', name: 'pinned' })
+      expect(result.status).toBe(200)
+      // The pin is explicit, so the new conversation cannot inherit Argon.
+      expect(driver.modePicks.at(-1)).toEqual({ model: 'GPT-6', effort: 'Medium' })
+      const bridge = JSON.parse(await readFile(join(dir, 'bridges', `${result.body.sessionId}.json`), 'utf8')) as BridgeState
+      expect(bridge.model).toBe('GPT-6')
+      // The effort recorded after the primer is what the page reports; the pin
+      // is what matters here, and it was Medium, never the picker's Low.
+      expect(bridge.effort).not.toBe('Low')
     } finally {
       await host.stop()
       await cleanup()

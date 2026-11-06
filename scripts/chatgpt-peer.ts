@@ -26,8 +26,8 @@ import { GatewaySessionTransport, listGatewayPeers } from '../src/utils/gatewayS
 import { resolveGatewayPeer } from '../src/utils/gatewayPeerSend.js'
 import { getClaudeConfigHomeDir } from '../src/utils/envUtils.js'
 import { DriverChild, isDriverFault, isDriverFaultReply, type DriverEvent, type DriverReply } from './chatgpt-peer/driver.ts'
-import { LaneManager, type LaneEvent, type LaneHandle } from './chatgpt-peer/lanes.ts'
-import { providerEnv, providerOf, type Provider } from './chatgpt-peer/providers.ts'
+import { DEFAULT_SHARED_IDLE_MS, LaneManager, type LaneEvent, type LaneHandle } from './chatgpt-peer/lanes.ts'
+import { providerEnv, providerOf, providerSupports, type Provider } from './chatgpt-peer/providers.ts'
 import { runCommandTurn } from './chatgpt-peer/turn.ts'
 import { answerAfter, askerOf, attributeSend, chainOf, diffThreadList, latestAssistantOf, listAllThreads, newPageAnswers, nodeComplete, nodeFilesOf, nodeIdsOf, nodeTextOf, normalizePromptText, PROMPT_PREFIX_MIN, pathOf, pendingHumanTurns, promptMatches, type Conversation, type ConversationNode, type HumanTurn, type PageAnswer, type Turn } from './chatgpt-peer/threads.ts'
 import { attachmentRefusal, COMMAND_OPS, MAX_ATTACHMENT_BYTES, MAX_COMMANDS_PER_TURN, MAX_MESSAGE_BYTES, parseCommand, proseFromTurn, readFences, sanitizePeerText, type Command } from './chatgpt-peer/commands.ts'
@@ -71,6 +71,17 @@ const TRIGGER_DEBOUNCE_MS = 300
  * short enough not to hammer the page. Tests inject a shorter schedule.
  */
 const PENDING_WATCH_GAPS_MS = [2_000, 3_000, 5_000, 8_000, 13_000, 21_000, 34_000]
+/**
+ * The cadence after that ladder is spent, while a posted turn is still owed.
+ *
+ * The ladder used to be the whole story, so a turn whose reads were throttled
+ * through all seven rungs then waited for the next reconcile pass - up to
+ * `observeEvery` (300 s) later, which the sender sees as a lost turn (measured
+ * live 2026-11-06). A slow, steady tail closes that gap: at most ONE read per
+ * 30 s per bridge with owed work, never a burst. It stops when the pending set
+ * empties; the turn's own TTL is what ends a genuinely stuck one.
+ */
+const PENDING_WATCH_TAIL_MS = 30_000
 
 /**
  * How long an unanswered send is remembered, and how wide a create_time window
@@ -394,6 +405,8 @@ type Config = {
   readTimeoutMs?: number
   /** The bounded follow-up cadence while a posted turn is owed. Tests shorten it. */
   pendingWatchGapsMs?: number[]
+  /** The slow cadence that follows the ladder while a posted turn is still owed. */
+  pendingWatchTailMs?: number
   /** The first 429 backoff before doubling. Tests shorten it; never widened. */
   readBackoffBaseMs?: number
   /**
@@ -404,7 +417,7 @@ type Config = {
   lanes?: boolean
   /** Live lane windows at once. */
   laneMax?: number
-  /** How long an idle lane survives before its process is killed. */
+  /** How long an idle lane survives before its tab (or window) is closed. */
   laneIdleMs?: number
   /** The first lane debugging port. */
   laneBasePort?: number
@@ -489,6 +502,11 @@ type Bridge = {
   /** Handling is once per process for this bridge (see the old drain note). */
   handled: Set<string>
   /**
+   * Consecutive drain failures (a lane that cannot open, a page that cannot be
+   * reached). Reset by any successful drain. Three in a row is not transient.
+   */
+  drainFailures: number
+  /**
    * Armed timers, one per label. The generation names the arm that owns the
    * label: a wake deletes only the generation that actually fired, so a label
    * the wake itself rescheduled keeps its NEW timer tracked and cancellable.
@@ -572,18 +590,22 @@ export function resolveConfig(partial: Partial<Config>): Config {
         : envNumber('OBSERVE_EVERY', 300),
     titlesEvery: Number.isFinite(partial.titlesEvery) ? Number(partial.titlesEvery) : envNumber('TITLES_EVERY', 120),
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
+    pendingWatchTailMs: partial.pendingWatchTailMs,
     // Production (the CLI path) runs lanes unless told not to. Tests build a
     // Config directly and therefore stay on the injected one-window driver.
     lanes: partial.lanes ?? (providerEnv('LANES') !== '0'),
     laneMax: Number.isFinite(partial.laneMax) ? Number(partial.laneMax) : envNumber('LANE_MAX', 8),
-    laneIdleMs: Number.isFinite(partial.laneIdleMs) ? Number(partial.laneIdleMs) : envNumber('LANE_IDLE_MS', 30_000),
+    // A shared-browser lane is a tab: keep it warm for an interactive chat
+    // (reopening is a full page load against the account) and never rotate it
+    // on a timer. A lane with its own window keeps the short, rotating shape.
+    laneIdleMs: Number.isFinite(partial.laneIdleMs) ? Number(partial.laneIdleMs) : envNumber('LANE_IDLE_MS', provider.laneSharedBrowser ? DEFAULT_SHARED_IDLE_MS : 30_000),
     laneBasePort: Number.isFinite(partial.laneBasePort) ? Number(partial.laneBasePort) : envNumber('LANE_BASE_PORT', provider.laneBasePort),
     laneSourcePort: Number.isFinite(partial.laneSourcePort)
       ? Number(partial.laneSourcePort)
       : Number(providerEnv('LANE_SOURCE_PORT') ?? process.env.CHATGPT_CDP_PORT ?? provider.masterPort),
     laneSyncCookies: partial.laneSyncCookies ?? (providerEnv('LANE_SYNC_COOKIES') !== '0'),
-    laneMaxTurns: Number.isFinite(partial.laneMaxTurns) ? Number(partial.laneMaxTurns) : envNumber('LANE_MAX_TURNS', 20),
-    laneMaxAgeMs: Number.isFinite(partial.laneMaxAgeMs) ? Number(partial.laneMaxAgeMs) : envNumber('LANE_MAX_AGE_MS', 10 * 60_000),
+    laneMaxTurns: Number.isFinite(partial.laneMaxTurns) ? Number(partial.laneMaxTurns) : envNumber('LANE_MAX_TURNS', provider.laneSharedBrowser ? 0 : 20),
+    laneMaxAgeMs: Number.isFinite(partial.laneMaxAgeMs) ? Number(partial.laneMaxAgeMs) : envNumber('LANE_MAX_AGE_MS', provider.laneSharedBrowser ? 0 : 10 * 60_000),
     laneBackoffBaseMs: Number.isFinite(partial.laneBackoffBaseMs) ? Number(partial.laneBackoffBaseMs) : envNumber('LANE_BACKOFF_BASE_MS', 5_000),
     emptyNodeGraceMs: Number.isFinite(partial.emptyNodeGraceMs) ? Number(partial.emptyNodeGraceMs) : envNumber('EMPTY_NODE_GRACE_MS', 120_000),
     laneManager: partial.laneManager,
@@ -1225,13 +1247,52 @@ export class ChatGptHost {
     for (const bridge of this.bridges.values()) {
       log(`bridge "${bridge.state.name}" (${shortId(bridge.state.sessionId)}) on 127.0.0.1:${this.hostState.healthPort} thread ${bridge.state.threadId ? shortId(bridge.state.threadId) : '(none)'}`)
       void this.drain(bridge)
-      // A message accepted into a thread and then killed mid-turn is still owed
-      // an answer. Each bridge knows which of its own messages those are.
-      void this.recoverOwed(bridge)
       // A restart may inherit a POSTED turn whose answer is still on the page.
       // Watch it on the bounded cadence too, so it does not wait for reconcile.
       this.armPendingWatch(bridge)
     }
+    // Owed replies are replayed after every bridge is listed, one bridge at a
+    // time, rather than one burst per bridge (see `recoverOwedAll`).
+    void this.recoverOwedAll()
+  }
+
+  /**
+   * Replay owed replies for every bridge, one pass at a time.
+   *
+   * Each pass needs one registry listing, and a restart used to fire every
+   * bridge's replay at once: up to thirteen page reads and re-posts in the same
+   * second, which is the startup 429 and ERR_INSUFFICIENT_RESOURCES burst
+   * measured on 2026-11-06. One bridge at a time also means one tab's worth of
+   * page work at a time, so a restart cannot fill the lane cap with ghosts.
+   */
+  private async recoverOwedAll(): Promise<void> {
+    const senders = await this.liveSenderIds()
+    for (const bridge of this.bridges.values()) {
+      try { await this.recoverOwed(bridge, senders) }
+      catch (error) { log(`could not recover owed replies on "${bridge.state.name}": ${(error as Error).message}`) }
+    }
+  }
+
+  /**
+   * The session ids with a registration on disk, or `null` when the directory
+   * could not be read.
+   *
+   * Presence, not liveness: `listGatewayPeers` also PROBES each registration and
+   * drops the ones that do not answer, which would read a live-but-busy peer as
+   * gone and throw its owed turn away. What retirement actually rests on is that
+   * the sender DELETED its registration - which is exactly what a session does
+   * when it exits, and what the synthetic stress senders left behind. Unknown
+   * is not "nobody", so any read failure keeps every turn on the evidence-first
+   * path.
+   */
+  private async liveSenderIds(): Promise<Set<string> | null> {
+    // The same registry the bridge transports are registered in: a host pointed
+    // at another directory must judge senders from THAT directory.
+    const directory = this.config.directory ?? join(getClaudeConfigHomeDir(), 'gateway-sessions')
+    try {
+      const entries = await readdir(directory)
+      return new Set(entries.filter(name => name.endsWith('.json')).map(name => name.slice(0, -'.json'.length)))
+    } catch { return null }
   }
 
   // ------------------------------------------------------------------ bridges
@@ -1244,6 +1305,7 @@ export class ChatGptHost {
       path: this.bridgePath(state.sessionId),
       transport: undefined,
       handled: new Set(),
+      drainFailures: 0,
       schedules: new Map(),
       reads: newReadGate(),
       draining: false,
@@ -1569,6 +1631,16 @@ export class ChatGptHost {
       owed: bridge.state.owed,
       schedules: bridge.state.schedules,
       queuedNotices: bridge.state.queuedNotices,
+      // What this bridge's reads cost, so "is an idle bridge reading?" is an
+      // answer from the operator state rather than a guess from a log line.
+      reads: {
+        attempted: bridge.reads.attempted,
+        skipped: bridge.reads.skipped,
+        rateLimited: bridge.reads.rateLimited,
+        delivery: bridge.reads.delivery,
+        idleSkips: bridge.reads.idleSkips,
+        backoffMs: bridge.reads.backoffMs,
+      },
     }
   }
 
@@ -1646,6 +1718,7 @@ export class ChatGptHost {
       if (op === 'recover') {
         const threadId = bridge.state.threadId
         if (!threadId) return this.send(response, 400, { ok: false, error: `${bridge.state.name} has no thread to reload` })
+        if (!providerSupports(this.provider, 'reload')) return this.send(response, 400, { ok: false, op, error: `the ${this.provider.fallbackName} driver cannot reload a thread` })
         const reply = await this.pageWork(() => this.driver.call({ op: 'reload', threadId }, 120_000))
         if (reply.ok !== true) return this.send(response, 502, { ok: false, op, error: one(reply.error, 200) || 'the page did not reload' })
         audit(this.hostState, { op: 'recover', target: threadId, result: `page reloaded on operator request [${bridge.state.name}]` })
@@ -1938,18 +2011,19 @@ export class ChatGptHost {
   /** Mint a peer and a brand-new ChatGPT thread for it. */
   private async createNewBridge(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; line: string }> {
     const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, null, `${this.provider.fallbackName}-${randomUUID().slice(0, 8)}`)
-    const model = typeof body.model === 'string' ? body.model.trim() : ''
-    const effort = typeof body.effort === 'string' ? body.effort.trim() : ''
+    // A bridge names its model at birth, ALWAYS. Inheritance was the defect:
+    // the picker is one control for the shared browser, so a bridge that named
+    // nothing silently ran on whatever the last turn selected (measured
+    // 2026-11-06: a fresh Gemini bridge came up on another session's Argon).
+    const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : this.provider.defaultModel
+    const effort = typeof body.effort === 'string' && body.effort.trim() ? body.effort.trim() : this.provider.defaultEffort
     const bridge = await this.createBridge(newBridgeState({ sessionId: randomUUID(), name }))
     try {
-      // A bridge names its model at birth. Without this the new conversation
-      // inherits whatever the shared picker last held (measured 2026-11-06: a
-      // fresh Gemini bridge came up on another session's model).
-      if (model || effort) {
+      {
         const picked = await this.pageWork(() => this.driver.call({ op: this.provider.modeOp, model, effort }, 120_000))
         if (picked.ok !== true) throw new Error(one(picked.error, 160) || 'the picker refused the selection')
-        bridge.state.model = typeof picked.model === 'string' && picked.model ? picked.model : (model || null)
-        bridge.state.effort = typeof picked.effort === 'string' && picked.effort ? picked.effort : (effort || null)
+        bridge.state.model = typeof picked.model === 'string' && picked.model ? picked.model : model
+        bridge.state.effort = typeof picked.effort === 'string' && picked.effort ? picked.effort : effort
       }
       await this.pageWork(() => this.ensurePrimerAndThread(bridge))
       await this.activateBridge(bridge)
@@ -2515,6 +2589,7 @@ export class ChatGptHost {
       const address = file.kind === 'attachment'
         ? { fileId: file.fileId }
         : { threadId, messageId: node.id, sandboxPath: file.sandboxPath }
+      if (!providerSupports(this.provider, 'file')) { refused.push(`index ${index} refused: the ${this.provider.fallbackName} page has no file download`); continue }
       let outPath = target
       let reply = await this.driver.call({ op: 'file', ...address, outPath, maxBytes: OUTBOX_MAX_FILE_BYTES }, 180_000)
       // A previous attempt may have left the deterministic target behind (e.g. an
@@ -3829,7 +3904,11 @@ export class ChatGptHost {
     }
     gate.attempted += 1
     if (kind === 'delivery') gate.delivery += 1
-    const reply = await this.driver.call({ op: 'conversation', threadId }, this.readTimeout)
+    // A delivery read may OPEN the thread in the writer's own tab (a driver
+    // whose transcript is the DOM can only read a thread that is on screen);
+    // an observation read never moves a tab. The ChatGPT driver reads over the
+    // backend API and ignores the flag.
+    const reply = await this.driver.call({ op: 'conversation', threadId, ...(kind === 'delivery' ? { open: true } : {}) }, this.readTimeout)
     if (reply.ok === true && reply.conversation && typeof reply.conversation === 'object') {
       this.observes = true
       // The page is answering again: the next 429 starts from the base again.
@@ -3856,6 +3935,12 @@ export class ChatGptHost {
         log(`thread ${shortId(threadId)}: the page rate-limited the observation read (backoff ${Math.round(gate.backoffMs / 1000)}s)`)
       }
       return { rateLimited: true }
+    }
+    if (reply.reason === 'not-open') {
+      // No tab shows this thread, and an observation read does not open one
+      // (it would be a page load per bridge per pass). That is "no evidence
+      // yet", not a page error: it neither counts nor backs off the pass.
+      return undefined
     }
     if (isDriverFaultReply(reply)) {
       // R-LIVE-5: the driver, not the page, failed this read - its own deadline
@@ -4171,6 +4256,9 @@ export class ChatGptHost {
    */
   async pollTitles(force = false): Promise<void> {
     if (this.stopping) return
+    // A provider with no account-wide list has nothing to walk; asking anyway
+    // logged `unknown op conversations` on every Gemini tick.
+    if (!providerSupports(this.provider, 'conversations')) return
     const gap = (this.config.titlesEvery ?? 0) * 1000
     if (!force && gap > 0 && Date.now() - this.lastListAt < gap) return
     const gate = this.listGate
@@ -4227,9 +4315,15 @@ export class ChatGptHost {
   private schedulePendingWatch(bridge: Bridge, step: number, ids: Set<string>): void {
     if (this.stopping || bridge.removed || bridge.stopping) return
     const gaps = this.config.pendingWatchGapsMs ?? PENDING_WATCH_GAPS_MS
-    const gap = gaps[step]
-    if (gap === undefined) return
-    const handle = setTimeout(() => this.pendingWatchTick(bridge, step), gap)
+    // Past the ladder the tail keeps going at a steady, slow cadence, so the
+    // answer is never left waiting for the reconcile timer.
+    const gap = gaps[step] ?? (this.config.pendingWatchTailMs ?? PENDING_WATCH_TAIL_MS)
+    // Never tick inside the bridge's own 429 window: the read gate would refuse
+    // it, so that tick buys nothing and only inflates the counters. Wait the
+    // window out, plus a little jitter so several bridges do not align.
+    const wait = Math.max(gap, bridge.reads.backoffUntil - Date.now())
+    const delay = wait + (wait > gap ? Math.floor(Math.random() * 1_000) : 0)
+    const handle = setTimeout(() => this.pendingWatchTick(bridge, step), delay)
     handle.unref?.()
     bridge.pendingWatch = { timer: handle, step, ids }
   }
@@ -4250,6 +4344,14 @@ export class ChatGptHost {
     if (this.pendingWatchIds(bridge).size === 0) return
     const threadId = bridge.state.threadId
     if (!threadId) return
+    // A tick that lands inside the bridge's own 429 window cannot read at all,
+    // so it must not spend a rung of the ladder: ask again when the window is
+    // out, at the same rung. A throttled account then still gets its ladder's
+    // worth of REAL reads instead of a storm of refusals.
+    if (Date.now() < bridge.reads.backoffUntil) {
+      this.schedulePendingWatch(bridge, step, watch.ids)
+      return
+    }
     this.triggerObserve('pending-watch', { threadId })
     this.schedulePendingWatch(bridge, step + 1, watch.ids)
   }
@@ -4980,9 +5082,22 @@ export class ChatGptHost {
           && !this.postedJobOf(bridge, item.message.id))
         if (!record) break
         await this.handleRecord(bridge, record)
+        bridge.drainFailures = 0
       }
     } catch (error) {
-      log(`drain for "${bridge.state.name}" failed: ${(error as Error).message}`)
+      const message = (error as Error).message
+      log(`drain for "${bridge.state.name}" failed: ${message}`)
+      // A lane that cannot open leaves the sender waiting with nothing said.
+      // One failure is transient; three in a row is the account or the page
+      // refusing to work, and every turn still unposted gets its one failure
+      // line instead of silence (measured 2026-11-06: a signed-out Gemini tab
+      // swallowed two turns with only a log line to show for it).
+      bridge.drainFailures += 1
+      if (bridge.drainFailures >= 3) {
+        for (const record of [...bridge.state.pendingTurns]) {
+          if (record.postedAt === null) await this.deliverSolicitedFailure(bridge, record, `the page could not be opened: ${message}`)
+        }
+      }
     } finally {
       bridge.draining = false
       this.refreshOwed(bridge)
@@ -5023,8 +5138,15 @@ export class ChatGptHost {
    * the turn. The job record says whether it was posted, and the page itself
    * says whether it is still there. Posting without looking re-typed a whole
    * prompt whose turn had long finished.
+   *
+   * SENDER FIRST (R1): a sender that is no longer on the bus cannot be paid, so
+   * its turn is retired instead of read or re-posted. Synthetic senders delete
+   * their registration when they exit, and the stress runs left dozens of such
+   * turns across every bridge - each one a page read and, on the post path, a
+   * real turn at startup. `senders` is `null` when the registry could not be
+   * listed, and then nothing is retired.
    */
-  private async recoverOwed(bridge: Bridge): Promise<void> {
+  private async recoverOwed(bridge: Bridge, senders: Set<string> | null = null): Promise<void> {
     const transport = bridge.transport
     if (!transport) return
     // A restart should not buy an unbounded replay: at most three page turns
@@ -5041,10 +5163,18 @@ export class ChatGptHost {
       .map(item => item.userNodeId)
       .filter((id): id is string => typeof id === 'string'))
     for (;;) {
-      const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId) && !unproven.has(item.toMessageId) && !this.settling.has(item.toMessageId))
+      // A turn retired on an earlier run is in `answeredTurns` under `r:`, so a
+      // restart does not re-list it and retire it again. Deliberately NOT the
+      // `m:` key: that one is written when a reply was obtained, and a crash
+      // between that write and the send must still be recovered from evidence.
+      const entry = transport.outstandingReplies().find(item => !bridge.handled.has(item.toMessageId) && !unproven.has(item.toMessageId) && !this.settling.has(item.toMessageId) && !bridge.state.answeredTurns.includes(`r:${item.toMessageId}`))
       if (!entry) return
       const record = transport.inbox().find(item => item.message.id === entry.toMessageId)
       if (!record) { bridge.handled.add(entry.toMessageId); continue }
+      if (senders && !senders.has(entry.toSessionId)) {
+        await this.retireOwedTurn(bridge, entry.toMessageId, entry.toSessionId, 'the sender is gone from the bus; not replayed')
+        continue
+      }
       // What do we already know about this turn? A job record with a null
       // `postedAt` was never typed, and no record at all means this host has no
       // evidence the page saw anything - both are the post path, unchanged. A
@@ -5052,7 +5182,14 @@ export class ChatGptHost {
       // never produce evidence either, so it keeps the old behaviour.
       const job = bridge.state.pendingTurns.find(item => item.messageId === entry.toMessageId)
       if (job && job.postedAt !== null && this.observes !== false) {
-        const evidence = await this.laneWork(this.laneIdOf({ fromSessionId: job.senderSessionId }), () => this.settlePostedTurn(bridge, job, claimed))
+        // Settling is a READ. It runs in the sender's lane only while that lane
+        // is open; otherwise in the host's own. Opening a tab per owed turn
+        // re-opened a lane for every dead sender on every pass (measured
+        // 2026-11-06: three such lanes opened and idled out again and again),
+        // which is a page load each time and what filled the cap with ghosts.
+        const senderLane = this.laneIdOf({ fromSessionId: job.senderSessionId })
+        const readLane = this.lanes && !this.lanes.has(senderLane) ? HOST_LANE : senderLane
+        const evidence = await this.laneWork(readLane, () => this.settlePostedTurn(bridge, job, claimed))
         if (evidence === 'delivered') {
           bridge.handled.add(entry.toMessageId)
           continue
@@ -5077,6 +5214,24 @@ export class ChatGptHost {
       pages++
       await this.handleRecord(bridge, record)
     }
+  }
+
+  /**
+   * Retire an owed turn whose sender no longer exists.
+   *
+   * The turn is settled, not answered: nobody is left to receive a reply, and
+   * the page must not be touched for it. The retirement key goes into
+   * `answeredTurns` so a later restart does not re-judge it, and the pending
+   * record is dropped so the observation pass cannot adopt it as a human turn.
+   */
+  private async retireOwedTurn(bridge: Bridge, messageId: string, senderSessionId: string, reason: string): Promise<void> {
+    bridge.handled.add(messageId)
+    const key = `r:${messageId}`
+    bridge.state.answeredTurns = [...bridge.state.answeredTurns.filter(item => item !== key), key].slice(-ANSWERED_TURNS_MAX)
+    bridge.state.pendingTurns = bridge.state.pendingTurns.filter(item => item.messageId !== messageId)
+    await this.persistBridgeState(bridge, true)
+    log(`retired ${shortId(messageId)} from ${shortId(senderSessionId)} on "${bridge.state.name}": ${reason}`)
+    audit(this.hostState, { op: 'recover', target: senderSessionId, result: `${reason} [${bridge.state.name}]`, messageId })
   }
 
   /**
@@ -6540,12 +6695,12 @@ async function main(): Promise<void> {
       '  --titles-every <n>  seconds between title walks (default 120; 0 = never)',
       '  --lanes / --no-lanes  one disposable Chrome window per writer (default on)',
       '  --lane-max <n>      live lane windows at once (default 8; extra writers queue)',
-      '  --lane-idle-ms <n>  kill an idle lane after this long (default 30000)',
+      '  --lane-idle-ms <n>  close an idle lane after this long (default 1800000 for a shared-browser tab, 30000 for a lane window)',
       '  --lane-base-port <n> first lane debugging port (default 9300)',
       '  --lane-source-port <n> master Chrome port lanes branch login from (default 9222)',
       '  --lane-sync-cookies <0|1> write a closing lane\'s cookies back to the master (default 1)',
-      '  --lane-max-turns <n> rotate a lane after this many turns (default 20)',
-      '  --lane-max-age-ms <n> rotate a lane this long after it opened (default 600000)',
+      '  --lane-max-turns <n> rotate a lane after this many turns (default 20; 0 = never, the shared-tab default)',
+      '  --lane-max-age-ms <n> rotate a lane this long after it opened (default 600000; 0 = never, the shared-tab default)',
       '  --lane-backoff-base-ms <n> first retry delay for a rate-limited lane open (default 5000)',
       '  --empty-node-grace-ms <n> idle textless-answer grace before repair (default 120000)',
       '',

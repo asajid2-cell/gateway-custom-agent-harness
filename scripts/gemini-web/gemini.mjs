@@ -7,6 +7,7 @@
  * (or off-screen) page hidden, and a hidden page drops CDP input, which makes a
  * send silently do nothing. Chrome is launched here with those flags.
  */
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
 import { closeSync, openSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -56,11 +57,21 @@ const LAUNCH_STALE_MS = 120_000
 // shared master forever (measured 2026-11-06: Gemini had neither).
 const LANE_LEASE_DIR = join(LANE_SHARED_DIR, 'lane-tabs')
 const LANE_LEASE_STALE_MS = 3 * 60_000
+/**
+ * The lane a request is for, when one process serves several tabs.
+ *
+ * The host runs ONE driver child per browser and stamps `lane` on each lane
+ * request; the env var is the older one-process-per-lane shape. Everything that
+ * picks a tab reads this, so each inputter gets its own tab and its own serial
+ * chain inside one process - the same contract as the ChatGPT driver.
+ */
+const LANE_CTX = new AsyncLocalStorage()
+const laneOf = () => LANE_CTX.getStore() || LANE_ID
 
 async function log(line) {
   try {
     await mkdir(STATE_DIR, { recursive: true })
-    await writeFile(LOG_FILE, `${new Date().toISOString()} [${LANE_ID || 'master'}] ${line}\n`, { flag: 'a' })
+    await writeFile(LOG_FILE, `${new Date().toISOString()} [${laneOf() || 'master'}] ${line}\n`, { flag: 'a' })
   } catch { /* logging must never break a turn */ }
 }
 
@@ -273,6 +284,26 @@ async function connect(port = CONNECT_PORT) {
   return { browser, context }
 }
 
+/**
+ * The connection this child keeps for the shared browser.
+ *
+ * Every op used to attach and then disconnect. One process now serves every
+ * inputter's tab, and Chrome 156 stalls a browser-level attach whenever another
+ * is in flight, so per-op attaches from several lanes are what turned a healthy
+ * page into "attach stalled; restarting the window". One attach, reused, and
+ * dropped only when the browser itself goes away.
+ */
+let SHARED_CONNECTION = null
+
+async function sharedConnection() {
+  if (SHARED_CONNECTION?.browser?.isConnected?.()) return SHARED_CONNECTION
+  SHARED_CONNECTION = null
+  const connection = await connect()
+  connection.browser.on('disconnected', () => { if (SHARED_CONNECTION === connection) SHARED_CONNECTION = null })
+  SHARED_CONNECTION = connection
+  return connection
+}
+
 /** Keep this lane's lease fresh: a tab whose lease ages out is swept. */
 async function touchLaneLease(id) {
   const file = join(LANE_LEASE_DIR, `${id}.json`)
@@ -282,47 +313,96 @@ async function touchLaneLease(id) {
   if (!refreshed) await writeFile(file, JSON.stringify({ pid: process.pid, at: now.toISOString() })).catch(() => {})
 }
 
-let SWEPT_LANE_TABS = false
+/** Each lane's tab, by lane id: the Page is the identity, the name the label. */
+const LANE_PAGES = new Map()
+/** When each lane last asked for its tab. An open in flight is never swept. */
+const LANE_SEEN = new Map()
+const LANE_SEEN_GRACE_MS = 60_000
+const LANE_SWEEP_EVERY_MS = 60_000
+let LANE_SWEPT_AT = 0
 
-/**
- * Close Gemini lane tabs whose owners are gone.
- *
- * The Gemini driver had no lease and no sweep at all, so a driver killed with
- * its host left an orphan `webbridge-lane:*` tab in the shared master forever
- * (measured 2026-11-06: `gemini-web/lanes/` held only lanes.json). Same rule as
- * the ChatGPT driver: a lease names a live lane, and whoever opens a lane next
- * closes every named tab whose lease is missing or stale. Runs once per child.
- */
-async function sweepOrphanLaneTabs(context) {
-  if (SWEPT_LANE_TABS) return 0
-  SWEPT_LANE_TABS = true
+function bounded(promise, ms) {
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer within ${ms} ms`)), ms); timer.unref?.() }),
+  ]).finally(() => clearTimeout(timer))
+}
+
+/** A tab's name, bounded: a hung renderer must not hold the caller. */
+async function tabNameOf(page) {
+  try { return String(await bounded(page.evaluate(() => window.name), 3_000) || '') } catch { return '' }
+}
+
+async function laneIdOfPage(page) {
+  for (const [id, known] of LANE_PAGES) if (known === page) return id
+  const name = await tabNameOf(page)
+  return name.startsWith(LANE_TAB_PREFIX) ? name.slice(LANE_TAB_PREFIX.length) : null
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+}
+
+async function readLeases() {
   let names = []
   try { names = await readdir(LANE_LEASE_DIR) } catch { names = [] }
-  const live = new Set()
-  const now = Date.now()
+  const leases = new Map()
   for (const name of names) {
     if (!name.endsWith('.json')) continue
     const file = join(LANE_LEASE_DIR, name)
     const info = await stat(file).catch(() => null)
     if (!info) continue
-    if (now - info.mtimeMs > LANE_LEASE_STALE_MS) { await rm(file, { force: true }).catch(() => {}); continue }
-    live.add(name.slice(0, -'.json'.length))
+    let pid = null
+    try { pid = Number(JSON.parse(await readFile(file, 'utf8'))?.pid) || null } catch { /* no owner */ }
+    leases.set(name.slice(0, -'.json'.length), { file, ageMs: Date.now() - info.mtimeMs, pid })
+  }
+  return leases
+}
+
+/**
+ * Close lane tabs (and leases) no live lane owns.
+ *
+ * With `keep` (the host lane manager's list, sent as `sweep-lanes`) the list is
+ * authoritative: this process is the browser's only driver, so any other lane
+ * tab is a ghost - a lease timer keeps a dead lane's lease fresh for as long
+ * as its tab lives, which is why the age rule alone never cleaned them. Without
+ * `keep` the age rule applies. A lane that asked for its tab in the last minute
+ * is always spared, and so is a fresh lease held by a different live process.
+ */
+async function sweepLaneTabs(context, { keep = null } = {}) {
+  LANE_SWEPT_AT = Date.now()
+  const leases = await readLeases()
+  const live = new Set(keep ? [...keep] : [...LANE_PAGES.keys()])
+  for (const [id, at] of LANE_SEEN) if (Date.now() - at < LANE_SEEN_GRACE_MS) live.add(id)
+  for (const [id, lease] of leases) {
+    if (lease.ageMs > LANE_LEASE_STALE_MS) continue
+    const foreign = lease.pid && lease.pid !== process.pid && pidAlive(lease.pid)
+    if (foreign || !keep) live.add(id)
   }
   let closed = 0
   for (const page of context.pages()) {
-    const name = String(await page.evaluate(() => window.name).catch(() => '') || '')
-    if (!name.startsWith(LANE_TAB_PREFIX)) continue
-    if (live.has(name.slice(LANE_TAB_PREFIX.length))) continue
+    const id = await laneIdOfPage(page)
+    if (id === null || live.has(id)) continue
     await page.close().catch(() => {})
+    LANE_PAGES.delete(id)
+    LANE_SEEN.delete(id)
     closed += 1
   }
-  if (closed) await log(`shared lane ${LANE_ID || '(unnamed)'}: closed ${closed} orphaned lane tab(s)`)
+  for (const [id, lease] of leases) {
+    if (!live.has(id)) await rm(lease.file, { force: true }).catch(() => {})
+  }
+  for (const id of [...LANE_PAGES.keys()]) if (!live.has(id)) { LANE_PAGES.delete(id); LANE_SEEN.delete(id) }
+  if (closed) await log(`lane sweep: closed ${closed} lane tab(s) no live lane owns`)
   return closed
 }
 
 /** Keep the lease younger than the sweep threshold for the tab's whole life. */
+const LEASED = new WeakSet()
 function keepLeaseFresh(page, leaseId) {
-  if (!LANE_SHARED || !leaseId) return
+  if (!LANE_SHARED || !leaseId || LEASED.has(page)) return
+  LEASED.add(page)
   const timer = setInterval(() => { void touchLaneLease(leaseId) }, Math.max(15_000, Math.floor(LANE_LEASE_STALE_MS / 3)))
   timer.unref?.()
   const stop = () => clearInterval(timer)
@@ -330,45 +410,93 @@ function keepLeaseFresh(page, leaseId) {
   page.once('crash', stop)
 }
 
+const isGeminiUrl = url => /^https:\/\/gemini\.google\.com\//.test(String(url || ''))
+
+/**
+ * The tab this request works in.
+ *
+ * A lane request gets its own named tab, opened once and then kept: reusing it
+ * is what makes an interactive back-and-forth cost no page load. A request with
+ * no lane is the master/operator page, and must never pick up a lane's tab. No
+ * tab is brought to the front here: a read must not steal the window from a
+ * lane that is typing, and the send path brings its tab forward under the focus
+ * lock for exactly the compose-and-click.
+ */
 async function geminiPage(context) {
-  if (LANE_SHARED) {
-    const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
-    const leaseId = wanted.slice(LANE_TAB_PREFIX.length)
-    await touchLaneLease(leaseId)
-    // Lane tabs are named; never borrow the operator's own tab.
-    for (const candidate of context.pages()) {
-      const name = await candidate.evaluate(() => window.name).catch(() => '')
-      if (name === wanted) {
-        await candidate.bringToFront().catch(() => {})
-        keepLeaseFresh(candidate, leaseId)
-        await sweepOrphanLaneTabs(context)
-        return candidate
+  const lane = laneOf()
+  if (LANE_SHARED && lane) {
+    const wanted = `${LANE_TAB_PREFIX}${lane}`
+    LANE_SEEN.set(lane, Date.now())
+    let page = LANE_PAGES.get(lane)
+    if (page && page.isClosed()) { LANE_PAGES.delete(lane); page = undefined }
+    if (!page) {
+      await touchLaneLease(lane)
+      const owned = new Set(LANE_PAGES.values())
+      for (const candidate of context.pages()) {
+        if (owned.has(candidate)) continue
+        if (await tabNameOf(candidate) === wanted) { page = candidate; break }
       }
+      if (!page) {
+        page = await context.newPage()
+        await page.goto(APP, { waitUntil: 'domcontentloaded' })
+        await log(`lane tab opened for ${lane}`)
+      }
+      const mine = page
+      LANE_PAGES.set(lane, mine)
+      mine.once('close', () => { if (LANE_PAGES.get(lane) === mine) LANE_PAGES.delete(lane) })
     }
-    const page = await context.newPage()
-    await page.goto(APP, { waitUntil: 'domcontentloaded' })
-    // Chrome clears window.name on a cross-site navigation, so name the tab
-    // AFTER it is on the site; same-site navigation and reload keep it.
-    await page.evaluate(name => { window.name = name }, wanted).catch(() => {})
-    keepLeaseFresh(page, leaseId)
-    await waitForComposer(page, 30_000)
-    await sweepOrphanLaneTabs(context)
+    // Chrome clears window.name on a cross-site navigation (a sign-in bounce),
+    // so the name is re-asserted whenever the tab is on the site.
+    if (isGeminiUrl(page.url()) && await tabNameOf(page) !== wanted) {
+      await bounded(page.evaluate(name => { window.name = name }, wanted), 3_000).catch(() => {})
+    }
+    keepLeaseFresh(page, lane)
+    if (Date.now() - LANE_SWEPT_AT > LANE_SWEEP_EVERY_MS) await sweepLaneTabs(context).catch(() => 0)
     return page
   }
-  const page = context.pages().find(candidate => candidate.url().includes('gemini.google.com'))
-    ?? context.pages()[0]
-    ?? await context.newPage()
-  if (!page.url().includes('gemini.google.com')) await page.goto(APP, { waitUntil: 'domcontentloaded' })
-  await page.bringToFront().catch(() => {})
+  const lanePages = new Set(LANE_PAGES.values())
+  let page = null
+  for (const candidate of context.pages()) {
+    if (lanePages.has(candidate) || !isGeminiUrl(candidate.url())) continue
+    if (LANE_SHARED && (await tabNameOf(candidate)).startsWith(LANE_TAB_PREFIX)) continue
+    page = candidate
+    break
+  }
+  if (!page) {
+    page = context.pages().find(candidate => !lanePages.has(candidate)) ?? await context.newPage()
+    if (!isGeminiUrl(page.url())) await page.goto(APP, { waitUntil: 'domcontentloaded' })
+  }
+  if (!LANE_SHARED) await page.bringToFront().catch(() => {})
   return page
 }
 
+/**
+ * A tab that already SHOWS `threadId`: this lane's own first, then any other.
+ *
+ * Gemini has no conversation API the page can call - the transcript is the DOM
+ * - so a thread can only be read from a tab that is on it. Reading whatever tab
+ * the request happened to land on is what reported "the page is on another
+ * thread" while the thread was open in its lane's tab.
+ */
+function pageShowing(context, threadId) {
+  const wanted = String(threadId || '').toLowerCase()
+  if (!wanted) return null
+  const own = LANE_PAGES.get(laneOf())
+  if (own && !own.isClosed() && threadOfUrl(own.url()) === wanted) return own
+  return context.pages().find(page => !page.isClosed() && threadOfUrl(page.url()) === wanted) ?? null
+}
+
 async function withPage(operation) {
-  const { browser, context } = await connect()
-  try {
-    const page = await geminiPage(context)
-    return await operation(page, context)
-  } finally { await browser.close().catch(() => {}) }
+  if (!LANE_SHARED) {
+    const { browser, context } = await connect()
+    try {
+      const page = await geminiPage(context)
+      return await operation(page, context)
+    } finally { await browser.close().catch(() => {}) }
+  }
+  const { context } = await sharedConnection()
+  const page = await geminiPage(context)
+  return await operation(page, context)
 }
 
 /* ------------------------------------------------------------- cookies */
@@ -665,6 +793,10 @@ async function typePrompt(page, text) {
     // pressed again. An unreadable count (-1 on either side) never re-presses.
     if (beforeSend >= 0 && afterSend >= 0 && afterSend <= beforeSend) await press()
   }
+  // The mark the ChatGPT driver already emits, so a turn's cost can be split
+  // the same way on both providers: receipt -> this click is bridge overhead,
+  // the click -> the reply on the bus is the model's own time.
+  await log('phase send clicked')
 }
 
 const PROVIDER_ERROR = /Sorry, something went wrong|encountering an error|having a hard time fulfilling/i
@@ -720,10 +852,10 @@ async function waitForAnswer(page, beforeCount, timeoutMs = SEND_TIMEOUT_MS) {
 
 async function warm() {
   await ensureChrome()
-  const { browser, context } = await connect()
-  try {
-    await branchMasterLogin(context)
-    const page = await geminiPage(context)
+  await branchMasterLogin()
+  return withPage(async page => {
+    // An existing lane tab that still shows a composer is warm already: no
+    // reload, so a returning writer keeps its thread on screen.
     if (!(await waitForComposer(page, 5_000))) await page.goto(APP, { waitUntil: 'domcontentloaded' })
     await waitForComposer(page, 30_000)
     let sign = await signedIn(page)
@@ -735,10 +867,10 @@ async function warm() {
     if (!sign.account) throw new Error('the lane did not accept the master login (no Google account on the page)')
     const mode = await pickerState(page)
     return {
-      ok: true, op: 'warm', lane: LANE_ID || 'master', signedIn: true, plan: 'google',
+      ok: true, op: 'warm', lane: laneOf() || 'master', signedIn: true, plan: 'google',
       url: sign.url, model: mode?.model ?? null, effort: mode?.effort ?? null,
     }
-  } finally { await browser.close().catch(() => {}) }
+  })
 }
 
 async function send(request) {
@@ -814,10 +946,18 @@ async function send(request) {
   })
 }
 
+/**
+ * The tab a thread-scoped read should look at: the one that shows the thread
+ * if any does, else this request's own tab (which then reports other-thread).
+ */
+async function withThreadPage(threadId, operation) {
+  return withPage(async (page, context) => operation(pageShowing(context, threadId) ?? page, context))
+}
+
 async function status(request) {
-  return withPage(async page => {
+  const wanted = typeof request.threadId === 'string' ? request.threadId.toLowerCase() : null
+  return withThreadPage(wanted, async page => {
     const state = await pageState(page)
-    const wanted = typeof request.threadId === 'string' ? request.threadId.toLowerCase() : null
     const mode = await pickerState(page)
     const base = {
       ok: true, op: 'status',
@@ -845,15 +985,35 @@ async function status(request) {
   })
 }
 
+/**
+ * Read one thread's transcript.
+ *
+ * Gemini's transcript is the DOM, so the read needs a tab that shows the
+ * thread. Any tab already on it is read where it stands (this lane's own tab
+ * first). With none, a request that says `open: true` - a delivery read, which
+ * the host sends inside the writer's lane - navigates THIS lane's tab to the
+ * thread; it is dispatched on the lane's own chain, so it never navigates under
+ * that lane's own send. Anything else (observation) answers `not-open` rather
+ * than moving a tab: an observation pass must not cost a page load, and a
+ * thread nobody has on screen has nothing new for it.
+ */
 async function conversation(request) {
-  return withPage(async page => {
-    const state = await pageState(page)
-    const wanted = typeof request.threadId === 'string' ? request.threadId.toLowerCase() : state.threadId
-    if (wanted && state.threadId && wanted !== state.threadId) {
-      return { ok: false, op: 'conversation', error: `the page is on another thread (${state.threadId})`, threadId: wanted }
+  return withPage(async (page, context) => {
+    const wanted = typeof request.threadId === 'string' && request.threadId ? request.threadId.toLowerCase() : null
+    let target = wanted ? pageShowing(context, wanted) : page
+    if (!target && request.open === true) {
+      if (await openThread(page, wanted)) target = page
     }
-    const turns = await pageTurns(page)
-    return { ok: true, op: 'conversation', conversation: conversationOf(wanted, turns.turns, turns.pending), threadId: wanted }
+    if (!target) {
+      return { ok: false, op: 'conversation', reason: 'not-open', error: `no tab shows thread ${wanted}`, threadId: wanted }
+    }
+    const state = await pageState(target)
+    const shown = wanted ?? state.threadId
+    if (shown && state.threadId && shown !== state.threadId) {
+      return { ok: false, op: 'conversation', reason: 'not-open', error: `the page is on another thread (${state.threadId})`, threadId: shown }
+    }
+    const turns = await pageTurns(target)
+    return { ok: true, op: 'conversation', conversation: conversationOf(shown, turns.turns, turns.pending), threadId: shown }
   })
 }
 
@@ -903,20 +1063,28 @@ async function unload() {
   // belongs to every lane and to the operator: closing a lane must never kill
   // it (2026-11-04: an idle lane closed the master Chrome mid-turn).
   if (LANE_SHARED) {
+    const lane = laneOf()
+    // No lane means a host-level unload: the master browser is never closed.
+    if (!lane) return { ok: true, op: 'unload', state: 'unloaded', sharedBrowser: true, tabClosed: false }
     // Drop the lease FIRST: if the close fails, the stale lease lets the next
-    // lane sweep the orphan. Same order as the ChatGPT driver.
-    const leaseId = (LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`).slice(LANE_TAB_PREFIX.length)
-    await rm(join(LANE_LEASE_DIR, `${leaseId}.json`), { force: true }).catch(() => {})
+    // sweep clean the orphan. Same order as the ChatGPT driver.
+    await rm(join(LANE_LEASE_DIR, `${lane}.json`), { force: true }).catch(() => {})
+    const known = LANE_PAGES.get(lane)
+    LANE_PAGES.delete(lane)
+    LANE_SEEN.delete(lane)
+    let tabClosed = false
     try {
-      const { browser, context } = await connect()
-      try {
+      if (known && !known.isClosed()) {
+        await known.close().catch(() => {})
+        tabClosed = true
+      } else {
+        const { context } = await sharedConnection()
         for (const candidate of context.pages()) {
-          const name = await candidate.evaluate(() => window.name).catch(() => '')
-          if (name === LANE_TAB) await candidate.close().catch(() => {})
+          if (await tabNameOf(candidate) === `${LANE_TAB_PREFIX}${lane}`) { await candidate.close().catch(() => {}); tabClosed = true }
         }
-      } finally { await browser.close().catch(() => {}) }
+      }
     } catch (error) { await log(`shared unload found no browser: ${error.message}`) }
-    return { ok: true, op: 'unload', state: 'unloaded', cookiesSynced: null }
+    return { ok: true, op: 'unload', state: 'unloaded', sharedBrowser: true, tabClosed, cookiesSynced: null }
   }
   const { browser, context } = await connect()
   let synced = null
@@ -945,21 +1113,51 @@ async function mode(request) {
 
 /* ---------------------------------------------------------------- dispatch */
 
-const CONCURRENT = new Set(['status', 'conversation', 'threads', 'read', 'ping'])
+/**
+ * Lane-wide sweep: the host's list of live lanes is authoritative, and every
+ * other lane tab in this browser is closed. Never starts Chrome.
+ */
+async function sweepLanes(request) {
+  if (!LANE_SHARED) return { ok: true, op: 'sweep-lanes', closed: 0, sharedBrowser: false }
+  if (!Array.isArray(request.keep)) return { ok: false, op: 'sweep-lanes', error: 'keep must be a list of lane ids' }
+  if (!(await portAnswers(CONNECT_PORT))) return { ok: true, op: 'sweep-lanes', closed: 0, browser: 'down' }
+  const { context } = await sharedConnection()
+  const closed = await sweepLaneTabs(context, { keep: new Set(request.keep.map(String)) })
+  return { ok: true, op: 'sweep-lanes', closed, lanes: [...LANE_PAGES.keys()] }
+}
+
+/**
+ * Ops that run at once instead of on their lane's chain. A conversation read
+ * that may NAVIGATE (`open: true`) is not one of them: it moves its lane's tab,
+ * so it waits behind that lane's own send.
+ */
+const CONCURRENT = new Set(['status', 'conversation', 'threads', 'read', 'ping', 'sweep-lanes'])
+const isConcurrent = request => CONCURRENT.has(request.op) && !(request.op === 'conversation' && request.open === true)
 const handlers = {
   ping: async () => ({ ok: true, op: 'ping' }),
   warm, send, status, conversation, threads, read, use, recover, unload, mode,
+  'sweep-lanes': sweepLanes,
 }
 
+/**
+ * One serial chain per LANE, not per process: the process serves every
+ * inputter's tab, so two writers never wait for each other, while one writer's
+ * mutations still never interleave. Every request runs inside its lane's
+ * context, so everything below resolves to the right tab.
+ */
 function createDispatcher({ run, emit }) {
-  let chain = Promise.resolve()
+  const chains = new Map()
   return (request, id) => {
-    const execute = () => run(request).then(
+    const lane = typeof request?.lane === 'string' ? request.lane : ''
+    const execute = () => LANE_CTX.run(lane, () => run(request)).then(
       result => { emit({ ...result, id }); return result },
       error => { emit({ ok: false, op: request.op, id, error: error.message }); return null },
     )
-    if (CONCURRENT.has(request.op)) { void execute(); return }
-    chain = chain.then(execute, execute).then(() => undefined)
+    if (isConcurrent(request)) { void execute(); return }
+    const next = (chains.get(lane) ?? Promise.resolve()).then(execute, execute).then(() => undefined)
+    chains.set(lane, next)
+    // Forget a drained chain so a lane that is gone does not keep an entry.
+    void next.then(() => { if (chains.get(lane) === next) chains.delete(lane) })
   }
 }
 

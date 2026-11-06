@@ -1173,15 +1173,6 @@ async function openOwnChrome({ visible = true } = {}) {
   throw new Error('Chrome did not open the debugging port')
 }
 
-/**
- * This lane's tab in the shared browser, created on first use.
- *
- * Lanes are told apart by `window.name`, not by tab order or URL: the operator's
- * own tab is in the same window and must never receive a lane's text. A fresh
- * tab is named only AFTER it has landed on chatgpt.com, because Chrome clears
- * `window.name` on a cross-site navigation and the name has to survive the first
- * load; same-site navigation and reload keep it.
- */
 /** Keep this lane's lease fresh: a tab whose lease ages out is swept. */
 async function touchLaneLease(id) {
   const file = path.join(LANE_LEASE_DIR, `${id}.json`)
@@ -1191,67 +1182,152 @@ async function touchLaneLease(id) {
   if (!refreshed) await fs.writeFile(file, JSON.stringify({ pid: process.pid, at: now.toISOString() })).catch(() => {})
 }
 
-let SWEPT_LANE_TABS = false
-
 /**
- * Close lane tabs whose owners are gone.
+ * Each lane's tab, by lane id, as this process opened or adopted it.
  *
- * Runs once per child, at tab creation, because that is the moment a new tab is
- * about to exist and every live lane is holding a fresh lease. A lane opens and
- * closes rarely; a sweep on every connect would be work for nothing.
+ * One process serves every inputter, so finding a lane's tab by asking every
+ * page for its `window.name` on every op was N evaluates per op - and an
+ * evaluate against a tab that is loading or starved (ERR_INSUFFICIENT_RESOURCES
+ * was live on 2026-11-06) is exactly what pushed a read past its deadline. The
+ * Page object is the identity; the name is only how a tab is recognised after a
+ * driver restart.
  */
-async function sweepOrphanLaneTabs(context) {
-  if (SWEPT_LANE_TABS) return 0
-  SWEPT_LANE_TABS = true
-  // No lease directory means no lease has ever been taken, so every lane tab
-  // that exists is an orphan - not a reason to skip the sweep.
+const LANE_PAGES = new Map()
+/** When each lane last asked for its tab. An open in flight is never swept. */
+const LANE_SEEN = new Map()
+const LANE_SEEN_GRACE_MS = 60_000
+/** How often a lane open may run the age-based sweep (the host sweeps by list). */
+const LANE_SWEEP_EVERY_MS = 60_000
+let LANE_SWEPT_AT = 0
+
+/** A tab's name, bounded: a hung renderer must not hold the caller. */
+async function tabNameOf(page) {
+  try { return String(await cdpTimed(page.evaluate(() => window.name), 3_000) || '') } catch { return '' }
+}
+
+/** The lane a page belongs to, from this process's own map first. */
+async function laneIdOfPage(page) {
+  for (const [id, known] of LANE_PAGES) if (known === page) return id
+  const name = await tabNameOf(page)
+  return name.startsWith(LANE_TAB_PREFIX) ? name.slice(LANE_TAB_PREFIX.length) : null
+}
+
+/** Forget everything this process kept for one lane. */
+function forgetLane(id) {
+  LANE_PAGES.delete(id)
+  LANE_SEEN.delete(id)
+  ACTIVE_THREADS.delete(id)
+  PUSHED.delete(id)
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+}
+
+/** Every lease on disk: id, age, and the pid that wrote it. */
+async function readLeases() {
   let names = []
   try { names = await fs.readdir(LANE_LEASE_DIR) } catch { names = [] }
-  const live = new Set()
-  const now = Date.now()
+  const leases = new Map()
   for (const name of names) {
     if (!name.endsWith('.json')) continue
     const file = path.join(LANE_LEASE_DIR, name)
     const stat = await fs.stat(file).catch(() => null)
     if (!stat) continue
-    if (now - stat.mtimeMs > LANE_LEASE_STALE_MS) { await fs.rm(file, { force: true }).catch(() => {}); continue }
-    live.add(name.slice(0, -'.json'.length))
+    let pid = null
+    try { pid = Number(JSON.parse(await fs.readFile(file, 'utf8'))?.pid) || null } catch { /* unreadable: no owner */ }
+    leases.set(name.slice(0, -'.json'.length), { file, ageMs: Date.now() - stat.mtimeMs, pid })
+  }
+  return leases
+}
+
+/**
+ * Close lane tabs (and leases) no live lane owns.
+ *
+ * Two modes. With `keep` - the host lane manager's own list, sent as the
+ * `sweep-lanes` op - the list is authoritative: this process is the only
+ * driver of the browser, so any other lane tab is a ghost from a dead writer,
+ * a crashed close or an earlier host, whatever its lease says (a tab's lease
+ * timer keeps a dead lane's lease fresh for as long as the tab lives, which is
+ * why the age rule alone never cleaned them). Without `keep` - a per-lane
+ * process with no list - the age rule applies. In both, a lane that asked for
+ * its tab in the last minute is spared (its open may be racing the list), and
+ * so is a fresh lease written by a DIFFERENT live process.
+ */
+async function sweepLaneTabs(context, { keep = null } = {}) {
+  LANE_SWEPT_AT = Date.now()
+  const leases = await readLeases()
+  const live = new Set(keep ? [...keep] : [...LANE_PAGES.keys()])
+  for (const [id, at] of LANE_SEEN) if (Date.now() - at < LANE_SEEN_GRACE_MS) live.add(id)
+  for (const [id, lease] of leases) {
+    if (lease.ageMs > LANE_LEASE_STALE_MS) continue
+    const foreign = lease.pid && lease.pid !== process.pid && pidAlive(lease.pid)
+    if (foreign || !keep) live.add(id)
   }
   let closed = 0
   for (const page of context.pages()) {
-    const name = String(await page.evaluate(() => window.name).catch(() => '') || '')
-    if (!name.startsWith(LANE_TAB_PREFIX)) continue
-    if (live.has(name.slice(LANE_TAB_PREFIX.length))) continue
+    const id = await laneIdOfPage(page)
+    if (id === null || live.has(id)) continue
     await page.close().catch(() => {})
+    forgetLane(id)
     closed += 1
   }
-  if (closed) await log(`shared lane ${LANE_ID || '(unnamed)'}: closed ${closed} orphaned lane tab(s)`)
+  for (const [id, lease] of leases) {
+    if (live.has(id)) continue
+    await fs.rm(lease.file, { force: true }).catch(() => {})
+  }
+  for (const id of [...LANE_PAGES.keys()]) if (!live.has(id)) forgetLane(id)
+  if (closed) await log(`lane sweep: closed ${closed} lane tab(s) no live lane owns`)
   return closed
 }
 
+/**
+ * This lane's tab in the shared browser, created on first use and then kept.
+ *
+ * Lanes are told apart by `window.name`, not by tab order or URL: the operator's
+ * own tab is in the same window and must never receive a lane's text. A fresh
+ * tab is named only AFTER it has landed on chatgpt.com, because Chrome clears
+ * `window.name` on a cross-site navigation and the name has to survive the first
+ * load; same-site navigation and reload keep it.
+ *
+ * It does NOT bring the tab to the front: a read must not steal the window from
+ * another lane that is typing. The send path takes the focus lock and brings
+ * its own tab forward for exactly the compose-and-click window.
+ */
 async function lanePage(context) {
   // The lane comes from the REQUEST when one process serves several inputters,
   // and from the env for the one-lane-per-process shape.
   const lane = laneOf()
   // A lane without an id still gets a name of its own rather than sharing one:
   // two lanes on the same name would type into each other's tab.
-  const wanted = lane ? `${LANE_TAB_PREFIX}${lane}` : `${LANE_TAB_PREFIX}pid-${process.pid}`
-  const leaseId = wanted.slice(LANE_TAB_PREFIX.length)
-  await touchLaneLease(leaseId)
-  for (const candidate of context.pages()) {
-    const name = await candidate.evaluate(() => window.name).catch(() => '')
-    if (name === wanted) {
-      await candidate.bringToFront().catch(() => {})
-      keepLeaseFresh(candidate, leaseId)
-      await sweepOrphanLaneTabs(context)
-      return candidate
+  const leaseId = lane || `pid-${process.pid}`
+  const wanted = `${LANE_TAB_PREFIX}${leaseId}`
+  LANE_SEEN.set(leaseId, Date.now())
+  let page = LANE_PAGES.get(leaseId)
+  if (page && page.isClosed()) { LANE_PAGES.delete(leaseId); page = undefined }
+  if (page) {
+    await ensureLaneName(page, wanted)
+  } else {
+    await touchLaneLease(leaseId)
+    // After a driver restart the tab outlives the process: adopt it by name.
+    const owned = new Set(LANE_PAGES.values())
+    for (const candidate of context.pages()) {
+      if (owned.has(candidate)) continue
+      if (await tabNameOf(candidate) === wanted) { page = candidate; break }
     }
+    if (!page) {
+      page = await context.newPage()
+      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+      await ensureLaneName(page, wanted)
+      await log(`lane tab opened for ${leaseId}`)
+    }
+    const mine = page
+    LANE_PAGES.set(leaseId, mine)
+    mine.once('close', () => { if (LANE_PAGES.get(leaseId) === mine) LANE_PAGES.delete(leaseId) })
   }
-  const page = await context.newPage()
-  await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
-  await ensureLaneName(page, wanted)
   keepLeaseFresh(page, leaseId)
-  await sweepOrphanLaneTabs(context)
+  if (Date.now() - LANE_SWEPT_AT > LANE_SWEEP_EVERY_MS) await sweepLaneTabs(context).catch(() => 0)
   return page
 }
 
@@ -1281,9 +1357,8 @@ function keepLeaseFresh(page, leaseId) {
 async function ensureLaneName(page, wanted = LANE_TAB) {
   if (!LANE_SHARED || !wanted) return
   if (!isChatGPTUrl(page.url())) return
-  const name = await page.evaluate(() => window.name).catch(() => '')
-  if (name === wanted) return
-  await page.evaluate(value => { window.name = value }, wanted).catch(() => {})
+  if (await tabNameOf(page) === wanted) return
+  await cdpTimed(page.evaluate(value => { window.name = value }, wanted), 3_000).catch(() => {})
 }
 
 /** Close only this lane's tab. The master window, and every other lane, stays. */
@@ -1296,14 +1371,19 @@ async function closeLaneTab() {
   const wanted = `${LANE_TAB_PREFIX}${lane}`
   // Drop the lease first: once the tab is gone the sweep has nothing to clean,
   // and if the close fails the stale lease lets the next lane clean it.
-  await fs.rm(path.join(LANE_LEASE_DIR, `${wanted.slice(LANE_TAB_PREFIX.length)}.json`), { force: true }).catch(() => {})
+  await fs.rm(path.join(LANE_LEASE_DIR, `${lane}.json`), { force: true }).catch(() => {})
+  const known = LANE_PAGES.get(lane)
+  forgetLane(lane)
+  if (known && !known.isClosed()) {
+    await known.close().catch(() => {})
+    return { tabClosed: true }
+  }
   const browser = await connectOwned()
   try {
     const context = browser.contexts()[0]
     if (!context) return { tabClosed: false }
     for (const page of context.pages()) {
-      const name = await page.evaluate(() => window.name).catch(() => '')
-      if (name === wanted) {
+      if (await tabNameOf(page) === wanted) {
         await page.close().catch(() => {})
         return { tabClosed: true }
       }
@@ -1365,10 +1445,11 @@ async function connect() {
   }
   // Never adopt a lane's tab as the master's page: a master turn typed into a
   // lane tab collides with that lane's turn. Every shared lane names its tab.
+  const lanePages = new Set(LANE_PAGES.values())
   const pages = []
   for (const candidate of context.pages()) {
-    const name = await candidate.evaluate(() => window.name).catch(() => '')
-    if (String(name || '').startsWith(LANE_TAB_PREFIX)) continue
+    if (lanePages.has(candidate)) continue
+    if ((await tabNameOf(candidate)).startsWith(LANE_TAB_PREFIX)) continue
     pages.push(candidate)
   }
   // Prefer the tab the caller adopted: a bridge can point at a thread the user
@@ -4215,6 +4296,20 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
         const applied = await setModelState(page, { model, effort })
         await log(`phase ${phaseName} model ${applied?.model ?? model ?? '?'}/${applied?.effort ?? effort ?? '?'}`)
       } catch (error) {
+        // No picker is USUALLY a page that never rendered: a conversation shell
+        // with no composer and no messages. That is the page-load fault the
+        // host already knows how to recycle, and repeating the picker on the
+        // same dead window can only fail the same way (measured live
+        // 2026-11-06: refused, queued, re-tried, refused - until the sender gave
+        // up). Anything else stays a configuration refusal.
+        const rendered = await cdpTimed(page.evaluate(() => ({
+          messages: document.querySelectorAll('[data-message-author-role]').length,
+          composer: Boolean(document.querySelector('#prompt-textarea, [contenteditable="true"]')),
+        })), 3_000).catch(() => ({ messages: 0, composer: false }))
+        if (!rendered.composer && rendered.messages === 0) {
+          const threadId = threadOf(page.url())
+          throw new TurnError(`the page could not render ${threadId ? `thread ${threadId}` : 'the conversation'}: no composer and no messages, so the model picker never appeared; nothing was typed`, { reason: 'page-load-error', ...(threadId ? { threadId } : {}) })
+        }
         throw new TurnError(`the model picker would not select ${wantedLabel} (${String(error?.message ?? error).slice(0, 140)}); nothing was typed`, { reason: 'model-unavailable' })
       }
     }
@@ -4629,9 +4724,19 @@ function noteTreeRead(line) {
 }
 
 async function backendGet(path, timeoutMs = 30_000) {
-  if (!(await cdpUp())) return { ok: false, status: 0, error: 'chrome is not running' }
+  if (!(await cdpUp())) return { ok: false, status: 0, reason: 'not-open', error: 'chrome is not running' }
   const { browser, page } = await connect()
-  try { return await backendGetOn(page, path, timeoutMs) } finally { release(browser) }
+  try {
+    // A backend read is a fetch inside chatgpt.com's own origin: it touches no
+    // composer and no DOM, so ANY chatgpt.com tab can serve it, lane or not.
+    // Prefer the master; fall back to a lane's tab rather than declaring the
+    // read impossible when the operator's tab happens to be closed.
+    const origin = isChatGPTUrl(page.url()) ? page : browser.contexts()[0]?.pages().find(candidate => isChatGPTUrl(candidate.url()))
+    // No chatgpt.com tab at all: "no evidence yet", not a page error, so the
+    // host neither counts a failed read nor backs the observation pass off.
+    if (!origin) return { ok: false, status: 0, reason: 'not-open', error: 'no chatgpt.com tab is open' }
+    return await backendGetOn(origin, path, timeoutMs)
+  } finally { release(browser) }
 }
 
 /**
@@ -4642,12 +4747,21 @@ async function backendGet(path, timeoutMs = 30_000) {
  * and one retry, and only then is it reported. Reads are idempotent; nothing
  * that can post a message is retried this way.
  */
-async function backendGetRetry(path, timeoutMs = 30_000) {
-  const first = await backendGet(path, timeoutMs)
+async function backendGetRetry(path, totalMs = BACKEND_READ_BUDGET_MS) {
+  // The whole read, retry included, fits inside the host's own read deadline
+  // (45 s). Two 30 s attempts used to outlast it, so a slow-but-alive page was
+  // reported by the HOST as "the driver timed out" - no evidence at all -
+  // instead of by the driver as a page that did not answer in time.
+  const startedAt = Date.now()
+  const first = await backendGet(path, Math.round(totalMs * 0.6))
   if (first.reason !== 'timeout') return first
-  await log('the page did not answer a backend read; reconnecting once')
-  return await backendGet(path, timeoutMs)
+  const left = totalMs - (Date.now() - startedAt)
+  if (left < 3_000) return first
+  await log(`the page did not answer a backend read in ${Math.round((Date.now() - startedAt) / 1000)}s; asking once more`)
+  return await backendGet(path, left)
 }
+/** One backend read's whole budget, kept under the host's 45 s read deadline. */
+const BACKEND_READ_BUDGET_MS = 38_000
 
 // --------------------------------------------------------------- turn status
 //
@@ -5385,7 +5499,9 @@ function startEventChannel(emit, claimed = () => false) {
  * path. `ping` touches no page at all but is not on the host's poll path either,
  * so it stays where it is rather than widening this change.
  */
-const CONCURRENT_READ_OPS = new Set(['conversation', 'conversations', 'threads', 'read'])
+// `sweep-lanes` is not a read, but it touches only tabs no live lane owns, so
+// it must not wait behind the master tab's own chain (a twenty-minute turn).
+const CONCURRENT_READ_OPS = new Set(['conversation', 'conversations', 'threads', 'read', 'sweep-lanes'])
 function isConcurrentRead(request) {
   if (CONCURRENT_READ_OPS.has(request.op)) return true
   return request.op === 'status' && typeof request.threadId === 'string' && request.threadId.length > 0
@@ -5781,7 +5897,8 @@ async function serve() {
     if (op === 'conversations') {
       const offset = Math.max(0, Math.floor(Number(request.offset ?? 0)) || 0)
       const limit = Math.min(100, Math.max(1, Math.floor(Number(request.limit ?? 100)) || 100))
-      const read = await backendGetRetry(`/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`)
+      // The host gives the list 30 s, so the read (retry included) must fit.
+      const read = await backendGetRetry(`/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`, 25_000)
       if (!read.ok) return { ok: false, op, status: read.status, error: read.error }
       const items = (read.body?.items ?? []).map(item => ({ id: item.id, title: item.title ?? '', update_time: item.update_time ?? null }))
       return { ok: true, op, offset, limit, items }
@@ -5820,6 +5937,20 @@ async function serve() {
       await doQuit()
       setActiveThread(null)
       return { ok: true, op, state: 'unloaded', cookiesSynced: 0, cookieSync: 'not a lane' }
+    }
+    if (op === 'sweep-lanes') {
+      // The host's lane list is the truth about which writers are live; every
+      // other lane tab in this browser is a ghost. Never starts Chrome.
+      if (!LANE_SHARED) return { ok: true, op, closed: 0, sharedBrowser: false }
+      if (!Array.isArray(request.keep)) return { ok: false, op, error: 'keep must be a list of lane ids' }
+      if (!(await cdpUp(CONNECT_PORT))) return { ok: true, op, closed: 0, browser: 'down' }
+      const browser = await connectOwned()
+      try {
+        const context = browser.contexts()[0]
+        if (!context) return { ok: true, op, closed: 0 }
+        const closed = await sweepLaneTabs(context, { keep: new Set(request.keep.map(String)) })
+        return { ok: true, op, closed, lanes: [...LANE_PAGES.keys()] }
+      } finally { release(browser) }
     }
     return { ok: false, op, error: `unknown op ${op ?? '(missing)'}` }
   }

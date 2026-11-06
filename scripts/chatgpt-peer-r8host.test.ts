@@ -266,7 +266,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number; pendingWatchGapsMs?: number[] } = {}): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number; pendingWatchGapsMs?: number[]; pendingWatchTailMs?: number } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -285,6 +285,7 @@ async function startHost(dir: string, driver: FakeDriver, options: { turnTimeout
     turnTimeoutMs: options.turnTimeoutMs ?? 900,
     waitPollMs: 20,
     pendingWatchGapsMs: options.pendingWatchGapsMs,
+    pendingWatchTailMs: options.pendingWatchTailMs,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -2093,7 +2094,7 @@ describe('pending-watch: a posted turn is delivered within seconds, not at recon
     }
   })
 
-  test('the bounded cadence never exceeds seven extra observations for one turn', async () => {
+  test('the ladder is bounded, then a slow tail keeps watching until the turn settles', async () => {
     const { dir, cleanup } = await scratch()
     const alpha = await primedBridge()
     await seedHost(dir, [alpha])
@@ -2102,21 +2103,23 @@ describe('pending-watch: a posted turn is delivered within seconds, not at recon
     // A tiny injected cadence (each gap > the 300 ms debounce, so each follow-up
     // is a distinct pass) exercises the whole schedule without sleeping 86 s.
     const gaps = [400, 400, 400, 400, 400, 400, 400]
-    const host = await startHost(dir, driver, { pendingWatchGapsMs: gaps })
+    const host = await startHost(dir, driver, { pendingWatchGapsMs: gaps, pendingWatchTailMs: 400 })
     try {
       const live = internals(host).bridges.get(alpha.sessionId)!
       postsyntheticPending(live, randomUUID())
       const readsBefore = driver.conversationReads
       internals(host).armPendingWatch(live)
-      // The schedule exhausts itself (the turn is never answered); the watcher
-      // must stop rather than run forever.
-      await waitFor(() => (live.pendingWatch === undefined ? true : undefined), 15_000)
-      // Let the last debounced (300 ms) observation run.
-      await new Promise(resolve => setTimeout(resolve, 700))
-      const extras = driver.conversationReads - readsBefore
-      expect(extras).toBeGreaterThanOrEqual(1)
-      expect(extras).toBeLessThanOrEqual(gaps.length)
-      expect(live.pendingWatch).toBeUndefined()
+      // Past the seven rungs the watch keeps going: a turn whose reads were all
+      // throttled must not wait for the reconcile pass (that was the live
+      // 2026-11-06 lost turn). It is still bounded by a slow tail, not a poll.
+      await waitFor(() => (driver.conversationReads - readsBefore >= gaps.length + 2 ? true : undefined), 15_000)
+      expect(live.pendingWatch).toBeDefined()
+      // With the work gone the watch stops: no read after the pending set empties.
+      live.state.pendingTurns = []
+      await waitFor(() => (live.pendingWatch === undefined ? true : undefined), 5_000)
+      const readsAfter = driver.conversationReads
+      await new Promise(resolve => setTimeout(resolve, 900))
+      expect(driver.conversationReads).toBe(readsAfter)
     } finally {
       await host.stop()
       await cleanup()

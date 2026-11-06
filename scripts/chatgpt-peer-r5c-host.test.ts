@@ -51,6 +51,12 @@ class FakeDriver {
   stallFor: ((request: Call) => boolean) | undefined
   readonly fileCalls: { fileId?: string; sandboxPath?: string; outPath?: string }[] = []
   conversationReads = 0
+  /** Every attempt, refused ones included: what the watch cadence is measured on. */
+  conversationAttempts = 0
+  /** Answer the next N conversation reads with a 429, then answer normally. */
+  conversation429 = 0
+  /** How many reads were refused with a 429. */
+  refusedReads = 0
   /** Fail the conversation read, as a page that cannot be read at all. */
   conversationFails = false
   answerFor: ((request: Call) => string | undefined) | undefined
@@ -166,6 +172,12 @@ class FakeDriver {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
     }
     if (op === 'conversation' && this.observable) {
+      this.conversationAttempts++
+      if (this.conversation429 > 0) {
+        this.conversation429--
+        this.refusedReads++
+        return { ok: false, op, status: 429, error: 'too many requests' }
+      }
       if (this.conversationFails) return { ok: false, op, error: 'the page did not answer the read' }
       this.conversationReads++
       const threadId = String(request.threadId ?? '')
@@ -269,7 +281,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number } = {}): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { turnTimeoutMs?: number; pendingWatchGapsMs?: number[]; pendingWatchTailMs?: number; readBackoffBaseMs?: number } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -284,6 +296,9 @@ async function startHost(dir: string, driver: FakeDriver, options: { turnTimeout
     titlesEvery: 0,
     turnTimeoutMs: options.turnTimeoutMs ?? 5_000,
     waitPollMs: 20,
+    pendingWatchGapsMs: options.pendingWatchGapsMs,
+    pendingWatchTailMs: options.pendingWatchTailMs,
+    readBackoffBaseMs: options.readBackoffBaseMs,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -482,6 +497,98 @@ describe('R-LIVE-6: a restart reads the page before re-posting a turn', () => {
         await new Promise(resolve => setTimeout(resolve, 300))
         expect(sender.inbox().length).toBe(1)
         expect(sendCount(driverB)).toBe(1)
+      } finally {
+        await host.stop()
+      }
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a turn from a sender that no longer exists is retired, not replayed', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const sender = await busPeer(dir, 'sender')
+    const driverA = new FakeDriver()
+    driverA.observable = true
+    try {
+      const senderId = sender.peer.sessionId
+      const messageId = await postedThenStopped(dir, driverA, alpha, sender)
+      // The sender exits and its registration goes with it, which is what a
+      // synthetic sender leaves behind. Nobody is left to receive a reply, so a
+      // restart must neither read the page for it nor type it again.
+      await sender.close()
+      await rm(join(sessionsDir(dir), `${senderId}.json`), { force: true })
+
+      const driverB = new FakeDriver()
+      driverB.observable = true
+      const host = await startHost(dir, driverB)
+      try {
+        await waitFor(async () => {
+          const bridge = await readBridge(dir, alpha.sessionId)
+          return bridge.pendingTurns.some(turn => turn.messageId === messageId) ? undefined : true
+        }, 15_000)
+        await new Promise(resolve => setTimeout(resolve, 300))
+        // Nothing was typed into the page for a turn nobody can be paid for.
+        expect(sendCount(driverB)).toBe(0)
+      } finally {
+        await host.stop()
+      }
+      // The retirement is recorded, so an operator can see why a turn was not
+      // answered rather than finding it silently missing.
+      const state = JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')) as { audit: { result: string }[] }
+      expect(state.audit.some(entry => entry.result.includes('the sender is gone from the bus; not replayed'))).toBe(true)
+    } finally {
+      await sender.close()
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a posted turn survives a 429 storm: the watch waits the window out, then delivers', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const sender = await busPeer(dir, 'sender')
+    try {
+      // The page takes the text and keeps generating, so the send ends owed.
+      const text = 'ask under a storm'
+      const driver = new FakeDriver()
+      driver.observable = true
+      driver.stallFor = () => true
+      // The first reads of the turn are throttled, which is the live 2026-11-06
+      // shape: a posted turn, a 429 window, and the watch's ladder spent inside
+      // that window.
+      driver.conversation429 = 2
+      const host = await startHost(dir, driver, {
+        pendingWatchGapsMs: [10, 10],
+        pendingWatchTailMs: 20,
+        readBackoffBaseMs: 40,
+      })
+      try {
+        await sender.send(alpha.sessionId, text, text, undefined, 'inquiry', true)
+        await waitFor(async () => {
+          const bridge = await readBridge(dir, alpha.sessionId)
+          return bridge.pendingTurns.some(turn => turn.postedAt !== null) ? true : undefined
+        }, 10_000)
+        // The answer arrives while the reads are still being refused. The two
+        // ladder rungs (20 ms) are spent before a refused read can succeed, so
+        // only the slow tail can deliver this turn; before the tail existed it
+        // waited for the reconcile pass, up to five minutes.
+        driver.stallFor = undefined
+        driver.pageNode(THREAD_A, 'the answer after the storm')
+        await waitFor(() => (sender.inbox().length >= 1 ? true : undefined), 15_000)
+        expect(sender.inbox().length).toBe(1)
+        expect(String((sender.inbox()[0]!.message as unknown as { text: string }).text)).toContain('the answer after the storm')
+        // Every read that was allowed to happen either got the 429 or delivered
+        // the turn; a tick inside the window spends no read at all, and one
+        // delivery means the extra attempts stayed bounded.
+        expect(driver.refusedReads).toBe(2)
+        expect(driver.conversationAttempts).toBeLessThanOrEqual(6)
+        // An empty render is not a reason to reload a page that reads over the
+        // backend API - a reload is another full page load against the account.
+        expect(driver.calls.filter(call => String(call.op) === 'reload').length).toBe(0)
       } finally {
         await host.stop()
       }
