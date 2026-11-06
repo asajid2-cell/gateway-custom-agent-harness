@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  MISTRAL_MAX_IMAGES,
   MISTRAL_ROUTES,
   anthropicToMistralChat,
+  capMistralImages,
   mistralEndpoint,
   mistralGatewayId,
   mistralHeaders,
@@ -149,6 +151,76 @@ test('assistant reasoning is echoed as a thinking block, never reasoning_content
   assert.equal('reasoning_content' in assistant, false)
   assert.equal(request.model, 'deepseek-v4-1-flash-1017')
   assert.equal(request.reasoning_effort, 'high')
+})
+
+test('a request with more than 20 images drops the oldest, not the newest', () => {
+  // Probed live 2026-11-06: the API answers 20 images, and 21 images with
+  // HTTP 503 "Service unavailable" at any payload size. A harness history that
+  // accumulates screenshots therefore bricks the route once it holds 21 - the
+  // condition has to be handled at the translation boundary.
+  assert.equal(MISTRAL_MAX_IMAGES, 20)
+  const image = () => ({
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+  })
+  const messages = [{ role: 'user', content: [image()] }]
+  for (let i = 1; i < 21; i += 1) {
+    messages.push({ role: 'user', content: [image()] })
+    messages[0].content.push({ type: 'text', text: `turn ${i}` })
+  }
+  const request = anthropicToMistralChat(
+    { messages, max_tokens: 16, stream: false },
+    'deepseek-v4-1-flash-1017',
+    '',
+  )
+  const images = request.messages.flatMap(message =>
+    Array.isArray(message.content)
+      ? message.content.filter(block => block.type === 'image_url')
+      : [],
+  )
+  assert.equal(images.length, 20)
+  // The first turn's image is the one that became a marker; the rest of its
+  // content, and every later image, is untouched.
+  const first = request.messages[1].content
+  assert.equal(first[0].type, 'text')
+  assert.match(first[0].text, /at most 20 images/)
+  assert.equal(first[1].text, 'turn 1')
+  assert.equal(request.messages.at(-1).content[0].type, 'image_url')
+})
+
+test('exactly 20 images are left alone', () => {
+  const request = {
+    messages: [{
+      role: 'user',
+      content: Array.from({ length: 20 }, () => ({
+        type: 'image_url',
+        image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
+      })),
+    }],
+  }
+  assert.equal(capMistralImages(request), request)
+})
+
+test('an image inside a tool result counts toward the cap', () => {
+  // Tool-result images are hoisted into their own user message by the shared
+  // converter, so the cap has to run after conversion, where they are
+  // ordinary image_url blocks.
+  const imageBlock = {
+    type: 'tool_result',
+    tool_use_id: 't',
+    content: [{
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+    }],
+  }
+  const messages = [{ role: 'assistant', content: [{ type: 'tool_use', id: 't', name: 'Read', input: {} }] }]
+  messages.push({ role: 'user', content: [imageBlock] })
+  for (let i = 0; i < 20; i += 1) messages.push({ role: 'user', content: [imageBlock] })
+  const request = anthropicToMistralChat({ messages, max_tokens: 16, stream: false }, 'deepseek-v4-1-flash-1017', '')
+  const count = request.messages.flatMap(message =>
+    Array.isArray(message.content) ? message.content.filter(block => block.type === 'image_url') : [],
+  ).length
+  assert.equal(count, 20)
 })
 
 test('Mistral multi-key pool rotates and promotes a key added mid-cycle', () => {

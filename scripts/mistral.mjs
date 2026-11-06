@@ -91,11 +91,53 @@ export function mistralHeaders(apiKey, stream = false) {
  * input, so thinking is re-sent as a `thinking` content block instead.
  */
 export function anthropicToMistralChat(body, upstreamModel, querySource) {
-  return anthropicToOpenCodeChat(
-    body,
-    upstreamModel,
-    querySource,
-    {},
-    { assistantReasoning: 'content-blocks' },
+  return capMistralImages(
+    anthropicToOpenCodeChat(
+      body,
+      upstreamModel,
+      querySource,
+      {},
+      { assistantReasoning: 'content-blocks' },
+    ),
   )
+}
+
+/**
+ * Mistral accepts at most 20 images in one chat request. The 21st is not
+ * rejected with a validation error: the API answers HTTP 503 "Service
+ * unavailable" (probed live 2026-11-06: 20 images pass, 21 fail, at any
+ * payload size or placement). That is fatal for a harness whose history
+ * accumulates screenshots - once a conversation holds 21, every later turn
+ * re-sends all of them and the route is permanently unusable.
+ *
+ * The newest images are the ones the turn is about, so older ones become a
+ * text marker. The block stays in place, which keeps message order and role
+ * alternation exactly as the provider would otherwise receive them.
+ */
+export const MISTRAL_MAX_IMAGES = 20
+
+export function capMistralImages(request, limit = MISTRAL_MAX_IMAGES) {
+  let total = 0
+  for (const message of request.messages || []) {
+    if (!Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (block?.type === 'image_url') total += 1
+    }
+  }
+  if (total <= limit) return request
+
+  let drop = total - limit
+  const messages = request.messages.map(message => {
+    if (drop <= 0 || !Array.isArray(message.content)) return message
+    const content = message.content.map(block => {
+      if (block?.type !== 'image_url' || drop <= 0) return block
+      drop -= 1
+      return {
+        type: 'text',
+        text: `[image omitted: Mistral accepts at most ${limit} images per request]`,
+      }
+    })
+    return { ...message, content }
+  })
+  return { ...request, messages }
 }
