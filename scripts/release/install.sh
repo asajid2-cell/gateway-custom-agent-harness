@@ -4,6 +4,9 @@
 # Two ways to run it:
 #   ./install.sh                 interactive: asks where and what command
 #   curl -fsSL <url> | sh        unattended with the defaults
+#   curl -fsSL <url> | GATEWAY_BASE_URL=<mirror> sh
+#                                the same, with the archive and SHA256SUMS
+#                                fetched from a mirror (a site directory)
 #
 # Options (all optional; on a TTY you are asked where and for the command):
 #   --prefix DIR    install directory   (default: /opt/gateway as root,
@@ -47,7 +50,7 @@ while [ $# -gt 0 ]; do
     --no-path) ADD_PATH=no; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --archive) ARCHIVE="$2"; ARCHIVE_EXPLICIT=1; shift 2 ;;
-    --help|-h) sed -n '2,19p' "$0"; exit 0 ;;
+    --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
 done
@@ -231,15 +234,27 @@ TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
 
+BASE="${GATEWAY_BASE_URL:-}"
+BASE="${BASE%/}"
+
 if [ -z "$ARCHIVE" ]; then
   if [ -z "$VERSION" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-      | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
-    [ -n "$VERSION" ] || die "could not resolve the latest release; set GATEWAY_VERSION"
+    if [ -n "$BASE" ]; then
+      # A mirror publishes the version it is serving next to the artifacts.
+      VERSION="$(curl -fsSL "$BASE/version" 2>/dev/null | head -n 1 | tr -d '\r')"
+    else
+      VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
+    fi
+    [ -n "$VERSION" ] || die "could not resolve the release version; set GATEWAY_VERSION or GATEWAY_BASE_URL"
   fi
   NAME="gateway-$VERSION-$OS-$ARCH.tar.gz"
   ARCHIVE="$TMP/$NAME"
-  URL="https://github.com/$REPO/releases/download/v$VERSION/$NAME"
+  if [ -n "$BASE" ]; then
+    URL="$BASE/$NAME"
+  else
+    URL="https://github.com/$REPO/releases/download/v$VERSION/$NAME"
+  fi
   echo "Downloading $URL"
   if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$ARCHIVE"
   elif command -v wget >/dev/null 2>&1; then wget -q "$URL" -O "$ARCHIVE"
@@ -273,7 +288,11 @@ for sums in "$HERE_DIR/SHA256SUMS" "$ARCHIVE.sha256"; do
   if [ -n "$EXPECTED" ]; then break; fi
 done
 if [ -z "$EXPECTED" ] && [ -n "$URL" ]; then
-  SUMS_URL="https://github.com/$REPO/releases/download/v$VERSION/SHA256SUMS"
+  if [ -n "$BASE" ]; then
+    SUMS_URL="$BASE/SHA256SUMS"
+  else
+    SUMS_URL="https://github.com/$REPO/releases/download/v$VERSION/SHA256SUMS"
+  fi
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$SUMS_URL" -o "$TMP/SHA256SUMS" 2>/dev/null || true
   elif command -v wget >/dev/null 2>&1; then
