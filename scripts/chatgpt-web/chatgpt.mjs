@@ -1262,12 +1262,53 @@ async function closeLaneTab() {
   }
 }
 
+/**
+ * Record what the page itself says when it fails.
+ *
+ * The "couldn't load messages" fault is a CLIENT render failure: the
+ * conversation API answers 200 with the messages the page refuses to paint
+ * (researched 2026-11-05; no public root cause). The evidence that separates
+ * that from a genuinely broken conversation is the page's own: an uncaught
+ * exception, a console error, or a failed conversation request. Those are
+ * written to stderr as well as the driver log because stderr is the durable
+ * trail - the host keeps it, while a lane's `driver.log` dies with the lane.
+ * Capped per page so a noisy app cannot flood either log.
+ */
+const WATCHED_PAGES = new WeakSet()
+
+function watchPageErrors(page) {
+  if (WATCHED_PAGES.has(page)) return
+  WATCHED_PAGES.add(page)
+  let logged = 0
+  const note = line => {
+    if (logged >= 30) return
+    logged += 1
+    const clean = String(line).replace(/\s+/g, ' ').slice(0, 300)
+    process.stderr.write(`[page] ${clean}\n`)
+    void log(`page: ${clean}`)
+  }
+  page.on('pageerror', error => note(`uncaught: ${error?.message ?? error}`))
+  page.on('console', message => {
+    try { if (message.type() === 'error') note(`console: ${message.text()}`) } catch { /* page gone */ }
+  })
+  page.on('requestfailed', request => {
+    try {
+      if (!/\/backend-api\/(?:f\/)?conversation/.test(request.url())) return
+      note(`conversation request failed: ${request.failure()?.errorText ?? 'unknown'}`)
+    } catch { /* page gone */ }
+  })
+}
+
 async function connect() {
   const browser = await connectOwned()
   const context = browser.contexts()[0] ?? await browser.newContext()
   // In a shared browser every lane is a named tab of the master window; the
   // operator's own tab is never selected, whatever ACTIVE_THREAD says.
-  if (LANE_SHARED) return { browser, context, page: await lanePage(context) }
+  if (LANE_SHARED) {
+    const page = await lanePage(context)
+    watchPageErrors(page)
+    return { browser, context, page }
+  }
   // Never adopt a lane's tab as the master's page: a master turn typed into a
   // lane tab collides with that lane's turn. Every shared lane names its tab.
   const pages = []
@@ -1286,6 +1327,7 @@ async function connect() {
   // "chatgpt.com" is a different origin and must not receive our text.
   if (!page) page = pages.find(p => isChatGPTUrl(p.url()))
   if (!page) page = pages[0] ?? await context.newPage()
+  watchPageErrors(page)
   return { browser, context, page }
 }
 
