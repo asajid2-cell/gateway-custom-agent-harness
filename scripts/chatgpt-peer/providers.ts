@@ -40,6 +40,14 @@ export type Provider = {
   primer: string
   /** The site the master window is signed into. */
   site: string
+  /**
+   * The driver op that selects a model/effort in the page's picker.
+   *
+   * The two drivers were written at different times and name the same
+   * capability differently; the host reads the name from here rather than
+   * guessing or trying both.
+   */
+  modeOp: 'set' | 'mode'
   /** A thread id this provider hands back. */
   threadId: (value: string) => boolean
 }
@@ -72,6 +80,7 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     driver: 'chatgpt.mjs',
     primer: 'primer.md',
     site: 'https://chatgpt.com/',
+    modeOp: 'set',
     threadId: value => UUID.test(value),
   },
   'gemini-web': {
@@ -89,6 +98,7 @@ export const PROVIDERS: Record<ProviderId, Provider> = {
     driver: 'gemini.mjs',
     primer: 'primer-gemini.md',
     site: 'https://gemini.google.com/app',
+    modeOp: 'mode',
     threadId: value => GEMINI_THREAD.test(value),
   },
 }

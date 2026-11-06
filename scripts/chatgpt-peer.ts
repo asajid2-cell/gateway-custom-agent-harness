@@ -169,7 +169,7 @@ const PEER_WORK_ALIASES = new Set(['send', 'ask', 'turn', 'read', 'reply'])
  * lifecycle, read-only diagnostics, the two documented attachment paths (which
  * post only into the bridge's own thread) and page recovery.
  */
-const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'recover', 'thread', 'attachTranscript', 'attachFile'] as const
+const OPERATOR_OPS = ['threads', 'adopt', 'newBridge', 'remove', 'status', 'recover', 'thread', 'mode', 'attachTranscript', 'attachFile'] as const
 
 /**
  * A page turn that outlived the driver's send budget while still running.
@@ -1638,6 +1638,30 @@ export class ChatGptHost {
         const status = await this.statusOf(bridge)
         return this.send(response, 200, { ok: true, op, state: status.state, phase: status.phase, latestAssistant: status.latestAssistant, line: status.line })
       }
+      if (op === 'mode') {
+        const model = typeof body.model === 'string' ? body.model.trim() : ''
+        const effort = typeof body.effort === 'string' ? body.effort.trim() : ''
+        if (!model && !effort) return this.send(response, 400, { ok: false, error: 'mode requires model and/or effort' })
+        const reply = await this.pageWork(() => this.driver.call({ op: this.provider.modeOp, model, effort }, 120_000))
+        if (reply.ok !== true) {
+          return this.send(response, 502, { ok: false, op, error: one(reply.error, 200) || 'the picker refused the selection' })
+        }
+        // Persist what the page ACTUALLY shows, not what was asked for: the
+        // picker can offer a near-name or clamp an unsupported effort, and the
+        // next turn must be sent with the value that is really selected.
+        if (typeof reply.model === 'string' && reply.model) bridge.state.model = reply.model
+        else if (model) bridge.state.model = model
+        if (typeof reply.effort === 'string' && reply.effort) bridge.state.effort = reply.effort
+        else if (effort) bridge.state.effort = effort
+        await this.persistBridgeState(bridge)
+        const line = `model ${bridge.state.model ?? '(unreadable)'}/${bridge.state.effort ?? '(unreadable)'} selected on "${bridge.state.name}"`
+        audit(this.hostState, { op: 'mode', target: bridge.state.name, result: line })
+        await this.persistHostState()
+        return this.send(response, 200, {
+          ok: true, op, model: bridge.state.model, effort: bridge.state.effort,
+          models: Array.isArray(reply.models) ? reply.models : undefined, line,
+        })
+      }
       if (op === 'thread') {
         const line = await this.pageWork(() => this.operatorThread(bridge, body))
         audit(this.hostState, { op: 'thread', target: String(body.threadId ?? body.action ?? ''), result: line })
@@ -1899,8 +1923,19 @@ export class ChatGptHost {
   /** Mint a peer and a brand-new ChatGPT thread for it. */
   private async createNewBridge(body: Record<string, unknown>): Promise<{ sessionId: string; name: string; threadId: string; line: string }> {
     const name = this.uniqueName(typeof body.name === 'string' ? body.name : undefined, null, `${this.provider.fallbackName}-${randomUUID().slice(0, 8)}`)
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    const effort = typeof body.effort === 'string' ? body.effort.trim() : ''
     const bridge = await this.createBridge(newBridgeState({ sessionId: randomUUID(), name }))
     try {
+      // A bridge names its model at birth. Without this the new conversation
+      // inherits whatever the shared picker last held (measured 2026-11-06: a
+      // fresh Gemini bridge came up on another session's model).
+      if (model || effort) {
+        const picked = await this.pageWork(() => this.driver.call({ op: this.provider.modeOp, model, effort }, 120_000))
+        if (picked.ok !== true) throw new Error(one(picked.error, 160) || 'the picker refused the selection')
+        bridge.state.model = typeof picked.model === 'string' && picked.model ? picked.model : (model || null)
+        bridge.state.effort = typeof picked.effort === 'string' && picked.effort ? picked.effort : (effort || null)
+      }
       await this.pageWork(() => this.ensurePrimerAndThread(bridge))
       await this.activateBridge(bridge)
     } catch (error) {
@@ -3865,6 +3900,15 @@ export class ChatGptHost {
     const reply = await this.driver.call({
       op: 'send',
       text,
+      // The bridge's model and effort travel WITH every turn. In a shared
+      // browser the picker is one control for every tab, so recording a choice
+      // and never sending it meant a fresh bridge silently ran on whatever the
+      // last turn in another conversation selected (measured 2026-11-06: a
+      // Gemini bridge came up on Argon because another session held the
+      // picker). The driver applies it under the focus lock, so nothing can
+      // retarget the picker between the selection and the Send click.
+      ...(bridge.state.model ? { model: bridge.state.model } : {}),
+      ...(bridge.state.effort ? { effort: bridge.state.effort } : {}),
       ...(options.threadId ? { threadId: options.threadId } : { newChat: true }),
       ...(options.attach ? { attach: options.attach } : {}),
       // Only send `wait` when the caller asked for it (or explicitly refused it):

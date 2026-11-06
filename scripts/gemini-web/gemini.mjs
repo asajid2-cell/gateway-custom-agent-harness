@@ -10,9 +10,9 @@
 import { spawn } from 'node:child_process'
 import { closeSync, openSync, statSync, unlinkSync, writeSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 
@@ -38,13 +38,24 @@ const EFFORT_WANTED = String(process.env.GEMINI_WEB_EFFORT || process.env.WEB_BR
  */
 const LANE_SHARED = (process.env.GEMINI_LANE_SHARED || process.env.CHATGPT_LANE_SHARED || '0') === '1'
 const CONNECT_PORT = LANE_SHARED && LANE_SOURCE_PORT ? LANE_SOURCE_PORT : PORT
-const LANE_TAB = LANE_ID ? `webbridge-lane:${LANE_ID}` : ''
+const LANE_TAB_PREFIX = 'webbridge-lane:'
+const LANE_TAB = LANE_ID ? `${LANE_TAB_PREFIX}${LANE_ID}` : ''
 const LANE_SHARED_DIR = process.env.GEMINI_LANE_SHARED_DIR || process.env.CHATGPT_LANE_SHARED_DIR || join(STATE_DIR, '..')
 // One tab can be in front at a time, and Playwright's click waits for the
 // target to be hit-testable: two lanes typing at once would race for focus and
 // one click would hang. Focus is held only while typing, not while waiting.
 const FOCUS_LOCK = join(LANE_SHARED_DIR, 'webbridge-focus.lock')
 const FOCUS_STALE_MS = 60_000
+// One browser-level launch/replace at a time. Two lanes that both decide the
+// master is wedged must not kill and relaunch it over each other.
+const LAUNCH_LOCK = join(LANE_SHARED_DIR, 'webbridge-launch.lock')
+const LAUNCH_STALE_MS = 120_000
+// Tab leases, exactly as the ChatGPT driver uses them: a lane names its tab,
+// writes a lease, and whoever opens a lane next sweeps tabs whose lease is
+// gone. Without this a driver killed with its host leaves an orphan tab in the
+// shared master forever (measured 2026-11-06: Gemini had neither).
+const LANE_LEASE_DIR = join(LANE_SHARED_DIR, 'lane-tabs')
+const LANE_LEASE_STALE_MS = 3 * 60_000
 
 async function log(line) {
   try {
@@ -61,23 +72,34 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
  * covers typing only - a lane waits for its answer with the token released, so
  * turns still overlap.
  */
-async function acquireFocus() {
-  const deadline = Date.now() + 90_000
+async function acquireLock(file, waitMs, staleMs) {
+  const deadline = Date.now() + waitMs
   for (;;) {
     try {
-      const fd = openSync(FOCUS_LOCK, 'wx')
+      const fd = openSync(file, 'wx')
       writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`)
       closeSync(fd)
-      return async () => { try { unlinkSync(FOCUS_LOCK) } catch { /* already released */ } }
+      return async () => { try { unlinkSync(file) } catch { /* already released */ } }
     } catch (error) {
-      if (error?.code !== 'EEXIST') throw error
+      // Windows answers an existing lock it cannot open with EPERM/EACCES as
+      // well as EEXIST; all three mean "someone holds it".
+      if (error?.code !== 'EEXIST' && error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error
       try {
-        if (Date.now() - statSync(FOCUS_LOCK).mtimeMs > FOCUS_STALE_MS) { unlinkSync(FOCUS_LOCK); continue }
+        if (Date.now() - statSync(file).mtimeMs > staleMs) { unlinkSync(file); continue }
       } catch { /* the holder released between the two calls */ }
-      if (Date.now() > deadline) throw new Error('another lane held the browser focus lock for 90s')
+      if (Date.now() > deadline) throw new Error(`another lane held ${basename(file)} for ${Math.round(waitMs / 1000)}s`)
       await sleep(120)
     }
   }
+}
+
+async function acquireFocus() {
+  // The wait must exceed the stale window, or a dead holder fails the waiter.
+  return acquireLock(FOCUS_LOCK, 90_000, FOCUS_STALE_MS)
+}
+
+async function acquireLaunch() {
+  return acquireLock(LAUNCH_LOCK, 150_000, LAUNCH_STALE_MS)
 }
 
 async function withFocus(page, work) {
@@ -136,7 +158,7 @@ let launched = null
  * A lane window is small but ON SCREEN: a hidden page drops CDP input, and a
  * send that types nothing is worse than one more small window.
  */
-async function ensureChrome() {
+async function ensureChrome(locked = false) {
   // A shared lane lives in the master browser. If the host unloaded it, the
   // master profile is still the one to open: the login lives there.
   const targetPort = LANE_SHARED ? CONNECT_PORT : PORT
@@ -144,6 +166,16 @@ async function ensureChrome() {
     ? (process.env.GEMINI_LANE_SOURCE_PROFILE || process.env.CHATGPT_LANE_SOURCE_PROFILE || PROFILE)
     : PROFILE
   if (await portAnswers(targetPort)) return
+  if (locked) return openChrome(targetPort, targetProfile)
+  const release = await acquireLaunch()
+  try {
+    if (await portAnswers(targetPort)) return
+    return await openChrome(targetPort, targetProfile)
+  } finally { await release() }
+}
+
+/** Spawn the window. The caller holds the launch lock. */
+async function openChrome(targetPort, targetProfile) {
   const exe = await chromeExe()
   await mkdir(targetProfile, { recursive: true })
   const lane = !LANE_SHARED && LANE_SOURCE_PORT > 0
@@ -164,7 +196,9 @@ async function ensureChrome() {
   launched.on('exit', () => log(`Closed Chrome pid=${launched?.pid ?? '?'}`))
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
-    if (await portAnswers(PORT)) return
+    // The shared master's source port is not necessarily PORT; waiting on the
+    // wrong one timed the launch out while the window was up and answering.
+    if (await portAnswers(targetPort)) return
     await sleep(400)
   }
   throw new Error('Chrome did not open the debugging port')
@@ -172,8 +206,34 @@ async function ensureChrome() {
 
 /* ----------------------------------------------------------- Playwright */
 
-/** Kill the browser that owns this debug port (only this driver's profile). */
-async function killPortOwner(port) {
+/**
+ * The command line of the process listening on `port`, or '' if unreadable.
+ *
+ * Killing a browser is only safe when it can be shown to carry THIS provider's
+ * profile. Matching on the port alone used to kill the shared master that every
+ * Gemini lane borrows - a stalled lane took the whole browser down mid-turn.
+ */
+async function portOwnerCommandLine(port) {
+  return new Promise(resolve => {
+    const script = `$c=Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { (Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)").CommandLine }`
+    const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { stdio: ['ignore', 'pipe', 'ignore'] })
+    let out = ''
+    child.stdout.on('data', chunk => { out += chunk.toString('utf8') })
+    child.on('exit', () => resolve(out.trim()))
+    child.on('error', () => resolve(''))
+  })
+}
+
+/** Kill the browser that owns this debug port, and only when it is OURS. */
+async function killPortOwner(port, profile) {
+  const command = await portOwnerCommandLine(port)
+  // Normalise BOTH sides: Chrome may print the profile with forward slashes,
+  // backslashes, or a trailing separator, and a proof that fails on that is a
+  // proof that can never pass (measured 2026-11-06: the master was refused).
+  const canonical = value => String(value || '').replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+  if (!command || !canonical(command).includes(canonical(profile))) {
+    throw new Error(`refusing to kill the browser on port ${port}: its owner cannot be proven to carry --user-data-dir=${profile}`)
+  }
   await new Promise(resolve => {
     const script = `$p=(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }`
     const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { stdio: 'ignore' })
@@ -193,10 +253,19 @@ async function connect(port = CONNECT_PORT) {
     // the handshake: /json/version keeps answering while every attach hangs
     // (measured 2026-11-05 on both masters). The window is disposable - the
     // login lives in the profile - so replace it and attach to the new one.
+    // Two guards, both learned the hard way: the launch lock so two lanes never
+    // replace the same browser at once, and a profile proof before any kill so
+    // a lane can never take down a browser that is not this provider's.
+    const targetProfile = LANE_SHARED
+      ? (process.env.GEMINI_LANE_SOURCE_PROFILE || process.env.CHATGPT_LANE_SOURCE_PROFILE || PROFILE)
+      : PROFILE
     await log(`attach on port ${port} stalled (${String(error.message).split('\n')[0]}); restarting the window`)
-    await killPortOwner(port)
-    await sleep(1_500)
-    await ensureChrome()
+    const release = await acquireLaunch()
+    try {
+      await killPortOwner(port, targetProfile)
+      await sleep(1_500)
+      await ensureChrome(true)
+    } finally { await release() }
     browser = await attach()
   }
   const context = browser.contexts()[0]
@@ -204,13 +273,75 @@ async function connect(port = CONNECT_PORT) {
   return { browser, context }
 }
 
+/** Keep this lane's lease fresh: a tab whose lease ages out is swept. */
+async function touchLaneLease(id) {
+  const file = join(LANE_LEASE_DIR, `${id}.json`)
+  const now = new Date()
+  await mkdir(LANE_LEASE_DIR, { recursive: true }).catch(() => {})
+  const refreshed = await utimes(file, now, now).then(() => true, () => false)
+  if (!refreshed) await writeFile(file, JSON.stringify({ pid: process.pid, at: now.toISOString() })).catch(() => {})
+}
+
+let SWEPT_LANE_TABS = false
+
+/**
+ * Close Gemini lane tabs whose owners are gone.
+ *
+ * The Gemini driver had no lease and no sweep at all, so a driver killed with
+ * its host left an orphan `webbridge-lane:*` tab in the shared master forever
+ * (measured 2026-11-06: `gemini-web/lanes/` held only lanes.json). Same rule as
+ * the ChatGPT driver: a lease names a live lane, and whoever opens a lane next
+ * closes every named tab whose lease is missing or stale. Runs once per child.
+ */
+async function sweepOrphanLaneTabs(context) {
+  if (SWEPT_LANE_TABS) return 0
+  SWEPT_LANE_TABS = true
+  let names = []
+  try { names = await readdir(LANE_LEASE_DIR) } catch { names = [] }
+  const live = new Set()
+  const now = Date.now()
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue
+    const file = join(LANE_LEASE_DIR, name)
+    const info = await stat(file).catch(() => null)
+    if (!info) continue
+    if (now - info.mtimeMs > LANE_LEASE_STALE_MS) { await rm(file, { force: true }).catch(() => {}); continue }
+    live.add(name.slice(0, -'.json'.length))
+  }
+  let closed = 0
+  for (const page of context.pages()) {
+    const name = String(await page.evaluate(() => window.name).catch(() => '') || '')
+    if (!name.startsWith(LANE_TAB_PREFIX)) continue
+    if (live.has(name.slice(LANE_TAB_PREFIX.length))) continue
+    await page.close().catch(() => {})
+    closed += 1
+  }
+  if (closed) await log(`shared lane ${LANE_ID || '(unnamed)'}: closed ${closed} orphaned lane tab(s)`)
+  return closed
+}
+
+/** Keep the lease younger than the sweep threshold for the tab's whole life. */
+function keepLeaseFresh(page, leaseId) {
+  if (!LANE_SHARED || !leaseId) return
+  const timer = setInterval(() => { void touchLaneLease(leaseId) }, Math.max(15_000, Math.floor(LANE_LEASE_STALE_MS / 3)))
+  timer.unref?.()
+  const stop = () => clearInterval(timer)
+  page.once('close', stop)
+  page.once('crash', stop)
+}
+
 async function geminiPage(context) {
   if (LANE_SHARED) {
+    const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
+    const leaseId = wanted.slice(LANE_TAB_PREFIX.length)
+    await touchLaneLease(leaseId)
     // Lane tabs are named; never borrow the operator's own tab.
     for (const candidate of context.pages()) {
       const name = await candidate.evaluate(() => window.name).catch(() => '')
-      if (name === LANE_TAB) {
+      if (name === wanted) {
         await candidate.bringToFront().catch(() => {})
+        keepLeaseFresh(candidate, leaseId)
+        await sweepOrphanLaneTabs(context)
         return candidate
       }
     }
@@ -218,8 +349,10 @@ async function geminiPage(context) {
     await page.goto(APP, { waitUntil: 'domcontentloaded' })
     // Chrome clears window.name on a cross-site navigation, so name the tab
     // AFTER it is on the site; same-site navigation and reload keep it.
-    await page.evaluate(name => { window.name = name }, LANE_TAB).catch(() => {})
+    await page.evaluate(name => { window.name = name }, wanted).catch(() => {})
+    keepLeaseFresh(page, leaseId)
     await waitForComposer(page, 30_000)
+    await sweepOrphanLaneTabs(context)
     return page
   }
   const page = context.pages().find(candidate => candidate.url().includes('gemini.google.com'))
@@ -442,7 +575,21 @@ async function clickMenuItem(page, pattern) {
 }
 
 function exactName(name) {
-  return new RegExp(`^${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i')
+  return new RegExp(`^${String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9])`, 'i')
+}
+
+/**
+ * Click the row whose text names `name`, preferring a row that STARTS with it.
+ *
+ * The menu's row text is not the picker's short label: a picker reading "Pro"
+ * can be a row reading "Gemini 3 Pro", and the old start-anchored matcher then
+ * reported a model the account offers as missing (measured 2026-11-06:
+ * `model "Pro" not in the picker`). Fall back to a whole-word match.
+ */
+async function pickMenuItem(page, name) {
+  if (await clickMenuItem(page, exactName(name))) return true
+  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return await clickMenuItem(page, new RegExp(`(^|[\\s(])${escaped}(?![A-Za-z0-9])`, 'i'))
 }
 
 async function setMode(page, model, effort) {
@@ -452,7 +599,7 @@ async function setMode(page, model, effort) {
   const before = await pickerState(page)
   if (wantedModel && !modelMatches(wantedModel, before)) {
     if (!(await openPicker(page))) return { ok: false, error: 'the mode picker did not open' }
-    if (!(await clickMenuItem(page, exactName(wantedModel)))) {
+    if (!(await pickMenuItem(page, wantedModel))) {
       return { ok: false, error: `model "${wantedModel}" not in the picker` }
     }
     await sleep(1200)
@@ -503,11 +650,21 @@ async function typePrompt(page, text) {
     if (await send.count()) { await send.first().click({ timeout: 10_000 }); return }
     await page.keyboard.press('Enter')
   }
+  // A click can land on a button the app is about to replace, so one re-press
+  // is allowed - but only on PROOF the first press did nothing. The composer
+  // can keep the text while the request is already in flight, and time alone is
+  // not evidence: pressing then sends the prompt twice (found 2026-11-06).
+  const userTurns = async () => (await pageTurns(page)).turns.filter(turn => turn.role === 'user').length
+  const beforeSend = await userTurns().catch(() => -1)
   await press()
-  // The click can land on a button the app is about to replace. If the composer
-  // still holds the prompt a moment later, the message did not go: press once more.
   await sleep(600)
-  if ((await read()) === wanted) await press()
+  const stillHeld = (await read()) === wanted
+  if (stillHeld) {
+    const afterSend = await userTurns().catch(() => beforeSend)
+    // A new user bubble means the press landed; only the unchanged page may be
+    // pressed again. An unreadable count (-1 on either side) never re-presses.
+    if (beforeSend >= 0 && afterSend >= 0 && afterSend <= beforeSend) await press()
+  }
 }
 
 const PROVIDER_ERROR = /Sorry, something went wrong|encountering an error|having a hard time fulfilling/i
@@ -746,6 +903,10 @@ async function unload() {
   // belongs to every lane and to the operator: closing a lane must never kill
   // it (2026-11-04: an idle lane closed the master Chrome mid-turn).
   if (LANE_SHARED) {
+    // Drop the lease FIRST: if the close fails, the stale lease lets the next
+    // lane sweep the orphan. Same order as the ChatGPT driver.
+    const leaseId = (LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`).slice(LANE_TAB_PREFIX.length)
+    await rm(join(LANE_LEASE_DIR, `${leaseId}.json`), { force: true }).catch(() => {})
     try {
       const { browser, context } = await connect()
       try {

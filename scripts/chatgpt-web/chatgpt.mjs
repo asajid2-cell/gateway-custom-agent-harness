@@ -3898,7 +3898,7 @@ async function recoverComposer(page, { newChat = false, threadId = null } = {}) 
   return { composer, reloadMs, waitMs: Date.now() - reloadAt - reloadMs }
 }
 
-async function ask(page, text, { newChat = false, threadId = null, onAccepted = null, attachments = null, wait = true, acceptDeadlineMs = null } = {}) {
+async function ask(page, text, { newChat = false, threadId = null, onAccepted = null, attachments = null, wait = true, acceptDeadlineMs = null, model = null, effort = null } = {}) {
   // The op clock starts at request arrival. `SEND_ACCEPT_DEADLINE_MS` bounds
   // everything up to the Send click, and attachment time is credited back to the
   // budget after the files attach (attachments are outside the ceiling). The
@@ -4173,6 +4173,19 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
   const releaseFocus = await acquireFocus()
   let submitted
   try {
+    // The picker is ONE control for every tab in this browser. Selecting it
+    // inside the focus lock is what keeps another lane from retargeting it
+    // between the selection and the Send click below. A refusal here is a
+    // configuration error, not a page fault: name it, and type nothing.
+    if (model || effort) {
+      const wantedLabel = [model, effort].filter(Boolean).join('/')
+      try {
+        const applied = await setModelState(page, { model, effort })
+        await log(`phase ${phaseName} model ${applied?.model ?? model ?? '?'}/${applied?.effort ?? effort ?? '?'}`)
+      } catch (error) {
+        throw new TurnError(`the model picker would not select ${wantedLabel} (${String(error?.message ?? error).slice(0, 140)}); nothing was typed`, { reason: 'model-unavailable' })
+      }
+    }
     for (let attempt = 1; attempt <= 3 && !composed; attempt++) {
       // Keyboard input goes to the focused TAB. A shared lane's tab sits behind
       // the operator's, so without this every pass types into a page that will
@@ -5586,6 +5599,10 @@ async function serve() {
           wait: request.wait !== false,
           onAccepted: threadId => emit({ event: 'accepted', threadId, id: request.id }),
           attachments,
+          // Per-turn model/effort from the bridge. Absent (CLI, tests) keeps the
+          // page's current selection, exactly as before.
+          model: typeof request.model === 'string' && request.model ? request.model : null,
+          effort: typeof request.effort === 'string' && request.effort ? request.effort : null,
         })
         const sentThread = threadOf(result.url)
         if (sentThread) ACTIVE_THREAD = sentThread
