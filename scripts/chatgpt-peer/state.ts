@@ -46,6 +46,19 @@ export const scheduleSchema = z.object({ label: z.string().max(80), at: z.string
 export const PENDING_ATTRIBUTION_TEXT_MAX = 65536
 
 /**
+ * A conversation id as the provider's own URL carries it.
+ *
+ * ChatGPT names conversations with UUIDs, Gemini with 16 hex characters. This
+ * used to be `z.string().uuid()`, which rejected every Gemini id, so on the
+ * next host restart every Gemini bridge was quarantined and silently lost
+ * (measured 2026-11-06: 0/3 Gemini bridges loaded, 34/34 ChatGPT did). A
+ * thread id is a URL token, not a UUID: one conservative pattern covers both,
+ * and session/host ids stay UUIDs because those are minted on the bus.
+ */
+export const THREAD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$/
+export const threadIdSchema = z.string().regex(THREAD_ID_PATTERN, 'not a conversation id')
+
+/**
  * A send the page had not shown us yet when we looked for it.
  *
  * The snapshot path - the node ids before a send versus after it - is exact,
@@ -63,7 +76,7 @@ export const pendingAttributionSchema = z.object({
   /** When the page was asked, ISO. The match window and the expiry are from here. */
   sentAt: z.string(),
   /** The thread we sent into, for the audit line. Null for a brand-new chat. */
-  threadId: z.string().uuid().nullable(),
+  threadId: threadIdSchema.nullable(),
 }).strict()
 
 export type PendingAttribution = z.infer<typeof pendingAttributionSchema>
@@ -87,13 +100,13 @@ export const peerStateSchema = z.object({
   sessionId: z.string().uuid(),
   /** Which signed-in browser instance this host owns. Defaults to `default`. */
   instanceId: z.string().regex(INSTANCE_ID_PATTERN),
-  threadId: z.string().uuid().nullable(),
+  threadId: threadIdSchema.nullable(),
   /**
    * The thread the recorded primer sha actually belongs to. A thread selected
    * with `use` has no primer of ours in it, so the sha alone cannot say that
    * thread is primed - this pairing can.
    */
-  primedThreadId: z.string().uuid().nullable().default(null),
+  primedThreadId: threadIdSchema.nullable().default(null),
   model: z.string().max(100).nullable(),
   effort: z.string().max(40).nullable(),
   profile: z.string().max(4096),
@@ -221,7 +234,7 @@ export const inboundRunSchema = z.object({
  */
 export const pendingTurnSchema = z.object({
   /** Null only for a brand-new chat: the page has not named a thread yet. */
-  threadId: z.string().uuid().nullable().default(null),
+  threadId: threadIdSchema.nullable().default(null),
   /** Our own user node, once the page has shown it. Null until then. */
   userNodeId: z.string().max(64).nullable().default(null),
   /**
@@ -292,8 +305,8 @@ export const ANSWERED_TURNS_MAX = 200
 export const bridgeStateSchema = z.object({
   sessionId: z.string().uuid(),
   name: z.string().regex(BRIDGE_NAME_PATTERN),
-  threadId: z.string().uuid().nullable(),
-  primedThreadId: z.string().uuid().nullable(),
+  threadId: threadIdSchema.nullable(),
+  primedThreadId: threadIdSchema.nullable(),
   primerSha256: z.string().max(64).nullable(),
   owed: z.array(owedEntrySchema).max(50),
   schedules: z.array(scheduleSchema).max(8),

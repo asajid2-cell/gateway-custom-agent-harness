@@ -1217,11 +1217,13 @@ async function lanePage(context) {
   // A lane without an id still gets a name of its own rather than sharing one:
   // two lanes on the same name would type into each other's tab.
   const wanted = LANE_TAB || `${LANE_TAB_PREFIX}pid-${process.pid}`
-  await touchLaneLease(wanted.slice(LANE_TAB_PREFIX.length))
+  const leaseId = wanted.slice(LANE_TAB_PREFIX.length)
+  await touchLaneLease(leaseId)
   for (const candidate of context.pages()) {
     const name = await candidate.evaluate(() => window.name).catch(() => '')
     if (name === wanted) {
       await candidate.bringToFront().catch(() => {})
+      keepLeaseFresh(candidate, leaseId)
       await sweepOrphanLaneTabs(context)
       return candidate
     }
@@ -1229,8 +1231,26 @@ async function lanePage(context) {
   const page = await context.newPage()
   await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
   await ensureLaneName(page, wanted)
+  keepLeaseFresh(page, leaseId)
   await sweepOrphanLaneTabs(context)
   return page
+}
+
+/**
+ * Keep a lane's lease younger than the sweep threshold while its tab lives.
+ *
+ * The lease used to be written once, when the tab was opened, while a turn may
+ * legitimately run for SEND_TIMEOUT_MS (240 s) - longer than the 180 s stale
+ * window. Any other lane opening in that time therefore swept this lane's tab
+ * out from under a running turn. Refresh on a timer tied to the page's life.
+ */
+function keepLeaseFresh(page, leaseId) {
+  if (!LANE_SHARED || !leaseId) return
+  const timer = setInterval(() => { void touchLaneLease(leaseId) }, Math.max(15_000, Math.floor(LANE_LEASE_STALE_MS / 3)))
+  timer.unref?.()
+  const stop = () => clearInterval(timer)
+  page.once('close', stop)
+  page.once('crash', stop)
 }
 
 /** Re-assert the lane's tab name after a navigation that may have cleared it. */
@@ -1753,12 +1773,16 @@ async function assistantText(page) {
  * conversation mapping. When that happens the reply must come from the source,
  * not from a window that failed to draw: a render fault is not a lost turn.
  * Attribution stays strict: only the last user message may match the text this
- * send typed (its tail), and only an assistant message after it is accepted.
+ * send typed (the whole normalized text - a shared tail is not evidence), and
+ * only an assistant message after it is accepted.
  */
 async function readServerReply(page, threadId, sentText) {
   if (!threadId) return ''
-  const tail = String(sentText || '').replace(/\s+/g, ' ').trim().slice(-60)
-  return page.evaluate(async ([id, wantedTail]) => {
+  // The WHOLE text, not a tail: every bus inbound ends with the same footer,
+  // so a 60-character suffix matches other turns' user messages too and the
+  // fallback would hand back the wrong turn's answer (found 2026-11-06).
+  const wanted = String(sentText || '').replace(/\s+/g, ' ').trim()
+  return page.evaluate(async ([id, wantedText]) => {
     try {
       const session = await (await fetch('/api/auth/session')).json()
       const headers = session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {}
@@ -1778,7 +1802,7 @@ async function readServerReply(page, threadId, sentText) {
         if (messages[index].author.role === 'user') { lastUser = index; break }
       }
       if (lastUser < 0) return ''
-      if (wantedTail && !norm(textOf(messages[lastUser])).endsWith(wantedTail)) return ''
+      if (wantedText && norm(textOf(messages[lastUser])) !== wantedText) return ''
       for (let index = messages.length - 1; index > lastUser; index--) {
         if (messages[index].author.role !== 'assistant') continue
         const text = norm(textOf(messages[index]))
@@ -1786,7 +1810,7 @@ async function readServerReply(page, threadId, sentText) {
       }
       return ''
     } catch { return '' }
-  }, [threadId, tail]).catch(() => '')
+  }, [threadId, wanted]).catch(() => '')
 }
 
 async function threadContentState(page, threadId) {
@@ -4173,7 +4197,12 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
         const match = /\/c\/([A-Za-z0-9-]{8,})/.exec(location.pathname)
         if (!match) return 0
         try {
-          const response = await fetch(`/backend-api/conversation/${match[1]}`, { credentials: 'include' })
+          const session = await (await fetch('/api/auth/session')).json().catch(() => null)
+          // The conversation read needs the session bearer: without it the backend
+          // answers 404 for every thread (measured 2026-11-06), so a 429 could never
+          // be seen and a live thread could be called missing.
+          const headers = session?.accessToken ? { authorization: `Bearer ${session.accessToken}` } : {}
+          const response = await fetch(`/backend-api/conversation/${match[1]}`, { credentials: 'include', headers })
           return response.status
         } catch { return 0 }
       }).catch(() => 0)

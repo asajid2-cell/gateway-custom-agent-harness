@@ -3427,7 +3427,15 @@ export class ChatGptHost {
       if (this.generatingLooksLive(gate)) return
     }
     const laneId = this.laneIdOf({ fromSessionId: deferred.senderSessionId })
-    const posted = await this.turnStep(bridge, laneId, () => this.postPendingTurn(bridge, deferred, 0, locked))
+    const posted = await this.turnStep(bridge, laneId, () => {
+      // Re-check under the lock: this selection happens outside it, and the
+      // deferred-retry ladder and the observation pass can both reach here for
+      // the same record. Without this the second poster finds `postedAt` set by
+      // the first and types the prompt again.
+      const still = bridge.state.pendingTurns.find(record => record.messageId === deferred.messageId)
+      if (!still || still.postedAt !== null) return Promise.resolve({ posted: false, text: null })
+      return this.postPendingTurn(bridge, still, 0, locked)
+    })
     if (posted.posted) {
       audit(this.hostState, { op: 'turn', target: deferred.senderSessionId, result: `deferred job posted after the turn ended [${bridge.state.name}]`, messageId: deferred.messageId })
       await this.persistHostState()
@@ -5153,6 +5161,11 @@ export class ChatGptHost {
     const transport = bridge.transport
     if (!transport) return
     const message = record.message
+    // Idempotent by message id. At startup `drain` and `recoverOwed` run
+    // concurrently and both select from the same inbox; the second one to
+    // arrive here used to type the prompt again. Being handled is what makes a
+    // second entry a no-op, so check it before marking.
+    if (bridge.handled.has(message.id)) return
     bridge.handled.add(message.id)
     // The bus is authoritative for what has been answered (R-LIVE-7). This
     // guard is for the DRAIN path: a kill between a reply and its
@@ -5249,7 +5262,10 @@ export class ChatGptHost {
           // looking at the wrong thing (live 2026-11-06).
           const queuedRecord = bridge.state.pendingTurns.find(record => record.messageId === job.messageId)
           const queuedWhy = queuedRecord?.queuedReason
-          const line = queuedWhy
+          // A genuine mid-turn deferral keeps the phrase operators (and the
+          // D5b test) know; anything else says why, because "mid-turn" for a
+          // rate limit sent the reader to the wrong layer.
+          const line = queuedWhy && !/mid-turn/i.test(queuedWhy)
             ? `queued: ${one(queuedWhy, 160)}; it stays queued`
             : 'queued: the page is mid-turn; it will be posted when the turn ends'
           audit(this.hostState, { op: 'turn', target: message.fromSessionId, result: line, messageId: message.id })
