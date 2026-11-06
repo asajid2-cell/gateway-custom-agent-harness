@@ -4,9 +4,11 @@
 // they do not know where a program lives. It reads the same HKCU keys the
 // installer wrote and only touches files inside the install directory.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Text.RegularExpressions;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -50,7 +52,52 @@ internal sealed class ManagerForm : Form
     private readonly Label _path = new Label();
     private readonly Label _health = new Label();
 
-    private static string InstallDir { get { return Program.Read("InstallDir", ""); } }
+    // Manager.exe lives in the install it belongs to, so that is the answer
+    // even when two copies exist and the registry describes the other one.
+    private static string InstallDir
+    {
+        get
+        {
+            var own = Path.GetDirectoryName(Application.ExecutablePath);
+            if (!string.IsNullOrEmpty(own) && File.Exists(Path.Combine(own, "scripts\\cc.cmd"))) return own;
+            return Program.Read("InstallDir", "");
+        }
+    }
+
+    private static string ManifestValue(string name, string fallback)
+    {
+        try
+        {
+            var path = Path.Combine(InstallDir, "install-manifest.json");
+            if (!File.Exists(path)) return fallback;
+            var match = Regex.Match(File.ReadAllText(path), "\"" + name + "\"\\s*:\\s*\"([^\"]*)\"");
+            return match.Success ? match.Groups[1].Value : fallback;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+
+    // The first copy owns HKCU\Software\Gateway; a second copy must not
+    // rewrite that record, or the first one would be described wrongly.
+    private static bool IsPrimary
+    {
+        get
+        {
+            var dir = Program.Read("InstallDir", "");
+            return string.IsNullOrEmpty(dir) ||
+                   string.Equals(TrimEnd(InstallDir), TrimEnd(dir), StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private static string TrimEnd(string value)
+    {
+        return (value ?? "").TrimEnd('\\');
+    }
+
+    private static string Version { get { return ManifestValue("numeric_version", Program.Read("Version", "unknown")); } }
+    private static string SourceSha { get { return ManifestValue("source_sha", Program.Read("SourceSha", "unknown")); } }
 
     // The command name becomes a file name, so a value read back from the
     // registry is validated before it is combined into a path.
@@ -71,6 +118,25 @@ internal sealed class ManagerForm : Form
     {
         get
         {
+            // The shims in this install's own bin are the truth when two
+            // copies exist: the registry alias belongs to whichever ran last.
+            try
+            {
+                var bin = Path.Combine(InstallDir, "bin");
+                if (Directory.Exists(bin))
+                {
+                    foreach (var file in Directory.GetFiles(bin, "*.cmd"))
+                    {
+                        var name = Path.GetFileNameWithoutExtension(file);
+                        if (IsValidAlias(name) && !string.Equals(name, "gateway", StringComparison.OrdinalIgnoreCase))
+                            return name;
+                    }
+                }
+            }
+            catch
+            {
+                // Fall through to the recorded value.
+            }
             var value = Program.Read("Alias", "gateway");
             return IsValidAlias(value) ? value : "gateway";
         }
@@ -129,7 +195,7 @@ internal sealed class ManagerForm : Form
     private void Refresh_State()
     {
         var dir = InstallDir;
-        _version.Text = "Version: " + Program.Read("Version", "unknown") + "  (build " + Program.Read("SourceSha", "unknown") + ")";
+        _version.Text = "Version: " + Version + "  (build " + SourceSha + ")";
         _where.Text = dir == "" ? "Install folder: not recorded" : "Install folder: " + dir;
         _command.Text = "Command: " + Alias;
         _path.Text = "On PATH: " + (OnPath(dir) ? "yes" : "no");
@@ -189,7 +255,9 @@ internal sealed class ManagerForm : Form
         if (dir == "") return;
         var bin = Path.Combine(dir, "bin");
         Directory.CreateDirectory(bin);
-        WriteShim(bin, "gateway");
+        // `gateway` belongs to the first copy; a second copy keeps only its
+        // own command so the two do not fight over PATH order.
+        if (IsPrimary || File.Exists(Path.Combine(bin, "gateway.cmd"))) WriteShim(bin, "gateway");
         if (!string.Equals(value, "gateway", StringComparison.OrdinalIgnoreCase)) WriteShim(bin, value);
         var old = Alias;
         if (!string.Equals(old, value, StringComparison.OrdinalIgnoreCase) && !string.Equals(old, "gateway", StringComparison.OrdinalIgnoreCase))
@@ -197,7 +265,7 @@ internal sealed class ManagerForm : Form
             var stale = Path.Combine(bin, old + ".cmd");
             if (File.Exists(stale)) File.Delete(stale);
         }
-        Program.Write("Alias", value);
+        if (IsPrimary) Program.Write("Alias", value);
         MessageBox.Show(this, "The command is now \"" + value + "\". Open a new terminal to use it.", "Gateway", MessageBoxButtons.OK, MessageBoxIcon.Information);
         Refresh_State();
     }
@@ -212,7 +280,7 @@ internal sealed class ManagerForm : Form
         }
         var bin = Path.Combine(dir, "bin");
         Directory.CreateDirectory(bin);
-        WriteShim(bin, "gateway");
+        if (IsPrimary || File.Exists(Path.Combine(bin, "gateway.cmd"))) WriteShim(bin, "gateway");
         WriteShim(bin, Alias);
         AddPath(Path.Combine(dir, "bin"));
         RecreateShortcuts(dir);

@@ -28,7 +28,8 @@ AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
 AppPublisherURL={#AppUrl}
 AppSupportURL={#AppUrl}
-DefaultDirName={autopf}\Gateway
+; {code:} so a detected install can supply its own folder as the default.
+DefaultDirName={code:GetDefaultInstallDir}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; Per-user by default so no elevation is needed; the user can opt into an
@@ -70,17 +71,10 @@ Source: "{#TreeDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs cr
 Source: "{#ManagerExe}"; DestDir: "{app}"; DestName: "GatewayManager.exe"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Gateway"; Filename: "{app}\scripts\cc.cmd"; WorkingDir: "{%USERPROFILE}"
-Name: "{group}\Gateway Manager"; Filename: "{app}\GatewayManager.exe"
-Name: "{group}\Uninstall Gateway"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\Gateway"; Filename: "{app}\scripts\cc.cmd"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
-
-[Registry]
-Root: HKCU; Subkey: "Software\Gateway"; ValueType: string; ValueName: "InstallDir"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Gateway"; ValueType: string; ValueName: "Alias"; ValueData: "{code:GetAlias}"
-Root: HKCU; Subkey: "Software\Gateway"; ValueType: string; ValueName: "Version"; ValueData: "{#AppVersion}"
-Root: HKCU; Subkey: "Software\Gateway"; ValueType: string; ValueName: "SourceSha"; ValueData: "{#SourceSha}"
-Root: HKCU; Subkey: "Software\Gateway"; ValueType: string; ValueName: "PathEntry"; ValueData: "{app}\bin"
+Name: "{group}\Gateway{code:GetShortcutSuffix}"; Filename: "{app}\scripts\cc.cmd"; WorkingDir: "{%USERPROFILE}"
+Name: "{group}\Gateway Manager{code:GetShortcutSuffix}"; Filename: "{app}\GatewayManager.exe"
+Name: "{group}\Uninstall Gateway{code:GetShortcutSuffix}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\Gateway{code:GetShortcutSuffix}"; Filename: "{app}\scripts\cc.cmd"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
 
 [UninstallDelete]
 ; bin/ holds shims written after the file copy, so the uninstaller does not
@@ -104,6 +98,18 @@ var
   PreviousAlias: string;
   SilentAlias: string;
   SilentRun: Boolean;
+  // What an earlier install left behind, if anything: '', 'wizard', 'msi',
+  // 'tree'. The choice page lets the user update it, replace it, or put this
+  // copy beside it without sharing a folder or a command name.
+  ExistingPage: TInputOptionWizardPage;
+  ExistingKind: string;
+  ExistingDir: string;
+  ExistingAlias: string;
+  ExistingVersion: string;
+  ExistingProduct: string;
+  ExistingRoot: Integer;
+  ExistingNotes: string;
+  ExistingChoice: Integer;
 
 function SendMessageTimeout(hWnd: Longint; Msg: Longint; wParam: Longint; lParam: Longint;
   fuFlags: Longint; uTimeout: Longint; var lpdwResult: Longint): Longint;
@@ -136,6 +142,141 @@ function AliasIsCompiler(const Value: string): Boolean;
 begin
   Result := (CompareText(Value, 'cc') = 0) or (CompareText(Value, 'cl') = 0) or
             (CompareText(Value, 'gcc') = 0) or (CompareText(Value, 'clang') = 0);
+end;
+
+// --- an existing install ---------------------------------------------------
+// Three shapes are possible: an install made by this wizard (HKCU\Software\
+// Gateway), an MSI product (an Add/Remove Programs entry with a product
+// code), and a plain tree at the per-user default (a portable copy, or an
+// install whose registry key was lost). Detection only reads.
+function DirLooksLikeGateway(const Dir: string): Boolean;
+begin
+  Result := (Dir <> '') and
+    (FileExists(Dir + '\scripts\cc.cmd') or FileExists(Dir + '\dist\cli.js'));
+end;
+
+function TrimDir(const Value: string): string;
+begin
+  Result := Trim(Value);
+  while (Length(Result) > 3) and (Result[Length(Result)] = '\') do
+    Delete(Result, Length(Result), 1);
+end;
+
+function DirIsNotEmpty(const Dir: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if not FindFirst(Dir + '\*', FindRec) then Exit;
+  repeat
+    if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+    begin
+      Result := True;
+      Break;
+    end;
+  until not FindNext(FindRec);
+  FindClose(FindRec);
+end;
+
+procedure DetectMsiIn(const Root: Integer; const Base: string);
+var
+  Names: TArrayOfString;
+  I: Integer;
+  Key, Disp, Loc, Ver: string;
+begin
+  if not RegGetSubkeyNames(Root, Base, Names) then Exit;
+  for I := 0 to GetArrayLength(Names) - 1 do
+  begin
+    if Copy(Names[I], 1, 1) <> '{' then Continue;
+    Key := Base + '\' + Names[I];
+    if not RegQueryStringValue(Root, Key, 'DisplayName', Disp) then Continue;
+    if CompareText(Disp, 'Gateway') <> 0 then Continue;
+    if not RegQueryStringValue(Root, Key, 'DisplayVersion', Ver) then Ver := '?';
+    if not RegQueryStringValue(Root, Key, 'InstallLocation', Loc) then Loc := '';
+    if ExistingKind = '' then
+    begin
+      ExistingKind := 'msi';
+      ExistingProduct := Names[I];
+      ExistingRoot := Root;
+      ExistingVersion := Ver;
+      ExistingDir := Loc;
+      if (ExistingDir = '') and DirLooksLikeGateway(ExpandConstant('{localappdata}\Programs\Gateway')) then
+        ExistingDir := ExpandConstant('{localappdata}\Programs\Gateway');
+    end;
+    ExistingNotes := ExistingNotes + 'MSI ' + Ver + ' (product ' + Names[I] + ')' + #13#10;
+  end;
+end;
+
+procedure DetectExisting;
+var
+  Dir, Ver, Alias, Key: string;
+  Names: TArrayOfString;
+  I: Integer;
+begin
+  ExistingKind := '';
+  ExistingDir := '';
+  ExistingAlias := '';
+  ExistingVersion := '';
+  ExistingProduct := '';
+  ExistingNotes := '';
+  ExistingChoice := 0;
+  ExistingRoot := HKCU;
+
+  if RegQueryStringValue(HKCU, 'Software\Gateway', 'InstallDir', Dir) and DirLooksLikeGateway(Dir) then
+  begin
+    ExistingKind := 'wizard';
+    ExistingDir := Dir;
+    if not RegQueryStringValue(HKCU, 'Software\Gateway', 'Version', Ver) then Ver := '?';
+    if not RegQueryStringValue(HKCU, 'Software\Gateway', 'Alias', Alias) then Alias := '';
+    ExistingVersion := Ver;
+    ExistingAlias := Alias;
+    ExistingNotes := ExistingNotes + 'Gateway ' + Ver + ' at ' + Dir +
+      ' (command "' + Alias + '")' + #13#10;
+  end;
+
+  // Copies installed beside the first one.
+  if RegGetSubkeyNames(HKCU, 'Software\Gateway\Installs', Names) then
+    for I := 0 to GetArrayLength(Names) - 1 do
+    begin
+      Key := 'Software\Gateway\Installs\' + Names[I];
+      if RegQueryStringValue(HKCU, Key, 'InstallDir', Dir) and DirLooksLikeGateway(Dir) then
+      begin
+        if not RegQueryStringValue(HKCU, Key, 'Version', Ver) then Ver := '?';
+        if not RegQueryStringValue(HKCU, Key, 'Alias', Alias) then Alias := Names[I];
+        if ExistingKind = '' then
+        begin
+          ExistingKind := 'wizard';
+          ExistingDir := Dir;
+          ExistingVersion := Ver;
+          ExistingAlias := Alias;
+        end;
+        ExistingNotes := ExistingNotes + 'Gateway ' + Ver + ' at ' + Dir +
+          ' (command "' + Alias + '")' + #13#10;
+      end;
+    end;
+
+  DetectMsiIn(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall');
+  DetectMsiIn(HKLM, 'Software\Microsoft\Windows\CurrentVersion\Uninstall');
+  DetectMsiIn(HKLM, 'Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall');
+
+  Dir := ExpandConstant('{localappdata}\Programs\Gateway');
+  if DirLooksLikeGateway(Dir) and
+     ((ExistingDir = '') or (CompareText(TrimDir(Dir), TrimDir(ExistingDir)) <> 0)) then
+  begin
+    if ExistingKind = '' then
+    begin
+      ExistingKind := 'tree';
+      ExistingDir := Dir;
+      ExistingVersion := '?';
+    end;
+    ExistingNotes := ExistingNotes + 'Gateway files at ' + Dir + #13#10;
+  end;
+end;
+
+function GetDefaultInstallDir(Param: string): string;
+begin
+  if ExistingDir <> '' then Result := ExistingDir
+  else Result := ExpandConstant('{autopf}\Gateway');
 end;
 
 function InitializeSetup(): Boolean;
@@ -185,11 +326,47 @@ begin
     PreviousAlias := '';
   if not AliasIsValid(PreviousAlias) then
     PreviousAlias := '';
+  DetectExisting;
 end;
 
 procedure InitializeWizard;
+var
+  AfterID: Integer;
 begin
-  AliasPage := CreateInputQueryPage(wpSelectDir,
+  // The choice page comes before the command-name page, so a name that
+  // collides with the other install can be rejected when it is typed.
+  if ExistingKind <> '' then
+  begin
+    ExistingPage := CreateInputOptionPage(wpSelectDir,
+      'Existing installation',
+      'Gateway is already on this computer.',
+      ExistingNotes +
+        'Choose what this copy should do. Installing alongside needs a ' +
+        'different folder and a different command name; it leaves the other ' +
+        'installation and its PATH entry alone.',
+      True, False);
+    if ExistingKind = 'msi' then
+    begin
+      ExistingPage.Add('Replace the MSI installation (uninstall it, then install this copy)');
+      ExistingPage.Add('Install alongside it (different folder and command)');
+    end
+    else if ExistingKind = 'tree' then
+    begin
+      ExistingPage.Add('Update those files in place');
+      ExistingPage.Add('Install alongside them (different folder and command)');
+    end
+    else
+    begin
+      ExistingPage.Add('Update the existing installation in place');
+      ExistingPage.Add('Install alongside it (different folder and command)');
+    end;
+    ExistingPage.Values[0] := True;
+    AfterID := ExistingPage.ID;
+  end
+  else
+    AfterID := wpSelectDir;
+
+  AliasPage := CreateInputQueryPage(AfterID,
     'Command name',
     'Which command should start Gateway?',
     'Type the name you will use in a terminal. "gateway" is recommended. ' +
@@ -211,11 +388,47 @@ begin
     Result := 'gateway';
 end;
 
+// "Alongside" is decided by where it is going, not only by the page: an
+// unattended run has no page, and a different folder means a second copy.
+function ChoosingAlongside: Boolean;
+begin
+  Result := (ExistingKind <> '') and (ExistingDir <> '') and
+    (CompareText(TrimDir(ExpandConstant('{app}')), TrimDir(ExistingDir)) <> 0);
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   Value: string;
+  AlongsideNow: Boolean;
 begin
   Result := True;
+  // Silent runs have no pages to correct and must never show a dialog: a modal
+  // box in /VERYSILENT waits forever for a click. The install-time logic
+  // (ChoosingAlongside, PrepareToInstall) already handles both choices.
+  if SilentRun then Exit;
+  if Assigned(ExistingPage) and (CurPageID = ExistingPage.ID) then
+  begin
+    if ExistingPage.Values[0] then ExistingChoice := 0 else ExistingChoice := 1;
+    if ExistingDir <> '' then
+    begin
+      if ExistingChoice = 1 then
+      begin
+        if CompareText(TrimDir(WizardForm.DirEdit.Text), TrimDir(ExistingDir)) = 0 then
+        begin
+          MsgBox('That is the folder the existing installation uses. Go back and choose a different folder for a second copy.', mbError, MB_OK);
+          Result := False;
+          Exit;
+        end;
+      end
+      else if CompareText(TrimDir(WizardForm.DirEdit.Text), TrimDir(ExistingDir)) <> 0 then
+      begin
+        MsgBox('This choice updates the installation at ' + ExistingDir + '.' + Chr(13) + Chr(10) + Chr(13) + Chr(10) +
+          'Go back and select that folder, or choose "Install alongside".', mbError, MB_OK);
+        Result := False;
+        Exit;
+      end;
+    end;
+  end;
   if CurPageID = AliasPage.ID then
   begin
     Value := Trim(AliasPage.Values[0]);
@@ -230,6 +443,25 @@ begin
       if MsgBox('"' + Value + '" is also the name of a C compiler on many machines. ' +
         'Windows resolves your own command first, so a developer shell may run Gateway where it expected a compiler.' + Chr(13) + Chr(10) + Chr(13) + Chr(10) + 'Use it anyway?', mbConfirmation, MB_YESNO) <> IDYES then
         Result := False;
+    // A second copy must not answer to the same command as the first: both
+    // bin folders end up on PATH, so the winner would depend on PATH order.
+    AlongsideNow := (ExistingKind <> '') and (ExistingDir <> '') and
+      (CompareText(TrimDir(WizardForm.DirEdit.Text), TrimDir(ExistingDir)) <> 0);
+    if AlongsideNow then
+    begin
+      if (ExistingAlias <> '') and (CompareText(Value, ExistingAlias) = 0) then
+      begin
+        MsgBox('"' + Value + '" is the command the existing installation uses. Choose a different name so the two copies stay apart.', mbError, MB_OK);
+        Result := False;
+        Exit;
+      end;
+      if (ExistingDir <> '') and FileExists(ExistingDir + '\bin\' + Value + '.cmd') then
+      begin
+        MsgBox('The installation in ' + ExistingDir + ' already provides "' + Value + '". Choose a different command name.', mbError, MB_OK);
+        Result := False;
+        Exit;
+      end;
+    end;
   end;
 end;
 
@@ -240,6 +472,114 @@ begin
     Result := True
   else if ModifyMode and (PageID = wpSelectDir) then
     Result := True;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code, I: Integer;
+  Key: string;
+begin
+  Result := '';
+  // Replacing an MSI install means removing the product first: the wizard and
+  // the MSI would otherwise both own Programs\Gateway and leave two Add/Remove
+  // Programs entries. Repair and Modify never remove anything.
+  if (ExistingKind = 'msi') and (ExistingChoice = 0) and (not RepairMode) and (not ModifyMode) then
+  begin
+    if (not Exec('msiexec.exe', '/x ' + ExistingProduct + ' /qn /norestart', '',
+      SW_HIDE, ewWaitUntilTerminated, Code)) or (Code <> 0) then
+      Result := 'The existing Gateway MSI could not be removed (msiexec returned ' +
+        IntToStr(Code) + '). Uninstall it from Settings > Apps, then run this setup again.'
+    else
+    begin
+      // msiexec can return before the service finishes writing its registry
+      // cleanup; wait for the product key to go, or the MSI's own deletion can
+      // land after our install record and remove it again.
+      Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' + ExistingProduct;
+      for I := 1 to 120 do
+      begin
+        if not RegKeyExists(ExistingRoot, Key) then Break;
+        Sleep(500);
+      end;
+      if RegKeyExists(ExistingRoot, Key) then
+        Result := 'The existing Gateway MSI is still registered after 60 seconds. ' +
+          'Wait for it to finish, then run this setup again.';
+    end;
+  end;
+end;
+
+// A second copy gets its own Start Menu entries: the first copy owns the
+// unsuffixed names, and two installs sharing one shortcut path would mean one
+// uninstaller removes the other's icon.
+function GetShortcutSuffix(Param: string): string;
+begin
+  if ChoosingAlongside then
+    Result := ' (' + GetAlias('') + ')'
+  else
+    Result := '';
+end;
+
+// --- install records -------------------------------------------------------
+// The first copy owns HKCU\Software\Gateway. A copy installed beside it gets
+// HKCU\Software\Gateway\Installs\<command> instead, so uninstalling one copy
+// cannot delete the other's record, and detection can list both.
+procedure WriteInstallRecord(Alias: string);
+var
+  Dir, Primary: string;
+begin
+  // The name becomes a registry key when this copy is not the first one.
+  if not AliasIsValid(Alias) then Alias := 'gateway';
+  Dir := ExpandConstant('{app}');
+  Primary := '';
+  RegQueryStringValue(HKCU, 'Software\Gateway', 'InstallDir', Primary);
+  if (Primary = '') or (CompareText(TrimDir(Primary), TrimDir(Dir)) = 0) then
+  begin
+    RegWriteStringValue(HKCU, 'Software\Gateway', 'InstallDir', Dir);
+    RegWriteStringValue(HKCU, 'Software\Gateway', 'Alias', Alias);
+    RegWriteStringValue(HKCU, 'Software\Gateway', 'Version', '{#AppVersion}');
+    RegWriteStringValue(HKCU, 'Software\Gateway', 'SourceSha', '{#SourceSha}');
+    RegWriteStringValue(HKCU, 'Software\Gateway', 'PathEntry', Dir + '\bin');
+  end
+  else
+  begin
+    RegWriteStringValue(HKCU, 'Software\Gateway\Installs\' + Alias, 'InstallDir', Dir);
+    RegWriteStringValue(HKCU, 'Software\Gateway\Installs\' + Alias, 'Alias', Alias);
+    RegWriteStringValue(HKCU, 'Software\Gateway\Installs\' + Alias, 'Version', '{#AppVersion}');
+    RegWriteStringValue(HKCU, 'Software\Gateway\Installs\' + Alias, 'SourceSha', '{#SourceSha}');
+  end;
+end;
+
+procedure RemoveInstallRecord;
+var
+  Names: TArrayOfString;
+  I: Integer;
+  Key, Dir, Value: string;
+begin
+  Dir := ExpandConstant('{app}');
+  if RegQueryStringValue(HKCU, 'Software\Gateway', 'InstallDir', Value) and
+     (CompareText(TrimDir(Value), TrimDir(Dir)) = 0) then
+  begin
+    RegDeleteValue(HKCU, 'Software\Gateway', 'InstallDir');
+    RegDeleteValue(HKCU, 'Software\Gateway', 'Alias');
+    RegDeleteValue(HKCU, 'Software\Gateway', 'Version');
+    RegDeleteValue(HKCU, 'Software\Gateway', 'SourceSha');
+    RegDeleteValue(HKCU, 'Software\Gateway', 'PathEntry');
+    // Leave a subkey tree alone: another copy may still be listed there.
+    RegDeleteKeyIfEmpty(HKCU, 'Software\Gateway');
+    Exit;
+  end;
+  if RegGetSubkeyNames(HKCU, 'Software\Gateway\Installs', Names) then
+    for I := 0 to GetArrayLength(Names) - 1 do
+    begin
+      Key := 'Software\Gateway\Installs\' + Names[I];
+      if RegQueryStringValue(HKCU, Key, 'InstallDir', Value) and
+         (CompareText(TrimDir(Value), TrimDir(Dir)) = 0) then
+      begin
+        RegDeleteKeyIncludingSubkeys(HKCU, Key);
+        RegDeleteKeyIfEmpty(HKCU, 'Software\Gateway\Installs');
+        RegDeleteKeyIfEmpty(HKCU, 'Software\Gateway');
+        Exit;
+      end;
+    end;
 end;
 
 function CmdShim(const Name: string): string;
@@ -304,17 +644,25 @@ begin
     ForceDirectories(ExpandConstant('{app}\bin'));
     Alias := Trim(GetAlias(''));
     if not AliasIsValid(Alias) then Alias := 'gateway';
-    WriteShim('gateway');
-    if CompareText(Alias, 'gateway') <> 0 then
-      WriteShim(Alias);
+    WriteShim(Alias);
+    // When installing alongside, `gateway` belongs to the other install: do
+    // not put a second `gateway.cmd` on PATH behind its back.
+    if (CompareText(Alias, 'gateway') <> 0) and
+       not (ChoosingAlongside and FileExists(ExistingDir + '\bin\gateway.cmd')) then
+      WriteShim('gateway');
     if AliasIsValid(PreviousAlias) and (CompareText(PreviousAlias, Alias) <> 0)
        and (CompareText(PreviousAlias, 'gateway') <> 0) then
       DeleteFile(ExpandConstant('{app}\bin\') + PreviousAlias + '.cmd');
+    WriteInstallRecord(Alias);
     if WizardIsTaskSelected('addtopath') then
       AddPathEntry
     else
       RemovePathEntry;
   end;
+  // Write the record once more at the end: an MSI removal started in
+  // PrepareToInstall can still be finishing its own registry cleanup.
+  if CurStep = ssDone then
+    WriteInstallRecord(GetAlias(''));
   // Never block an unattended run: a modal box in /VERYSILENT waits forever.
   if (CurStep = ssDone) and RepairMode and (not WizardSilent) then
     MsgBox('Gateway was repaired: files, command shims and shortcuts are in place, and the install folder is on your PATH.', mbInformation, MB_OK);
@@ -323,5 +671,8 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
+  begin
     RemovePathEntry;
+    RemoveInstallRecord;
+  end;
 end;
