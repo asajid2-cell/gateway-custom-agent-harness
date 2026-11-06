@@ -172,9 +172,33 @@ async function ensureChrome() {
 
 /* ----------------------------------------------------------- Playwright */
 
+/** Kill the browser that owns this debug port (only this driver's profile). */
+async function killPortOwner(port) {
+  await new Promise(resolve => {
+    const script = `$p=(Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess; if ($p) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }`
+    const child = spawn('powershell.exe', ['-NoProfile', '-Command', script], { stdio: 'ignore' })
+    child.on('exit', resolve)
+    child.on('error', resolve)
+  })
+}
+
 async function connect(port = CONNECT_PORT) {
   const { chromium } = loadPlaywright()
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 30_000 })
+  const attach = () => chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: 30_000 })
+  let browser
+  try {
+    browser = await attach()
+  } catch (error) {
+    // Chrome 156 intermittently accepts the browser websocket and never answers
+    // the handshake: /json/version keeps answering while every attach hangs
+    // (measured 2026-11-05 on both masters). The window is disposable - the
+    // login lives in the profile - so replace it and attach to the new one.
+    await log(`attach on port ${port} stalled (${String(error.message).split('\n')[0]}); restarting the window`)
+    await killPortOwner(port)
+    await sleep(1_500)
+    await ensureChrome()
+    browser = await attach()
+  }
   const context = browser.contexts()[0]
   if (!context) throw new Error(`browser on port ${port} has no browser context`)
   return { browser, context }
@@ -500,6 +524,28 @@ async function lastAnswer(page) {
   })
 }
 
+/**
+ * Did the turn actually begin?
+ *
+ * Any one of: a new model-response node, the Stop control appearing (the
+ * client's own "generating" signal), or the URL moving to a conversation id
+ * (a new chat is created server-side before the first stream frame). Absent
+ * all three, the click was cosmetic and waiting would burn the whole budget
+ * on a page that will never answer.
+ */
+async function waitForTurnStart(page, start, timeoutMs = 12_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = await pageState(page)
+    const read = await lastAnswer(page)
+    if (read.nodes > start.nodes) return true
+    if (state.generating) return true
+    if (state.threadId && state.threadId !== start.threadId) return true
+    await sleep(300)
+  }
+  return false
+}
+
 async function waitForAnswer(page, beforeCount, timeoutMs = SEND_TIMEOUT_MS) {
   const deadline = Date.now() + timeoutMs
   let last = null
@@ -541,8 +587,25 @@ async function warm() {
 async function send(request) {
   return withPage(async page => {
     const wanted = typeof request.threadId === 'string' && request.threadId ? request.threadId : null
-    if (wanted && !(await openThread(page, wanted))) {
-      return { ok: false, op: 'send', error: `thread ${wanted} did not load a composer`, threadId: wanted }
+    if (wanted) {
+      if (!(await openThread(page, wanted))) {
+        return { ok: false, op: 'send', error: `thread ${wanted} did not load a composer`, threadId: wanted }
+      }
+    } else if (!/^https:\/\/gemini\.google\.com\/app\/?$/.test(page.url())) {
+      // No thread means "start a new conversation". Without this the send types
+      // into whatever conversation the tab happens to show, which is how two
+      // fresh bridges were primed into ONE thread (measured 2026-11-05: both
+      // newBridge calls returned the same conversation id).
+      await page.goto(APP, { waitUntil: 'domcontentloaded' })
+      await waitForComposer(page, 30_000)
+    }
+    // Refuse to type into a tab whose previous turn never finished: measured
+    // 2026-11-05, such a tab accepts text, adds the user bubble, and then never
+    // starts a stream - the Stop control stays forever and no answer is ever
+    // rendered. The window is the broken part; the host recycles it.
+    const start = await pageState(page)
+    if (start.generating) {
+      return { ok: false, op: 'send', reason: 'page-load-error', threadId: start.threadId ?? wanted, error: 'the page was still generating a previous turn' }
     }
     const composed = await withFocus(page, async () => {
       const mode = await setMode(page, request.model ?? MODEL_WANTED, request.effort ?? EFFORT_WANTED)
@@ -554,6 +617,19 @@ async function send(request) {
     if (composed.mode.ok !== true) return { ok: false, op: 'send', error: composed.mode.error, threadId: wanted }
     const before = composed.before
     const acceptedAt = Date.now()
+    // Acceptance is not a turn. Gemini's client occasionally takes the click,
+    // prints the user bubble, and never issues the generation request, so the
+    // Stop control is the only sign that anything is happening. Require one of
+    // the three real signals before spending the reply budget waiting.
+    const started = await waitForTurnStart(page, { nodes: before.nodes, threadId: start.threadId })
+    if (!started) {
+      const now = await pageState(page)
+      return {
+        ok: false, op: 'send', reason: 'page-load-error', acceptedAt,
+        threadId: now.threadId ?? wanted,
+        error: 'the page accepted the text but never started generating',
+      }
+    }
     const answer = await waitForAnswer(page, before.nodes)
     const state = await pageState(page)
     const modeNow = await pickerState(page)
