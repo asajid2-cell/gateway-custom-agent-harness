@@ -323,6 +323,9 @@ mkdir -p "$TMP/tree"
 tar -xzf "$ARCHIVE" -C "$TMP/tree"
 [ -f "$TMP/tree/scripts/cc" ] || die "the archive does not contain scripts/cc"
 
+# The chosen folder's parent need not exist yet (~/apps/gateway is the common
+# case); mv cannot create it.
+mkdir -p "$(dirname -- "$PREFIX")"
 rm -rf "$PREFIX.new"
 mv "$TMP/tree" "$PREFIX.new"
 chmod 0755 "$PREFIX.new/scripts/cc" "$PREFIX.new/runtime/bun" 2>/dev/null || true
@@ -425,7 +428,9 @@ EOF
 # This copy runs on the bundled vault, in a directory of its own. Without it the
 # installed gateway would read whatever ~/.keysafe or ~/.claude/keysafe the
 # machine already has (for example a development session's keys).
-VAULT_ID="$(printf '%s' "$PREFIX" | sed -e 's/[^A-Za-z0-9_-]/-/g')"
+# The CRC keeps folders apart when their names differ only in punctuation.
+VAULT_HASH="$(printf '%s' "$PREFIX" | cksum | awk '{print $1}')"
+VAULT_ID="$(printf '%s' "$PREFIX" | sed -e 's/[^A-Za-z0-9_-]/-/g')-$VAULT_HASH"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 cat > "$PREFIX/install.env" <<EOF
 # Written by the Gateway installer.
