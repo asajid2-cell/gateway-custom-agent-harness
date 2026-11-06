@@ -8,6 +8,10 @@
 #                                the same, with the archive and SHA256SUMS
 #                                fetched from a mirror (a site directory)
 #
+# A mirror may ask for a username and password (HTTP basic auth). Nothing is
+# kept in a URL: the download asks for the password on the terminal. A piped
+# run with no terminal needs GATEWAY_HTTP_USER and GATEWAY_HTTP_PASS.
+#
 # Options (all optional; on a TTY you are asked where and for the command):
 #   --prefix DIR    install directory   (default: /opt/gateway as root,
 #                                        ~/.local/share/gateway otherwise)
@@ -35,6 +39,8 @@ ARCHIVE=""
 ARCHIVE_EXPLICIT=0
 ASSUME_ROOT=0
 URL=""
+HTTP_USER="${GATEWAY_HTTP_USER:-}"
+HTTP_PASS="${GATEWAY_HTTP_PASS:-}"
 
 if [ -n "${GATEWAY_ALIAS:-}" ]; then ALIAS_EXPLICIT=1; fi
 
@@ -50,7 +56,7 @@ while [ $# -gt 0 ]; do
     --no-path) ADD_PATH=no; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --archive) ARCHIVE="$2"; ARCHIVE_EXPLICIT=1; shift 2 ;;
-    --help|-h) sed -n '2,22p' "$0"; exit 0 ;;
+    --help|-h) sed -n '2,28p' "$0"; exit 0 ;;
     *) die "unknown option $1" ;;
   esac
 done
@@ -237,13 +243,94 @@ trap cleanup EXIT INT TERM
 BASE="${GATEWAY_BASE_URL:-}"
 BASE="${BASE%/}"
 
+# --- basic auth -------------------------------------------------------------
+# The password is read from /dev/tty, not stdin: the script itself may have
+# arrived on stdin. It is handed to curl/wget for this run only.
+auth_prompt() {
+  # The permission bits say nothing about whether a controlling terminal
+  # exists; opening it in a subshell is the test. A failed redirect inside the
+  # subshell would abort dash if it ran in this one.
+  if ! ( : >/dev/tty ) 2>/dev/null; then
+    die "this mirror needs a username and password, and there is no terminal to ask on; set GATEWAY_HTTP_USER and GATEWAY_HTTP_PASS"
+  fi
+  [ -n "$HTTP_USER" ] || HTTP_USER=gateway
+  printf 'Username [%s]: ' "$HTTP_USER" >/dev/tty
+  IFS= read -r answer </dev/tty || answer=""
+  [ -n "$answer" ] && HTTP_USER="$answer"
+  printf 'Password: ' >/dev/tty
+  stty -echo </dev/tty 2>/dev/null || true
+  IFS= read -r HTTP_PASS </dev/tty || HTTP_PASS=""
+  stty echo </dev/tty 2>/dev/null || true
+  printf '\n' >/dev/tty
+  [ -n "$HTTP_PASS" ] || die "a password is required for $BASE"
+}
+
+http_status() {
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then
+      curl -s -o /dev/null -w '%{http_code}' -u "$HTTP_USER:$HTTP_PASS" "$1" 2>/dev/null || true
+    else
+      curl -s -o /dev/null -w '%{http_code}' "$1" 2>/dev/null || true
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then
+      wget --spider --server-response -q --user="$HTTP_USER" --password="$HTTP_PASS" "$1" 2>&1
+    else
+      wget --spider --server-response -q "$1" 2>&1
+    fi | sed -n 's/.*HTTP\/[0-9.]* \([0-9][0-9][0-9]\).*/\1/p' | tail -n 1
+  else
+    printf '000'
+  fi
+}
+
+fetch_url() {
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then curl -fsSL -u "$HTTP_USER:$HTTP_PASS" "$1"
+    else curl -fsSL "$1"; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then wget -qO- --user="$HTTP_USER" --password="$HTTP_PASS" "$1"
+    else wget -qO- "$1"; fi
+  else
+    die "curl or wget is required"
+  fi
+}
+
+fetch_file() {
+  if command -v curl >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then curl -fsSL -u "$HTTP_USER:$HTTP_PASS" "$1" -o "$2"
+    else curl -fsSL "$1" -o "$2"; fi
+  elif command -v wget >/dev/null 2>&1; then
+    if [ -n "$HTTP_PASS" ]; then wget -q --user="$HTTP_USER" --password="$HTTP_PASS" "$1" -O "$2"
+    else wget -q "$1" -O "$2"; fi
+  else
+    die "curl or wget is required"
+  fi
+}
+
+display_url() {
+  printf '%s' "$1" | sed 's|://[^/@]*@|://|'
+}
+
+# Ask before the first fetch only when the folder answers 401. A wrong
+# password is asked for again, up to three times.
+if [ -n "$BASE" ]; then
+  tries=0
+  while :; do
+    [ "$(http_status "$BASE/version")" = 401 ] || break
+    tries=$((tries + 1))
+    [ "$tries" -le 3 ] || die "authentication failed for $BASE"
+    HTTP_PASS=""
+    auth_prompt
+  done
+fi
+
 if [ -z "$ARCHIVE" ]; then
   if [ -z "$VERSION" ]; then
     if [ -n "$BASE" ]; then
       # A mirror publishes the version it is serving next to the artifacts.
-      VERSION="$(curl -fsSL "$BASE/version" 2>/dev/null | head -n 1 | tr -d '\r')"
+      VERSION="$(fetch_url "$BASE/version" 2>/dev/null | head -n 1 | tr -d '\r')"
     else
-      VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+      VERSION="$(fetch_url "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
     fi
     [ -n "$VERSION" ] || die "could not resolve the release version; set GATEWAY_VERSION or GATEWAY_BASE_URL"
@@ -255,11 +342,8 @@ if [ -z "$ARCHIVE" ]; then
   else
     URL="https://github.com/$REPO/releases/download/v$VERSION/$NAME"
   fi
-  echo "Downloading $URL"
-  if command -v curl >/dev/null 2>&1; then curl -fsSL "$URL" -o "$ARCHIVE"
-  elif command -v wget >/dev/null 2>&1; then wget -q "$URL" -O "$ARCHIVE"
-  else die "curl or wget is required"
-  fi
+  echo "Downloading $(display_url "$URL")"
+  fetch_file "$URL" "$ARCHIVE"
 fi
 [ -f "$ARCHIVE" ] || die "archive not found: $ARCHIVE"
 
@@ -293,11 +377,7 @@ if [ -z "$EXPECTED" ] && [ -n "$URL" ]; then
   else
     SUMS_URL="https://github.com/$REPO/releases/download/v$VERSION/SHA256SUMS"
   fi
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$SUMS_URL" -o "$TMP/SHA256SUMS" 2>/dev/null || true
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q "$SUMS_URL" -O "$TMP/SHA256SUMS" 2>/dev/null || true
-  fi
+  fetch_file "$SUMS_URL" "$TMP/SHA256SUMS" 2>/dev/null || true
   if [ -f "$TMP/SHA256SUMS" ]; then EXPECTED="$(sums_lookup "$TMP/SHA256SUMS")"; fi
 fi
 if [ -n "$EXPECTED" ]; then
