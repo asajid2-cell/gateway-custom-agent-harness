@@ -4669,13 +4669,17 @@ const MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/
  *
  * The host meters only its own `conversation` op; this sees the send's tree
  * baseline, the reply read, the title walk and the list too. Measured wall:
- * four reads answer, the fifth is refused for 48 s. 3/min with a burst of 2
- * keeps one read of margin for the page app's own fetches. A delivery read
+ * four reads answer, the fifth is refused for 48 s. A meter below that wall
+ * keeps a read of margin for the page app's own fetches. A delivery read
  * may spend the last token; an observation waits briefly and otherwise defers
  * to the next pass. Gemini reads a DOM and never imports this file.
+ *
+ * 2/min, not 3: with two turns in flight a CONVERSATION read was still refused
+ * under the 3/min meter (measured 2026-11-07), and the page's own fetches spend
+ * the same wall without passing this door.
  */
 const accountReads = createReadBudget({
-  perMinute: Number(process.env.CHATGPT_READ_BUDGET_PER_MINUTE ?? 3),
+  perMinute: Number(process.env.CHATGPT_READ_BUDGET_PER_MINUTE ?? 2),
   burst: Number(process.env.CHATGPT_READ_BUDGET_BURST ?? 2),
 })
 
