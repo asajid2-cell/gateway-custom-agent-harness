@@ -4558,6 +4558,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
         const relayOptions = {
           signal: control.signal,
           throwPreOutput: true,
+          onActivity: () => control.upstreamActivity(),
         }
         if (wantsStream) {
           await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
@@ -4699,7 +4700,7 @@ async function handleCommandCode(body, req, res, modelName, route) {
       }
 
       try {
-        const relayOptions = { signal: control.signal, throwPreOutput: true }
+        const relayOptions = { signal: control.signal, throwPreOutput: true, onActivity: () => control.upstreamActivity() }
         if (wantsStream) {
           await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
         } else {
@@ -4847,7 +4848,7 @@ async function handleMistral(body, req, res, modelName, route) {
       }
 
       try {
-        const relayOptions = { signal: control.signal, throwPreOutput: true }
+        const relayOptions = { signal: control.signal, throwPreOutput: true, onActivity: () => control.upstreamActivity() }
         if (wantsStream) {
           await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
         } else {
@@ -4980,7 +4981,7 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
       return
     }
 
-    const relayOptions = { signal: control.signal, throwPreOutput: true }
+    const relayOptions = { signal: control.signal, throwPreOutput: true, onActivity: () => control.upstreamActivity() }
     if (wantsStream) {
       await relayOpenCodeStream(res, upstream, modelName, route.protocol, trace, relayOptions)
     } else {

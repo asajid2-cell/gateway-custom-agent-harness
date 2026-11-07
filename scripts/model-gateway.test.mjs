@@ -6668,6 +6668,34 @@ test('translates OpenCode Chat Completions reasoning-only deltas', async () => {
   assert.equal(events.find(event => event.type === 'message_delta').delta.stop_reason, 'max_tokens')
 })
 
+test('every upstream chunk resets the consumer idle deadline', async () => {
+  // A long but healthy stream must not be killed at the same age as a silent
+  // one. The relay reports each byte to the request control, which is what
+  // re-arms the consumer deadline; without it the deadline is a total-request
+  // deadline and a 275k-token Mistral turn dies at 180 s mid-answer.
+  const response = new CaptureResponse()
+  let activity = 0
+  const chunks = [
+    'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"OK"}}]}\n\n',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+  ]
+  const upstream = {
+    status: 200,
+    headers: new Headers({ 'content-type': 'text/event-stream' }),
+    body: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk))
+        controller.close()
+      },
+    }),
+  }
+  await relayOpenCodeChatStream(response, upstream, 'opencode-go/kimi-k3', null, {
+    onActivity: () => { activity += 1 },
+  })
+  assert.equal(activity, chunks.length)
+})
+
 test('translates OpenCode Chat Completions tool calls', async () => {
   const response = new CaptureResponse()
   await relayOpenCodeChatStream(response, openCodeUpstream([

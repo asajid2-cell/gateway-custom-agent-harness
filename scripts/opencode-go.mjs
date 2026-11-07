@@ -691,7 +691,7 @@ function finishError(res, error) {
   }
 }
 
-async function consumeSse(upstream, onData, trace = null, signal = null) {
+async function consumeSse(upstream, onData, trace = null, signal = null, onActivity = null) {
   const reader = upstream.body?.getReader()
   if (!reader) throw new Error('OpenCode returned an empty response body')
   const decoder = new TextDecoder()
@@ -728,6 +728,10 @@ async function consumeSse(upstream, onData, trace = null, signal = null) {
       if (aborted || signal?.aborted) {
         throw signal?.reason || new Error('Gateway request aborted')
       }
+      // A byte on the wire is proof the provider is still working. Without
+      // this the consumer deadline is a total-request deadline, so a long but
+      // healthy stream is killed at the same age as a silent one.
+      onActivity?.()
       trace?.markFirstByte()
       trace?.addBytes(value?.byteLength || 0)
       trace?.addEvent()
@@ -1153,7 +1157,7 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
           eventLine(res, { type: 'message_delta', delta: {} })
         }
       }
-    }, trace, options.signal)
+    }, trace, options.signal, options.onActivity)
     if (!sawCompletion) throw new Error('OpenCode Responses stream ended before response.completed')
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
     trace?.markCompletion()
@@ -1280,7 +1284,7 @@ export async function relayOpenCodeChatStream(res, upstream, model, trace = null
           if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'function_call') toolCallSeen = true
         }
       }
-    }, trace, options.signal)
+    }, trace, options.signal, options.onActivity)
     if (!sawCompletion) throw new Error('OpenCode Chat Completions stream ended before completion')
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
     trace?.markCompletion()
@@ -1367,7 +1371,7 @@ export async function relayOpenCodeAnthropicStream(res, upstream, model, trace =
       }
       if (event.type === 'error') throw new Error(event.error?.message || 'OpenCode Anthropic request failed')
       emit(event)
-    }, trace, options.signal)
+    }, trace, options.signal, options.onActivity)
     if (!sawCompletion) throw new Error('OpenCode Anthropic stream ended before message_stop')
     if (!sawOutput) throw new Error('OpenCode returned an empty or malformed response')
     trace?.markCompletion()
