@@ -3393,8 +3393,10 @@ function isPooledKeyEnvVar(name) {
 // size, rather than surfacing as the provider's one-line error.
 const UPSTREAM_BODY_LIMIT_BYTES = 19_000_000
 const IMAGE_OMITTED_MARKER =
-  "[image omitted: sending it would put this request over the provider's body " +
-  'limit. Ask for the image in a separate turn if you need to see it.]'
+  "[image withheld: sending it would put this request over the provider's 20 MB " +
+  'body limit, so it was not sent. Do not answer as if you had seen it. Say in ' +
+  'one line that it was withheld, and read it with the Read tool before you ' +
+  'answer if you know its path.]'
 
 function requestBodyBytes(request) {
   try {

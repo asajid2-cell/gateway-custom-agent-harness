@@ -104,7 +104,8 @@ test('an oversized provider request loses its images rather than the turn', () =
   assert.equal(stripImagesOverLimit(tight, 1_000_000), 1)
   assert.equal(tight.messages[0].content[0].text, 'what is in this screenshot?')
   assert.equal(tight.messages[0].content[1].type, 'text')
-  assert.match(tight.messages[0].content[1].text, /image omitted/)
+  assert.match(tight.messages[0].content[1].text, /image withheld/)
+  assert.match(tight.messages[0].content[1].text, /Read tool/)
   assert.ok(Buffer.byteLength(JSON.stringify(tight)) < 1_000_000)
 
   // The Responses protocol names the replacement type differently.
