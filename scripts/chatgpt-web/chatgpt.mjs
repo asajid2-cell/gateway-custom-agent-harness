@@ -1437,21 +1437,26 @@ async function closeLaneTab() {
   await fs.rm(path.join(LANE_LEASE_DIR, `${lane}.json`), { force: true }).catch(() => {})
   const known = LANE_PAGES.get(lane)
   forgetLane(lane)
+  let closed = 0
   if (known && !known.isClosed()) {
     await known.close().catch(() => {})
-    return { tabClosed: true }
+    closed += 1
   }
+  // A lane that failed a turn can leave MORE than one tab carrying its name
+  // (each retry re-adopts by name, and a name is not unique in a browser).
+  // Close every one, not just the page this process remembered.
   const browser = await connectOwned()
   try {
     const context = browser.contexts()[0]
-    if (!context) return { tabClosed: false }
+    if (!context) return { tabClosed: closed > 0, closed }
     for (const page of context.pages()) {
+      if (page.isClosed()) continue
       if (await tabNameOf(page) === wanted) {
         await page.close().catch(() => {})
-        return { tabClosed: true }
+        closed += 1
       }
     }
-    return { tabClosed: false }
+    return { tabClosed: closed > 0, closed }
   } finally {
     release(browser)
   }

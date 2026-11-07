@@ -1086,11 +1086,13 @@ async function unload() {
       if (known && !known.isClosed()) {
         await known.close().catch(() => {})
         tabClosed = true
-      } else {
-        const { context } = await sharedConnection()
-        for (const candidate of context.pages()) {
-          if (await tabNameOf(candidate) === `${LANE_TAB_PREFIX}${lane}`) { await candidate.close().catch(() => {}); tabClosed = true }
-        }
+      }
+      // A retry can leave more than one tab carrying the lane's name; close
+      // every one, not just the page this process remembered.
+      const { context } = await sharedConnection()
+      for (const candidate of context.pages()) {
+        if (candidate.isClosed()) continue
+        if (await tabNameOf(candidate) === `${LANE_TAB_PREFIX}${lane}`) { await candidate.close().catch(() => {}); tabClosed = true }
       }
     } catch (error) { await log(`shared unload found no browser: ${error.message}`) }
     return { ok: true, op: 'unload', state: 'unloaded', sharedBrowser: true, tabClosed, cookiesSynced: null }
