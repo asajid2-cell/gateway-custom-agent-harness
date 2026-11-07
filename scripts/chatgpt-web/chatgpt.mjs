@@ -1872,6 +1872,69 @@ const sampleTurn = page => page.evaluate(([selector, block]) => {
   return { found: true, text: (chosen.innerText || '').trim(), state, candidates: nodes.length }
 }, [ASSISTANT, ANSWER_BLOCKS])
 
+/**
+ * The user message id THIS send created, read from the page's own POST body.
+ *
+ * The app mints it client-side and sends `messages[0].id`. It is the anchor an
+ * answer must descend from: on a bridge whose primer is still finishing, the
+ * newest assistant node in the thread is the primer's answer, not ours.
+ */
+export function sendUserIdOf(postData) {
+  if (typeof postData !== 'string' || !postData) return null
+  try {
+    const body = JSON.parse(postData)
+    const id = Array.isArray(body?.messages) ? body.messages[0]?.id : null
+    return typeof id === 'string' && id ? id : null
+  } catch { return null }
+}
+
+const NORM_TEXT = value => String(value || '').replace(/\s+/g, ' ').trim()
+
+/**
+ * Does this assistant reply descend from the send that is waiting for it?
+ *
+ * `roles` is the rendered conversation in order: `{ role, id, text }` for every
+ * `[data-message-author-role]` node. The reply is ours only when the nearest
+ * USER node before it is the one this send created (by id, or - when the id was
+ * not captured - by carrying exactly the text this send typed). Pure, so the
+ * three cases live in one testable place.
+ */
+export function answerBelongs(roles, replyText, sentText, userNodeId) {
+  const list = Array.isArray(roles) ? roles : []
+  const wanted = NORM_TEXT(replyText)
+  if (!wanted) return { proven: false, why: 'the reply is empty' }
+  let chosen = -1
+  for (let index = list.length - 1; index >= 0; index--) {
+    if (list[index]?.role !== 'assistant') continue
+    if (NORM_TEXT(list[index].text) === wanted) { chosen = index; break }
+  }
+  if (chosen < 0) return { proven: false, why: 'no rendered assistant node carries the reply text' }
+  let asker = null
+  for (let index = chosen - 1; index >= 0; index--) {
+    if (list[index]?.role === 'user') { asker = list[index]; break }
+  }
+  if (!asker) return { proven: false, why: 'no user node precedes the reply' }
+  const askerId = typeof asker.id === 'string' ? asker.id : ''
+  if (userNodeId && askerId && askerId === userNodeId) {
+    return { proven: true, why: `the reply asks after user node ${askerId}` }
+  }
+  if (NORM_TEXT(sentText) && NORM_TEXT(asker.text) === NORM_TEXT(sentText)) {
+    return { proven: true, why: 'the reply asks after the text this send typed' }
+  }
+  return { proven: false, why: userNodeId ? `the reply asks after ${askerId || 'another user node'}, not this send` : 'no captured user node and the asker text differs' }
+}
+
+/** Read the rendered conversation in order and apply `answerBelongs`. */
+async function answerBelongsTo(page, replyText, sentText, userNodeId) {
+  const roles = await page.evaluate(() => [...document.querySelectorAll('[data-message-author-role]')].map(node => ({
+    role: node.getAttribute('data-message-author-role') || '',
+    id: node.getAttribute('data-message-id') || '',
+    text: node.innerText || '',
+  }))).catch(() => null)
+  if (!roles) return { proven: false, why: 'the rendered conversation could not be read' }
+  return answerBelongs(roles, replyText, sentText, userNodeId)
+}
+
 async function assistantText(page) {
   const sample = await sampleTurn(page).catch(() => null)
   return sample && sample.found ? sample.text : ''
@@ -2814,13 +2877,20 @@ async function submitTurn(page, { baseline, text, treeBaseline = null, phaseLabe
   // events. The listener is attached before the click and removed once the
   // acceptance window has been judged, so it cannot outlive the turn.
   let postSeenAt = null
+  // The user message id this send created, from the POST body. This is the
+  // anchor an answer must descend from; a primer answer is not ours.
+  let sendUserNodeId = null
   const onRequest = request => {
     try {
       // One regex for both forms: the live send is `POST /backend-api/f/conversation`,
       // and earlier builds used the bare `/backend-api/conversation`. The `f/`
       // segment is optional rather than a second listener, so the page contrast
       // against the CDP watch stays one observation of one predicate.
-      if (postSeenAt === null && request.method() === 'POST' && /\/backend-api\/(?:f\/)?conversation/.test(request.url())) postSeenAt = Date.now()
+      if (request.method() === 'POST' && /\/backend-api\/(?:f\/)?conversation/.test(request.url())) {
+        if (postSeenAt === null) postSeenAt = Date.now()
+        const userId = sendUserIdOf(typeof request.postData === 'function' ? request.postData() : '')
+        if (userId && !sendUserNodeId) sendUserNodeId = userId
+      }
     } catch {}
   }
   const watchingPost = typeof page?.on === 'function'
@@ -2962,7 +3032,7 @@ async function submitTurn(page, { baseline, text, treeBaseline = null, phaseLabe
       : outcome.path === 'response'
         ? `acceptance in ${elapsed}ms: the send response, the page's own POST was answered HTTP ${outcome.response?.status ?? '2xx'}`
         : `acceptance in ${elapsed}ms: thread tree, exactly one new turn carrying the sent text`)
-    if (holdNetwork) return { network, release }
+    if (holdNetwork) { network.userId = sendUserNodeId; return { network, release } }
     await release().catch(() => null)
     return null
   }
@@ -2983,7 +3053,7 @@ async function submitTurn(page, { baseline, text, treeBaseline = null, phaseLabe
   await log(`acceptance ceiling: the last tree read took ${Date.now() - ceilingAt}ms`)
   if (tree.accepted) {
     await log(`acceptance in ${Date.now() - clickedAt}ms: the DOM exposed no new user turn; the thread tree shows exactly one new turn carrying the sent text`)
-    if (holdNetwork) return { network, release }
+    if (holdNetwork) { network.userId = sendUserNodeId; return { network, release } }
     await release().catch(() => null)
     return null
   }
@@ -3289,6 +3359,18 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null, se
     }
   }
   const finish = async (how, reply) => {
+    // The answer must descend from the user node THIS send created. On a bridge
+    // whose primer is still finishing, the newest assistant node is the primer's
+    // answer; accepting it delivered the primer to a sender (measured
+    // 2026-11-07). The server path already anchors on the sent text itself, so
+    // it proves its own attribution; every DOM path proves it here.
+    if (how !== 'server' && reply) {
+      const proof = await answerBelongsTo(page, reply, sentText, watch?.userId || '')
+      if (!proof.proven) {
+        await log(`reply ${how}: rejected - ${proof.why}; leaving the turn to the observation pass`)
+        return null
+      }
+    }
     const elapsed = Date.now() - startedAt
     const stableFor = stableSince === null ? 0 : Date.now() - stableSince
     // The guard's verdict line is unchanged: one line, the same fields the
@@ -3446,7 +3528,9 @@ async function waitForReply(page, beforeCount, beforeText = '', watch = null, se
           const threadId = threadOf(page.url())
           throw new TurnError(
             `the page could not load the messages${threadId ? ` in thread ${threadId}` : ''}`,
-            { reason: 'page-load-error', ...(threadId ? { threadId } : {}) },
+            // This guard runs AFTER submitTurn accepted the send, so the POST
+            // landed: the host must settle by evidence and never type again.
+            { reason: 'page-load-error', accepted: true, ...(threadId ? { threadId } : {}) },
           )
         }
       }
@@ -5593,6 +5677,9 @@ function createDispatcher({ run, emit, isConcurrent = isConcurrentRead }) {
         ...(error.reason ? { reason: error.reason } : {}),
         ...(error.state ? { state: error.state } : {}),
         ...(error.threadId ? { threadId: error.threadId } : {}),
+        // A fault AFTER the send POST is a delivery problem; the host must know
+        // the text landed so it never re-posts it.
+        ...(error.accepted === true ? { accepted: true } : {}),
       })
       return null
     },

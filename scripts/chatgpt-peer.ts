@@ -594,7 +594,9 @@ export function resolveConfig(partial: Partial<Config>): Config {
       : Number.isFinite(partial.pollSeconds)
         ? Number(partial.pollSeconds)
         : envNumber('OBSERVE_EVERY', 300),
-    titlesEvery: Number.isFinite(partial.titlesEvery) ? Number(partial.titlesEvery) : envNumber('TITLES_EVERY', 120),
+    // 300 s, not 120: the list endpoint has its own tighter limit and the walk
+    // is discovery, not latency (the push path owns a turn's answer).
+    titlesEvery: Number.isFinite(partial.titlesEvery) ? Number(partial.titlesEvery) : envNumber('TITLES_EVERY', 300),
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
     pendingWatchTailMs: partial.pendingWatchTailMs,
     readStormLimit: partial.readStormLimit,
@@ -808,6 +810,10 @@ export class ChatGptHost {
   private readStormAt = 0
   private readStormBackoffMs = 0
   private readStormUntil = 0
+  /** Turns currently past a lane and inside a page turn; the title walk yields. */
+  private turnsInFlight = 0
+  /** When a lane tab last started opening (the app's own fetches follow it). */
+  private lastLaneOpenAt = 0
   /** Monotonic arm identity; a wake compares it to tell a replacement from its own timer. */
   private scheduleGeneration = 0
   /** When a 429 observation was last audited, so throttling is one line, not a flood. */
@@ -2198,7 +2204,10 @@ export class ChatGptHost {
       if (reply.reason === 'page-load-error' || isPageLoadError(String(reply.error ?? ''))) {
         const lane = this.laneContext.getStore()
         if (lane) lane.pageFault = 'the messages could not load'
-        throw new PageLoadFault(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, false, one(reply.error, 200))
+        // A fault AFTER the send POST is not "nothing was typed": the driver
+        // says so, and the host settles it by evidence instead of re-posting.
+        const accepted = reply.accepted === true
+        throw new PageLoadFault(typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId, accepted, one(reply.error, 200))
       }
       this.classifyFailure(String(reply.error ?? 'no answer'))
       throw new Error(one(reply.error, 300) || 'the page returned nothing')
@@ -2258,7 +2267,9 @@ export class ChatGptHost {
         const lane = this.laneContext.getStore()
         if (lane) lane.pageFault = 'the messages could not load'
         const threadId = typeof reply.threadId === 'string' ? reply.threadId : bridge.state.threadId
-        throw new PageLoadFault(threadId, acceptedByPage, one(reply.error, 200))
+        // The driver's own word that the send POST landed is as good as the
+        // mid-call acceptance event: either way the host must not type again.
+        throw new PageLoadFault(threadId, acceptedByPage || reply.accepted === true, one(reply.error, 200))
       }
       // R-LIVE-5: a driver failure is not a page refusal (see pageTurn).
       if (isDriverFaultReply(reply)) {
@@ -3079,7 +3090,11 @@ export class ChatGptHost {
       // the record keeps the node it became. Only a send that did not land may
       // be cleared. (`accepted` covers the throw inside `pageTurnAsync` after
       // the driver returned ok, where `posted` is still undefined.)
-      if (posted || accepted) {
+      // A page-load fault that the driver says came AFTER the send POST is the
+      // same state: the text landed, so the record must keep `postedAt` and the
+      // turn settles by evidence. Re-posting there typed one inbound twice.
+      const acceptedAfterSend = accepted || (error instanceof PageLoadFault && error.accepted)
+      if (posted || acceptedAfterSend) {
         if (posted) {
           record.threadId = posted.threadId ?? record.threadId
           record.userNodeId = posted.userNodeId ?? record.userNodeId
@@ -4045,7 +4060,10 @@ export class ChatGptHost {
     // snapshot read below fails or this host dies mid-send. The snapshot path
     // is exact; this is what covers it when the page's own read lags.
     await this.notePendingSend(bridge, text, options.threadId)
+    const laneId = this.laneContext.getStore()?.laneId ?? HOST_LANE
+    log(`turn lane ${shortId(laneId)}: record written; reading the pre-send snapshot`)
     const before = await this.snapshotBeforeSend(bridge, options.threadId)
+    log(`turn lane ${shortId(laneId)}: snapshot ${before ? 'read' : 'unavailable'}; issuing the send`)
     // R7-F4: the removal check in postRecordedTurn is upstream of this await,
     // and `notePendingSend`/`snapshotBeforeSend` both yield. This is the last
     // point before the send with nothing in between: a bridge removed during
@@ -4261,6 +4279,15 @@ export class ChatGptHost {
   private async titlesTick(): Promise<void> {
     try {
       if (this.stopping || this.observes === false) return
+      // The list endpoint has its own, tighter limit than the conversation
+      // reads, and a fresh lane tab's page load fires the app's own list and
+      // conversation fetches that no meter of ours can see. So the title walk
+      // never competes with a turn: not while one is in flight, and not within
+      // a minute of a lane tab opening.
+      if (this.turnsInFlight > 0 || Date.now() - this.lastLaneOpenAt < 60_000) {
+        log('title walk deferred: a turn is in flight or a lane just opened')
+        return
+      }
       if (!(await this.cdpAlive())) return
       await this.pollTitles()
     } finally {
@@ -6544,7 +6571,16 @@ export class ChatGptHost {
    * lane another writer needs.
    */
   private turnStep<T>(bridge: Bridge, laneId: string, work: (lane: LaneHandle) => Promise<T>): Promise<T> {
-    return this.turnLockFor(bridge).run(() => this.laneWork(laneId, work))
+    log(`turn lane ${shortId(laneId)}: waiting for the bridge lock ("${bridge.state.name}")`)
+    return this.turnLockFor(bridge).run(async () => {
+      log(`turn lane ${shortId(laneId)}: bridge lock acquired`)
+      this.turnsInFlight += 1
+      try {
+        return await this.laneWork(laneId, work)
+      } finally {
+        this.turnsInFlight = Math.max(0, this.turnsInFlight - 1)
+      }
+    })
   }
 
   /**
@@ -6568,6 +6604,7 @@ export class ChatGptHost {
       log(`lane "${laneId}": ${line}`)
       void this.persistHostState()
     })
+    log(`turn lane ${shortId(laneId)}: lane acquired (port ${lane.port || 'shared'})`)
     const context: { driver: DriverChild; laneId: string; empty?: boolean; pageGone?: boolean; pageFault?: string } = { driver: lane.driver, laneId }
     let pageGone = false
     try {
@@ -6589,6 +6626,7 @@ export class ChatGptHost {
 
   /** One line per lane lifecycle event, in the audit the host already keeps. */
   private onLaneEvent(event: LaneEvent, laneId: string, detail: string): void {
+    if (event === 'open') this.lastLaneOpenAt = Date.now()
     if (!this.hostState) return
     audit(this.hostState, {
       op: `lane_${event}`,

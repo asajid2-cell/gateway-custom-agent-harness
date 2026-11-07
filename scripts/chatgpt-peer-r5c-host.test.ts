@@ -157,7 +157,15 @@ class FakeDriver {
       const stalls = this.stallFor?.(request) === true
       if (!this.lags) {
         this.grow(threadId, 'user', String(request.text ?? ''))
-        if (!stalls) this.grow(threadId, 'assistant', this.answer)
+        // A page that reports the render fault has not drawn the answer; the
+        // test supplies it with `pageNode` once the page can draw again.
+        if (!stalls && !this.pageLoadAccepted) this.grow(threadId, 'assistant', this.answer)
+      }
+      // The render fault the driver reports AFTER a 2xx send POST: the text is
+      // on the page, the page just cannot draw the thread.
+      if (this.pageLoadAccepted) {
+        this.sentAtMs.push(Date.now())
+        return { ok: false, op, reason: 'page-load-error', accepted: true, threadId, error: 'the page could not load the messages' }
       }
       this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
       this.sentAtMs.push(Date.now())
@@ -247,6 +255,8 @@ class FakeDriver {
   sendError: string | null = null
   landOn: string | null = null
   lags = false
+  /** The driver reports a render fault AFTER a 2xx send POST (the text landed). */
+  pageLoadAccepted = false
 }
 
 const newestAnswerNode = (tree: { mapping: Record<string, any>; current: string }): any => {
@@ -580,6 +590,41 @@ describe('R-LIVE-6: a restart reads the page before re-posting a turn', () => {
       expect(driver.calls.filter(call => call.op === 'send').length).toBe(sendsBefore)
       const state = JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')) as { audit: { result: string }[] }
       expect(state.audit.some(entry => entry.result.includes('sender gone; reply not delivered'))).toBe(true)
+    } finally {
+      await host.stop()
+      await sender.close().catch(() => {})
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('a render fault after the send POST is never posted a second time', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const sender = await busPeer(dir, 'sender')
+    const driver = new FakeDriver()
+    driver.observable = true
+    // The text landed (the fake grows the user node), the page then reports it
+    // cannot draw the thread. One inbound, one POST.
+    driver.pageLoadAccepted = true
+    const host = await startHost(dir, driver, { pendingWatchGapsMs: [200] })
+    try {
+      const receipt = await sender.send(alpha.sessionId, 'ask the page', 'ask the page', undefined, 'inquiry', true) as { id: string }
+      await waitFor(() => (driver.sentAtMs.length >= 1 ? true : undefined), 15_000)
+      // The record keeps POSTED, so no pass may type it again.
+      const job = (await readBridge(dir, alpha.sessionId)).pendingTurns.find(turn => turn.messageId === receipt.id)!
+      expect(job.postedAt).not.toBe(null)
+      await host.pollOnce()
+      expect(sendCount(driver)).toBe(1)
+      // The page draws the answer it already had; it is delivered exactly once.
+      driver.pageLoadAccepted = false
+      driver.pageNode(THREAD_A, 'the answer the page finally drew')
+      await host.pollOnce()
+      await waitFor(() => (sender.inbox().length >= 1 ? true : undefined), 15_000)
+      await new Promise(resolve => setTimeout(resolve, 300))
+      expect(sender.inbox().length).toBe(1)
+      expect(String((sender.inbox()[0]!.message as unknown as { text: string }).text)).toContain('the answer the page finally drew')
+      expect(sendCount(driver)).toBe(1)
     } finally {
       await host.stop()
       await sender.close().catch(() => {})
