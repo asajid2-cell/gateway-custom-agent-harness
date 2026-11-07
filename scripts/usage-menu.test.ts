@@ -184,7 +184,16 @@ test('the menu draws the real ledger and returns to the menu on Escape', async (
         assert.match(frame(), /2 requests/, 'the summary counts both chats')
         assert.match(frame(), /2 chats/)
         assert.match(frame(), /4\.8K tokens/, 'the summary sums the four figures')
-        for (const label of ['Tokens by model', 'Tokens by chat', 'Tokens by upstream', 'Close']) {
+        // The list scrolls, so this asserts the first screen's options rather
+        // than every option: Close sits below the fold and is reached by
+        // scrolling, which the keybinding layer owns.
+        for (const label of [
+          'Tokens by model',
+          'Tokens by chat',
+          'Tokens by upstream',
+          'Throughput (tok/s)',
+          'Custom range',
+        ]) {
           assert.ok(frame().includes(label), `${label} is offered`)
         }
 
@@ -196,7 +205,7 @@ test('the menu draws the real ledger and returns to the menu on Escape', async (
         // plumbing the real REPL already covers.
         stdin.write('5')
         await tick(250)
-        assert.match(frame(), /Last 30 days/, 'the trend screen opened')
+        assert.match(frame(), /Trend [\u2014-] \d+ day/, 'the trend screen opened')
         assert.match(frame(), /peak 4\.8K tokens on \d{4}-\d{2}-\d{2}/, 'the trend reports its peak, not just a shape')
         assert.ok(!frame().includes('0…'), 'the date axis is labels, not a row of clipped stubs')
         assert.match(frame(), /Esc returns to the menu/)
@@ -214,7 +223,15 @@ test('the menu draws the real ledger and returns to the menu on Escape', async (
 })
 
 test('a narrow terminal gets a dated range instead of clipped labels', async () => {
-  await withLedger([row({ input: 1000 })], async () => {
+  // Fifteen days of history: the series is daily (the span is under three
+  // weeks), and fifteen two-cell columns will not fit a 40-column terminal, so
+  // the axis must fall back to the range.
+  const today = new Date()
+  const rows = Array.from({ length: 15 }, (_, index) => {
+    const day = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (14 - index))
+    return row({ at: day.toISOString(), input: 1000 })
+  })
+  await withLedger(rows, async () => {
     const stdout = Object.assign(new PassThrough(), { columns: 40, rows: 40 })
     const stdin = Object.assign(new PassThrough(), {
       isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {},
@@ -234,9 +251,9 @@ test('a narrow terminal gets a dated range instead of clipped labels', async () 
       const plain = output
         .replace(/\x1b\[(\d+)C/g, (_, count: string) => ' '.repeat(Number(count)))
         .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
-      // 30 buckets will not fit as labelled columns at 40 columns, so the axis
-      // becomes one full range rather than 30 clipped stubs.
-      assert.match(plain, /Last 30 days/)
+      // Fifteen daily points will not fit as labelled columns at 40 columns, so
+      // the axis becomes one full range rather than fifteen clipped stubs.
+      assert.match(plain, /Trend [\u2014-] 15 days/)
       assert.match(plain, /\d{4}-\d{2}-\d{2} … \d{4}-\d{2}-\d{2}/)
       assert.ok(!plain.includes('0…'))
     } finally {
@@ -244,6 +261,96 @@ test('a narrow terminal gets a dated range instead of clipped labels', async () 
       await tick(20)
     }
   })
+})
+
+/** Render the menu on a non-TTY stdout and return the last frame as plain text. */
+async function withMenu(
+  rows: readonly Record<string, unknown>[],
+  body: (frame: () => string, stdin: PassThrough) => Promise<void>,
+  columns = 100,
+): Promise<void> {
+  await withLedger(rows, async () => {
+    const stdout = Object.assign(new PassThrough(), { columns, rows: 40 })
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {},
+    })
+    let output = ''
+    stdout.on('data', chunk => { output += chunk.toString() })
+    const app = await render(React.createElement(UsageMenu, { onDone: () => {} }), {
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      stderr: stdout as unknown as NodeJS.WriteStream,
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      patchConsole: false, exitOnCtrlC: false,
+    })
+    const plain = () =>
+      output
+        .replace(/\x1b\[(\d+)C/g, (_, count: string) => ' '.repeat(Number(count)))
+        .replace(/\x1b\][^\x07]*\x07/g, '')
+        .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    const frame = () => plain().slice(plain().lastIndexOf('Usage'))
+    try {
+      await tick(150)
+      await body(frame, stdin)
+    } finally {
+      app.unmount()
+      await tick(20)
+    }
+  })
+}
+
+test('the throughput screen ranks measured responses and names the upstreams', async () => {
+  await withMenu(
+    [
+      row({ output: 100, genMs: 2000, ttftMs: 500, totalMs: 2500, tokPerSec: 50 }),
+      row({ output: 20, genMs: 4000, ttftMs: 900, totalMs: 4900, tokPerSec: 5, session: 'slow-chat' }),
+    ],
+    async (frame, stdin) => {
+      stdin.write('6')
+      await tick(250)
+      const screen = frame()
+      assert.match(screen, /Throughput/, 'the screen opened')
+      assert.match(screen, /50\.0 tok\/s/, 'the fast response is reported at its own rate')
+      assert.match(screen, /5\.0 tok\/s/, 'the slow response is reported at its own rate')
+      assert.match(screen, /Slowest responses/)
+      assert.match(screen, /Fastest responses/)
+      assert.match(screen, /By upstream/)
+      assert.match(screen, /measured/, 'the count of measured responses is stated')
+    },
+  )
+})
+
+test('a custom range is typed, applied, and narrows the report', async () => {
+  const old = new Date()
+  old.setDate(old.getDate() - 40)
+  await withMenu(
+    [
+      row({ input: 1000 }),
+      row({ at: old.toISOString(), input: 5000, session: 'old-chat' }),
+    ],
+    async (frame, stdin) => {
+      stdin.write('7')
+      await tick(250)
+      assert.match(frame(), /Custom range/, 'the range screen opened')
+      assert.match(frame(), /From/)
+      assert.match(frame(), /To/)
+
+      const today = new Date()
+      const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+      stdin.write(day)
+      await tick(80)
+      stdin.write('\t')
+      await tick(80)
+      stdin.write(day)
+      await tick(80)
+      stdin.write('\r')
+      await tick(250)
+
+      const home = frame()
+      assert.match(home, new RegExp(`Usage [\\u2014-] ${day} . ${day}`), 'the window is the typed range')
+      assert.match(home, /1 requests/, 'the row outside the range is not counted')
+      assert.ok(!home.includes('old-chat'), 'the excluded chat is gone from the window')
+    },
+  )
 })
 
 test('an empty ledger explains itself instead of drawing an empty chart', async () => {

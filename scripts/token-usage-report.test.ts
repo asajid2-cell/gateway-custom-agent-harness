@@ -4,9 +4,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
+  averageTtftMs,
+  averageTokPerSecond,
   buildUsageReport,
   cachedShare,
   dailyPoints,
+  parseDay,
   periodStart,
   readTokenLedger,
   totalTokens,
@@ -38,6 +41,10 @@ type LedgerRow = {
   cacheWrite: number
   costUSD: number
   src?: string
+  genMs?: number
+  ttftMs?: number
+  totalMs?: number
+  tokPerSec?: number
 }
 
 function row(overrides: Partial<LedgerRow> = {}): LedgerRow {
@@ -289,6 +296,8 @@ function empty() {
     speedRows: 0,
     speedOutput: 0,
     speedMs: 0,
+    ttftRows: 0,
+    ttftMs: 0,
   }
 }
 
@@ -446,4 +455,73 @@ test('the text report renders a window, totals and every section', async () => {
 test('an empty ledger says so rather than printing an empty table', () => {
   const text = renderUsageText({ directory: join(tmpdir(), 'usage-report-empty-none') })
   assert.ok(text.includes('No usage recorded'))
+})
+
+test('an explicit range counts its own days, inclusive on both ends', async () => {
+  const at = (day: number, hour: number) =>
+    new Date(2026, 8, day, hour, 0, 0).toISOString()
+  await withLedger(
+    [
+      row({ at: at(10, 12), input: 1 }),
+      // Both edges are inside the range: midnight on the start day and late on
+      // the end day. A UTC comparison would move one of them across.
+      row({ at: at(11, 0), input: 10 }),
+      row({ at: at(12, 23), input: 100 }),
+      row({ at: at(13, 12), input: 1000 }),
+    ],
+    async dir => {
+      const report = buildUsageReport({
+        directory: dir,
+        from: '2026-09-11',
+        to: '2026-09-12',
+      })
+      assert.equal(report.totals.input, 110)
+      assert.equal(report.excluded.otherPeriod, 2)
+    },
+  )
+})
+
+test('a range that cannot be read is refused, not widened', () => {
+  assert.throws(() => parseDay('2026-02-31'), /no such day/i)
+  assert.throws(() => parseDay('11/09/2026'), /YYYY-MM-DD/)
+  assert.throws(() => parseUsageArgs(['--from', '2026-02-31']), UsageArgumentError)
+  assert.throws(() => parseUsageArgs(['--to', 'soon']), UsageArgumentError)
+  // The removed spellings still fail loudly and now name the replacement.
+  assert.throws(() => parseUsageArgs(['--since', '2026-09-01']), /--from/)
+})
+
+test('the series fills the days nobody used', async () => {
+  const at = (day: number) => new Date(2026, 8, day, 12).toISOString()
+  await withLedger(
+    [row({ at: at(1), input: 5 }), row({ at: at(3), input: 7 })],
+    async dir => {
+      const report = buildUsageReport({
+        directory: dir,
+        from: '2026-09-01',
+        to: '2026-09-03',
+      })
+      assert.equal(report.series.unit, 'day')
+      assert.deepEqual(
+        report.series.points.map(point => point.key),
+        ['2026-09-01', '2026-09-02', '2026-09-03'],
+      )
+      assert.equal(report.series.points[1]!.totals.input, 0)
+    },
+  )
+})
+
+test('measured rows are exposed for the speed drill-down', async () => {
+  await withLedger(
+    [
+      row({ output: 100, genMs: 2000, ttftMs: 500, totalMs: 2500 }),
+      row({ output: 50 }),
+    ],
+    async dir => {
+      const report = buildUsageReport({ directory: dir })
+      assert.equal(report.measured.length, 1, 'only the row with a generation window')
+      assert.equal(report.totals.speedRows, 1)
+      assert.equal(averageTokPerSecond(report.totals), 50)
+      assert.equal(averageTtftMs(report.totals), 500)
+    },
+  )
 })

@@ -22,6 +22,7 @@ import {
   parseUsageArgs,
   renderUsageText,
 } from '../src/utils/tokenUsageText.ts'
+import { loadSessionTitles } from '../src/utils/sessionTitles.ts'
 
 let options
 try {
@@ -35,4 +36,7 @@ try {
   process.exit(1)
 }
 
-process.stdout.write(renderUsageText(options))
+// Names are resolved from the transcripts, not the ledger. A failure returns an
+// empty map, and the report falls back to short ids.
+const titles = await loadSessionTitles()
+process.stdout.write(renderUsageText({ ...options, titles }))

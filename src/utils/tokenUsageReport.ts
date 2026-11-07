@@ -26,6 +26,57 @@ export const USAGE_PERIODS: readonly UsagePeriod[] = [
   'all',
 ]
 
+/** A date the user typed, or the one the report could not read. */
+export class UsageRangeError extends Error {}
+
+/**
+ * Parse a `YYYY-MM-DD` day as a *local* calendar day.
+ *
+ * The ledger stamps rows in UTC, but a range is a question about the days the
+ * user lived through. Parsing the string as UTC midnight and comparing against
+ * local timestamps would move the boundary by the UTC offset and quietly put a
+ * row on the wrong side of it. The components are therefore validated and then
+ * fed to the local Date constructor.
+ *
+ * Round-tripping the components is what rejects `2026-02-31`: Date would roll
+ * it forward to March 3, and a range that silently means a different set of
+ * days is worse than one that refuses.
+ */
+export function parseDay(value: string): { year: number; month: number; day: number } {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim())
+  if (!match) throw new UsageRangeError(`Expected YYYY-MM-DD, got "${value}"`)
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const probe = new Date(year, month - 1, day)
+  if (
+    probe.getFullYear() !== year ||
+    probe.getMonth() !== month - 1 ||
+    probe.getDate() !== day
+  ) {
+    throw new UsageRangeError(`There is no such day: ${value}`)
+  }
+  return { year, month, day }
+}
+
+/** Local midnight at the start of the named day. */
+export function dayStartMs(value: string): number {
+  const { year, month, day } = parseDay(value)
+  return new Date(year, month - 1, day).getTime()
+}
+
+/** Local midnight at the start of the day AFTER the named day (exclusive end). */
+export function dayEndMs(value: string): number {
+  const { year, month, day } = parseDay(value)
+  return new Date(year, month - 1, day + 1).getTime()
+}
+
+/** The day a timestamp falls in, as `YYYY-MM-DD` in local time. */
+export function dayKey(at: number): string {
+  const date = new Date(at)
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
 export interface UsageTotals {
   requests: number
   input: number
@@ -40,6 +91,10 @@ export interface UsageTotals {
   speedOutput: number
   /** Total generation milliseconds from those responses. */
   speedMs: number
+  /** Measured rows that also recorded a first-token time. */
+  ttftRows: number
+  /** Sum of those first-token times. */
+  ttftMs: number
 }
 
 export interface UsageGroup {
@@ -54,12 +109,39 @@ export interface UsageBucket {
   totals: UsageTotals
 }
 
+export interface UsageSeriesPoint {
+  /** Sortable key: `YYYY-MM-DD`, `YYYY-Www` or `YYYY-MM`. */
+  key: string
+  totals: UsageTotals
+}
+
+/**
+ * The counted window as contiguous points, oldest first.
+ *
+ * Contiguous on purpose: a missing point would be indistinguishable from a
+ * period nobody used, and a chart that cannot tell those apart is a chart that
+ * lies. The unit is chosen from the span so a year of history is not 365
+ * one-character columns.
+ */
+export interface UsageSeries {
+  unit: 'day' | 'week' | 'month'
+  points: UsageSeriesPoint[]
+}
+
 export interface UsageReport {
   totals: UsageTotals
   byModel: UsageGroup[]
   byBackend: UsageGroup[]
   bySession: UsageGroup[]
   buckets: UsageBucket[]
+  /** The counted window, gap-filled, for the trend chart. */
+  series: UsageSeries
+  /**
+   * Counted rows that measured a generation window, oldest first. The UI uses
+   * them for the slowest/fastest drill-down; the report itself never ranks
+   * them, because "slowest" is a question about a window and a filter.
+   */
+  measured: TokenLedgerRow[]
   /** Rows the ledger held but the report did not count, with the reason. */
   excluded: {
     replay: number
@@ -77,6 +159,13 @@ export interface UsageReport {
 export interface LoadOptions {
   directory?: string
   period?: UsagePeriod
+  /**
+   * Explicit window, inclusive on both ends, as `YYYY-MM-DD` local days.
+   * When either is set it replaces the calendar period for that side, so
+   * `from` alone means "since that day" and `to` alone means "up to it".
+   */
+  from?: string
+  to?: string
   /** Only rows whose session id starts with this prefix. */
   sessionPrefix?: string
   /** Only rows whose model id contains this substring, case-insensitive. */
@@ -106,6 +195,8 @@ function emptyTotals(): UsageTotals {
     speedRows: 0,
     speedOutput: 0,
     speedMs: 0,
+    ttftRows: 0,
+    ttftMs: 0,
   }
 }
 
@@ -140,7 +231,21 @@ export function addRow(totals: UsageTotals, row: TokenLedgerRow): void {
     totals.speedRows += 1
     totals.speedOutput += row.output
     totals.speedMs += row.genMs
+    // First-token time is measured separately from the generation window, and
+    // older rows may have one without the other. It is averaged over the rows
+    // that recorded it, not over every measured row.
+    if (typeof row.ttftMs === 'number' && row.ttftMs > 0) {
+      totals.ttftRows += 1
+      totals.ttftMs += row.ttftMs
+    }
   }
+}
+
+/** Mean time to first token over the rows that recorded one, or null. */
+export function averageTtftMs(totals: UsageTotals): number | null {
+  if (totals.ttftRows <= 0) return null
+  const value = totals.ttftMs / totals.ttftRows
+  return Number.isFinite(value) && value > 0 ? value : null
 }
 
 /** The output rate implied by a group's measured rows, or null when none did. */
@@ -386,8 +491,11 @@ export function buildUsageReport(options: LoadOptions = {}): UsageReport {
     datable.push({ row, at })
   }
 
-  const start = periodStart(period, now)
-  const end = periodEnd(period, now)
+  // An explicit day wins over the calendar period on the side it names. The
+  // parse throws rather than returning null: a range that cannot be read must
+  // not quietly become an unbounded one.
+  const start = options.from !== undefined ? dayStartMs(options.from) : periodStart(period, now)
+  const end = options.to !== undefined ? dayEndMs(options.to) : periodEnd(period, now)
   const filtered: TokenLedgerRow[] = []
   for (const entry of datable) {
     if (start !== null && entry.at < start) {
@@ -446,6 +554,11 @@ export function buildUsageReport(options: LoadOptions = {}): UsageReport {
         totals: summarize(members),
       }))
       .sort((a, b) => a.key.localeCompare(b.key)),
+    series: buildSeries(filtered, unit, start, end),
+    measured: filtered.filter(
+      row =>
+        typeof row.genMs === 'number' && row.genMs > 0 && row.output > 0,
+    ),
     excluded,
     window: {
       from: times.length > 0 ? new Date(times[0]!).toISOString() : null,
@@ -453,6 +566,73 @@ export function buildUsageReport(options: LoadOptions = {}): UsageReport {
     },
     lifetime: summarize(counted),
   }
+}
+
+/**
+ * The counted window as contiguous points at `unit`.
+ *
+ * The bounds come from the selected range when there is one, and from the
+ * counted rows otherwise. Filling the gaps is the point: a day with no rows is
+ * a real zero, and leaving it out would draw a straight line across a week
+ * nobody used.
+ */
+function buildSeries(
+  rows: readonly TokenLedgerRow[],
+  unit: 'day' | 'week' | 'month',
+  start: number | null,
+  end: number | null,
+): UsageSeries {
+  const times = rows
+    .map(row => Date.parse(row.at))
+    .filter(value => !Number.isNaN(value))
+  const first = start ?? (times.length > 0 ? Math.min(...times) : null)
+  const last = end ?? (times.length > 0 ? Math.max(...times) + 1 : null)
+  if (first === null || last === null || last <= first) {
+    return { unit, points: [] }
+  }
+
+  const byKey = new Map<string, TokenLedgerRow[]>()
+  for (const row of rows) {
+    const at = Date.parse(row.at)
+    if (Number.isNaN(at)) continue
+    const key = bucketKey(at, unit)
+    const bucket = byKey.get(key)
+    if (bucket) bucket.push(row)
+    else byKey.set(key, [row])
+  }
+
+  const points: UsageSeriesPoint[] = []
+  const cursor = bucketCursor(first, unit)
+  // A window wide enough to overflow the chart is aggregated rather than
+  // truncated: a truncated axis silently misstates the window.
+  const limit = unit === 'month' ? 240 : 400
+  while (cursor.getTime() < last && points.length < limit) {
+    const key = bucketKey(cursor.getTime(), unit)
+    points.push({ key, totals: summarize(byKey.get(key) ?? []) })
+    advanceBucket(cursor, unit)
+  }
+  if (points.length >= limit && cursor.getTime() < last) {
+    return buildSeries(rows, unit === 'day' ? 'week' : 'month', first, last)
+  }
+  return { unit, points }
+}
+
+/** Local start of the bucket containing `at`. */
+function bucketCursor(at: number, unit: 'day' | 'week' | 'month'): Date {
+  const date = new Date(at)
+  const cursor = new Date(date.getFullYear(), date.getMonth(), date.getDate())
+  if (unit === 'week') {
+    cursor.setDate(cursor.getDate() - ((cursor.getDay() + 6) % 7))
+  } else if (unit === 'month') {
+    cursor.setDate(1)
+  }
+  return cursor
+}
+
+function advanceBucket(cursor: Date, unit: 'day' | 'week' | 'month'): void {
+  if (unit === 'day') cursor.setDate(cursor.getDate() + 1)
+  else if (unit === 'week') cursor.setDate(cursor.getDate() + 7)
+  else cursor.setMonth(cursor.getMonth() + 1)
 }
 
 /**

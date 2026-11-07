@@ -1,8 +1,10 @@
 import { tokenLedgerDirectory } from './tokenLedger.js'
+import { chatLabel } from './sessionTitles.js'
 import {
   averageTokPerSecond,
   buildUsageReport,
   cachedShare,
+  parseDay,
   totalTokens,
   type UsagePeriod,
   type UsageReport,
@@ -27,12 +29,17 @@ import {
 export interface UsageCliOptions {
   format: 'text' | 'json'
   period: UsagePeriod
+  /** Explicit window (inclusive), `YYYY-MM-DD`; overrides `period` per side. */
+  from?: string
+  to?: string
   directory?: string
   sessionPrefix?: string
   model?: string
   backend?: string
   includeReplay: boolean
   top: number
+  /** Session id → chat name, when a caller has resolved one. */
+  titles?: ReadonlyMap<string, string>
   /** `--help` was asked for; the report is the help text instead. */
   help: boolean
 }
@@ -45,6 +52,8 @@ Usage: /usage [options]          (bare /usage opens the menu)
 Options:
   --dir DIR            Ledger directory (default: $GATEWAY_TOKEN_LEDGER_DIR or ~/.claude/token-ledger)
   --period WHEN        today | week | month | all        (default: all)
+  --from YYYY-MM-DD    Start of an explicit window (inclusive, local day)
+  --to YYYY-MM-DD      End of an explicit window (inclusive, local day)
   --session PREFIX     Only rows whose session id starts with PREFIX
   --model SUBSTRING    Only rows whose model contains SUBSTRING (case-insensitive)
   --backend NAME       Only rows for one backend (codex, deepseek, opencode-go, ...)
@@ -92,12 +101,25 @@ export function parseUsageArgs(argv: readonly string[]): UsageCliOptions {
         throw new UsageArgumentError(`--period must be one of: ${PERIODS.join(', ')}`)
       }
       options.period = period
+    } else if (arg === '--from' || arg === '--to') {
+      const value = valueOf(index++, arg)
+      // Validate here rather than at report time: a range the report cannot
+      // read must be refused before it prints a window nobody asked for.
+      try {
+        parseDay(value)
+      } catch (error) {
+        throw new UsageArgumentError(
+          error instanceof Error ? error.message : `${arg} is not a day`,
+        )
+      }
+      if (arg === '--from') options.from = value
+      else options.to = value
     } else if (arg === '--since' || arg === '--until') {
       // Kept as a loud failure rather than silently ignored: these were
       // advertised once and removed, and a user who still types them should be
-      // told the window moved to --period rather than shown an unscoped report.
+      // told the surface rather than shown an unscoped report.
       throw new UsageArgumentError(
-        `${arg} was replaced by --period (today | week | month | all)`,
+        `${arg} is not a flag; use --from / --to (YYYY-MM-DD) or --period (today | week | month | all)`,
       )
     } else if (arg === '--session') options.sessionPrefix = valueOf(index++, '--session')
     else if (arg === '--model') options.model = valueOf(index++, '--model')
@@ -242,6 +264,8 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
   const report = buildUsageReport({
     directory: resolved.directory,
     period: resolved.period,
+    from: resolved.from,
+    to: resolved.to,
     sessionPrefix: resolved.sessionPrefix,
     model: resolved.model,
     backend: resolved.backend,
@@ -252,9 +276,13 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
 
   const width = 100
   const lines: string[] = []
+  const windowLabel =
+    resolved.from || resolved.to
+      ? `${resolved.from ?? 'start'} → ${resolved.to ?? 'now'}`
+      : resolved.period
   lines.push(`Token ledger ${resolved.directory ?? tokenLedgerDirectory()}`)
   lines.push(
-    `  window ${resolved.period} · ${num(report.totals.requests)} requests · ${num(report.totals.sessions)} chats`,
+    `  window ${windowLabel} · ${num(report.totals.requests)} requests · ${num(report.totals.sessions)} chats`,
   )
   if (report.window.from && report.window.to) {
     lines.push(`  recorded between ${report.window.from} and ${report.window.to}`)
@@ -295,6 +323,22 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
     }
     lines.push(labelLine(report.buckets.map(bucket => bucket.key), width))
     lines.push('')
+
+    // Throughput over time, on the same buckets. A bucket with no measured
+    // response is a gap, not a zero: drawing it as zero would claim the
+    // provider answered instantly.
+    const speeds = report.buckets.map(bucket => averageTokPerSecond(bucket.totals))
+    if (speeds.some(value => value !== null)) {
+      const measured = speeds.map(value => value ?? 0)
+      const peak = Math.max(...measured)
+      const peakBucket = report.buckets[measured.indexOf(peak)]
+      lines.push(`SPEED (output tok/s per bucket, measured responses only)`)
+      lines.push(`  ${sparkline(measured)}`)
+      lines.push(
+        `  peak ${rate(peak)} tok/s in ${peakBucket?.key ?? '—'} · ${num(report.totals.speedRows)} measured of ${num(report.totals.requests)} responses`,
+      )
+      lines.push('')
+    }
   }
 
   const composition = renderShare(
@@ -316,7 +360,20 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
 
   lines.push(barSection('BY MODEL', report.byModel, resolved.top, width))
   lines.push('')
-  lines.push(barSection('BY CHAT', report.bySession, resolved.top, width))
+  lines.push(
+    barSection(
+      'BY CHAT',
+      report.bySession.map(group => ({
+        ...group,
+        key:
+          group.key === '(no session)'
+            ? group.key
+            : chatLabel(group.key, resolved.titles),
+      })),
+      resolved.top,
+      width,
+    ),
+  )
   lines.push('')
   lines.push(barSection('BY UPSTREAM', report.byBackend, report.byBackend.length, width))
   lines.push('')
@@ -324,7 +381,8 @@ export function renderUsageText(options: Partial<UsageCliOptions> = {}): string 
     'input, output, cache read and cache write are the four figures the provider reported and\n' +
       'do not overlap. "cached" is the share of the total spent re-reading cache. "tok/s" is\n' +
       'output tokens over the time between the first and last streamed token, weighted across\n' +
-      'the responses that measured it.',
+      'the responses that measured it. Chat labels are "name (short id)"; --session takes the\n' +
+      'id prefix, which is the part in parentheses.',
   )
   return `${lines.join('\n')}\n`
 }
@@ -334,6 +392,8 @@ function renderUsageJson(report: UsageReport, options: UsageCliOptions): string 
     {
       ledger: options.directory ?? tokenLedgerDirectory(),
       period: options.period,
+      from: options.from ?? null,
+      to: options.to ?? null,
       window: report.window,
       totals: report.totals,
       lifetime: report.lifetime,
@@ -341,7 +401,10 @@ function renderUsageJson(report: UsageReport, options: UsageCliOptions): string 
       byModel: report.byModel,
       byBackend: report.byBackend,
       bySession: report.bySession,
+      // The ids stay the machine key; the names are the same rows, readable.
+      titles: Object.fromEntries(options.titles ?? []),
       buckets: report.buckets,
+      series: report.series,
     },
     null,
     2,
