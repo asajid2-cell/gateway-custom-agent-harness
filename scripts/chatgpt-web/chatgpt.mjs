@@ -4505,7 +4505,11 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
     // Post-reply enrichment only: the reply is already in hand, so an expiry here
     // costs the model label and never the answer.
     const state = await railOr(pageState(page), Date.now() + SEND_TAIL_MS, { model: null })
-    if (waited.timedOut) {
+    // `null` is the attribution refusal: no DOM answer proved it descends from
+    // this send, so nothing may be delivered synchronously. It is the same
+    // outcome as the budget running out - the turn stays owed and the
+    // observation pass settles it - never an error.
+    if (!waited || waited.timedOut) {
       // The DOM waited as long as it may. Before calling the turn lost, ask the
       // server: when the page fails to render ("can't load conversation") the
       // answer is usually already there, and the turn did complete.
@@ -4514,7 +4518,8 @@ async function ask(page, text, { newChat = false, threadId = null, onAccepted = 
         await log(`reply recovered from the server after the page stopped rendering (${recovered.length} chars)`)
         return { reply: clampReply(recovered), url: page.url(), model: state.model, attachment, source: 'server' }
       }
-      return { reply: '', url: page.url(), model: state.model, attachment, timedOut: true, seconds: waited.seconds, state: 'generating' }
+      const seconds = waited?.seconds ?? Math.round((Date.now() - replyStartedAt) / 1000)
+      return { reply: '', url: page.url(), model: state.model, attachment, timedOut: true, seconds, state: 'generating' }
     }
     return { reply: clampReply(waited.reply), url: page.url(), model: state.model, attachment }
   } finally {
