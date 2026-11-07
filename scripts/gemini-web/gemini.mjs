@@ -16,6 +16,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { createLaneGate } from '../web-lane-gate.mjs'
 
 const PORT = Number(process.env.GEMINI_CDP_PORT || process.env.CHATGPT_CDP_PORT || 9223)
 const PROFILE = process.env.GEMINI_PROFILE || process.env.CHATGPT_PROFILE || join(homedir(), '.gemini-web', 'profile')
@@ -320,6 +321,8 @@ const LANE_SEEN = new Map()
 const LANE_SEEN_GRACE_MS = 60_000
 const LANE_SWEEP_EVERY_MS = 60_000
 let LANE_SWEPT_AT = 0
+/** Tab creation and its first load are one-at-a-time; see scripts/web-lane-gate.mjs. */
+const serialLaneOpen = createLaneGate()
 
 function bounded(promise, ms) {
   let timer
@@ -437,9 +440,15 @@ async function geminiPage(context) {
         if (await tabNameOf(candidate) === wanted) { page = candidate; break }
       }
       if (!page) {
-        page = await context.newPage()
-        await page.goto(APP, { waitUntil: 'domcontentloaded' })
-        await log(`lane tab opened for ${lane}`)
+        // One tab opens at a time per browser: concurrent first loads starve
+        // each other and a lane warm then misses its budget (ChatGPT measured
+        // two at 120 s; the browser is the same single resource here).
+        page = await serialLaneOpen(async () => {
+          const created = await context.newPage()
+          await created.goto(APP, { waitUntil: 'domcontentloaded' })
+          await log(`lane tab opened for ${lane}`)
+          return created
+        })
       }
       const mine = page
       LANE_PAGES.set(lane, mine)

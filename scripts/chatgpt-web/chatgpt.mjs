@@ -25,6 +25,7 @@ import { pathToFileURL } from 'node:url'
 import readline from 'node:readline'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createReadBudget } from './readbudget.mjs'
+import { createLaneGate } from '../web-lane-gate.mjs'
 
 const HOME = os.homedir()
 const BASE = path.join(HOME, '.chatgpt-web')
@@ -1200,6 +1201,8 @@ const LANE_SEEN_GRACE_MS = 60_000
 /** How often a lane open may run the age-based sweep (the host sweeps by list). */
 const LANE_SWEEP_EVERY_MS = 60_000
 let LANE_SWEPT_AT = 0
+/** Tab creation and its first load are one-at-a-time; see scripts/web-lane-gate.mjs. */
+const serialLaneOpen = createLaneGate()
 
 /** A tab's name, bounded: a hung renderer must not hold the caller. */
 async function tabNameOf(page) {
@@ -1318,10 +1321,16 @@ async function lanePage(context) {
       if (await tabNameOf(candidate) === wanted) { page = candidate; break }
     }
     if (!page) {
-      page = await context.newPage()
-      await page.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
-      await ensureLaneName(page, wanted)
-      await log(`lane tab opened for ${leaseId}`)
+      // Creation + first load is the expensive, contention-sensitive part; it
+      // is one-at-a-time per browser so four senders cannot load four tabs at
+      // once (measured: two warms past 120 s, child silent >50 s).
+      page = await serialLaneOpen(async () => {
+        const created = await context.newPage()
+        await created.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+        await ensureLaneName(created, wanted)
+        await log(`lane tab opened for ${leaseId}`)
+        return created
+      })
     }
     const mine = page
     LANE_PAGES.set(leaseId, mine)
