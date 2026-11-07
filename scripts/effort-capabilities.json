@@ -129,14 +129,8 @@
   "gatewayWebSearch": {
     "serverToolModels": [
       "gateway-claude-haiku-5-5",
-      "gateway-claude-haiku-4-5-20251001",
       "gateway-gpt-6-luna",
-      "gateway-gpt-luna",
-      "gateway-gpt-6-sol",
-      "gateway-gpt-sol",
-      "gateway-gpt-astra",
-      "gateway-gpt-terra",
-      "gateway-gpt-6.1-sol"
+      "gateway-mistral-search"
     ]
   },
   "opencodeGo": {

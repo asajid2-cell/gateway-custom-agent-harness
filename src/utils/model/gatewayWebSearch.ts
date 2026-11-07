@@ -99,3 +99,48 @@ export function resolveGatewayWebSearchModel(requested: string): string {
     : undefined
   return first ?? requested
 }
+
+/**
+ * The backends a search can be run on, in preference order.
+ *
+ * This is the *choice* surface: the tool's `provider`/`providers` inputs name
+ * one of these ids, and the order here is what `auto` follows. It is kept next
+ * to the catalog lookup rather than in the tool so a route becomes offered (and
+ * a label becomes accurate) in one place.
+ *
+ * A route is offered only once its backend is judged able to execute the server
+ * tool, so the Mistral Conversations route appears here automatically when its
+ * model is added to `serverToolModels`.
+ */
+export type GatewaySearchProvider = 'haiku' | 'luna' | 'mistral'
+
+export type GatewaySearchRoute = {
+  id: GatewaySearchProvider
+  /** What the user and the model see, so a run names who served it. */
+  label: string
+  model: string
+}
+
+const SEARCH_ROUTES: readonly GatewaySearchRoute[] = [
+  { id: 'haiku', label: 'Claude Haiku 5.5', model: 'gateway-claude-haiku-5-5' },
+  { id: 'luna', label: 'Codex Luna', model: 'gateway-gpt-6-luna' },
+  { id: 'mistral', label: 'Mistral web search', model: 'gateway-mistral-search' },
+]
+
+export function gatewaySearchRoutes(): GatewaySearchRoute[] {
+  return SEARCH_ROUTES.filter(route => gatewayModelSupportsWebSearch(route.model))
+}
+
+export function gatewaySearchRoute(
+  id: GatewaySearchProvider,
+): GatewaySearchRoute | undefined {
+  return gatewaySearchRoutes().find(route => route.id === id)
+}
+
+/** The human label for a route, for the tool result line. */
+export function gatewaySearchLabel(model: string): string {
+  const route = SEARCH_ROUTES.find(
+    candidate => candidate.model.toLowerCase() === model.toLowerCase(),
+  )
+  return route?.label ?? model
+}

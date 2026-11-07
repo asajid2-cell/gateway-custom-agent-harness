@@ -64,9 +64,11 @@ import {
   MISTRAL_ROUTES,
   mistralEffortLevels,
   mistralEndpoint,
+  mistralConversationsEndpoint,
   mistralGatewayId,
   mistralRouteVariants,
   mistralHeaders,
+  mistralSearchModel,
   anthropicToMistralChat,
 } from './mistral.mjs'
 import {
@@ -399,6 +401,15 @@ const DEFAULT_MODELS = {
       ]),
     ),
   ),
+  // The Mistral web-search executor. Not a conversation model: WebSearchTool
+  // addresses it when it wants Mistral's own search, and the route runs the
+  // Anthropic server tool through the Conversations API. Hidden from discovery
+  // and from the picker.
+  'gateway-mistral-search': {
+    backend: 'mistral-search',
+    upstream: mistralSearchModel(),
+    hidden: true,
+  },
   // Legacy aliases for existing transcripts and direct callers. They remain
   // routable but hidden so a new session cannot accidentally select a Claude-
   // named route.
@@ -4894,6 +4905,308 @@ async function handleMistral(body, req, res, modelName, route) {
   }
 }
 
+/**
+ * The query a WebSearchTool turn asks for.
+ *
+ * The tool builds the whole turn as one instruction ("Perform a web search for
+ * the query: <q>"), so the last user message is the query with that prefix.
+ */
+export function mistralSearchQuery(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role !== 'user') continue
+    const text = contentText(messages[index].content).trim()
+    if (!text) continue
+    return text.replace(/^perform a web search for the query:\s*/i, '').trim() || text
+  }
+  return ''
+}
+
+function mistralSearchFilter(body) {
+  const tool = (Array.isArray(body?.tools) ? body.tools : []).find(
+    candidate =>
+      candidate?.type === 'web_search_20250305' || candidate?.type === 'web_search',
+  )
+  return {
+    maxUses:
+      Number.isSafeInteger(tool?.max_uses) && tool.max_uses > 0
+        ? tool.max_uses
+        : 8,
+    allowed: Array.isArray(tool?.allowed_domains)
+      ? tool.allowed_domains.filter(domain => typeof domain === 'string' && domain)
+      : [],
+    blocked: Array.isArray(tool?.blocked_domains)
+      ? tool.blocked_domains.filter(domain => typeof domain === 'string' && domain)
+      : [],
+  }
+}
+
+function domainMatches(host, domain) {
+  const wanted = domain.toLowerCase().replace(/^\./, '')
+  return host === wanted || host.endsWith(`.${wanted}`)
+}
+
+function mistralResultAllowed(url, filter) {
+  let host = ''
+  try {
+    host = new URL(url).hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  if (!host) return false
+  if (filter.blocked.some(domain => domainMatches(host, domain))) return false
+  if (filter.allowed.length === 0) return true
+  return filter.allowed.some(domain => domainMatches(host, domain))
+}
+
+/**
+ * One `tool.execution` entry as Anthropic `web_search_result` blocks.
+ *
+ * Mistral packs the results into `info.result`, a *JSON string* mapping an
+ * opaque id to `{url,title,description,snippets}` - probed live 2026-11-07.
+ * Anthropic's block wants `{type:'web_search_result', url, title}`; the harness
+ * reads only title and url, and the remaining fields are carried as text.
+ */
+export function mistralSearchResults(entry, filter = { allowed: [], blocked: [] }) {
+  const raw = entry?.info?.result
+  if (typeof raw !== 'string' || !raw) return []
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return []
+  }
+  const results = []
+  for (const value of Object.values(parsed || {})) {
+    if (!value || typeof value !== 'object') continue
+    const url = typeof value.url === 'string' ? value.url : ''
+    if (!url || !mistralResultAllowed(url, filter)) continue
+    results.push({
+      type: 'web_search_result',
+      title: typeof value.title === 'string' && value.title ? value.title : url,
+      url,
+      encrypted_content: '',
+    })
+  }
+  return results
+}
+
+/**
+ * The Anthropic server-side web_search, executed on Mistral.
+ *
+ * Chat completions refuses the connector for this account and for the hosted
+ * DeepSeek model; the Conversations API runs it on a Mistral-hosted model and
+ * returns the executed query plus real results. The reply is relayed in the
+ * Anthropic shape the caller expects (`server_tool_use` then
+ * `web_search_tool_result`, then the answer text), so the session's own model
+ * never needs search ability of its own.
+ */
+async function handleMistralSearch(body, req, res, modelName) {
+  const wantsStream = body.stream === true
+  const trace = createGatewayTrace({
+    model: modelName,
+    backend: 'mistral-search',
+    protocol: 'anthropic-messages',
+  })
+  const control = createRequestControl(req, res, trace)
+  const query = mistralSearchQuery(body)
+  if (!query) {
+    anthropicError(res, 400, 'Web search request carried no query')
+    trace.finish('invalid-request', null, 400)
+    control.cleanup()
+    return
+  }
+  const filter = mistralSearchFilter(body)
+  const apiPool = await ensureMistralPreference(upstreamSessionId(req, body))
+  const credentials = mistralRouteCredentials(apiPool)
+  const apiKey = credentials.key
+  if (!apiKey) {
+    anthropicError(res, 401, 'Mistral API key is not configured')
+    trace.finish('auth-error', null, 401)
+    control.cleanup()
+    return
+  }
+
+  control.startUpstream()
+  let payload
+  try {
+    const upstream = await fetch(mistralConversationsEndpoint(), {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+        'user-agent': 'gateway-model-gateway/0.1',
+      },
+      body: JSON.stringify({
+        model: mistralSearchModel(),
+        inputs: [{ role: 'user', content: `Search the web for: ${query}` }],
+        tools: [{ type: 'web_search' }],
+        stream: false,
+      }),
+      signal: control.signal,
+    })
+    control.upstreamConnected()
+    if (!upstream.ok) {
+      const detail = await safeUpstreamResponseError(upstream, 'Mistral', apiKey, {
+        signal: control.signal,
+        timeoutMs: RETRY_RESPONSE_TIMEOUT_MS,
+        onTimeout: error => control.abortUpstream(error),
+      })
+      const status = upstream.status >= 500 ? 502 : upstream.status
+      anthropicError(res, status, `Mistral web search: ${detail}`)
+      trace.finish('upstream-http-error', null, status)
+      return
+    }
+    payload = await upstream.json()
+  } catch (error) {
+    trace.markError(error)
+    const status = control.statusFor(error)
+    anthropicError(res, status, 'Mistral web search failed')
+    trace.finish('upstream-error', error, status)
+    control.cleanup()
+    return
+  }
+
+  const outputs = Array.isArray(payload?.outputs) ? payload.outputs : []
+  const executions = outputs
+    .filter(entry => entry?.type === 'tool.execution' && entry?.name === 'web_search')
+    .slice(0, filter.maxUses)
+  const answer = outputs.find(entry => entry?.type === 'message.output')
+  const textParts = (Array.isArray(answer?.content) ? answer.content : [])
+    .filter(part => part?.type === 'text' && typeof part.text === 'string' && part.text)
+    .map(part => part.text)
+  const seenReference = new Set()
+  const references = (Array.isArray(answer?.content) ? answer.content : []).filter(
+    part => {
+      if (
+        part?.type !== 'tool_reference' ||
+        typeof part.url !== 'string' ||
+        !part.url ||
+        seenReference.has(part.url) ||
+        !mistralResultAllowed(part.url, filter)
+      ) {
+        return false
+      }
+      seenReference.add(part.url)
+      return true
+    },
+  )
+
+  if (executions.length === 0 && textParts.length === 0) {
+    anthropicError(res, 502, 'Mistral web search returned no results')
+    trace.finish('empty-response', null, 502)
+    control.cleanup()
+    return
+  }
+
+  const executionBlocks = executions.map(execution => {
+    const toolUseId = `srvtoolu_${randomUUID().replaceAll('-', '')}`
+    return {
+      toolUseId,
+      results: mistralSearchResults(execution, filter),
+    }
+  })
+  const referenceList = references.length
+    ? `Sources:\n${references.map(part => `- [${part.title || part.url}](${part.url})`).join('\n')}`
+    : ''
+
+  trace.markOutput()
+  try {
+    if (wantsStream) {
+      startAnthropicStream(res, modelName)
+      let index = 0
+      for (const block of executionBlocks) {
+        sendEvent(res, 'content_block_start', {
+          index,
+          content_block: {
+            type: 'server_tool_use',
+            id: block.toolUseId,
+            name: 'web_search',
+            input: {},
+          },
+        })
+        sendEvent(res, 'content_block_delta', {
+          index,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify({ query }),
+          },
+        })
+        sendEvent(res, 'content_block_stop', { index })
+        index += 1
+        sendEvent(res, 'content_block_start', {
+          index,
+          content_block: {
+            type: 'web_search_tool_result',
+            tool_use_id: block.toolUseId,
+            content: block.results,
+          },
+        })
+        sendEvent(res, 'content_block_stop', { index })
+        index += 1
+      }
+      for (const text of [...textParts, ...(referenceList ? [referenceList] : [])]) {
+        sendEvent(res, 'content_block_start', {
+          index,
+          content_block: { type: 'text', text: '' },
+        })
+        sendEvent(res, 'content_block_delta', {
+          index,
+          delta: { type: 'text_delta', text },
+        })
+        sendEvent(res, 'content_block_stop', { index })
+        index += 1
+      }
+      sendEvent(res, 'message_delta', {
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { input_tokens: 0, output_tokens: 0 },
+      })
+      sendEvent(res, 'message_stop', {})
+      res.end()
+    } else {
+      const content = []
+      for (const block of executionBlocks) {
+        content.push({
+          type: 'server_tool_use',
+          id: block.toolUseId,
+          name: 'web_search',
+          input: { query },
+        })
+        content.push({
+          type: 'web_search_tool_result',
+          tool_use_id: block.toolUseId,
+          content: block.results,
+        })
+      }
+      for (const text of textParts) content.push({ type: 'text', text })
+      if (referenceList) content.push({ type: 'text', text: referenceList })
+      json(res, 200, {
+        id: `msg_${randomUUID().replaceAll('-', '')}`,
+        type: 'message',
+        role: 'assistant',
+        model: modelName,
+        content,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      })
+    }
+    trace.markCompletion()
+    trace.finish('success', null, res.statusCode)
+  } catch (error) {
+    trace.markError(error)
+    if (!res.headersSent) {
+      anthropicError(res, 502, error instanceof Error ? error.message : 'Mistral web search failed')
+    } else {
+      finishAnthropicStreamWithError(res, error)
+    }
+    trace.finish('stream-error', error, res.statusCode)
+  } finally {
+    control.cleanup()
+  }
+}
+
 async function handleOpenCodeZen(body, req, res, modelName, route) {
   const wantsStream = body.stream === true
   const sessionId = upstreamSessionId(req, body)
@@ -6760,6 +7073,10 @@ async function dispatchRoute({ body, rawBody, req, res, requestUrl, modelName, r
   }
   if (route.backend === 'mistral') {
     await handleMistral(body, req, res, modelName, route)
+    return
+  }
+  if (route.backend === 'mistral-search') {
+    await handleMistralSearch(body, req, res, modelName)
     return
   }
   if (route.backend === 'amd-radeon') {

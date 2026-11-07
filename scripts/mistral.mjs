@@ -73,6 +73,22 @@ export function mistralEndpoint() {
   return `${MISTRAL_BASE_URL.replace(/\/$/, '')}/chat/completions`
 }
 
+/**
+ * The Conversations API. Chat completions refuses the `web_search` connector
+ * for this account and model ("WebSearchTool connector is not supported" /
+ * "does not support builtin connectors"), but the same key runs it here -
+ * probed live 2026-11-07 on both the Vibe and the Studio key, with a
+ * Mistral-hosted model.
+ */
+export function mistralConversationsEndpoint() {
+  return `${MISTRAL_BASE_URL.replace(/\/$/, '')}/conversations`
+}
+
+/** The Mistral-hosted model the search route runs on. */
+export function mistralSearchModel() {
+  return process.env.MODEL_GATEWAY_MISTRAL_SEARCH_MODEL || 'mistral-small-latest'
+}
+
 export function mistralHeaders(apiKey, stream = false) {
   return {
     authorization: `Bearer ${apiKey}`,

@@ -14,42 +14,41 @@ async function load() {
   )
 }
 
-test('the backends that serve the server tool are the Claude and Codex routes', async () => {
+test('the search providers are Haiku 5.5 and Luna, in that order', async () => {
+  const { gatewayModelSupportsWebSearch, gatewaySearchRoutes } = await load()
+  // Anthropic's own passthrough executes the tool and returns real result
+  // blocks with URLs - verified live 2026-11-07 on haiku 5.5.
+  assert.equal(gatewayModelSupportsWebSearch('gateway-claude-haiku-5-5'), true)
+  // Codex executes it natively - `anthropicToCodex` maps the declaration onto
+  // Codex's hosted `{type:'web_search'}` - but its results carry no URLs.
+  assert.equal(gatewayModelSupportsWebSearch('gateway-gpt-6-luna'), true)
+
+  // Exactly these three, in this order. Haiku 4.5 was removed deliberately.
+  assert.deepEqual(
+    gatewaySearchRoutes().map(route => route.id),
+    ['haiku', 'luna', 'mistral'],
+  )
+  assert.deepEqual(
+    gatewaySearchRoutes().map(route => route.label),
+    ['Claude Haiku 5.5', 'Codex Luna', 'Mistral web search'],
+  )
+})
+
+test('routes that cannot execute the server tool are not counted', async () => {
   const { gatewayModelSupportsWebSearch } = await load()
-  // Anthropic's own passthrough executes it and returns real result blocks with
-  // URLs - verified live 2026-11-07 on both haiku generations.
-  for (const model of [
-    'gateway-claude-haiku-5-5',
-    'gateway-claude-haiku-4-5-20251001',
-  ]) {
-    assert.equal(
-      gatewayModelSupportsWebSearch(model),
-      true,
-      `${model} executes the server tool (verified live: real result blocks)`,
-    )
-  }
-  // Codex executes it too, but natively - `anthropicToCodex` maps the
-  // declaration onto Codex's hosted `{type:'web_search'}` rather than a
-  // function call, and live probes return `web_search_call` items with real
-  // queries and live citations (luna, sol, astra all verified).
-  for (const model of ['gateway-gpt-luna', 'gateway-gpt-sol', 'gateway-gpt-astra']) {
-    assert.equal(
-      gatewayModelSupportsWebSearch(model),
-      true,
-      `${model} executes the search natively via the Codex hosted tool`,
-    )
-  }
   // AMD Radeon answers HTTP 400 "does not support native web search"; the
   // commandcode/opencode/mistral chat-completions lanes hand the model a
   // `tool_use` named web_search that nothing runs. The DeepSeek routes served
   // it until their credential left the vault - a listed route that answers 401
-  // can never serve a search, so they are not counted either.
+  // can never serve a search. Haiku 4.5 is simply not offered any more.
   for (const model of [
     'gateway-amd-ds-v4-flash',
     'gateway-commandcode-deepseek-v4.1-flash',
     'gateway-opencode-deepseek-v4.1-flash',
     'gateway-mistral-vibe-deepseek-v4.1-flash',
     'gateway-ds-flash',
+    'gateway-claude-haiku-4-5-20251001',
+    'gateway-gpt-sol',
   ]) {
     assert.equal(
       gatewayModelSupportsWebSearch(model),
@@ -80,12 +79,17 @@ test('a session is offered web search even when its own backend cannot run it', 
 
 test('the search request is addressed to a model whose backend executes it', async () => {
   const { resolveGatewayWebSearchModel } = await load()
-  // A Codex session runs its search natively now, so it keeps the route it is
-  // already on rather than paying to redirect to another backend.
+  // A session already on an offered route keeps it rather than paying to
+  // redirect to another backend.
   assert.equal(
-    resolveGatewayWebSearchModel('gateway-gpt-luna'),
-    'gateway-gpt-luna',
-    'a Codex-routed session searches natively and must stay on its own route',
+    resolveGatewayWebSearchModel('gateway-gpt-6-luna'),
+    'gateway-gpt-6-luna',
+    'a Luna-routed session searches natively and must stay on its own route',
+  )
+  // Any other Codex generation is not offered any more; it redirects.
+  assert.equal(
+    resolveGatewayWebSearchModel('gateway-gpt-sol'),
+    'gateway-claude-haiku-5-5',
   )
   // A route with no hosted search still gets a real search, because the search
   // is its own request and can be addressed to a backend that serves it. The
@@ -116,10 +120,13 @@ test('the search request is addressed to a model whose backend executes it', asy
 test('every listed model is a real gateway route, so the list cannot rot', async () => {
   const listed = CATALOG.gatewayWebSearch.serverToolModels
   const options = CATALOG.gatewayModelOptions.map(option => option.value)
+  // The Mistral executor is a hidden route on purpose: it is not a
+  // conversation model, so it is never selectable in the picker.
+  const hiddenButReal = new Set(['gateway-mistral-search'])
   assert.ok(listed.length > 0, 'at least one model must be able to search')
   for (const model of listed) {
     assert.ok(
-      options.includes(model),
+      options.includes(model) || hiddenButReal.has(model),
       `${model} is listed as able to search but is not a selectable route`,
     )
   }
