@@ -1203,6 +1203,48 @@ const LANE_SWEEP_EVERY_MS = 60_000
 let LANE_SWEPT_AT = 0
 /** Tab creation and its first load are one-at-a-time; see scripts/web-lane-gate.mjs. */
 const serialLaneOpen = createLaneGate()
+const LANE_RENDER_WAIT_MS = 12_000
+const LANE_RENDER_POLL_MS = 300
+
+/**
+ * Prove a freshly opened tab rendered the app shell: a composer or any message.
+ *
+ * A tab that loads while another lane's turn is running can come up with
+ * neither (measured 2026-11-07: the send then faulted pre-post and the turn
+ * paid a 90-190 s requeue). Callers reload the same tab once before giving up;
+ * they never open a second tab.
+ */
+export async function laneRenderProof(page, timeoutMs = LANE_RENDER_WAIT_MS, pollMs = LANE_RENDER_POLL_MS) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const state = await page.evaluate(() => ({
+      composer: Boolean(document.querySelector('#prompt-textarea, [contenteditable="true"]')),
+      messages: document.querySelectorAll('[data-message-author-role]').length,
+    })).catch(() => null)
+    if (state && (state.composer || state.messages > 0)) {
+      return { proven: true, composer: state.composer, messages: state.messages }
+    }
+    if (Date.now() >= deadline) {
+      return { proven: false, composer: state?.composer === true, messages: state?.messages ?? 0 }
+    }
+    await new Promise(resolve => setTimeout(resolve, pollMs))
+  }
+}
+
+/**
+ * A lane tab is usable when it rendered; if not, reload THAT tab once.
+ *
+ * Never a second tab: a duplicate page is a second identity and the user's
+ * rule is one bridge, one window. `reloads` is reported so a caller can log it.
+ */
+export async function ensureLaneRendered(page, { timeoutMs = LANE_RENDER_WAIT_MS, pollMs = LANE_RENDER_POLL_MS, label = '' } = {}) {
+  const first = await laneRenderProof(page, timeoutMs, pollMs)
+  if (first.proven) return { ...first, reloads: 0 }
+  await log(`lane tab${label ? ` for ${label}` : ''} rendered nothing; reloading it once`)
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+  const second = await laneRenderProof(page, timeoutMs, pollMs)
+  return { ...second, reloads: 1 }
+}
 
 /** A tab's name, bounded: a hung renderer must not hold the caller. */
 async function tabNameOf(page) {
@@ -1327,6 +1369,13 @@ async function lanePage(context) {
       page = await serialLaneOpen(async () => {
         const created = await context.newPage()
         await created.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+        // A tab that loaded while another turn was running can show neither a
+        // composer nor a message; typing there is the 90-190 s requeue measured
+        // on 2026-11-07. Prove the shell rendered, reloading this same tab once.
+        const proof = await ensureLaneRendered(created, { label: leaseId })
+        if (!proof.proven) {
+          throw new TurnError(`the lane tab did not render after one reload (composer ${proof.composer ? 'yes' : 'no'}, messages ${proof.messages})`, { reason: 'page-load-error', accepted: false })
+        }
         await ensureLaneName(created, wanted)
         await log(`lane tab opened for ${leaseId}`)
         return created
