@@ -1064,12 +1064,16 @@ $env:MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'
 # session titles, session search, agent hooks - so a lane that stalls degrades
 # all of them at once. The Codex lanes are not usable for this: measured 10
 # concurrent calls each, gateway-gpt-luna answered 1/10 (med 14.5s) and gpt-astra
-# 0/10, against 10/10 (med 1.0s) for gateway-ds-flash. Keep this on a lane that
-# answers. (Measured 2026-09-17.)
-$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'
+# 0/10. Keep this on a lane that answers. (Measured 2026-09-17.) The DeepSeek
+# lane it used to name (10/10, med 1.0s) lost its credential from the vault
+# (2026-11-07: every gateway-ds-* route answers 401), so the fast lane is now
+# the Anthropic haiku route - cheap, and the same route the web-search redirect
+# uses.
+$env:MODEL_GATEWAY_FAST_MODEL = 'gateway-claude-haiku-5-5'
 # Subagents do real work, so pick for capability among the lanes that answer.
-# gateway-ds-4.1-flash is the strongest measured here and answered 10/10.
-$env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-ds-4.1-flash'
+# The DeepSeek lane this named is gone with its credential; luna is the next
+# capable lane, and subagents run one or a few at a time rather than ten.
+$env:MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-6-luna'
 # Keep gateway-backed cc on the standard native harness compaction path.
 # Session-memory compaction is a separate summary producer and can replace
 # compactConversation() without making a provider request, which makes it

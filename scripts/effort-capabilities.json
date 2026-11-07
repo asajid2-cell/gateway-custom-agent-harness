@@ -128,9 +128,8 @@
   },
   "gatewayWebSearch": {
     "serverToolModels": [
-      "gateway-ds-flash",
-      "gateway-ds-pro",
-      "gateway-ds-4.1-flash",
+      "gateway-claude-haiku-5-5",
+      "gateway-claude-haiku-4-5-20251001",
       "gateway-gpt-6-luna",
       "gateway-gpt-luna",
       "gateway-gpt-6-sol",

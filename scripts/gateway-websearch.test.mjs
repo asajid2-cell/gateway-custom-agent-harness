@@ -14,20 +14,14 @@ async function load() {
   )
 }
 
-test('a DeepSeek-routed model is offered web search', async () => {
-  const { gatewayWebSearchAvailability } = await load()
-  for (const model of ['gateway-ds-flash', 'gateway-ds-pro', 'gateway-ds-4.1-flash']) {
-    assert.equal(
-      gatewayWebSearchAvailability(model),
-      true,
-      `${model} serves the server-side web_search tool (verified live)`,
-    )
-  }
-})
-
-test('the backends that serve the server tool are the DeepSeek and Codex routes', async () => {
+test('the backends that serve the server tool are the Claude and Codex routes', async () => {
   const { gatewayModelSupportsWebSearch } = await load()
-  for (const model of ['gateway-ds-flash', 'gateway-ds-pro', 'gateway-ds-4.1-flash']) {
+  // Anthropic's own passthrough executes it and returns real result blocks with
+  // URLs - verified live 2026-11-07 on both haiku generations.
+  for (const model of [
+    'gateway-claude-haiku-5-5',
+    'gateway-claude-haiku-4-5-20251001',
+  ]) {
     assert.equal(
       gatewayModelSupportsWebSearch(model),
       true,
@@ -46,12 +40,16 @@ test('the backends that serve the server tool are the DeepSeek and Codex routes'
     )
   }
   // AMD Radeon answers HTTP 400 "does not support native web search"; the
-  // commandcode/opencode chat-completions lanes hand the model a `tool_use`
-  // named web_search that nothing runs. Neither may be counted as serving it.
+  // commandcode/opencode/mistral chat-completions lanes hand the model a
+  // `tool_use` named web_search that nothing runs. The DeepSeek routes served
+  // it until their credential left the vault - a listed route that answers 401
+  // can never serve a search, so they are not counted either.
   for (const model of [
     'gateway-amd-ds-v4-flash',
     'gateway-commandcode-deepseek-v4.1-flash',
     'gateway-opencode-deepseek-v4.1-flash',
+    'gateway-mistral-vibe-deepseek-v4.1-flash',
+    'gateway-ds-flash',
   ]) {
     assert.equal(
       gatewayModelSupportsWebSearch(model),
@@ -90,16 +88,28 @@ test('the search request is addressed to a model whose backend executes it', asy
     'a Codex-routed session searches natively and must stay on its own route',
   )
   // A route with no hosted search still gets a real search, because the search
-  // is its own request and can be addressed to a backend that serves it.
+  // is its own request and can be addressed to a backend that serves it. The
+  // first entry is the Anthropic haiku route: cheapest, and it returns URLs
+  // where Codex returns none.
   assert.equal(
     resolveGatewayWebSearchModel('gateway-commandcode-deepseek-v4.1-flash'),
-    CATALOG.gatewayWebSearch.serverToolModels[0],
-    'a Command-Code-routed session must not send the search to chat-completions',
+    'gateway-claude-haiku-5-5',
+    'a Command-Code-routed session searches on the cheap Claude route',
+  )
+  assert.equal(
+    resolveGatewayWebSearchModel('gateway-mistral-vibe-deepseek-v4.1-flash'),
+    'gateway-claude-haiku-5-5',
+    'a Mistral-routed session searches on the cheap Claude route',
+  )
+  // The dead DeepSeek route must not keep a search addressed to itself.
+  assert.equal(
+    resolveGatewayWebSearchModel('gateway-ds-flash'),
+    'gateway-claude-haiku-5-5',
   )
   // When the session already runs on a capable model, keep it.
   assert.equal(
-    resolveGatewayWebSearchModel('gateway-ds-flash'),
-    'gateway-ds-flash',
+    resolveGatewayWebSearchModel('gateway-claude-haiku-5-5'),
+    'gateway-claude-haiku-5-5',
   )
 })
 

@@ -12,10 +12,15 @@ import { normalizeGatewayModelId } from './gatewayModelIds.js'
  * conversation therefore does not need any search ability of its own - but the
  * provider endpoint it is addressed to does have to execute that schema.
  *
- * Probed route by route (2026-09-17, all 45 routes in gatewayModelOptions):
- *   - `gateway-ds-*`    SERVES      - Anthropic-protocol passthrough; the
- *                                   provider runs the tool and streams back real
- *                                   `web_search_tool_result` blocks with URLs
+ * Probed route by route (2026-11-07, re-probed live through the Gateway):
+ *   - `gateway-claude-haiku-*` SERVES - Anthropic passthrough; the subscription
+ *                                   runs the tool and streams real
+ *                                   `web_search_tool_result` blocks with URLs.
+ *                                   Listed FIRST because it is the cheapest route
+ *                                   that returns citable URLs, and because the
+ *                                   search is its own request: a DeepSeek session
+ *                                   on Command Code or Mistral searches here
+ *                                   without a Codex or Anthropic subagent.
  *   - `gateway-gpt-*`   SERVES      - Codex hosted `{type:'web_search'}`,
  *                                   translated in `anthropicToCodex`. No URLs in
  *                                   `annotations` (always empty), so the answer
@@ -24,6 +29,16 @@ import { normalizeGatewayModelId } from './gatewayModelIds.js'
  *   - commandcode/mistral/opencode - emit a `tool_use` named `web_search` that
  *                                   nothing executes; opencode-zen is 403
  *                                   ("free tier can only be used inside OpenCode")
+ *
+ * The `gateway-ds-*` routes served this until their credential left the vault;
+ * they are no longer listed, because a listed route that answers 401 is a
+ * redirect target that can never serve a search. Command Code was re-checked the
+ * same day and has no hosted tool to map onto (its API accepts only
+ * `{"type":"function"}` declarations), and Mistral refuses the connector on
+ * chat completions (`WebSearchTool connector is not supported`) and on its
+ * hosted DeepSeek model ("does not support builtin connectors"); its
+ * Conversations API does serve `web_search`, which is the route to add when that
+ * path is built.
  *
  * Only the backends that actually run the search are listed. Note this says
  * nothing about whether a *session* on the model can search - see
@@ -65,10 +80,12 @@ export function gatewayWebSearchAvailability(_model: string): boolean {
  *
  * The search runs as its own nested request, so the model running the outer
  * conversation does not have to be the model that searches - and in practice it
- * often cannot be: a Codex- or Command-Code-routed session has no backend that
- * executes the server tool. Sending the search to the requested model when it
- * can search, and otherwise to a listed one, is what makes WebSearch work in any
- * Gateway session rather than only a DeepSeek-routed one.
+ * often cannot be: a Command-Code- or OpenCode-routed session has no backend
+ * that executes the server tool. Sending the search to the requested model when
+ * it can search, and otherwise to the first listed one, is what makes WebSearch
+ * work in any Gateway session. With the Claude haiku route first, that redirect
+ * lands on the cheapest route that returns citable URLs, so a DeepSeek session
+ * on Command Code or Mistral never needs a subagent to search.
  *
  * Falls back to the requested model when nothing is listed, so a misconfigured
  * catalog degrades to the previous behaviour instead of silently picking some

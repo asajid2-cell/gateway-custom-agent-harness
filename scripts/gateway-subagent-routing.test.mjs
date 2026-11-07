@@ -435,7 +435,9 @@ test('tmux and pane teammates inherit the complete Gateway route', async () => {
 test('Gateway teammate model resolution is provider-aware', () => {
   assert.match(teammateModelSource, /getAPIProvider\(\)\s*===\s*['"]gateway['"]/)
   assert.match(teammateModelSource, /MODEL_GATEWAY_SUBAGENT_MODEL/)
-  // The bare-CLI fallback must sit on a lane that answers, not a Codex lane.
-  assert.match(teammateModelSource, /gateway-ds-4\.1-flash/)
+  // The bare-CLI fallback must sit on a lane that answers. It named the ds lane
+  // until that credential left the vault (2026-11-07: every gateway-ds-* route
+  // answers 401), so it now names a capable Codex route.
+  assert.match(teammateModelSource, /gateway-gpt-6-luna/)
   assert.match(agentModelSource, /parseUserSpecifiedModel/)
 })

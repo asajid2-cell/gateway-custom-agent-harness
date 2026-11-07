@@ -118,10 +118,12 @@ test('launcher forwards the full Gateway model catalog with economical role defa
   assert.doesNotMatch(script, /else \{ 'medium' \}/)
   assert.match(script, /MODEL_GATEWAY_DEFAULT_MODEL = 'gateway-gpt-6-sol'/)
   assert.match(script, /MODEL_GATEWAY_OPUS_MODEL = 'gateway-gpt-astra'/)
-  // Both roles must land on a lane that answers: the Codex lanes measured
-  // 1/10 and 0/10 under 10 concurrent auxiliary calls, the ds lanes 10/10.
-  assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-ds-flash'/)
-  assert.match(script, /MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-ds-4\.1-flash'/)
+  // Both roles must land on a lane that answers. The ds lanes this named lost
+  // their credential from the vault (2026-11-07: every gateway-ds-* route
+  // answers 401), so the fast lane is the Anthropic haiku route; the subagent
+  // lane is a capable Codex route, which subagents reach one or a few at a time.
+  assert.match(script, /MODEL_GATEWAY_FAST_MODEL = 'gateway-claude-haiku-5-5'/)
+  assert.match(script, /MODEL_GATEWAY_SUBAGENT_MODEL = 'gateway-gpt-6-luna'/)
   assert.match(script, /\$GatewayModelOptions = @\(\$CapabilityCatalog\.gatewayModelOptions\)/)
   assert.doesNotMatch(script, /ApprovedGatewayModels/)
   assert.doesNotMatch(script, /Where-Object \{[\s\S]*\$_\.value -in/)
