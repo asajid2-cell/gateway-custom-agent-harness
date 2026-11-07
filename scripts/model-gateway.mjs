@@ -3589,6 +3589,10 @@ export async function relayCodexStream(
   let buffer = ''
   let streamStarted = false
   let pendingTool = null
+  // Reasoning summaries arrive as their own stream, before the answer. They are
+  // a real content block on the Anthropic contract, so they open and close like
+  // text does rather than being folded into the answer.
+  let activeThinking = false
   // Codex streams its pre-search commentary and its final answer as two
   // `message` items. Both arrive as `response.output_text.delta`, which carries
   // no phase, so the delta has to be attributed to whichever message is open.
@@ -3601,15 +3605,34 @@ export async function relayCodexStream(
   }
 
   const closeActive = () => {
-    if (activeText || activeTool) sendEvent(res, 'content_block_stop', { index: contentIndex })
+    if (activeText || activeTool || activeThinking) sendEvent(res, 'content_block_stop', { index: contentIndex })
     activeText = false
     activeTool = null
+    activeThinking = false
+  }
+
+  const openThinking = () => {
+    if (activeThinking) return
+    startStream()
+    if (activeText || activeTool) {
+      closeActive()
+      contentIndex += 1
+    }
+    activeThinking = true
+    sawOutput = true
+    trace?.markOutput()
+    sendEvent(res, 'content_block_start', {
+      index: contentIndex,
+      content_block: { type: 'thinking', thinking: '' },
+    })
   }
 
   const openText = () => {
     if (activeText) return
     startStream()
+    const hadThinking = activeThinking
     closeActive()
+    if (hadThinking) contentIndex += 1
     activeText = true
     sawOutput = true
     trace?.markOutput()
@@ -3621,7 +3644,9 @@ export async function relayCodexStream(
 
   const openTool = item => {
     startStream()
+    const hadThinking = activeThinking
     closeActive()
+    if (hadThinking) contentIndex += 1
     activeTool = {
       callId: item.call_id || item.id || `call_${randomUUID().replaceAll('-', '')}`,
       name: item.name || 'tool',
@@ -3722,6 +3747,37 @@ export async function relayCodexStream(
       // Metadata alone is not usable output. Buffer it until arguments arrive
       // so a provider timeout cannot commit an incomplete Anthropic message.
       pendingTool = event.item
+      return
+    }
+    if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
+      const delta = typeof event.delta === 'string' ? event.delta : ''
+      if (!delta) return
+      openThinking()
+      sendEvent(res, 'content_block_delta', {
+        index: contentIndex,
+        delta: {
+          type: 'thinking_delta',
+          thinking: delta,
+          // A live token estimate is what the fold in the UI counts while the
+          // answer has not started yet. Four characters per token is the only
+          // honest figure available at this point in the stream.
+          estimated_tokens: Math.max(1, Math.round(delta.length / 4)),
+        },
+      })
+      return
+    }
+    if (type === 'response.reasoning_summary_part.done' || type === 'response.reasoning_text.done') {
+      if (activeThinking) {
+        closeActive()
+        contentIndex += 1
+      }
+      return
+    }
+    if (type === 'response.output_item.done' && event.item?.type === 'reasoning') {
+      if (activeThinking) {
+        closeActive()
+        contentIndex += 1
+      }
       return
     }
     if (type === 'response.output_item.done' && event.item?.type === 'web_search_call') {
