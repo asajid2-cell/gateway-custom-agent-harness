@@ -2051,8 +2051,8 @@ function reasoningThenAnswerCodexHandler(state) {
     const frame = event => res.write(`data: ${JSON.stringify(event)}\n\n`)
     frame({ type: 'response.created' })
     frame({ type: 'response.in_progress' })
-    // Reasoning is the whole wait, and none of it reaches the caller: the
-    // answer only starts once the summary text does.
+    // Reasoning is the whole wait. It reaches the caller as its own content
+    // block now; the answer starts only once the summary text ends.
     frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing the conversation' })
     await new Promise(resolve => setTimeout(resolve, 120))
     frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing it again' })
@@ -4617,7 +4617,7 @@ test('a stalled compaction upstream is bounded and cancelled before HTTP 200', a
   })
 })
 
-test('a compaction whose provider is only reasoning still reports liveness', async () => {
+test('a compaction whose provider is only reasoning streams that reasoning', async () => {
   await withGatewayAndFakeCodexState({
     handlerFactory: reasoningThenAnswerCodexHandler,
     gatewayEnv: {
@@ -4636,17 +4636,26 @@ test('a compaction whose provider is only reasoning still reports liveness', asy
           event.type === 'content_block_delta' &&
           event.delta?.type === 'text_delta',
       )
-      const liveness = events
-        .map((event, index) => ({ event, index }))
+      const thinkingAt = events.findIndex(
+        event =>
+          event.type === 'content_block_start' &&
+          event.content_block?.type === 'thinking',
+      )
+      const reasoning = events
         .filter(
-          ({ event }) =>
-            event.type === 'message_delta' && !event.delta?.stop_reason,
+          event =>
+            event.type === 'content_block_delta' &&
+            event.delta?.type === 'thinking_delta',
         )
+        .map(event => event.delta.thinking)
+        .join('')
 
-      // The provider was working the whole time it was reasoning, and the
-      // caller has to be able to tell that from a request nothing is serving.
-      assert.ok(liveness.length >= 1)
-      assert.ok(liveness[0].index < textAt)
+      // Reasoning used to be dropped, so the only trace of the wait was a
+      // liveness ping. It is a content block now: the caller sees the thinking
+      // itself, before the answer, with the text it actually produced.
+      assert.equal(reasoning, 'weighing the conversationweighing it again')
+      assert.ok(thinkingAt >= 0)
+      assert.ok(thinkingAt < textAt)
     },
   })
 })
@@ -5384,8 +5393,8 @@ function reasoningThenAnswerOpenCodeHandler(req, res) {
   const frame = event => res.write(`data: ${JSON.stringify(event)}\n\n`)
   frame({ type: 'response.created' })
   frame({ type: 'response.in_progress' })
-  // Reasoning is the whole wait, and none of it reaches the caller: the answer
-  // only starts once the output text does.
+  // Reasoning is the whole wait. It reaches the caller as its own content
+  // block now; the answer starts only once the output text does.
   frame({ type: 'response.reasoning_summary_text.delta', delta: 'weighing the conversation' })
   void (async () => {
     await new Promise(resolve => setTimeout(resolve, 120))
@@ -6595,7 +6604,7 @@ test('an OpenCode Responses answer that arrives promptly carries no liveness eve
   assert.equal(deltas[0].delta.stop_reason, 'end_turn')
 })
 
-test('an OpenCode Responses stream that is only reasoning still reports liveness', async () => {
+test('an OpenCode Responses stream that is only reasoning streams that reasoning', async () => {
   await withGatewayAndFakeOpenCode({
     handler: reasoningThenAnswerOpenCodeHandler,
     gatewayEnv: {
@@ -6619,17 +6628,26 @@ test('an OpenCode Responses stream that is only reasoning still reports liveness
           event.type === 'content_block_delta' &&
           event.delta?.type === 'text_delta',
       )
-      const liveness = events
-        .map((event, index) => ({ event, index }))
+      const thinkingAt = events.findIndex(
+        event =>
+          event.type === 'content_block_start' &&
+          event.content_block?.type === 'thinking',
+      )
+      const reasoning = events
         .filter(
-          ({ event }) =>
-            event.type === 'message_delta' && !event.delta?.stop_reason,
+          event =>
+            event.type === 'content_block_delta' &&
+            event.delta?.type === 'thinking_delta',
         )
+        .map(event => event.delta.thinking)
+        .join('')
 
-      // The provider was working the whole time it was reasoning, and the
-      // caller has to be able to tell that from a request nothing is serving.
-      assert.ok(liveness.length >= 1)
-      assert.ok(liveness[0].index < textAt)
+      // The Responses route used to drop these frames and keep the request
+      // alive with liveness pings. The reasoning is a content block now, so the
+      // caller watches the thinking instead of guessing from silence.
+      assert.equal(reasoning, 'weighing the conversationweighing it again')
+      assert.ok(thinkingAt >= 0)
+      assert.ok(thinkingAt < textAt)
     },
   })
 })

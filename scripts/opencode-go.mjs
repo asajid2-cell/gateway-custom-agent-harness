@@ -320,7 +320,11 @@ export function anthropicToOpenCodeResponses(body, upstreamModel, querySource) {
     !isNativeSummaryRequest(querySource) &&
     body.thinking?.type !== 'disabled'
   ) {
-    request.reasoning = { effort }
+    // `summary` is what makes a reasoning model stream its thinking at all:
+    // without it the provider sends encrypted reasoning items and no text, so
+    // the Responses route had nothing to show. The wire values are OpenAI's,
+    // and every provider this route speaks that dialect.
+    request.reasoning = { effort, summary: 'auto' }
   }
   return request
 }
@@ -1029,6 +1033,7 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
   let streamStarted = false
   let activeText = false
   let activeTool = null
+  let activeThinking = false
   let contentIndex = 0
   let sawOutput = false
   let sawCompletion = false
@@ -1043,12 +1048,34 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
     }
   }
   const close = (advance = true) => {
-    if (activeText || activeTool) {
+    if (activeText || activeTool || activeThinking) {
       eventLine(res, { type: 'content_block_stop', index: contentIndex })
       if (advance) contentIndex += 1
     }
     activeText = false
     activeTool = null
+    activeThinking = false
+  }
+  const thinking = value => {
+    if (!value) return
+    start()
+    if (!activeThinking) {
+      close()
+      activeThinking = true
+      sawOutput = true
+      trace?.markOutput()
+      eventLine(res, { type: 'content_block_start', index: contentIndex, content_block: { type: 'thinking', thinking: '' } })
+    }
+    eventLine(res, {
+      type: 'content_block_delta',
+      index: contentIndex,
+      delta: {
+        type: 'thinking_delta',
+        thinking: value,
+        // The live estimate the fold counts before any answer has started.
+        estimated_tokens: Math.max(1, Math.round(value.length / 4)),
+      },
+    })
   }
   const text = value => {
     if (!value) return
@@ -1086,7 +1113,13 @@ export async function relayOpenCodeResponsesStream(res, upstream, model, trace =
       let event
       try { event = JSON.parse(payload) } catch { throw new Error('OpenCode returned malformed Responses SSE data') }
       const type = event?.type
-      if (type === 'response.output_text.delta') text(typeof event.delta === 'string' ? event.delta : '')
+      if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') {
+        thinking(typeof event.delta === 'string' ? event.delta : '')
+      } else if (type === 'response.reasoning_summary_part.done' || type === 'response.reasoning_text.done') {
+        if (activeThinking) close()
+      } else if (type === 'response.output_item.done' && event.item?.type === 'reasoning') {
+        if (activeThinking) close()
+      } else if (type === 'response.output_text.delta') text(typeof event.delta === 'string' ? event.delta : '')
       else if (type === 'response.output_item.added' && event.item?.type === 'function_call') tool(event.item)
       else if (type === 'response.function_call_arguments.delta') tool(event.item || {}, event.delta || '')
       else if (type === 'response.output_item.done' && event.item?.type === 'function_call') {
