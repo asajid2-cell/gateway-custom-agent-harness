@@ -64,7 +64,11 @@ if (report.platform !== platform || report.arch !== arch) {
 // This is the download pin, not a claim about what was embedded: `--runtime`
 // can supply any binary. The version that reaches the manifest is read back
 // from the binary itself.
-const BUN_DOWNLOAD_VERSION = process.env.GATEWAY_BUN_VERSION ?? '1.4.0'
+//
+// 1.4.4, not 1.4.0: the harness segfaults in JavaScriptCore's GC on Windows
+// under 1.4.0/1.4.1 (oven-sh/bun#41343, #40607). The fix in that area is the
+// WebKit bump in oven-sh/bun#41378, which first ships in 1.4.2.
+const BUN_DOWNLOAD_VERSION = process.env.GATEWAY_BUN_VERSION ?? '1.4.4'
 const BUN_ASSETS = {
   'win32-x64': { asset: 'bun-windows-x64.zip', binary: 'bun.exe' },
   'win32-arm64': { asset: 'bun-windows-aarch64.zip', binary: 'bun.exe' },
