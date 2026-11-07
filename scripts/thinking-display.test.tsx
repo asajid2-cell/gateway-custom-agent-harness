@@ -92,11 +92,11 @@ test('a completed thinking block renders in the ordinary view', async () => {
   expect(output).toContain('Thinking')
 })
 
-test('the ordinary view does not print the thinking text, only its line', async () => {
-  const secret = 'internal reasoning that should stay folded'
+test('the ordinary view prints the thinking text, so it is unmistakably shown', async () => {
+  const visible = 'reasoning that the reader should be able to see'
   const output = await capture(
     <Message
-      message={thinkingMessage(secret)}
+      message={thinkingMessage(visible)}
       lookups={{} as any}
       addMargin={false}
       tools={{} as any}
@@ -112,7 +112,31 @@ test('the ordinary view does not print the thinking text, only its line', async 
     />,
   )
   expect(output).toContain('Thinking')
-  expect(output).not.toContain(secret)
+  expect(output).toContain('reasoning that the reader should be able to see')
+})
+
+test('a long block is tailed in the ordinary view, not printed whole', async () => {
+  const lines = Array.from({ length: 40 }, (_, index) => `line-${index + 1}`)
+  const output = await capture(
+    <Message
+      message={thinkingMessage(lines.join('\n'))}
+      lookups={{} as any}
+      addMargin={false}
+      tools={{} as any}
+      commands={[]}
+      verbose={false}
+      inProgressToolUseIDs={new Set()}
+      progressMessagesForMessage={[]}
+      shouldAnimate={false}
+      shouldShowDot={false}
+      isTranscriptMode={false}
+      isStatic={true}
+      lastThinkingBlockId={null}
+    />,
+  )
+  expect(output).toContain('line-40')
+  expect(output).not.toContain('line-1 ')
+  expect(output).toContain('earlier lines hidden')
 })
 
 test('/toggle-thinking off hides the completed block again', async () => {
