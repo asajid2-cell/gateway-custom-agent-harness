@@ -1203,7 +1203,7 @@ const LANE_SWEEP_EVERY_MS = 60_000
 let LANE_SWEPT_AT = 0
 /** Tab creation and its first load are one-at-a-time; see scripts/web-lane-gate.mjs. */
 const serialLaneOpen = createLaneGate()
-const LANE_RENDER_WAIT_MS = 12_000
+const LANE_RENDER_WAIT_MS = 30_000
 const LANE_RENDER_POLL_MS = 300
 
 /**
@@ -1369,14 +1369,18 @@ async function lanePage(context) {
       page = await serialLaneOpen(async () => {
         const created = await context.newPage()
         await created.goto(CHAT_URL, { waitUntil: 'domcontentloaded', timeout: LOGIN_WAIT_MS }).catch(() => {})
+        // Name it BEFORE the render proof: a tab that fails the proof must still
+        // be closeable by lease name, or every failed open leaks a page (eleven
+        // probe-thread tabs accumulated this way on 2026-11-07).
+        await ensureLaneName(created, wanted)
         // A tab that loaded while another turn was running can show neither a
         // composer nor a message; typing there is the 90-190 s requeue measured
         // on 2026-11-07. Prove the shell rendered, reloading this same tab once.
         const proof = await ensureLaneRendered(created, { label: leaseId })
         if (!proof.proven) {
+          await created.close().catch(() => {})
           throw new TurnError(`the lane tab did not render after one reload (composer ${proof.composer ? 'yes' : 'no'}, messages ${proof.messages})`, { reason: 'page-load-error', accepted: false })
         }
-        await ensureLaneName(created, wanted)
         await log(`lane tab opened for ${leaseId}`)
         return created
       })
