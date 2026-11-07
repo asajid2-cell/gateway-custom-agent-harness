@@ -13,6 +13,7 @@ import {
   popNewestEditable,
   queuedPromptCount,
 } from '../src/utils/messageQueueManager.ts'
+import { processQueueIfReady } from '../src/utils/queueProcessor.ts'
 
 test('the queue holds a bounded number of the user\'s own messages', () => {
   clearCommandQueue()
@@ -160,13 +161,94 @@ test('an image queued with a message comes back with it', () => {
 
 test('a message enqueued by another route still waits behind the user', () => {
   clearCommandQueue()
-  // enter mid-turn and Tab take the same path, so a plain enqueue is a user
-  // message too, and the cap sees it.
+  // Enter mid-turn takes the plain enqueue path, so it is a user message too,
+  // and the cap sees it.
   enqueue({ value: 'from enter', mode: 'prompt' })
   for (let i = 0; i < MAX_QUEUED_PROMPTS - 1; i++) {
     assert.equal(enqueueUserPrompt({ value: `extra ${i}`, mode: 'prompt' }), true)
   }
   assert.equal(queuedPromptCount(), MAX_QUEUED_PROMPTS)
   assert.equal(enqueueUserPrompt({ value: 'refused', mode: 'prompt' }), false)
+  clearCommandQueue()
+})
+
+// A Tab-queued prompt is a real queue entry, not a second Enter. The
+// between-turn drain must leave it alone until the session has rested, and a
+// mid-turn drain (query.ts) must never see it at all.
+test('a Tab-queued prompt waits for the rest, not for the next idle tick', () => {
+  clearCommandQueue()
+  enqueueUserPrompt({ value: 'held', mode: 'prompt', deferred: true })
+
+  const drained: string[] = []
+  const executeInput = async (commands: any[]) => {
+    for (const cmd of commands) drained.push(cmd.value)
+  }
+
+  // The ordinary between-turn drain does not release it.
+  assert.deepEqual(processQueueIfReady({ executeInput }), { processed: false })
+  assert.deepEqual(drained, [])
+  assert.deepEqual(getCommandQueue().map(cmd => cmd.value), ['held'])
+
+  // The rested drain does, and it goes through the normal prompt path.
+  assert.deepEqual(
+    processQueueIfReady({ executeInput, includeDeferred: true }),
+    { processed: true },
+  )
+  assert.deepEqual(drained, ['held'])
+  assert.equal(getCommandQueue().length, 0)
+  clearCommandQueue()
+})
+
+test('a held prompt never blocks what is behind it', () => {
+  clearCommandQueue()
+  enqueueUserPrompt({ value: 'held', mode: 'prompt', deferred: true })
+  enqueuePendingNotification({ value: 'notice', mode: 'prompt', isMeta: true })
+
+  const drained: string[] = []
+  const executeInput = async (commands: any[]) => {
+    for (const cmd of commands) drained.push(cmd.value)
+  }
+
+  // The notification drains now; the held prompt is still waiting.
+  assert.deepEqual(processQueueIfReady({ executeInput }), { processed: true })
+  assert.deepEqual(drained, ['notice'])
+  assert.deepEqual(getCommandQueue().map(cmd => cmd.value), ['held'])
+  clearCommandQueue()
+})
+
+test('held prompts are released one per rest, in the order written', () => {
+  clearCommandQueue()
+  enqueueUserPrompt({ value: 'first', mode: 'prompt', deferred: true })
+  enqueueUserPrompt({ value: 'second', mode: 'prompt', deferred: true })
+
+  const drained: string[] = []
+  const executeInput = async (commands: any[]) => {
+    for (const cmd of commands) drained.push(cmd.value)
+  }
+
+  processQueueIfReady({ executeInput, includeDeferred: true })
+  assert.deepEqual(drained, ['first'])
+  assert.deepEqual(getCommandQueue().map(cmd => cmd.value), ['second'])
+
+  processQueueIfReady({ executeInput, includeDeferred: true })
+  assert.deepEqual(drained, ['first', 'second'])
+  assert.equal(getCommandQueue().length, 0)
+  clearCommandQueue()
+})
+
+test('an Enter-queued prompt still drains immediately and steers', () => {
+  clearCommandQueue()
+  // Enter mid-turn does not set `deferred`, so the mid-turn drain in query.ts
+  // (and this between-turn drain) both see it right away.
+  enqueueUserPrompt({ value: 'steer', mode: 'prompt' })
+
+  const drained: string[] = []
+  const executeInput = async (commands: any[]) => {
+    for (const cmd of commands) drained.push(cmd.value)
+  }
+
+  assert.deepEqual(processQueueIfReady({ executeInput }), { processed: true })
+  assert.deepEqual(drained, ['steer'])
+  assert.equal(getCommandQueue().length, 0)
   clearCommandQueue()
 })
