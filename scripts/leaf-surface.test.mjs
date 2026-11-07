@@ -359,7 +359,10 @@ test('the Leaf tool is registered so agents can see and drive their leaves', asy
   assert.equal(LeafTool.inputSchema.safeParse({ action: 'driver', leaf: 'Driver', leaves: ['Alpha'] }).success, true)
   const tool = await readFile(new URL('../src/tools/LeafTool/LeafTool.ts', import.meta.url), 'utf8')
   assert.match(tool, /case 'driver':/)
-  assert.match(tool, /conferDriver\(member\.sessionId, leafIds\)/)
+  // The turn boundary is passed through as the third argument so the write can
+  // be attributed to the reply that made it; the driver and its scope are still
+  // the two things this assertion is about.
+  assert.match(tool, /conferDriver\(member\.sessionId, leafIds(?:, turnBoundary)?\)/)
   // `driver <leaf> clear` drops the role itself: the reserved word is passed
   // through unresolved at the tool and the command, and conferDriver is the one
   // place that reads it, so the role and its scope are dropped together.
