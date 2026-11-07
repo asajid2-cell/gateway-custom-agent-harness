@@ -124,7 +124,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver, options: { readStormLimit?: number; readBackoffBaseMs?: number } = {}): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { readStormLimit?: number; readBackoffBaseMs?: number; readBudgetPerMinute?: number; readBudgetBurst?: number } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -141,6 +141,8 @@ async function startHost(dir: string, driver: FakeDriver, options: { readStormLi
     waitPollMs: 20,
     readStormLimit: options.readStormLimit,
     readBackoffBaseMs: options.readBackoffBaseMs,
+    readBudgetPerMinute: options.readBudgetPerMinute,
+    readBudgetBurst: options.readBudgetBurst,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -156,7 +158,7 @@ async function primed(name: string, threadId: string): Promise<BridgeState> {
   return bridge
 }
 
-type Gate = { licence: number; attempted: number; idleSkips: number; skipped: number }
+type Gate = { licence: number; attempted: number; idleSkips: number; skipped: number; rateLimited: number }
 const gateOf = (host: ChatGptHost, sessionId: string): Gate =>
   (host as any).bridges.get(sessionId).reads as Gate
 
@@ -198,6 +200,27 @@ describe('a throttled account pauses every bridge, not one bridge at a time', ()
       const afterFirst = reads()
       await host.pollOnce()
       expect(reads()).toBe(afterFirst)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+})
+
+describe('the read budget paces the account before it refuses', () => {
+  test('a burst of two spends two reads and the third never reaches the driver', async () => {
+    const { dir, cleanup } = await scratch()
+    const bridges = [await primed('alpha', THREAD_A), await primed('beta', THREAD_B), await primed('gamma', THREAD_C)]
+    await seedHost(dir, bridges)
+    const driver = new FakeDriver()
+    // Nothing is throttled: the host itself refuses the third read.
+    const host = await startHost(dir, driver, { readBudgetPerMinute: 2, readBudgetBurst: 2 })
+    try {
+      await host.pollOnce()
+      const total = () => [...driver.conversationReads.values()].reduce((sum, count) => sum + count, 0)
+      expect(total()).toBe(2)
+      expect(gatesOf(host, bridges).some(gate => gate.skipped > 0)).toBe(true)
+      expect(gatesOf(host, bridges).every(gate => gate.rateLimited === 0)).toBe(true)
     } finally {
       await host.stop()
       await cleanup()
