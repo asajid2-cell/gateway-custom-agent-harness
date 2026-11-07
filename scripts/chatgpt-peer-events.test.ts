@@ -333,6 +333,36 @@ describe('page events trigger observation', () => {
     }
   })
 
+  test('a second page-ready re-reads only the threads with a posted turn', async () => {
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    const beta = bridgeNamed('beta', THREAD_B)
+    beta.primedThreadId = THREAD_B
+    beta.primerSha256 = await primerSha()
+    await seedHost(dir, [alpha, beta])
+    const driver = new FakeDriver()
+    const host = await startHost(dir, driver)
+    try {
+      // The boot catch-up: one read per bound thread, once per process.
+      const start = driver.conversationReads()
+      driver.emit({ event: 'page-ready', reason: 'attach' })
+      await host.flushTriggers()
+      expect(driver.conversationReads() - start).toBe(2)
+      // Every lane that attaches emits its own ready. A second one with nothing
+      // owed must cost no reads at all (55 attaches once bought ~1,980 reads).
+      const before = driver.conversationReads()
+      driver.emit({ event: 'page-ready', reason: 'attach' })
+      await host.flushTriggers()
+      await new Promise(resolve => setTimeout(resolve, 400))
+      expect(driver.conversationReads()).toBe(before)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  })
+
   test('C12: a trigger during pollOnce never starts a second concurrent pass', async () => {
     const { dir, cleanup } = await scratch()
     const driver = new FakeDriver()

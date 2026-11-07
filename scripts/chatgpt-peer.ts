@@ -794,6 +794,8 @@ export class ChatGptHost {
   private detachEvents: (() => void) | undefined
   /** Failed thread reads, bumped inside readConversation and read by pollOnce. */
   private readErrors = 0
+  /** The one wide catch-up a process gets; later attaches license owed work only. */
+  private pageReadySeen = false
   /** Monotonic arm identity; a wake compares it to tell a replacement from its own timer. */
   private scheduleGeneration = 0
   /** When a 429 observation was last audited, so throttling is one line, not a flood. */
@@ -4560,15 +4562,40 @@ export class ChatGptHost {
           void this.pollTitles()
           return
         }
-        log('page ready; observing every bound thread')
-        // A loaded page is one event, not a tick: license exactly one read per
-        // live thread, so a restart or a reload still catches up on what the
-        // page changed while nobody was looking - without a read per pass.
-        for (const bridge of this.bridges.values()) {
-          if (bridge.removed || bridge.stopping || !bridge.state.threadId) continue
-          bridge.reads.licence = 1
+        // A loaded page is one event, not a tick: one read per live thread, so a
+        // restart catches up on what the page changed while nobody was looking.
+        //
+        // ONE such catch-up, though. In the shared browser every lane that
+        // attaches emits its own ready, and licensing every bound thread for
+        // each of them was the read tax: 55 attaches in one hour bought ~1,980
+        // conversation reads against a throttled account (measured 2026-11-07,
+        // 1,707 answered 429). After the boot catch-up an attach licenses only
+        // the threads with a POSTED turn waiting; the account-wide list walk
+        // still discovers everything else.
+        // An `attach` is a NEW tab with nothing changed in any thread, so only
+        // the boot one is a catch-up; a document (or an unnamed) ready is a page
+        // that reloaded under us and keeps its wide catch-up.
+        const attach = event.reason === 'attach'
+        const wide = !attach || !this.pageReadySeen
+        this.pageReadySeen = true
+        if (wide) {
+          log('page ready; observing every bound thread')
+          for (const bridge of this.bridges.values()) {
+            if (bridge.removed || bridge.stopping || !bridge.state.threadId) continue
+            bridge.reads.licence = 1
+          }
+          this.triggerObserve('page-ready', { full: true })
+        } else {
+          let licensed = 0
+          for (const bridge of this.bridges.values()) {
+            if (bridge.removed || bridge.stopping || !bridge.state.threadId) continue
+            if (!bridge.state.pendingTurns.some(turn => turn.postedAt !== null)) continue
+            bridge.reads.licence = 1
+            licensed += 1
+          }
+          log(`page ready (attach); observing ${licensed} thread(s) with a posted turn`)
+          if (licensed > 0) this.triggerObserve('page-ready:attach', { full: true })
         }
-        this.triggerObserve('page-ready', { full: true })
         void this.pollTitles()
         return
       }
