@@ -3384,6 +3384,79 @@ function isPooledKeyEnvVar(name) {
   return typeof name === 'string' && POOLED_KEY_PATTERN.test(name)
 }
 
+// Providers enforce a body ceiling as a hard wall, and Command Code's is 20 MB.
+// Images are what carry a normal turn over it: one 4 MB screenshot is ~5.4 MB
+// once base64'd, so a handful of pasted pictures is a rejection the model can
+// neither see nor act on. Replacing only the images that put the request over
+// the line keeps the rest of the turn intact and tells the model what happened;
+// a request still over the line with no images left is refused here, with its
+// size, rather than surfacing as the provider's one-line error.
+const UPSTREAM_BODY_LIMIT_BYTES = 19_000_000
+const IMAGE_OMITTED_MARKER =
+  "[image omitted: sending it would put this request over the provider's body " +
+  'limit. Ask for the image in a separate turn if you need to see it.]'
+
+function requestBodyBytes(request) {
+  try {
+    return Buffer.byteLength(JSON.stringify(request))
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * Replace inline images until the serialized request fits, returning how many
+ * were removed. A marker keeps the model from reading the hole as "no image was
+ * attached", which is the behavior an empty content part would produce.
+ */
+export function stripImagesOverLimit(request, limitBytes = UPSTREAM_BODY_LIMIT_BYTES) {
+  if (requestBodyBytes(request) <= limitBytes) return 0
+  let stripped = 0
+  const visit = node => {
+    if (Array.isArray(node)) {
+      for (let index = 0; index < node.length; index += 1) {
+        const item = node[index]
+        if (
+          item &&
+          typeof item === 'object' &&
+          (item.type === 'image_url' || item.type === 'input_image')
+        ) {
+          node[index] = {
+            type: item.type === 'input_image' ? 'input_text' : 'text',
+            text: IMAGE_OMITTED_MARKER,
+          }
+          stripped += 1
+          continue
+        }
+        visit(item)
+      }
+      return
+    }
+    if (node && typeof node === 'object') {
+      for (const key of Object.keys(node)) visit(node[key])
+    }
+  }
+  visit(request)
+  return stripped
+}
+
+/**
+ * Fit one prepared provider request to the body ceiling. Returns the message a
+ * caller should see when the request cannot fit even without its images.
+ */
+function fitRequestToProvider(request, provider) {
+  const stripped = stripImagesOverLimit(request)
+  const bytes = requestBodyBytes(request)
+  if (stripped > 0) {
+    process.stderr.write(
+      `model-gateway image-strip provider=${safeLogValue(provider)} stripped=${stripped} bytes=${bytes}\n`,
+    )
+  }
+  if (bytes <= UPSTREAM_BODY_LIMIT_BYTES) return null
+  const size = `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${provider} accepts request bodies under 20 MB, and this one is ${size} even after its images were removed. Split it into smaller turns.`
+}
+
 export async function fetchWithRetry({
   provider,
   url,
@@ -4343,6 +4416,13 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
       )
     }
     request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    const tooLarge = fitRequestToProvider(request, 'OpenCode Go')
+    if (tooLarge) {
+      anthropicError(res, 413, tooLarge)
+      trace.finish('request-too-large', null, 413)
+      control.cleanup()
+      return
+    }
     logRequestShape({
       body: normalizedBody,
       providerRequest: request,
@@ -4490,6 +4570,13 @@ async function handleCommandCode(body, req, res, modelName, route) {
     )
     const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
     request = anthropicToOpenCodeRequest(normalizedBody, route, querySource)
+    const tooLarge = fitRequestToProvider(request, 'Command Code')
+    if (tooLarge) {
+      anthropicError(res, 413, tooLarge)
+      trace.finish('request-too-large', null, 413)
+      control.cleanup()
+      return
+    }
     logRequestShape({
       body: normalizedBody,
       providerRequest: request,
@@ -4631,6 +4718,13 @@ async function handleMistral(body, req, res, modelName, route) {
     )
     const normalizedBody = normalizeGatewayEffort(toolSafeBody, route, querySource)
     request = anthropicToMistralChat(normalizedBody, route.upstream, querySource)
+    const tooLarge = fitRequestToProvider(request, 'Mistral')
+    if (tooLarge) {
+      anthropicError(res, 413, tooLarge)
+      trace.finish('request-too-large', null, 413)
+      control.cleanup()
+      return
+    }
     logRequestShape({
       body: normalizedBody,
       providerRequest: request,
@@ -4771,6 +4865,13 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
     // still has an SSE request made on its behalf, and the collector relay
     // folds the stream back into that single body.
     request = { ...request, stream: true }
+    const tooLarge = fitRequestToProvider(request, 'OpenCode Zen')
+    if (tooLarge) {
+      anthropicError(res, 413, tooLarge)
+      trace.finish('request-too-large', null, 413)
+      control.cleanup()
+      return
+    }
     logRequestShape({
       body: normalizedBody,
       providerRequest: request,

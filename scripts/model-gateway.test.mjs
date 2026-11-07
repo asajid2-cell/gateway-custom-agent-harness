@@ -23,6 +23,7 @@ import {
   modelsResponse,
   stripUnsupportedOpenCodeTools,
   stripUnsupportedOpenCodeToolChoice,
+  stripImagesOverLimit,
   safeUpstreamResponseError,
   gatewayRequestShape,
   credentialPool,
@@ -76,6 +77,43 @@ import {
 } from './gateway-contract.mjs'
 import { quotaKey, readSharedQuota } from './quota-cache.mjs'
 import { codexQuotaWindows, codexQuotaIsStale, CODEX_READ_INTERVAL_MS } from './codex-quota.mjs'
+
+test('an oversized provider request loses its images rather than the turn', () => {
+  const image = `data:image/png;base64,${'A'.repeat(2_000_000)}`
+  const build = () => ({
+    model: 'deepseek',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is in this screenshot?' },
+          { type: 'image_url', image_url: { url: image } },
+        ],
+      },
+    ],
+  })
+
+  // Under the ceiling the image is the point of the turn, so nothing moves.
+  const roomy = build()
+  assert.equal(stripImagesOverLimit(roomy, 8_000_000), 0)
+  assert.equal(roomy.messages[0].content[1].type, 'image_url')
+
+  // Over it, the image becomes a marker: the text survives, the model is told
+  // the picture was withheld, and the request is back under the ceiling.
+  const tight = build()
+  assert.equal(stripImagesOverLimit(tight, 1_000_000), 1)
+  assert.equal(tight.messages[0].content[0].text, 'what is in this screenshot?')
+  assert.equal(tight.messages[0].content[1].type, 'text')
+  assert.match(tight.messages[0].content[1].text, /image omitted/)
+  assert.ok(Buffer.byteLength(JSON.stringify(tight)) < 1_000_000)
+
+  // The Responses protocol names the replacement type differently.
+  const responses = {
+    input: [{ role: 'user', content: [{ type: 'input_image', image_url: image }] }],
+  }
+  assert.equal(stripImagesOverLimit(responses, 1_000_000), 1)
+  assert.equal(responses.input[0].content[0].type, 'input_text')
+})
 
 test('OpenCode retries cycle numbered credentials and wrap to the original', async () => {
   const credentials = openCodeCredentialPool({
