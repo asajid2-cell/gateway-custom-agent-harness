@@ -39,6 +39,8 @@ class FakeDriver {
     { id: THREAD_C, title: 'Gamma work' },
   ]
   observable = true
+  /** Every conversation read is refused with a 429, as a throttled account does. */
+  throttled = false
   /** Conversation reads per thread, so scoping is measured at the driver. */
   readonly conversationReads = new Map<string, number>()
   private readonly listeners = new Set<(event: Record<string, unknown>) => void>()
@@ -82,6 +84,7 @@ class FakeDriver {
     if (op === 'conversation' && this.observable) {
       const threadId = String(request.threadId ?? '')
       this.conversationReads.set(threadId, this.readsOf(threadId) + 1)
+      if (this.throttled) return { ok: false, op, status: 429, error: 'too many requests' }
       const tree = this.treeOf(threadId)
       return { ok: true, op, conversation: { current_node: tree.current, mapping: structuredClone(tree.mapping) } }
     }
@@ -121,7 +124,7 @@ async function seedHost(dir: string, bridges: BridgeState[] = []): Promise<void>
   for (const bridge of bridges) await saveJson(join(dir, 'bridges', `${bridge.sessionId}.json`), bridge)
 }
 
-async function startHost(dir: string, driver: FakeDriver): Promise<ChatGptHost> {
+async function startHost(dir: string, driver: FakeDriver, options: { readStormLimit?: number; readBackoffBaseMs?: number } = {}): Promise<ChatGptHost> {
   process.env.CLAUDE_CONFIG_DIR = dir
   const host = new ChatGptHost({
     home: dir,
@@ -136,6 +139,8 @@ async function startHost(dir: string, driver: FakeDriver): Promise<ChatGptHost> 
     titlesEvery: 0,
     turnTimeoutMs: 5_000,
     waitPollMs: 20,
+    readStormLimit: options.readStormLimit,
+    readBackoffBaseMs: options.readBackoffBaseMs,
     directory: sessionsDir(dir),
     privateHome: privateHome(dir),
   }, driver as unknown as DriverChild)
@@ -151,7 +156,7 @@ async function primed(name: string, threadId: string): Promise<BridgeState> {
   return bridge
 }
 
-type Gate = { licence: number; attempted: number; idleSkips: number }
+type Gate = { licence: number; attempted: number; idleSkips: number; skipped: number }
 const gateOf = (host: ChatGptHost, sessionId: string): Gate =>
   (host as any).bridges.get(sessionId).reads as Gate
 
@@ -172,6 +177,33 @@ async function mounted(): Promise<{
   const host = await startHost(dir, driver)
   return { dir, bridges, driver, host, cleanup: async () => { await host.stop(); await cleanup() } }
 }
+
+describe('a throttled account pauses every bridge, not one bridge at a time', () => {
+  test('consecutive 429s open one host-wide window; the next bridge never asks', async () => {
+    const { dir, cleanup } = await scratch()
+    const bridges = [await primed('alpha', THREAD_A), await primed('beta', THREAD_B), await primed('gamma', THREAD_C)]
+    await seedHost(dir, bridges)
+    const driver = new FakeDriver()
+    driver.throttled = true
+    // Two refusals is not a transient; a third read would be us adding load.
+    const host = await startHost(dir, driver, { readStormLimit: 2, readBackoffBaseMs: 1_000 })
+    try {
+      const reads = () => [...driver.conversationReads.values()].reduce((total, count) => total + count, 0)
+      const before = reads()
+      await host.pollOnce()
+      expect(reads() - before).toBe(2)
+      // The third bridge's read was refused by the host, not by the account.
+      expect(gatesOf(host, bridges).some(gate => gate.skipped > 0)).toBe(true)
+      // And a second pass inside the window asks nobody at all.
+      const afterFirst = reads()
+      await host.pollOnce()
+      expect(reads()).toBe(afterFirst)
+    } finally {
+      await host.stop()
+      await cleanup()
+    }
+  }, 20_000)
+})
 
 describe('R16: a document page-ready pays for one thread', () => {
   test('1. document + a known thread licenses only that bridge and reads only that thread', async () => {

@@ -82,6 +82,11 @@ const PENDING_WATCH_GAPS_MS = [2_000, 3_000, 5_000, 8_000, 13_000, 21_000, 34_00
  * empties; the turn's own TTL is what ends a genuinely stuck one.
  */
 const PENDING_WATCH_TAIL_MS = 30_000
+/** Refusals within this window that open the host-wide read pause. */
+const READ_STORM_WINDOW_MS = 60_000
+const READ_STORM_LIMIT = 5
+const READ_STORM_BASE_MS = 60_000
+const READ_STORM_MAX_MS = 15 * 60_000
 
 /**
  * How long an unanswered send is remembered, and how wide a create_time window
@@ -407,6 +412,8 @@ type Config = {
   pendingWatchGapsMs?: number[]
   /** The slow cadence that follows the ladder while a posted turn is still owed. */
   pendingWatchTailMs?: number
+  /** Consecutive 429s that pause every bridge's reads. Tests lower it. */
+  readStormLimit?: number
   /** The first 429 backoff before doubling. Tests shorten it; never widened. */
   readBackoffBaseMs?: number
   /**
@@ -591,6 +598,7 @@ export function resolveConfig(partial: Partial<Config>): Config {
     titlesEvery: Number.isFinite(partial.titlesEvery) ? Number(partial.titlesEvery) : envNumber('TITLES_EVERY', 120),
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
     pendingWatchTailMs: partial.pendingWatchTailMs,
+    readStormLimit: partial.readStormLimit,
     // Production (the CLI path) runs lanes unless told not to. Tests build a
     // Config directly and therefore stay on the injected one-window driver.
     lanes: partial.lanes ?? (providerEnv('LANES') !== '0'),
@@ -796,6 +804,11 @@ export class ChatGptHost {
   private readErrors = 0
   /** The one wide catch-up a process gets; later attaches license owed work only. */
   private pageReadySeen = false
+  /** Consecutive 429s across ALL bridges: the account throttles the account, not a bridge. */
+  private readStormStreak = 0
+  private readStormAt = 0
+  private readStormBackoffMs = 0
+  private readStormUntil = 0
   /** Monotonic arm identity; a wake compares it to tell a replacement from its own timer. */
   private scheduleGeneration = 0
   /** When a 429 observation was last audited, so throttling is one line, not a flood. */
@@ -3858,6 +3871,21 @@ export class ChatGptHost {
     gate.failures = Math.min(gate.failures + 1, 12)
     gate.backoffMs = grownBackoffMs(gate.failures, this.config.readBackoffBaseMs ?? READ_BACKOFF_BASE_MS, reply)
     gate.backoffUntil = Date.now() + gate.backoffMs
+    // Same lesson one level up: a 429 is the ACCOUNT speaking, so consecutive
+    // refusals from different bridges open one host-wide window instead of
+    // forty private ones.
+    const nowMs = Date.now()
+    if (nowMs - this.readStormAt > READ_STORM_WINDOW_MS) this.readStormStreak = 0
+    this.readStormAt = nowMs
+    this.readStormStreak += 1
+    if (this.readStormStreak >= (this.config.readStormLimit ?? READ_STORM_LIMIT)) {
+      this.readStormBackoffMs = Math.min(Math.max(this.readStormBackoffMs * 2, READ_STORM_BASE_MS), READ_STORM_MAX_MS)
+      this.readStormUntil = nowMs + this.readStormBackoffMs
+      this.readStormStreak = 0
+      log(`the account is throttling reads: pausing every bridge's reads for ${Math.round(this.readStormBackoffMs / 1000)}s`)
+      audit(this.hostState, { op: 'observe', target: 'reads', result: `account throttling: reads paused for ${Math.round(this.readStormBackoffMs / 1000)}s` })
+      void this.persistHostState().catch(() => {})
+    }
   }
 
   /**
@@ -3900,6 +3928,15 @@ export class ChatGptHost {
   ): Promise<{ conversation: Conversation } | { missing: true } | { rateLimited: true } | undefined> {
     if (this.observes === false) return undefined
     const gate = bridge.reads
+    // A host-wide breaker, not just the per-bridge window. The account throttles
+    // per account, so forty bridges each starting their own backoff is one
+    // account-wide storm: after five consecutive refusals no bridge reads at
+    // all until the storm window ends (measured 2026-11-07: the boot catch-up
+    // alone kept a throttled account throttled for the whole hour).
+    if (Date.now() < this.readStormUntil) {
+      gate.skipped += 1
+      return { rateLimited: true }
+    }
     if (Date.now() < gate.backoffUntil) {
       gate.skipped += 1
       return { rateLimited: true }
@@ -3913,10 +3950,14 @@ export class ChatGptHost {
     const reply = await this.driver.call({ op: 'conversation', threadId, ...(kind === 'delivery' ? { open: true } : {}) }, this.readTimeout)
     if (reply.ok === true && reply.conversation && typeof reply.conversation === 'object') {
       this.observes = true
-      // The page is answering again: the next 429 starts from the base again.
+      // The page is answering again: the next 429 starts from the base again,
+      // and a successful read closes the host-wide storm window.
       gate.failures = 0
       gate.backoffMs = 0
       gate.backoffUntil = 0
+      this.readStormStreak = 0
+      this.readStormBackoffMs = 0
+      this.readStormUntil = 0
       return { conversation: reply.conversation as Conversation }
     }
     if (/unknown op/i.test(String(reply.error ?? ''))) {
