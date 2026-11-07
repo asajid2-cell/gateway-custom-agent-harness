@@ -2399,7 +2399,7 @@ test('HTTP boundary enforces the upstream timeout and cleans up the request', as
     },
     expectedStatus: 504,
     expected: response => {
-      assert.equal(parseGatewayError(response.body).message, 'Gateway upstream request timed out')
+      assert.equal(parseGatewayError(response.body).message, 'Codex upstream request timed out')
     },
   })
   // The 40ms upstream timeout must end the call, not the 1000ms consumer
@@ -3267,7 +3267,7 @@ test('Codex pre-output retry re-arms the upstream header timeout', async () => {
       const result = await postGateway(gateway.port, minimalCodexBody())
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.match(result.body, /Codex upstream request timed out/)
       assertCompletedBeforeFallback(elapsed, {
         label: 'Codex retry re-arm',
         // Two 40ms attempt windows plus a 1ms backoff. The second attempt must
@@ -4564,7 +4564,7 @@ test('a stalled compaction upstream is bounded and cancelled before HTTP 200', a
         /model-gateway native-compaction source=compact/,
       )
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.match(result.body, /Codex upstream request timed out/)
       assertCompletedBeforeFallback(elapsed, {
         label: 'stalled compaction',
         // Two 40ms attempt windows plus a 1ms backoff, versus the 3000ms
@@ -5681,6 +5681,54 @@ test('HTTP boundary retries a malformed OpenCode stream before committing 200', 
   })
 })
 
+test('a stalled OpenCode account fails over to the next key', async () => {
+  const attempts = []
+  await withGatewayAndFakeOpenCode({
+    handler: async (req, res, state) => {
+      await requestJson(req)
+      attempts.push({ key: req.headers.authorization, path: req.url })
+      if (attempts.length === 1) {
+        // This account accepts the request and never sends headers: the shape a
+        // queueing provider produces. The header deadline must end the attempt
+        // (not the request) so the pool can move on.
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'resp-failover',
+        status: 'completed',
+        output: [{ type: 'message', content: [{ type: 'output_text', text: 'second key answered' }] }],
+      }))
+    },
+    gatewayEnv: {
+      OPENCODE_API_KEY2: 'opencode-two',
+      MODEL_GATEWAY_UPSTREAM_RETRY_BASE_MS: '1',
+      MODEL_GATEWAY_UPSTREAM_RETRY_MAX_MS: '4',
+      MODEL_GATEWAY_UPSTREAM_TIMEOUT_MS: '40',
+      MODEL_GATEWAY_CONSUMER_TIMEOUT_MS: '4000',
+    },
+    run: async ({ gateway }) => {
+      const started = performance.now()
+      const result = await postGateway(gateway.port, {
+        model: 'opencode-go/gpt-5.6-luna',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'failover' }],
+      })
+      assert.equal(result.status, 200)
+      assert.equal(attempts.length, 2)
+      assert.notEqual(attempts[0].key, attempts[1].key)
+      assert.match(gateway.getStderr(), /timeout provider=OpenCode Go attempt=1 failover=yes/)
+      assertCompletedBeforeFallback(performance.now() - started, {
+        label: 'stalled account failover',
+        // One 40ms header window, a 1ms backoff, then an immediate answer. The
+        // 4000ms consumer timeout is the fall-through this guards.
+        path: 40,
+        fallback: 4000,
+      })
+    },
+  })
+})
+
 test('OpenCode pre-output retry re-arms the upstream header timeout', async () => {
   await withGatewayAndFakeOpenCode({
     handler: (req, res, state) => malformedThenWaitingOpenCodeHandler(state)(req, res),
@@ -5701,7 +5749,7 @@ test('OpenCode pre-output retry re-arms the upstream header timeout', async () =
       })
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.match(result.body, /OpenCode Go upstream request timed out/)
       assertCompletedBeforeFallback(elapsed, {
         label: 'OpenCode retry re-arm',
         // Two 40ms attempt windows plus a 1ms backoff; the retry must re-arm
@@ -5823,7 +5871,7 @@ test('HTTP boundary bounds an OpenCode retry that never returns headers', async 
       })
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.match(result.body, /OpenCode Go upstream request timed out/)
       assertCompletedBeforeFallback(elapsed, {
         label: 'OpenCode retry deadline',
         // Two 40ms attempt windows plus a 1ms backoff, against the 3000ms
@@ -5859,7 +5907,7 @@ test('OpenCode has a bounded upstream request deadline even when the provider st
       })
       const elapsed = performance.now() - started
       assert.equal(result.status, 504)
-      assert.match(result.body, /Gateway upstream request timed out/)
+      assert.match(result.body, /OpenCode Go upstream request timed out/)
       assertCompletedBeforeFallback(elapsed, {
         label: 'OpenCode upstream deadline',
         // The 40ms upstream timeout ends the stalled request; the 3000ms

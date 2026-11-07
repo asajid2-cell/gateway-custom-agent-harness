@@ -819,9 +819,10 @@ function createRequestControl(req, res, trace, options = {}) {
   const controller = new AbortController()
   let closed = false
   let upstreamTimer = null
+  let attemptController = null
+  let attemptTimedOut = false
   let consumerTimer = null
   let totalTimer = null
-  let upstreamStarted = false
   let streamErrorFinalizer = null
   const abort = (message, status = 504) => {
     if (closed) return
@@ -854,10 +855,34 @@ function createRequestControl(req, res, trace, options = {}) {
       totalTimeoutMs,
     )
   }
-  const armUpstreamTimeout = (timeoutMs = upstreamTimeoutMs) => {
-    if (upstreamStarted || upstreamTimeoutMs <= 0) return
-    upstreamStarted = true
-    upstreamTimer = setTimeout(() => abort('Gateway upstream request timed out', 504), timeoutMs)
+  // The header deadline ends one upstream attempt, not the whole request.
+  // Aborting here used to write the 504 itself, which made a stalled provider
+  // fatal even when the pool held other accounts that could have answered:
+  // every client retry then landed on the same stalled key. The deadline now
+  // only kills the in-flight fetch, so the retry loop can move on; whoever
+  // exhausts the attempts writes the reply.
+  const beginUpstreamAttempt = (timeoutMs = upstreamTimeoutMs) => {
+    if (upstreamTimer) {
+      clearTimeout(upstreamTimer)
+      upstreamTimer = null
+    }
+    attemptTimedOut = false
+    if (upstreamTimeoutMs <= 0) return controller.signal
+    const attempt = new AbortController()
+    attemptController = attempt
+    if (controller.signal.aborted) {
+      attempt.abort(controller.signal.reason)
+    } else {
+      controller.signal.addEventListener('abort', () => attempt.abort(controller.signal.reason), { once: true })
+    }
+    const budget = timeoutMs > 0 ? timeoutMs : upstreamTimeoutMs
+    upstreamTimer = setTimeout(() => {
+      if (controller.signal.aborted) return
+      attemptTimedOut = true
+      trace.markTimeout('Gateway upstream request timed out')
+      attempt.abort(new Error('Gateway upstream request timed out'))
+    }, budget)
+    return attempt.signal
   }
   const armConsumerTimeout = () => {
     if (consumerTimeoutMs <= 0 || consumerTimer) return
@@ -876,9 +901,10 @@ function createRequestControl(req, res, trace, options = {}) {
 
   return {
     signal: controller.signal,
+    beginUpstreamAttempt,
+    attemptTimedOut() { return attemptTimedOut },
     startUpstream() {
       armTotalTimeout()
-      armUpstreamTimeout()
       armConsumerTimeout()
     },
     upstreamConnected() {
@@ -886,20 +912,9 @@ function createRequestControl(req, res, trace, options = {}) {
         clearTimeout(upstreamTimer)
         upstreamTimer = null
       }
-      // Header acquisition completes one upstream attempt. Outer relay
-      // retries must be treated as a new attempt, even when the first fetch
-      // returned a response before its body proved usable.
-      upstreamStarted = false
-    },
-    retryUpstream() {
-      if (upstreamTimer) clearTimeout(upstreamTimer)
-      upstreamTimer = null
-      upstreamStarted = false
-      armUpstreamTimeout(
-        RETRY_ATTEMPT_TIMEOUT_MS > 0
-          ? Math.min(upstreamTimeoutMs, RETRY_ATTEMPT_TIMEOUT_MS)
-          : upstreamTimeoutMs,
-      )
+      // Headers arrived, so this attempt is no longer waiting on them. A later
+      // attempt (a relay retry or a pool failover) arms its own deadline.
+      attemptTimedOut = false
     },
     abortUpstream,
     upstreamActivity() {
@@ -3378,14 +3393,22 @@ export async function fetchWithRetry({
   credentials,
 }) {
   let lastError = null
+  // A stalled account gets exactly one successor. The deadline is a queueing
+  // signal, not proof the route is dead, and walking the whole pool would cost
+  // a full header window per key before the caller hears anything.
+  let timeoutFailovers = 0
   const retries = Math.max(UPSTREAM_RETRIES, credentials?.size > 1 ? credentials.size : 0)
   for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
-    if (attempt > 1) control.retryUpstream?.()
+    // Each attempt arms its own header deadline; a retry gets the shorter
+    // window that exists for retries. `undefined` means "the full window".
+    const signal = control.beginUpstreamAttempt
+      ? control.beginUpstreamAttempt(attempt === 1 ? undefined : RETRY_RESPONSE_TIMEOUT_MS)
+      : control.signal
     try {
       // A pool whose credential comes from a file (Codex homes) resolves its
       // headers asynchronously; a synchronous option builder is unaffected.
       const resolvedOptions = typeof options === 'function' ? await options() : options
-      const response = await fetch(url, resolvedOptions)
+      const response = await fetch(url, { ...resolvedOptions, signal })
       trace.markUpstreamConnect()
       control.upstreamConnected()
       const failedCredential = await credentialFailure(provider, response, credentials, control)
@@ -3414,6 +3437,24 @@ export async function fetchWithRetry({
       await waitForRetry(delay, control.signal)
     } catch (error) {
       lastError = error
+      if (control.attemptTimedOut?.()) {
+        // The provider never sent headers. The account may be queueing while a
+        // sibling key answers, so this is a route failure rather than a
+        // verdict on the request. Named on stderr because a bare 504 in a
+        // session transcript cannot say which route stalled or for how long.
+        const failover = timeoutFailovers < 1 && attempt <= retries && Number(credentials?.size) > 1
+        process.stderr.write(
+          `model-gateway timeout provider=${safeLogValue(provider)} attempt=${attempt} failover=${failover ? 'yes' : 'no'}\n`,
+        )
+        if (!failover) {
+          error.gatewayStatus = 504
+          throw error
+        }
+        timeoutFailovers += 1
+        credentials.advance()
+        await waitForRetry(retryDelayMs(attempt, null), control.signal)
+        continue
+      }
       if (!retryableConnectionError(error, control.signal) || attempt > retries) {
         throw error
       }
@@ -4145,7 +4186,7 @@ async function handleCodex(body, req, res, modelName, route) {
           })
         } catch (error) {
           requestError = error
-          const status = control.signal.aborted ? control.statusFor(error) : 502
+          const status = control.statusFor(error)
           anthropicError(res, status, status === 504 ? 'Codex upstream request timed out' : 'Codex connection failed')
           trace.finish('upstream-error', error, status)
           advanceVariant = false
@@ -4341,7 +4382,7 @@ async function handleOpenCodeGo(body, req, res, modelName, route) {
         })
       } catch (error) {
         trace.markError(error)
-        const status = control.signal.aborted ? control.statusFor(error) : 502
+        const status = control.statusFor(error)
         anthropicError(res, status, status === 504 ? 'OpenCode Go upstream request timed out' : 'OpenCode Go connection failed')
         trace.finish('upstream-error', error, status)
         return
@@ -4488,7 +4529,7 @@ async function handleCommandCode(body, req, res, modelName, route) {
         })
       } catch (error) {
         trace.markError(error)
-        const status = control.signal.aborted ? control.statusFor(error) : 502
+        const status = control.statusFor(error)
         anthropicError(res, status, control.signal.aborted ? 'Command Code upstream request timed out' : 'Command Code connection failed')
         trace.finish('upstream-error', error, status)
         return
@@ -4629,7 +4670,7 @@ async function handleMistral(body, req, res, modelName, route) {
         })
       } catch (error) {
         trace.markError(error)
-        const status = control.signal.aborted ? control.statusFor(error) : 502
+        const status = control.statusFor(error)
         anthropicError(res, status, control.signal.aborted ? 'Mistral upstream request timed out' : 'Mistral connection failed')
         trace.finish('upstream-error', error, status)
         return
@@ -4790,7 +4831,7 @@ async function handleOpenCodeZen(body, req, res, modelName, route) {
   } catch (error) {
     trace.markError(error)
     if (!res.headersSent) {
-      const status = control.signal.aborted ? control.statusFor(error) : 502
+      const status = control.statusFor(error)
       anthropicError(res, status, control.signal.aborted ? 'OpenCode Zen upstream request timed out' : credentials.redact(errorMessage(error)))
     } else if (wantsStream) {
       finishAnthropicStreamWithError(res, error)
@@ -5799,7 +5840,7 @@ async function handleAnthropicPassthrough(req, res, requestUrl, rawBody, modelNa
     })
   } catch (error) {
     trace.markError(error)
-    const status = control.signal.aborted ? control.statusFor(error) : 502
+    const status = control.statusFor(error)
     anthropicError(res, status, status === 504 ? `${label} upstream request timed out` : `${label} connection failed`)
     trace.finish('upstream-error', error, status)
     control.cleanup()
