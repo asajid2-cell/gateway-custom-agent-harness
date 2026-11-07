@@ -88,15 +88,6 @@ const READ_STORM_LIMIT = 5
 const READ_STORM_BASE_MS = 60_000
 const READ_STORM_MAX_MS = 15 * 60_000
 /**
- * What the account actually allows, measured directly (2026-11-07): four
- * conversation reads answered, the fifth refused with `Retry-After: 48`. A
- * human uses the page in exactly that shape - a couple of reads per turn - so
- * the host spends its reads from a budget instead of waiting to be refused.
- */
-const READ_BUDGET_PER_MINUTE = 4
-const READ_BUDGET_BURST = 2
-
-/**
  * How long an unanswered send is remembered, and how wide a create_time window
  * counts as "this node is that send".
  *
@@ -422,10 +413,6 @@ type Config = {
   pendingWatchTailMs?: number
   /** Consecutive 429s that pause every bridge's reads. Tests lower it. */
   readStormLimit?: number
-  /** Account-wide read budget, per minute (0 = unlimited). Tests lower it. */
-  readBudgetPerMinute?: number
-  /** How many reads may go out back to back before the budget paces them. */
-  readBudgetBurst?: number
   /** The first 429 backoff before doubling. Tests shorten it; never widened. */
   readBackoffBaseMs?: number
   /**
@@ -611,10 +598,6 @@ export function resolveConfig(partial: Partial<Config>): Config {
     pendingWatchGapsMs: partial.pendingWatchGapsMs,
     pendingWatchTailMs: partial.pendingWatchTailMs,
     readStormLimit: partial.readStormLimit,
-    // The production host paces its reads at a human's rate; a Config built
-    // directly in a test (like the lane model) keeps the unlimited default.
-    readBudgetPerMinute: Number.isFinite(partial.readBudgetPerMinute) ? Number(partial.readBudgetPerMinute) : READ_BUDGET_PER_MINUTE,
-    readBudgetBurst: Number.isFinite(partial.readBudgetBurst) ? Number(partial.readBudgetBurst) : READ_BUDGET_BURST,
     // Production (the CLI path) runs lanes unless told not to. Tests build a
     // Config directly and therefore stay on the injected one-window driver.
     lanes: partial.lanes ?? (providerEnv('LANES') !== '0'),
@@ -825,9 +808,6 @@ export class ChatGptHost {
   private readStormAt = 0
   private readStormBackoffMs = 0
   private readStormUntil = 0
-  /** Fractional tokens left in the account-wide read budget; -1 until first use. */
-  private readTokens = -1
-  private readTokensAt = 0
   /** Monotonic arm identity; a wake compares it to tell a replacement from its own timer. */
   private scheduleGeneration = 0
   /** When a 429 observation was last audited, so throttling is one line, not a flood. */
@@ -3880,33 +3860,6 @@ export class ChatGptHost {
   }
 
   /**
-   * One read from the account-wide budget, or false when it is empty.
-   *
-   * Tokens refill at READ_BUDGET_PER_MINUTE and are capped at the burst, so a
-   * turn that needs two reads gets them at once and everything else waits its
-   * turn instead of racing into a 429.
-   */
-  private takeReadToken(): boolean {
-    const perMinute = this.config.readBudgetPerMinute ?? 0
-    if (!(perMinute > 0)) return true
-    const burst = this.config.readBudgetBurst ?? READ_BUDGET_BURST
-    const nowMs = Date.now()
-    if (this.readTokens < 0) {
-      this.readTokens = burst
-      this.readTokensAt = nowMs
-    } else {
-      const gained = ((nowMs - this.readTokensAt) / 60_000) * perMinute
-      if (gained > 0) {
-        this.readTokens = Math.min(burst, this.readTokens + gained)
-        this.readTokensAt = nowMs
-      }
-    }
-    if (this.readTokens < 1) return false
-    this.readTokens -= 1
-    return true
-  }
-
-  /**
    * The page asked us to slow down. Grow the backoff (exponentially, with
    * jitter so two bridges cannot synchronise) and honour a Retry-After the
    * driver reported: the server's own number is a floor, never a ceiling.
@@ -3994,14 +3947,6 @@ export class ChatGptHost {
       gate.skipped += 1
       return { rateLimited: true }
     }
-    // The account's own shape: a few reads, then wait. Spending from a budget
-    // means a pass never sends the burst that would earn a 429 in the first
-    // place; the refused reads the breaker exists for become the rare case of
-    // another client sharing the account.
-    if (!this.takeReadToken()) {
-      gate.skipped += 1
-      return { rateLimited: true }
-    }
     gate.attempted += 1
     if (kind === 'delivery') gate.delivery += 1
     // A delivery read may OPEN the thread in the writer's own tab (a driver
@@ -4044,6 +3989,11 @@ export class ChatGptHost {
       // No tab shows this thread, and an observation read does not open one
       // (it would be a page load per bridge per pass). That is "no evidence
       // yet", not a page error: it neither counts nor backs off the pass.
+      return undefined
+    }
+    if (reply.reason === 'budget') {
+      // The driver spent the account-wide read budget at its one door and
+      // deferred this read; the next pass will ask again. Not a page error.
       return undefined
     }
     if (isDriverFaultReply(reply)) {
@@ -5364,6 +5314,23 @@ export class ChatGptHost {
   }
 
   /**
+   * Retire a reply the bus will never deliver.
+   *
+   * "No live session X" is the bus saying it never knew X. That alone is not
+   * proof of death, so the registration directory decides: retire only when it
+   * was readable and X has no file there. Unknown is never "gone", and a busy
+   * peer still has its file. Without this a reply to a vanished probe sender
+   * was re-sent on every observation pass (measured 2026-11-07: nine tries in
+   * four minutes).
+   */
+  private async retireIfSenderGone(bridge: Bridge, messageId: string, senderSessionId: string, error: unknown): Promise<void> {
+    if (!/no live session/i.test(one((error as Error)?.message, 200))) return
+    const senders = await this.liveSenderIds()
+    if (!senders || senders.has(senderSessionId)) return
+    await this.retireOwedTurn(bridge, messageId, senderSessionId, 'sender gone; reply not delivered')
+  }
+
+  /**
    * Settle one recorded-as-posted turn from the page before re-posting it.
    *
    * `delivered` - the page finished an answer of ours: it is sent to the
@@ -5999,6 +5966,7 @@ export class ChatGptHost {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: note, messageId: message.id })
     } catch (error) {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `failed: ${one((error as Error).message, 200)}`, messageId: message.id })
+      await this.retireIfSenderGone(bridge, message.id, message.fromSessionId, error)
     }
   }
 
@@ -6174,6 +6142,7 @@ export class ChatGptHost {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `error reply: ${one(reason, 180)}`, messageId: message.id })
     } catch (error) {
       audit(this.hostState, { op: 'reply', target: message.fromSessionId, result: `error reply failed: ${one((error as Error).message, 160)}`, messageId: message.id })
+      await this.retireIfSenderGone(bridge, message.id, message.fromSessionId, error)
     }
   }
 

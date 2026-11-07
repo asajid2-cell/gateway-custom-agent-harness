@@ -546,6 +546,47 @@ describe('R-LIVE-6: a restart reads the page before re-posting a turn', () => {
     }
   }, 40_000)
 
+  test('a reply the bus refuses for a vanished sender is retired once, not retried', async () => {
+    const { dir, cleanup } = await scratch()
+    const { alpha } = await primedBridge()
+    await seedHost(dir, [alpha])
+    const sender = await busPeer(dir, 'sender')
+    const driver = new FakeDriver()
+    driver.observable = true
+    // The page takes the text and holds the answer until the sender is gone,
+    // so the ONE live run reaches the send and hears the bus refuse it.
+    driver.stallFor = () => true
+    const host = await startHost(dir, driver, { pendingWatchGapsMs: [200] })
+    try {
+      const senderId = sender.peer.sessionId
+      const receipt = await sender.send(alpha.sessionId, 'ask the page', 'ask the page', undefined, 'inquiry', true) as { id: string }
+      await waitFor(() => (driver.sentAtMs.length >= 1 ? true : undefined), 15_000)
+
+      // The sender exits; its registration goes with it. The answer lands
+      // afterwards, so the host has something to deliver to nobody.
+      await sender.close()
+      await rm(join(sessionsDir(dir), `${senderId}.json`), { force: true })
+      driver.stallFor = undefined
+      driver.pageNode(THREAD_A, 'an answer nobody can receive')
+
+      const sendsBefore = driver.calls.filter(call => call.op === 'send').length
+      await host.pollOnce()
+      await waitFor(async () => {
+        const bridge = await readBridge(dir, alpha.sessionId)
+        return bridge.pendingTurns.some(turn => turn.messageId === receipt.id) ? undefined : true
+      }, 15_000)
+      // A second pass must find nothing left to retry.
+      await host.pollOnce()
+      expect(driver.calls.filter(call => call.op === 'send').length).toBe(sendsBefore)
+      const state = JSON.parse(await readFile(join(dir, 'peer.json'), 'utf8')) as { audit: { result: string }[] }
+      expect(state.audit.some(entry => entry.result.includes('sender gone; reply not delivered'))).toBe(true)
+    } finally {
+      await host.stop()
+      await sender.close().catch(() => {})
+      await cleanup()
+    }
+  }, 40_000)
+
   test('a posted turn survives a 429 storm: the watch waits the window out, then delivers', async () => {
     const { dir, cleanup } = await scratch()
     const { alpha } = await primedBridge()

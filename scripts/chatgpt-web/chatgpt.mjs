@@ -24,6 +24,7 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import readline from 'node:readline'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { createReadBudget } from './readbudget.mjs'
 
 const HOME = os.homedir()
 const BASE = path.join(HOME, '.chatgpt-web')
@@ -2219,7 +2220,7 @@ async function treeSendEvidence(page, text, baseline, timeoutMs = TREE_PROBE_REA
   if (!(baseline instanceof Map)) return { accepted: false, why: 'could not be read before the send' }
   const threadId = threadOf(page.url())
   if (!threadId) return { accepted: false, why: 'has no thread to read' }
-  const read = await readUserNodesOn(page, `/backend-api/conversation/${threadId}`, timeoutMs).catch(() => null)
+  const read = await readUserNodesOn(page, `/backend-api/conversation/${threadId}`, timeoutMs, 'delivery').catch(() => null)
   if (!read?.ok) return { accepted: false, why: 'could not be read' }
   const fresh = newUserNodes(baseline, userTreeNodes(read.body))
   if (fresh === null) return { accepted: false, why: 'could not be read' }
@@ -3099,7 +3100,7 @@ async function readUserTreeOnPage(page, onRead = null) {
   }
   const threadId = threadOf(page.url())
   if (!threadId) return report(new Map(), 'new-chat', 'no-thread')
-  const read = await readUserNodesOn(page, `/backend-api/conversation/${threadId}`, TREE_BASELINE_TIMEOUT_MS).catch(() => null)
+  const read = await readUserNodesOn(page, `/backend-api/conversation/${threadId}`, TREE_BASELINE_TIMEOUT_MS, 'delivery').catch(() => null)
   if (!read?.ok) {
     const status = read?.reason === 'timeout' ? 'timeout' : `error${read?.status ? `-${read.status}` : ''}`
     return report(null, status, read?.how ?? null)
@@ -4566,14 +4567,48 @@ const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 const MESSAGE_ID = /^[A-Za-z0-9_-]{1,128}$/
 
 /**
+ * The account's read budget, spent at the one door every backend GET passes.
+ *
+ * The host meters only its own `conversation` op; this sees the send's tree
+ * baseline, the reply read, the title walk and the list too. Measured wall:
+ * four reads answer, the fifth is refused for 48 s. 3/min with a burst of 2
+ * keeps one read of margin for the page app's own fetches. A delivery read
+ * may spend the last token; an observation waits briefly and otherwise defers
+ * to the next pass. Gemini reads a DOM and never imports this file.
+ */
+const accountReads = createReadBudget({
+  perMinute: Number(process.env.CHATGPT_READ_BUDGET_PER_MINUTE ?? 3),
+  burst: Number(process.env.CHATGPT_READ_BUDGET_BURST ?? 2),
+})
+
+const budgetRefused = () => ({ ok: false, status: 0, reason: 'budget', error: 'the account read budget is spent' })
+
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** Wait for a token, bounded: a delivery read is worth a short wait, an observation is not. */
+async function acquireRead(priority = 'observation') {
+  if (accountReads.unlimited) return true
+  const deadline = Date.now() + (priority === 'delivery' ? 20_000 : 5_000)
+  for (;;) {
+    if (accountReads.take(priority)) return true
+    const wait = accountReads.waitMs(priority)
+    const left = deadline - Date.now()
+    if (left <= 0 || wait > left) return false
+    await pause(Math.max(50, Math.min(wait, left)))
+  }
+}
+
+/**
  * A read of the page's own JSON API, made from inside the page.
  *
  * The bearer token is fetched and used inside the page and never returned to
  * this process. Observation never launches Chrome: if no browser or no
  * chatgpt.com tab is up, the read fails and the host looks again later.
  * Which thread the tab shows does not matter; the path names the thread.
+ *
+ * Unmetered by design: every public caller has already spent one account read.
  */
-async function backendGetOn(page, path, timeoutMs = 30_000) {
+async function backendGetOnRaw(page, path, timeoutMs) {
   // Checked here as well as at tab selection: the tab may have navigated away
   // since it was chosen, and the bearer-token read must only ever run on the
   // real origin.
@@ -4592,6 +4627,12 @@ async function backendGetOn(page, path, timeoutMs = 30_000) {
     if (error?.reason === 'timeout') return { ok: false, status: 0, reason: 'timeout', error: error.message }
     throw error
   }
+}
+
+/** The metered door: one account read, or a deferred read when there is none. */
+async function backendGetOn(page, path, timeoutMs = 30_000, priority = 'observation') {
+  if (!(await acquireRead(priority))) return budgetRefused()
+  return backendGetOnRaw(page, path, timeoutMs)
 }
 
 /**
@@ -4678,11 +4719,14 @@ async function readUserNodesInPage(request) {
  * A readable thread must never become unreadable because a faster path was
  * added, so every failure below falls back to the exact read it replaced.
  */
-async function readUserNodesOn(page, path, timeoutMs = 30_000) {
+async function readUserNodesOn(page, path, timeoutMs = 30_000, priority = 'observation') {
   const bodyFallback = (read, how) => {
     if (!read?.ok) return { ok: false, status: read?.status, reason: read?.reason, error: read?.error, how }
     return { ok: true, status: read.status, body: read.body, how }
   }
+  // One account read per call, whichever path serves it: the in-page projection
+  // is still a backend GET, so the fallback below must not spend a second.
+  if (!(await acquireRead(priority))) return { ...budgetRefused(), how: 'budget' }
   let result = null
   try {
     result = await evaluateTimed(page, readUserNodesInPage, path, timeoutMs)
@@ -4694,7 +4738,7 @@ async function readUserNodesOn(page, path, timeoutMs = 30_000) {
       return { ok: false, status: 0, reason: 'timeout', error: error.message, how: 'in-page-timeout' }
     }
     noteTreeRead(`tree read path: whole-body fallback (${error?.message ?? error})`)
-    return bodyFallback(await backendGetOn(page, path, timeoutMs).catch(() => null), 'whole-body')
+    return bodyFallback(await backendGetOnRaw(page, path, timeoutMs).catch(() => null), 'whole-body')
   }
   if (result?.ok === true && 'body' in result) {
     // `via` is the page's own report: 'in-page' means it projected the mapping,
@@ -4711,7 +4755,7 @@ async function readUserNodesOn(page, path, timeoutMs = 30_000) {
   }
   // A shape we do not know: fall back rather than guess.
   noteTreeRead('tree read path: whole-body fallback (unrecognised in-page result)')
-  return bodyFallback(await backendGetOn(page, path, timeoutMs).catch(() => null), 'whole-body')
+  return bodyFallback(await backendGetOnRaw(page, path, timeoutMs).catch(() => null), 'whole-body')
 }
 
 /**
@@ -4723,7 +4767,7 @@ function noteTreeRead(line) {
   if (isMain) log(line)
 }
 
-async function backendGet(path, timeoutMs = 30_000) {
+async function backendGet(path, timeoutMs = 30_000, priority = 'observation') {
   if (!(await cdpUp())) return { ok: false, status: 0, reason: 'not-open', error: 'chrome is not running' }
   const { browser, page } = await connect()
   try {
@@ -4735,7 +4779,7 @@ async function backendGet(path, timeoutMs = 30_000) {
     // No chatgpt.com tab at all: "no evidence yet", not a page error, so the
     // host neither counts a failed read nor backs the observation pass off.
     if (!origin) return { ok: false, status: 0, reason: 'not-open', error: 'no chatgpt.com tab is open' }
-    return await backendGetOn(origin, path, timeoutMs)
+    return await backendGetOn(origin, path, timeoutMs, priority)
   } finally { release(browser) }
 }
 
@@ -4747,18 +4791,18 @@ async function backendGet(path, timeoutMs = 30_000) {
  * and one retry, and only then is it reported. Reads are idempotent; nothing
  * that can post a message is retried this way.
  */
-async function backendGetRetry(path, totalMs = BACKEND_READ_BUDGET_MS) {
+async function backendGetRetry(path, totalMs = BACKEND_READ_BUDGET_MS, priority = 'observation') {
   // The whole read, retry included, fits inside the host's own read deadline
   // (45 s). Two 30 s attempts used to outlast it, so a slow-but-alive page was
   // reported by the HOST as "the driver timed out" - no evidence at all -
   // instead of by the driver as a page that did not answer in time.
   const startedAt = Date.now()
-  const first = await backendGet(path, Math.round(totalMs * 0.6))
+  const first = await backendGet(path, Math.round(totalMs * 0.6), priority)
   if (first.reason !== 'timeout') return first
   const left = totalMs - (Date.now() - startedAt)
   if (left < 3_000) return first
   await log(`the page did not answer a backend read in ${Math.round((Date.now() - startedAt) / 1000)}s; asking once more`)
-  return await backendGet(path, left)
+  return await backendGet(path, left, priority)
 }
 /** One backend read's whole budget, kept under the host's 45 s read deadline. */
 const BACKEND_READ_BUDGET_MS = 38_000
@@ -5889,7 +5933,10 @@ async function serve() {
     if (op === 'conversation') {
       const threadId = String(request.threadId ?? '')
       if (!THREAD_ID.test(threadId)) return { ok: false, op, error: 'threadId must be a conversation uuid' }
-      const read = await backendGetRetry(`/backend-api/conversation/${threadId}`)
+      // The host marks a read it needs for a posted turn `open:true`; that read
+      // may spend the last token. An observation waits briefly and defers.
+      const priority = request.open === true ? 'delivery' : 'observation'
+      const read = await backendGetRetry(`/backend-api/conversation/${threadId}`, undefined, priority)
       if (!read.ok) return { ok: false, op, status: read.status, reason: read.reason, error: read.error }
       const { current_node = null, mapping = {} } = read.body ?? {}
       return { ok: true, op, threadId, conversation: { current_node, mapping } }
