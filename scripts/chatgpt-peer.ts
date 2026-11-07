@@ -780,6 +780,16 @@ export class ChatGptHost {
   /** When page work was last submitted; idle unload refuses to run past it. */
   private lastWorkAt = 0
   private readonly pageLock = this.makeLock()
+  /**
+   * ONE page turn at a time, across every bridge.
+   *
+   * Two lanes rendering at once in the one shared browser made ChatGPT fail its
+   * own render ("no composer and no messages", measured 2026-11-07) and pushed
+   * the retry past the sender's window. A human types into one chat at a time
+   * too; a second bridge's turn queues FIFO behind the first instead of
+   * failing.
+   */
+  private readonly pageTurnLock = this.makeLock()
   private readonly primer: { text: string; sha: string }
   private stopping = false
   /** G-013: the state-file lock this process holds, and when it claimed it. */
@@ -6560,26 +6570,29 @@ export class ChatGptHost {
   }
 
   /**
-   * One turn at a time per conversation.
+   * One turn at a time per conversation, and one page turn at a time overall.
    *
-   * A bridge is one linear thread. Two turns posted into it at once make the
-   * app re-render under its own feet, and in a shared browser both tabs watch
-   * the other's stream: the conversation then stops loading ("the messages
-   * could not load") and one answer lands on top of the other's. Lanes still
-   * run in parallel ACROSS bridges; within one thread they queue. The bridge
-   * lock is taken BEFORE the lane, so a writer waiting its turn never holds a
-   * lane another writer needs.
+   * A bridge is one linear thread, so two turns posted into it at once make the
+   * app re-render under its own feet. Across bridges the same is now true for a
+   * different reason: every bridge is a tab in ONE browser, and two lanes
+   * rendering at once made ChatGPT stop rendering at all ("no composer and no
+   * messages"; the retry then missed the sender's window). The page turn lock
+   * is taken first (FIFO), then the bridge lock, then the lane, so a writer
+   * waiting its turn holds nothing another writer needs.
    */
   private turnStep<T>(bridge: Bridge, laneId: string, work: (lane: LaneHandle) => Promise<T>): Promise<T> {
-    log(`turn lane ${shortId(laneId)}: waiting for the bridge lock ("${bridge.state.name}")`)
-    return this.turnLockFor(bridge).run(async () => {
-      log(`turn lane ${shortId(laneId)}: bridge lock acquired`)
-      this.turnsInFlight += 1
-      try {
-        return await this.laneWork(laneId, work)
-      } finally {
-        this.turnsInFlight = Math.max(0, this.turnsInFlight - 1)
-      }
+    log(`turn lane ${shortId(laneId)}: waiting for the page turn ("${bridge.state.name}")`)
+    return this.pageTurnLock.run(() => {
+      log(`turn lane ${shortId(laneId)}: page turn acquired`)
+      return this.turnLockFor(bridge).run(async () => {
+        log(`turn lane ${shortId(laneId)}: bridge lock acquired`)
+        this.turnsInFlight += 1
+        try {
+          return await this.laneWork(laneId, work)
+        } finally {
+          this.turnsInFlight = Math.max(0, this.turnsInFlight - 1)
+        }
+      })
     })
   }
 

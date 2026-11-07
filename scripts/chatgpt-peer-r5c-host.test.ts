@@ -145,36 +145,43 @@ class FakeDriver {
       return { ok: true, op, threadId, url: `https://chatgpt.com/c/${threadId}`, adopted: true }
     }
     if (op === 'send') {
-      if (this.sendError) return { ok: false, op, error: this.sendError }
-      if (this.generating || this.refuseSend) {
-        return { ok: false, op, reason: 'busy', state: 'generating', threadId: this.current, error: 'the page is mid-turn; your message was not typed' }
-      }
-      const requested = typeof request.threadId === 'string' ? request.threadId : null
-      const threadId = this.landOn ?? requested ?? (request.newChat ? randomUUID() : this.current)
-      if (!threadId) return { ok: false, op, error: 'no thread is open' }
-      this.current = threadId
-      this.answer = this.answerFor?.(request) ?? this.answer
-      const stalls = this.stallFor?.(request) === true
-      if (!this.lags) {
-        this.grow(threadId, 'user', String(request.text ?? ''))
-        // A page that reports the render fault has not drawn the answer; the
-        // test supplies it with `pageNode` once the page can draw again.
-        if (!stalls && !this.pageLoadAccepted) this.grow(threadId, 'assistant', this.answer)
-      }
-      // The render fault the driver reports AFTER a 2xx send POST: the text is
-      // on the page, the page just cannot draw the thread.
-      if (this.pageLoadAccepted) {
+      this.sendConcurrency += 1
+      this.maxSendConcurrency = Math.max(this.maxSendConcurrency, this.sendConcurrency)
+      try {
+        if (this.sendDelayMs) await new Promise(resolve => setTimeout(resolve, this.sendDelayMs))
+        if (this.sendError) return { ok: false, op, error: this.sendError }
+        if (this.generating || this.refuseSend) {
+          return { ok: false, op, reason: 'busy', state: 'generating', threadId: this.current, error: 'the page is mid-turn; your message was not typed' }
+        }
+        const requested = typeof request.threadId === 'string' ? request.threadId : null
+        const threadId = this.landOn ?? requested ?? (request.newChat ? randomUUID() : this.current)
+        if (!threadId) return { ok: false, op, error: 'no thread is open' }
+        this.current = threadId
+        this.answer = this.answerFor?.(request) ?? this.answer
+        const stalls = this.stallFor?.(request) === true
+        if (!this.lags) {
+          this.grow(threadId, 'user', String(request.text ?? ''))
+          // A page that reports the render fault has not drawn the answer; the
+          // test supplies it with `pageNode` once the page can draw again.
+          if (!stalls && !this.pageLoadAccepted) this.grow(threadId, 'assistant', this.answer)
+        }
+        // The render fault the driver reports AFTER a 2xx send POST: the text is
+        // on the page, the page just cannot draw the thread.
+        if (this.pageLoadAccepted) {
+          this.sentAtMs.push(Date.now())
+          return { ok: false, op, reason: 'page-load-error', accepted: true, threadId, error: 'the page could not load the messages' }
+        }
+        this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
         this.sentAtMs.push(Date.now())
-        return { ok: false, op, reason: 'page-load-error', accepted: true, threadId, error: 'the page could not load the messages' }
+        onAccepted?.(String(request.id ?? ''))
+        // `wait:true` promises the answer on this request. A turn that is still
+        // streaming has none: the real child reports `timedOut` instead of
+        // returning stale text, so the host must leave the turn owed.
+        if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
+        return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
+      } finally {
+        this.sendConcurrency -= 1
       }
-      this.signal = { phase: stalls ? 'streaming' : 'complete', threadId, at: Date.now() }
-      this.sentAtMs.push(Date.now())
-      onAccepted?.(String(request.id ?? ''))
-      // `wait:true` promises the answer on this request. A turn that is still
-      // streaming has none: the real child reports `timedOut` instead of
-      // returning stale text, so the host must leave the turn owed.
-      if (request.wait === true && stalls) return { ok: false, op, reason: 'timeout', timedOut: true, state: 'generating', threadId }
-      return { ok: true, op, text: this.sendTextFor?.(request) ?? this.answer, threadId, model: 'GPT-6', effort: 'High' }
     }
     if (op === 'read') {
       return { ok: true, op, threadId: this.current, text: this.answer, evidence: this.evidence }
@@ -257,6 +264,10 @@ class FakeDriver {
   lags = false
   /** The driver reports a render fault AFTER a 2xx send POST (the text landed). */
   pageLoadAccepted = false
+  /** How long one send holds the page; lets a test see whether two overlap. */
+  sendDelayMs = 0
+  sendConcurrency = 0
+  maxSendConcurrency = 0
 }
 
 const newestAnswerNode = (tree: { mapping: Record<string, any>; current: string }): any => {
@@ -593,6 +604,42 @@ describe('R-LIVE-6: a restart reads the page before re-posting a turn', () => {
     } finally {
       await host.stop()
       await sender.close().catch(() => {})
+      await cleanup()
+    }
+  }, 40_000)
+
+  test('two bridges turning at once still type one page turn at a time', async () => {
+    const THREAD_B = '22222222-2222-4222-8222-222222222222'
+    const { dir, cleanup } = await scratch()
+    const alpha = bridgeNamed('alpha', THREAD_A)
+    alpha.primedThreadId = THREAD_A
+    alpha.primerSha256 = await primerSha()
+    const beta = bridgeNamed('beta', THREAD_B)
+    beta.primedThreadId = THREAD_B
+    beta.primerSha256 = alpha.primerSha256
+    await seedHost(dir, [alpha, beta])
+    const senderA = await busPeer(dir, 'sender-a')
+    const senderB = await busPeer(dir, 'sender-b')
+    const driver = new FakeDriver()
+    driver.observable = true
+    // Each send holds the page for a moment, so overlapping turns are visible.
+    driver.sendDelayMs = 150
+    const host = await startHost(dir, driver, { pendingWatchGapsMs: [200] })
+    try {
+      // Both land within a moment of each other; each send only waits on the
+      // bus accepting it, not on the host's answer.
+      const receiptA = await senderA.send(alpha.sessionId, 'ask alpha', 'ask alpha', undefined, 'inquiry', true) as { id: string }
+      const receiptB = await senderB.send(beta.sessionId, 'ask beta', 'ask beta', undefined, 'inquiry', true) as { id: string }
+      await waitFor(() => (senderA.inbox().length >= 1 && senderB.inbox().length >= 1 ? true : undefined), 20_000)
+      // Both were answered, and no two sends were ever in flight together.
+      expect(driver.maxSendConcurrency).toBe(1)
+      expect(driver.sentAtMs.length).toBe(2)
+      expect(senderA.inbox()[0]!.message.replyTo).toBe(receiptA.id)
+      expect(senderB.inbox()[0]!.message.replyTo).toBe(receiptB.id)
+    } finally {
+      await host.stop()
+      await senderA.close().catch(() => {})
+      await senderB.close().catch(() => {})
       await cleanup()
     }
   }, 40_000)
