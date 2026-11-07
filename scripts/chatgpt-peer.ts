@@ -3937,6 +3937,13 @@ export class ChatGptHost {
       gate.skipped += 1
       return { rateLimited: true }
     }
+    // Half-open: the first read after the window is the probe. A refusal must
+    // reopen the window at once, so the streak starts one short of the limit -
+    // the account sees ONE read per window while it is still throttling, not
+    // another burst that keeps the throttle alive.
+    if (this.readStormBackoffMs > 0 && this.readStormStreak === 0) {
+      this.readStormStreak = Math.max(0, (this.config.readStormLimit ?? READ_STORM_LIMIT) - 1)
+    }
     if (Date.now() < gate.backoffUntil) {
       gate.skipped += 1
       return { rateLimited: true }
