@@ -326,12 +326,18 @@ display_url() {
   printf '%s' "$1" | sed 's|://[^/@]*@|://|'
 }
 
-# Ask before the first fetch only when the folder answers 401. A wrong
-# password is asked for again, up to three times.
+# Ask before the first fetch unless the folder answers 200 without credentials.
+# A gate may answer 401 (Basic) or 302 to a browser login page; both mean the
+# same thing here: credentials are required. Following that redirect hands us
+# the login page instead of the version, and a version taken from HTML becomes
+# a URL that curl rejects as malformed. A wrong password is asked for again, up
+# to three times.
 if [ -n "$BASE" ]; then
   tries=0
   while :; do
-    [ "$(http_status "$BASE/version")" = 401 ] || break
+    status="$(http_status "$BASE/version")"
+    [ "$status" = 200 ] && break
+    [ "$status" = 404 ] && die "no release folder at $(display_url "$BASE")"
     tries=$((tries + 1))
     [ "$tries" -le 3 ] || die "authentication failed for $BASE"
     HTTP_PASS=""
@@ -345,6 +351,13 @@ if [ -z "$ARCHIVE" ]; then
       # A mirror publishes the version it is serving next to the artifacts.
       say "Reading $(display_url "$BASE")/version"
       VERSION="$(fetch_url "$BASE/version" 2>/dev/null | head -n 1 | tr -d '\r')"
+      # A version is a plain token. Anything else is a login page or an error
+      # body that arrived because a credential was missing; using it would build
+      # a malformed archive URL instead of saying what went wrong.
+      case "$VERSION" in
+        ''|*[!A-Za-z0-9._+-]*)
+          die "could not read a version from $(display_url "$BASE")/version; check the username and password" ;;
+      esac
     else
       VERSION="$(fetch_url "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
         | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)"
