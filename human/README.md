@@ -1,27 +1,27 @@
 # Gateway, for humans
 
-Gateway is a coding agent that runs in a terminal. You describe a task; it
-reads the folder you started it in, edits the files, runs commands, and shows
-you what changed. It signs in to Claude, ChatGPT/Codex, OpenCode, CommandCode,
-Mistral and DeepSeek with accounts you supply.
+Gateway runs in a terminal and works on the folder you start it in. You
+describe what you want; it reads the files, edits them, runs commands, and
+shows you what changed before it writes. It signs in to claude, chatgpt/codex,
+opencode, commandcode, mistral and deepseek with accounts you supply.
 
-Sessions are not isolated. A session can split its context into *leaves* that
-work in parallel and check each other, so a mistake or a derailment in one is
-usually caught by another.
+A session can also split. It can fork itself into a leaf that works in parallel
+and checks its reasoning, or open a fresh leaf on a stronger model for a second
+opinion - the family keeps each other honest, which is most of the point.
 
-## Install
+## Installing
 
-Everything is at https://ahmedsajid.ca/gateway/ — the page asks for a
-username and password, then offers:
+Everything is at https://ahmedsajid.ca/gateway/. The page asks for a username
+and password first, then offers the downloads. Each one carries its own
+runtime, so there is nothing to install before it.
 
-- **Windows**: `GatewaySetup.exe`. SmartScreen says "Windows protected your
-  PC" because the build is unsigned: **More info**, then **Run anyway**.
-- **Linux**: the one-line `curl ... | sh` command, or the `.deb`.
-- **macOS**: the `.pkg`, or the same one-liner.
+On Windows, run GatewaySetup.exe. SmartScreen will say "Windows protected your
+PC" because the build is unsigned: choose More info, then Run anyway. On Linux
+and macOS there is a one-line `curl` command on the page, or the .deb and .pkg
+if you would rather.
 
-Every download carries its own runtime, so there is nothing to install first.
-
-Open a **new** terminal afterwards and run:
+Afterwards open a new terminal - PATH changes do not reach windows that were
+already open - and run:
 
 ```
 gateway
@@ -29,36 +29,29 @@ gateway
 
 ## First run
 
-Sign in from inside the session:
+Sign in from inside the session. `/login` covers claude and chatgpt/codex;
+`/opencodelogin`, `/mistrallogin`, `/commandcodelogin` and `/deepseeklogin`
+take provider keys.
 
-- `/login` — Claude or ChatGPT/Codex.
-- `/opencodelogin`, `/mistrallogin`, `/commandcodelogin`, `/deepseeklogin` —
-  provider API keys.
+Each login is saved under a numbered name like `claude1` or `opencode1`, so you
+can keep several accounts and switch between them without signing out.
 
-Each sign-in is saved under a numbered name (`claude1`, `opencode1`, ...), so
-you can keep several accounts and switch between them.
-
-To check an install without starting a session:
+## Checking an install
 
 ```
 gateway login --status
 ```
 
-It reports `"mode": "bundled"` on a healthy install.
+On a healthy install it reports `"mode": "bundled"`. That is also the cheapest
+proof the runtime came along with the download.
 
-## Where your things live
+## Your files
 
-| What | Where |
-|---|---|
-| Program files | the folder you installed into |
-| Settings and sessions | `~/.claude` (`%USERPROFILE%\.claude` on Windows) |
-| Keys | the install's own keysafe folder |
-| Launcher log | the install's `launcher.jsonl` |
+Program files live in the folder you installed into. Settings and sessions are
+in `~/.claude`, which is the only place they have ever been. Keys are kept
+separately, in the install's own keysafe folder, so two installs never share
+credentials by accident. Uninstalling leaves your settings, sessions and keys
+alone - reinstalling keeps your accounts.
 
-Uninstalling removes the program files and PATH entry, and leaves your
-settings, sessions and keys alone - reinstalling keeps your accounts.
-
-## Next
-
-[`using.md`](using.md) covers day-to-day use: sessions, models, leaves, and
-what to do when something does not start.
+Day to day use - models, leaves, questions, and what to do when nothing starts
+- is in [using.md](using.md).

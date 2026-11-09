@@ -24,25 +24,17 @@ during the occasional compaction boundary.
 
 ## Download
 
-Builds for Windows, Linux and macOS, 1.0.0-research, unsigned:
-https://ahmedsajid.ca/gateway/
-
-## This repository
-
-This tree is the Gateway layer: the model gateway, session family and peer
-bus, the question rail, the vault, and the release tooling. The Claude Code
-source snapshot it builds against is not redistributed here, so the tree is
-not buildable on its own.
+Builds for Windows, Linux and macOS are at https://ahmedsajid.ca/gateway/.
+They're 1.0.0-research and unsigned.
 
 ## Where to go next
 
-- **For humans** — [`human/README.md`](human/README.md): what Gateway is, how
-  to install it, and how to use it. Short, no internals.
-- **For agents** — [`agents/AGENTS.md`](agents/AGENTS.md): how to reassemble
-  this tree onto a Claude Code snapshot, build it, run it, and answer
-  questions about it. [`agents/architecture.md`](agents/architecture.md) and
-  [`agents/internals.md`](agents/internals.md) go deeper.
+If you just want to use it, read [human/README.md](human/README.md) - installing
+it, starting it, and the things that come up in the first week.
 
-Want to build it yourself? Clone this repo, bring your own Claude Code source
-snapshot, and point your agent at [`agents/AGENTS.md`](agents/AGENTS.md) to
-start.
+If you want to understand it, take it apart or rebuild it, start at
+[agents/AGENTS.md](agents/AGENTS.md); [architecture](agents/architecture.md)
+says what the parts are and [internals](agents/internals.md) says how they work.
+
+Want to build it yourself? Bring your own claude code source snapshot, drop
+this repo on top, and let your agent read agents/AGENTS.md to start.

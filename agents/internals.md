@@ -1,140 +1,123 @@
 # Internals
 
-How the Gateway mechanisms work, in the order they matter. Where behaviour is
-subtle, the test named beside it is the authority - read it before trusting
-this prose.
+How the mechanisms behave, in the order they matter. Where something is subtle
+the test that pins it is named in the sentence, and the test is the authority -
+read it before trusting the prose.
 
-## 1. A turn boundary is the unit of coordination
+## A turn boundary is where everything meets
 
-Everything that arrives from outside a session - a peer message, a question
-answer - is a *queued command* with an origin, not a user prompt. A prompt
-would jump the composer queue, consume the prompt budget, and be pullable into
-the input box; a queued command with an origin does none of those.
+Anything that arrives from outside a session - a peer message, a question
+answer - is a queued command with an origin, not a user prompt. That distinction
+is load-bearing: a prompt would jump the composer queue, spend one of the four
+prompt slots, and could be pulled into the input box by Escape. A command with
+an origin does none of that.
 
-Two mechanisms share the work, and they partition the space:
-
-- **The queue** wakes a session that is idle (`enqueue({mode:'prompt',
-  priority:'next', isMeta:true, origin:{kind:...}})`).
-- **A Stop hook** claims the queue at a turn boundary, while the session is
-  still alive and its context is current.
-
-`src/utils/gatewayPeerInjection.ts` is the original of this shape; the question
-rail copies it. `src/utils/gatewayPeerStopHook.ts` shows the registration:
-`addFunctionHook(state, sessionId, 'Stop', ...)` with a stable hook id, so
+Two mechanisms share the work and between them cover the space. The queue wakes
+a session that is idle, which is how a message reaches one nobody is typing
+into. A Stop hook claims the queue at the turn boundary, which is how a message
+reaches one that is busy but still has its context loaded. The original of this
+shape is `src/utils/gatewayPeerInjection.ts`, and the rail reuses it. The
+registration lives in `gatewayPeerStopHook.ts` and uses a stable hook id, so
 registering twice does not double-deliver.
 
-Two origins exist today: `gateway-peer` (a message from another session) and
-`question-rail` (an answer or note). `src/utils/messages.ts` renders them
-without the "the user sent a message while you were working" framing, and
-`src/utils/sessionStorage.ts` keeps them as loggable attachments so a resumed
-session still has them.
+There are two origins today, `gateway-peer` and `question-rail`. `messages.ts`
+renders both without the "the user sent a message while you were working"
+framing, and `sessionStorage.ts` keeps them as loggable attachments so a
+resumed session still has them. `scripts/question-rail.test.mjs` pins the rail
+half, including that the hook blocks once and then allows.
 
-Tests: `scripts/gateway-peer-*`, `scripts/question-rail.test.mjs`.
+## Families and leaves
 
-## 2. Families and leaves
+A family is a session plus the leaves it opened. The record is in
+`leafFamily.ts`, the append-only history of what happened is in
+`headLedger.ts` and `zenithLedger.ts`.
 
-A family is a session plus the leaves it opened. The family record
-(`src/utils/leafFamily.ts`) holds members, their designations and who drives
-whom; the ledger (`headLedger.ts`, `zenithLedger.ts`) holds what happened,
-append-only.
+A leaf is a full session process, not a thread. Forking copies the parent's
+conversation at the moment the leaf opens, so it starts with the parent's
+context and diverges from there. A checkpoint freezes a conversation at a point
+and can be branched from repeatedly - taking the same conversation twice is one
+checkpoint, not two. Driving a leaf means sending it a message and reading its
+turns, and `leafBreakaway.ts` keeps that child out of the parent's Windows job
+object so it survives the parent exiting.
 
-A leaf is a full session process, not a thread:
+Liveness is observed, not assumed. A member is enumerable while closed, and
+"unknown" is not "closed" - the distinction is what lets a family reopen a
+member instead of declaring it dead. The tests that matter here are
+`leaf-family.test.ts`, `leaf-merge.test.ts`, `leaf-checkpoint.test.ts`,
+`leaf-pointer-succession.test.ts` and `leaf-owner-containment.test.ts`.
 
-- **Fork** copies the parent's conversation into the new leaf at the moment it
-  opens, so the leaf starts with the parent's context and then diverges.
-- **Checkpoint** freezes a conversation at a point; forks can branch from it
-  repeatedly. Taking the same conversation twice is one checkpoint.
-- **Driving** a leaf means sending it a message and reading its turns -
-  `leafChannel.ts` carries it, `leafProcess.ts` owns lifecycle, `leafBreakaway.ts`
-  keeps the child out of the parent's Windows job object so it survives the
-  parent's exit.
-- **Liveness** is observable, not assumed: a family member is enumerable while
-  closed, and "unknown" is not "closed".
+Designations - driver, heir, elder, matriarch, head - are organizational. They
+change who the family listens to and never the transcript or a number.
 
-Designations (`driver`, `heir`, `elder`, `matriarch`, `head`) are organizational
-only - they change who a family listens to, never the transcript or a number.
+## Sending a message to another session
 
-Tests: `scripts/leaf-family.test.ts`, `leaf-merge.test.ts`,
-`leaf-checkpoint.test.ts`, `leaf-pointer-succession.test.ts`,
-`leaf-owner-containment.test.ts`.
+`gatewayPeerSend.ts` builds the envelope from `gatewaySessionProtocol.ts`, the
+transport delivers it, and `gatewaySessionDelivery.ts` retries. Durability and
+ownership decide where it waits when the target is not running: a mailbox on
+disk, claimed once, rather than a race between two senders.
 
-## 3. Sending a message to another session
+The receiver does not poll. It is woken by the queue or claimed by the Stop hook
+above, which is why a peer message can arrive mid-turn and still land in the
+right place. And a message from a peer cannot authorize a secret read or a
+credential write - that is a rule about who is allowed to ask, and no code path
+overrides it.
 
-`gatewayPeerSend.ts` builds the envelope (`gatewaySessionProtocol.ts`), the
-transport delivers it (`gatewaySessionTransport.ts`), and
-`gatewaySessionDelivery.ts` retries. Durability and ownership
-(`gatewaySessionDurability.ts`, `gatewaySessionOwnership.ts`) decide where a
-message waits when the target is not running: a mailbox on disk, claimed once.
+## Model routing
 
-The receiving side does not poll: it is woken by the queue or claimed by the
-Stop hook (section 1). A peer message cannot authorize a secret read or a
-credential write - that is a rule about authorship, not a code path.
+The harness talks to one endpoint, the local gateway, and the gateway owns
+everything provider-shaped: request format, auth header, streaming, retries.
+Keys are numbered and held as a pool per provider in `gatewayCredentials.ts`. A
+key that reports a quota refusal is not marked dead; the next attempt just uses
+a different record, which is what `providerQuota.ts` and
+`quota-cache.mjs` are keeping track of.
 
-## 4. Model routing
+Model choice resolves through the catalogue in `src/utils/model/`, with effort
+support per model in `gatewayEffortCapabilities.ts` and
+`gatewayEffortDefaults.ts`. Failover is visible rather than silent - the route
+comes from `MODEL_GATEWAY_DEFAULT` or `gatewayDefaultModel.ts`, and a failure
+surfaces in the provider's own words.
+`scripts/model-gateway.test.mjs` is the place to look when routing surprises
+you.
 
-The harness talks to one endpoint: the local gateway
-(`scripts/model-gateway.mjs`). It owns provider differences - request shape,
-auth header, streaming format, retry - so a new provider is an adapter, not a
-new code path in the conversation loop.
+## The question rail
 
-- **Model choice** is resolved from the catalogue
-  (`gatewayModelIds.ts`, `gatewayModelOptions.ts`, `gatewayModelOrder.ts`),
-  with per-model effort support in `gatewayEffortCapabilities.ts` and
-  `gatewayEffortDefaults.ts`.
-- **Keys are numbered.** A session holds a pool per provider
-  (`gatewayCredentials.ts`); a key that reports a quota refusal is not marked
-  dead, but the next attempt uses a different record
-  (`src/utils/providerQuota.ts`, `scripts/quota-cache.mjs`).
-- **Failover is visible**, not silent: `gatewayDefaultModel.ts` and the
-  launcher's `MODEL_GATEWAY_DEFAULT` set the route; a failure surfaces with the
-  provider's own words.
+`questionRail.ts` is a module store read through `useSyncExternalStore`, so
+every component sees the same list without prop drilling. An item is open or
+answered, can carry a thread of notes, and persists to a JSONL file beside the
+session.
 
-Tests: `scripts/model-gateway.test.mjs`, `gateway-model-options.test.mjs`,
-`gateway-effort-defaults.test.mjs`, `provider-quota-control.test.ts`.
+An answer is recorded in the store and carried by the queued command. A note is
+different: `addQuestionNote` appends it to the item's thread and injects it
+straight into the queued question as context, without answering it - that is
+how you say "about that one, also consider X" without closing it.
 
-## 5. The question rail
+Clearing finished questions writes a tombstone (`cleared: true`) instead of
+rewriting history, and hydration still walks the tombstones when advancing the
+numbering, so an id is never reused. In the UI, `QuestionRailBar.tsx` registers
+an overlay while the chat box is open, which is what keeps exactly one input
+owning the keyboard.
 
-`questionRail.ts` is a module store read through `useSyncExternalStore`, so any
-component sees the same list. An item moves through open -> answered, may carry
-a `thread` of notes, and persists to a JSONL file next to the session.
+## The vault
 
-Two ways a rail item reaches the model:
+The vault turns a transcript into obligations: who owes what, on what evidence,
+in what state. `capture.ts` and `transcriptCapture.ts` read the turns,
+`eligibleActions.ts` decides what counts, `obligations.ts` and `projection.ts`
+are the model, `journal.ts` and `vault-journal-worker.ts` make the writes
+durable, and `recall.ts` answers "what did we decide".
 
-- **Answer**: recorded in the store; the queued command carries the answer.
-- **Note** (`addQuestionNote`): appended to the item's `thread` and injected
-  immediately as context for the queued question, without answering it.
+Credentials are deliberately not in the same store. The keysafe injects vault
+records into a child process's environment at launch, so a key is never an
+argument, never a file the agent reads, and never printed - which is the whole
+reason `scripts/gateway-keysafe.mjs` exists in this shape.
 
-Clearing finished questions writes tombstones (`cleared: true`) rather than
-rewriting history, and hydration still advances the numbering over tombstones,
-so an id is never reused. The UI (`QuestionRailBar.tsx`) registers an overlay
-while the chat box is open - exactly one input owns the keyboard - and shows
-the count of finished items next to *Clear finished*.
+## Packaging proves itself
 
-Test: `scripts/question-rail.test.mjs`.
-
-## 6. The vault
-
-The vault turns a transcript into obligations: who owes what, with what
-evidence, in what state. `capture.ts` and `transcriptCapture.ts` read turns;
-`eligibleActions.ts` decides what counts; `obligations.ts` and
-`projection.ts` are the model; `journal.ts` (with `vault-journal-worker.ts`)
-makes the writes durable; `recall.ts` answers "what did we decide".
-
-Credentials are separate and deliberately not in the same store: the keysafe
-(`scripts/gateway-keysafe.mjs`) injects vault records into a child process's
-environment at launch, so a key is never an argument, never a file the agent
-reads, and never printed.
-
-Tests: `scripts/vault-*.test.ts`, `scripts/keysafe-vault.test.mjs`.
-
-## 7. Packaging proves itself
-
-`scripts/release/package-release.mjs` embeds a pinned bun runtime, then proves
-the artifact: it runs the launcher with a `PATH` that cannot contain bun.
-`install-manifest.json` and `package-report.json` record `runtime.present`,
-the embedded runtime digest, and `proof: {bun, loginStatus,
+`scripts/release/package-release.mjs` embeds a pinned bun runtime and then
+proves it: it runs the launcher with a PATH that cannot contain bun.
+`install-manifest.json` and `package-report.json` record `runtime.present`, the
+digest of the embedded runtime, and `proof: {bun, loginStatus,
 pathWithoutBun}`. A report without that proof does not describe a bundled
-artifact, whatever the archive contains.
+artifact, whatever is inside the archive.
 
-The `gateway login --status` command is the cheapest independent check, which
-is why the installers run it too.
+`gateway login --status` is the independent version of the same check, which is
+why the installers run it too.

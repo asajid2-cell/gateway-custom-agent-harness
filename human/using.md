@@ -1,77 +1,67 @@
 # Using Gateway
 
-## Ask for work
+## Asking for work
 
-Start `gateway` in the folder you want it to work in and describe the task. It
-reads files, edits them and runs commands, and it shows you a diff before
-anything is written. It asks before anything destructive or outside that
-folder - answer yes or no, or tell it to do something different.
-
-Being specific pays: "make the failing test in `src/api/queue.test.ts` pass"
-beats "fix the tests".
+Start `gateway` in the folder you want it to work in and say what you want. It
+reads the files it needs, edits them, runs commands, and asks before doing
+something it cannot undo. Being specific pays - "make the failing test in
+`src/api/queue.test.ts` pass" gets further than "fix the tests".
 
 ## Sessions
 
-Each session keeps its own context. Starting Gateway again in the same folder
-gives you a new session; older ones stay on disk in `~/.claude`, and
-`/gateway-sessions` lists and reopens them.
+Every session keeps its own context, and they all live on disk. Starting
+Gateway again gives you a new session; `/gateway-sessions` lists the old ones
+and reopens them.
 
-Compact a long session with `/compact` when the context fills up. Gateway
-compacts on its own at the boundary; the summary keeps the recent decisions
-and the open work.
+When a session gets long, `/compact` folds it down. It also happens on its own
+at the limit - the summary keeps the recent decisions and whatever was still
+being worked on, and the family is what usually catches it if something gets
+lost in that fold.
 
 ## Models and providers
 
-- `/model` - pick a model for this session.
-- `/openmodels` - list the models the gateway can route to.
-- `/limit` - show what the current provider says about its rate limit and
-  quota.
-- `/toggle-thinking` - turn extended reasoning on or off where the model
-  supports it.
+`/model` picks a model for the session and `/openmodels` lists what the gateway
+can route to. `/limit` shows what the current provider says about its quota,
+and `/toggle-thinking` turns extended reasoning on or off where the model
+supports it.
 
-Different providers answer differently: Claude and ChatGPT/Codex sign in with
-your account, the rest take API keys. You can mix them - one session can hand
-work to a leaf on another provider.
+Claude and chatgpt/codex sign in with an account; the others take keys. You can
+mix them - one session can hand work to a leaf running on another provider,
+which is often the point.
 
-## Leaves, families, peers
+## Leaves and families
 
-A **family** is a session plus the leaves it has opened. `/leaf` opens one:
-either a fork of this session that keeps its context, or a fresh leaf on a
-stronger model for a second opinion.
+A family is a session and the leaves it has opened. `/leaf` opens one: either a
+fork of this session that keeps its context, or a fresh leaf on a stronger
+model when you want a real second opinion. `/fork` does the fork directly,
+`/peers` lists who is in the family and what they can reach, and
+`/gateway-sessions` shows every session on the machine.
 
-- A leaf is a real session. You can type into it, or the parent can drive it.
-- `/peers` lists the members of the family and the sessions they can message.
-- `/fork` branches this session's context into a new leaf.
-- `/gateway-sessions` shows every session, not just this family.
-
-The point is adversarial review: ask a leaf to find the flaw in the plan, and
-the family keeps both answers in view.
+A leaf is a real session, so you can type into it yourself, and the parent can
+drive it as a peer. Ask one to find the flaw in the plan and the family keeps
+both answers in view.
 
 ## Questions
 
-When Gateway needs a decision it does not guess. Questions collect in a small
-bar at the bottom instead of blocking the session:
-
-- answer one with a click or a number,
-- **Chat** adds detail to a question without answering it,
-- answered questions can be cleared once you are done with them.
+When Gateway needs a decision it asks instead of guessing. Questions collect in
+a bar at the bottom rather than blocking the session: answer one with a click
+or a number, use **Chat** to add detail to a question without answering it yet,
+and clear the answered ones when you are done with them.
 
 ## Keys and accounts
 
-`/gateway-login` shows which accounts this install holds and lets you add
-another. Keys live in the install's own keysafe folder, not in the repo and
-not in `~/.claude`, so two installs never share credentials by accident.
+`/gateway-login` shows the accounts this install holds and lets you add more.
+Keys stay in the install's own keysafe folder, not in the repo and not in
+`~/.claude`.
 
-## When something does not start
+## When nothing starts
 
-1. Open a new terminal - PATH changes do not reach windows that were already
-   open.
-2. Run `gateway login --status`. If it does not print `"mode": "bundled"`,
-   the install is incomplete; reinstall from the download page.
-3. If the window flashes and closes, run `scripts/cc.cmd` (Windows) or
-   `scripts/cc` (Linux, macOS) from the install folder to see the error text.
-4. The launcher's log is `launcher.jsonl` in the install's data folder.
+Open a new terminal first - PATH changes do not reach windows that were already
+open. If it still fails, `gateway login --status` will tell you whether the
+install is intact. If a window flashes and closes, run `scripts\cc.cmd` on
+Windows or `scripts/cc` on Linux and macOS from the install folder and you will
+see the error instead of a flash.
 
-Builds are unsigned. If Windows or macOS blocks the download, that is why;
-verify the file against `SHA256SUMS` on the download page rather than trusting
-the warning.
+The downloads are unsigned, so Windows and macOS will complain. That is what
+`SHA256SUMS` on the download page is for - check the file rather than the
+warning.

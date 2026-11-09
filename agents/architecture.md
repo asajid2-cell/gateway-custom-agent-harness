@@ -1,7 +1,7 @@
 # Architecture
 
-Where the Gateway parts live and how they fit. For how each one works, read
-`internals.md`.
+What the parts are and where they live. For how they work, read
+[internals](internals.md).
 
 ## The shape of the program
 
@@ -14,101 +14,89 @@ entrypoint -> app shell -> message loop -> model call -> tool calls -> render
                           session storage                  permissions
 ```
 
-Upstream supplies that skeleton. The fork replaces four things inside it:
+The snapshot supplies that skeleton. The fork changes four things inside it:
+which model a turn goes to, who a session is, where a decision comes from, and
+what gets remembered.
 
-1. **Which model a turn goes to.** A local HTTP gateway (`scripts/model-gateway.mjs`)
-   fronts every provider; the harness speaks one protocol to it.
-2. **Who a session is.** Sessions are members of a *family*, and families
-   exchange messages on a *peer bus*.
-3. **Where a decision comes from.** Questions are queued and answered from a
-   rail instead of blocking the turn.
-4. **What is remembered.** A vault records obligations and decisions from the
-   transcript; a keysafe holds credentials per install.
+## Model routing
 
-## Module map
+Every provider sits behind one local HTTP gateway, `scripts/model-gateway.mjs`,
+so the harness speaks a single protocol to it and a new provider is an adapter
+rather than a new code path in the conversation loop. The adapters are
+`scripts/opencode-zen.mjs`, `scripts/opencode-go.mjs`,
+`scripts/commandcode.mjs` and `scripts/mistral.mjs`; quota and rate-limit state
+is in `scripts/quota-cache.mjs` and `scripts/codex-quota.mjs`.
 
-### Model routing
+On the harness side, `src/utils/model/gatewayBackend.ts` is the connection
+itself, `gatewayModelIds.ts`, `gatewayModelOptions.ts` and
+`gatewayModelOrder.ts` are the catalogue, and `gatewayEffort*.ts` is what each
+model can do with reasoning effort. Usage and limits per provider live in
+`src/utils/providerQuota.ts` with friends - `commandCodeUsage.ts`,
+`mistralUsage.ts`, `opencodeUsage.ts`, `deepseek.ts`.
 
-| Path | Role |
-|---|---|
-| `scripts/model-gateway.mjs` | the local gateway: provider adapters, retries, quota |
-| `scripts/opencode-zen.mjs`, `scripts/opencode-go.mjs`, `scripts/commandcode.mjs`, `scripts/mistral.mjs` | provider adapters |
-| `scripts/quota-cache.mjs`, `scripts/codex-quota.mjs` | rate-limit and quota state |
-| `src/utils/model/gatewayBackend.ts` | harness side of the gateway connection |
-| `src/utils/model/gatewayModelIds.ts`, `gatewayModelOptions.ts`, `gatewayModelOrder.ts` | model catalogue and ordering |
-| `src/utils/model/gatewayEffort*.ts` | reasoning-effort support per model |
-| `src/utils/model/gatewayWebSearch.ts` | web search through the gateway |
-| `src/utils/providerQuota.ts`, `src/utils/commandCodeUsage.ts`, `mistralUsage.ts`, `opencodeUsage.ts`, `deepseek.ts` | per-provider limits and usage |
+## Families and leaves
 
-### Sessions, families, leaves
+`src/utils/leafFamily.ts` is the family record: who is in it, what they are
+designated, who came from whom. The rest hangs off it - `leafProcess.ts` for
+spawning and reaping, `leafTerminal.ts` and `leafTerminalHost.ts` for the
+terminal a leaf runs in, `leafChannel.ts` for talking to it, `leafWorkspace.ts`
+and `leafAliases.ts` for addressing, `leafCheckpoints.ts` for the frozen copies
+a leaf can branch from, and `leafBreakaway.ts` to keep a child out of the
+parent's job object. `partnerLeaf.ts` is the headless variant a session owns
+outright.
 
-| Path | Role |
-|---|---|
-| `src/utils/leafFamily.ts` | the family record: members, designations, lineage |
-| `src/utils/leafProcess.ts` | spawning, reaping, liveness |
-| `src/utils/leafTerminal.ts`, `leafTerminalHost.ts` | the terminal a leaf runs in |
-| `src/utils/leafChannel.ts`, `leafWorkspace.ts`, `leafAliases.ts` | addressing and workspace isolation |
-| `src/utils/leafCheckpoints.ts` | frozen copies of a conversation a leaf can branch from |
-| `src/utils/partnerLeaf.ts` | headless partner sessions owned by one session |
-| `src/utils/leafBreakaway.ts` | keeping leaves out of the parent's job object |
-| `src/utils/sessionReaper.ts`, `sessionIdentity.ts`, `sessionTitles.ts` | session lifecycle |
-| `src/utils/headLedger.ts`, `zenithLedger.ts`, `zenithRole.ts` | the family's own record of who did what |
-| `src/components/LeafWorkspaceDialog.tsx`, `GatewaySessionsDialog.tsx`, `SessionMetadataDialog.tsx` | the UI |
+`headLedger.ts`, `zenithLedger.ts` and `zenithRole.ts` are the family's own
+record of who did what. In the UI, `LeafWorkspaceDialog.tsx`,
+`GatewaySessionsDialog.tsx` and `SessionMetadataDialog.tsx` are the visible
+parts.
 
-### The peer bus
+## The peer bus
 
-| Path | Role |
-|---|---|
-| `src/utils/gatewaySessionProtocol.ts` | message shapes and envelopes |
-| `src/utils/gatewaySessionTransport.ts` | how a message reaches another session |
-| `src/utils/gatewaySessionRuntime.ts`, `gatewaySessionDelivery.ts` | delivery and retry |
-| `src/utils/gatewaySessionDurability.ts`, `gatewaySessionOwnership.ts` | mailbox, locks, ownership |
-| `src/utils/gatewayPeerSend.ts`, `gatewayPeerInjection.ts`, `gatewayPeerStopHook.ts` | sending, and turning a received message into a turn |
-| `src/skills/bundled/gatewayPeers.ts` | the peer skill the agent is given |
-| `src/tools/ListPeersTool/` | discovery |
-| `src/components/messages/UserPeerMessage.tsx`, `UserCrossSessionMessage.js` | rendering |
+`gatewaySessionProtocol.ts` defines the envelopes and `gatewaySessionTransport.ts`
+carries them; `gatewaySessionDelivery.ts` retries and
+`gatewaySessionDurability.ts` and `gatewaySessionOwnership.ts` decide where a
+message waits when the target is not running. On the receiving side,
+`gatewayPeerSend.ts`, `gatewayPeerInjection.ts` and `gatewayPeerStopHook.ts` turn
+a message into a turn, and `src/skills/bundled/gatewayPeers.ts` is what the
+agent is told about the bus. `src/tools/ListPeersTool` is discovery;
+`src/components/messages/UserPeerMessage.tsx` and `UserCrossSessionMessage.js`
+are how it looks.
 
-### Question rail
+## The question rail
 
-| Path | Role |
-|---|---|
-| `src/utils/questionRail.ts` | the store: items, answers, threads, persistence |
-| `src/utils/questionRailInjection.ts` | takes rail traffic out of the command queue |
-| `src/utils/questionRailStopHook.ts` | claims rail traffic at the turn boundary |
-| `src/components/QuestionRailBar.tsx` | the bar, the options and the per-question chat |
+`src/utils/questionRail.ts` is the store - items, answers, threads,
+persistence. `questionRailInjection.ts` takes rail traffic out of the command
+queue and `questionRailStopHook.ts` claims it at the turn boundary.
+`src/components/QuestionRailBar.tsx` is the bar, the options and the
+per-question chat.
 
-### Vault and keysafe
+## Vault and keysafe
 
-| Path | Role |
-|---|---|
-| `src/utils/vault/*.ts` | obligations, eligibility, capture, projection, recall, journal |
-| `scripts/vault-cli.ts`, `scripts/vault-journal-worker.ts` | command line and journal worker |
-| `scripts/gateway-keysafe.mjs`, `scripts/keysafe-vault.mjs` | credential store and injection |
-| `src/utils/keysafe/index.ts` | harness side |
-| `src/utils/gatewayCredentials.ts` | the credentials a run is allowed to see |
+The vault is `src/utils/vault/` - obligations, eligibility, capture,
+projection, recall, journal - with `scripts/vault-cli.ts` and
+`scripts/vault-journal-worker.ts` behind it. Credentials are a separate thing
+on purpose: `scripts/gateway-keysafe.mjs` and `scripts/keysafe-vault.mjs` are
+the store and the injection, `src/utils/keysafe/index.ts` and
+`gatewayCredentials.ts` are the harness side.
 
-### Terminal contracts and quality
+## Contracts and quality
 
-| Path | Role |
-|---|---|
-| `contracts/element-map-21338/` | the OSC 21338 element-map contract and its vectors |
-| `scripts/element-map-vectors.ts` | regenerates the vectors from the real codec |
-| `scripts/quality/cli.ts` | the quality gate (`scripts/quality/**`) |
-| `.quality/policy/` | what the gate considers source, and which roots may execute |
+`contracts/element-map-21338/` is the OSC 21338 element-map contract and its
+vectors, kept honest by `scripts/element-map-vectors.ts`, which regenerates them
+from the real codec so the fixture cannot drift. `scripts/quality/cli.ts` is the
+quality gate, and `.quality/policy/` says what counts as source and which roots
+may execute.
 
-### Release
+## Release
 
-| Path | Role |
-|---|---|
-| `scripts/stage-artifact.mjs`, `scripts/stage-codex.mjs` | stage a runnable tree and the pinned Codex binary |
-| `scripts/release/package-release.mjs` | embed the runtime, prove it, write the archives |
-| `scripts/release/build-msi.mjs`, `build-deb.mjs`, `package-macos.sh` | native installers |
-| `scripts/release/windows/` | Inno Setup wizard (`gateway.iss`, `GatewayManager.cs`) |
-| `scripts/release/install.sh`, `uninstall.sh` | portable install path |
-| `scripts/cc`, `scripts/cc.ps1`, `scripts/cc.cmd` | the launcher |
+`scripts/stage-artifact.mjs` and `scripts/stage-codex.mjs` build the tree that
+will ship; `scripts/release/package-release.mjs` embeds the runtime and writes
+the archives. The installers are `build-msi.mjs`, `build-deb.mjs`,
+`package-macos.sh` and the Inno wizard under `scripts/release/windows/`. The
+launchers are `scripts/cc`, `cc.ps1` and `cc.cmd`.
 
-## What is upstream, and not here
+## What is not here
 
-`upstream-touched.txt` lists the snapshot files this fork edits. If you are
-reconstructing, that list is the integration surface: the entrypoint, the
-command table, the tool registry, session storage, and the render hooks.
+`upstream-touched.txt` is the list of snapshot files the fork edits. If you are
+rebuilding, that list is the integration surface - the entrypoint, the command
+table, the tool registry, session storage and the render hooks.
