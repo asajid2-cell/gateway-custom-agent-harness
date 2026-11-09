@@ -1,18 +1,11 @@
 # The workflow, step by step
 
-Four short walkthroughs. Each one is a real shape of work, written out in the
-order it happens, with a note on what the capture for that step should show.
-Quoted terminal text is shortened - the real thing is wordier.
+Four shapes of work, written out in the order it happens. The first one is
+captured end to end; the others are the same workflow with a second session in
+the middle, and their captures are still to come.
 
-## Before you start
-
-You need Gateway installed (`human/README.md` has that) and a folder to work
-in. Something with a failing test is the easiest start, because the agent can
-check its own work.
-
-Open a terminal in that folder and run `gateway`. A new terminal window is
-better than your existing one; PATH changes do not reach windows that were
-already open.
+The session in the first example is real - a small `RetryQueue` with a test that
+fails on the second run, and the transcript below is what it actually did.
 
 ---
 
@@ -21,32 +14,31 @@ already open.
 Say what is wrong, not what to type.
 
 ```
-> the queue test keeps timing out on the second run
-
-● Reading src/api/queue.test.ts, src/api/queue.ts
-● The test awaits a promise that is only resolved by the watcher started in
-  the first test. The second run reuses the module, so the watcher is already
-  running and the promise never settles.
-● Editing src/api/queue.ts
+> the second run of the retry test times out. find out why and fix it properly - dont touch the test.
 ```
 
-The agent proposes the change and shows the diff before writing:
+![The session reading the repo and finding the shared state](media/01-plan.png)
 
-```
-  src/api/queue.ts
-  - let watcher: Watcher | undefined
-  + let watcher: Watcher | undefined
-  + export function resetWatcher() { watcher?.close(); watcher = undefined }
-```
+It lists the folder, searches, reads two files, and names the cause: `backoff`
+is module-scoped, so it is shared by every queue and every job. The first
+test's four retries push it to 80 ms, and the second test inherits that and
+blows its own 100 ms bound. It also notices the loop sleeps after the last
+failed attempt, which is a second, smaller bug.
 
-You accept, it runs the test, and it reports honestly - including when it
-still fails. That last part is the whole reason to prefer a session to a patch:
-it can check itself, and it does.
+The fix is two lines, and it shows them before writing:
 
-*Capture: `01-plan.gif` - the read, the diagnosis and the edit, ending on the
-diff.*
+![The two edits, and the test run that follows](media/02-fix.png)
 
-*Capture: `02-test.png` - the test run after the edit, one pass.*
+Then it runs the suite and reports what it saw:
+
+![The summary: what was wrong, what changed, both tests passing](media/03-pass.png)
+
+The test file is untouched, and the summary names the file and line it changed.
+That is the whole point of running the session rather than taking a patch: it
+found the bug, checked its own work, and left a record of both.
+
+*The full loop, from the prompt to the passing suite, is
+[`media/01-session.gif`](media/01-session.gif).*
 
 ---
 
@@ -69,22 +61,19 @@ repeated. You ask it for the thing you actually want:
 ```
 > leaf 2: what did the parent miss?
 
-● The resetWatcher export is a new public API for a test-only concern, and
-  nothing calls it in production. The parent also restarted the watcher on
-  every run, which is why it looked fixed.
+● The reset is right, but the loop still sleeps after the final failure, so a
+  job that never succeeds waits an extra backoff before it throws.
 ```
 
 Back in the parent, that arrives as a peer message, not as something you had to
 copy and paste:
 
 ```
-> accept leaf 2's point and hide the reset behind the test helper
+> fix that too, and cap the delay at a second
 ```
 
-What you end up with is two sessions that read the same problem and disagree,
-and the disagreement is visible in the family rather than in your head.
-
-*Capture: `03-leaf.gif` - the fork, the leaf's answer, the parent amending.*
+Two sessions, one problem, and the disagreement is visible in the family
+instead of living in your head.
 
 ---
 
@@ -106,24 +95,17 @@ session on a modal either. Questions collect in a bar at the bottom.
   b) no cap
 ```
 
-You answer the first with `b`, and the second is not obvious yet, so you use
+You answer the first with `b`. The second is not obvious yet, so you use
 **Chat** instead of answering:
 
 ```
 > about the cap: we already have a deadline at the call site, so the backoff
   only needs to outlast a blip
-
-● Question: should the backoff be capped?
-  a) yes, at 30s
-  b) no cap
-  answered: b - the caller already has a deadline
 ```
 
 The note reaches the model as context for that question. The question stays
 open until it is actually answered, and answered ones can be cleared from the
 bar once the session has moved on.
-
-*Capture: `04-rail.gif` - the two questions, the chat note, the answer.*
 
 ---
 
@@ -143,17 +125,12 @@ you get a second opinion that is not the same model agreeing with itself.
 That is also the cheapest way to find out whether a model is worth its price on
 your actual work: give it one review, not a whole project.
 
-*Capture: `05-providers.png` - `/openmodels` and one mixed-family leaf.*
-
 ---
 
 ## What to watch for
 
-Three things show up in every one of these and are the reason the harness looks
-the way it does. The agent reads before it writes, and the diff is yours to
-reject. The checks it runs are its own, not yours - a session that reports a
-passing test has usually run it. And a second session, given the same context,
-is the cheapest error detector there is.
-
-If you want the long version with video, the download site will have it. The
-captures in `media/` are the short ones.
+Three things show up in all of these and are the reason the harness looks the
+way it does. The agent reads before it writes, and the diff is yours to reject.
+The checks it runs are its own, not yours - a session that reports a passing
+test has run it. And a second session, given the same context, is the cheapest
+error detector there is.
