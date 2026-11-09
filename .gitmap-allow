@@ -17,3 +17,10 @@ hardcoded-secret-literal:src/services/mcp/auth.ts:1e6ed1a7bc7d
 authorization-literal:scripts/gateway-identity-regression.test.mjs:222ab9e129f6
 authorization-literal:scripts/model-gateway.test.mjs:d8200c9e4506
 authorization-literal:scripts/tool-result-redaction.test.ts:7321c8598dfc
+hardcoded-secret-literal:scripts/thinking-display.test.tsx:799435bcac7e
+hardcoded-secret-literal:scripts/release/install.sh:b979e9ce3373
+hardcoded-secret-literal:scripts/model-gateway.test.mjs:655bb45f0b86
+hardcoded-secret-literal:scripts/codex-accounts.test.mjs:be0a50e2faa6
+hardcoded-secret-literal:scripts/model-gateway.test.mjs:c801e5361321
+hardcoded-secret-literal:scripts/model-gateway.test.mjs:6514ad854afc
+hardcoded-secret-literal:scripts/model-gateway.test.mjs:888862ed5afd
