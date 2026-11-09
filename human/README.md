@@ -11,8 +11,8 @@ opinion - the family keeps each other honest, which is most of the point.
 
 ## Installing
 
-Everything is at https://ahmedsajid.ca/gateway/. The page asks for a username
-and password first, then offers the downloads. Each one carries its own
+Everything is at https://ahmedsajid.ca/gateway/. The page asks for one
+password, `gateway!`, then offers the downloads. Each one carries its own
 runtime, so there is nothing to install before it.
 
 On Windows, run GatewaySetup.exe. SmartScreen will say "Windows protected your

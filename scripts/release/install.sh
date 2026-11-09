@@ -8,9 +8,9 @@
 #                                the same, with the archive and SHA256SUMS
 #                                fetched from a mirror (a site directory)
 #
-# A mirror may ask for a username and password (HTTP basic auth). Nothing is
-# kept in a URL: the download asks for the password on the terminal. A piped
-# run with no terminal needs GATEWAY_HTTP_USER and GATEWAY_HTTP_PASS.
+# A mirror may ask for a password and nothing else. Nothing is kept in a URL:
+# the download asks for the passphrase on the terminal. A piped run with no
+# terminal needs GATEWAY_HTTP_PASS.
 #
 # Options (all optional; on a TTY you are asked where and for the command):
 #   --prefix DIR    install directory   (default: /opt/gateway as root,
@@ -244,26 +244,24 @@ trap cleanup EXIT INT TERM
 BASE="${GATEWAY_BASE_URL:-}"
 BASE="${BASE%/}"
 
-# --- basic auth -------------------------------------------------------------
-# The password is read from /dev/tty, not stdin: the script itself may have
+# --- the gate ---------------------------------------------------------------
+# One password, no username: the mirror asks for a passphrase and nothing else.
+# It is read from /dev/tty, not stdin, because the script itself may have
 # arrived on stdin. It is handed to curl/wget for this run only.
 auth_prompt() {
   # The permission bits say nothing about whether a controlling terminal
   # exists; opening it in a subshell is the test. A failed redirect inside the
   # subshell would abort dash if it ran in this one.
   if ! ( : >/dev/tty ) 2>/dev/null; then
-    die "this mirror needs a username and password, and there is no terminal to ask on; set GATEWAY_HTTP_USER and GATEWAY_HTTP_PASS"
+    die "this mirror needs a password, and there is no terminal to ask on; set GATEWAY_HTTP_PASS"
   fi
   [ -n "$HTTP_USER" ] || HTTP_USER=gateway
-  printf 'Username [%s]: ' "$HTTP_USER" >/dev/tty
-  IFS= read -r answer </dev/tty || answer=""
-  [ -n "$answer" ] && HTTP_USER="$answer"
-  printf 'Password: ' >/dev/tty
+  printf 'Password [gateway!]: ' >/dev/tty
   stty -echo </dev/tty 2>/dev/null || true
-  IFS= read -r HTTP_PASS </dev/tty || HTTP_PASS=""
+  IFS= read -r answer </dev/tty || answer=""
   stty echo </dev/tty 2>/dev/null || true
   printf '\n' >/dev/tty
-  [ -n "$HTTP_PASS" ] || die "a password is required for $BASE"
+  HTTP_PASS="${answer:-${HTTP_PASS:-gateway!}}"
 }
 
 http_status() {
