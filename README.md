@@ -24,7 +24,7 @@ during the occasional compaction boundary.
 
 ## Download
 
-I have builds for Windows, Linux and macOS at with password "gateway" at https://ahmedsajid.ca/gateway/. They are 1.0.0-research and unsigned.
+There are builds for Windows, Linux and macOS avilable at https://ahmedsajid.ca/gateway/ with password "gateway". They are 1.0.0-research and unsigned.
 
 ## This repository
 
