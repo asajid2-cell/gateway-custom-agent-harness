@@ -2,7 +2,7 @@
 
 The session captures used in [workflow.md](../workflow.md) are kept here.
 
-The number matches the example, and the name says what the capture shows: `01-plan.png`, `02-fix.png`, `03-pass.png`, and `01-session.gif`. The first session is the only one recorded so far.
+The number matches the example, and the name says what the capture shows: `01-fix.png`, `02-leaf.png`, `03-review.png`, and `01-session.gif`. The first session is the only one recorded so far.
 
 The GIF is 28 seconds and 4.0 MB. Keep GIFs under 5 MB, PNGs under 300 KB, and this folder under 15 MB. These limits keep the captures small enough to load from a README.
 

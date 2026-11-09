@@ -1,15 +1,21 @@
 # Examples
 
-I wanted a few real sessions here, so the first one is a small RetryQueue bug from a scratch repo, recorded from the first tool call through the passing test suite. The other examples are written out in [workflow.md](workflow.md), and I have not captured those yet.
-
-The first test makes four retries and pushes the shared `backoff` to 80 ms. Since `backoff` was declared at module scope, the second test inherits it and breaks its own 100 ms bound. The agent listed the folder, searched, read two files, made two edits, and ran the suite without touching the test file.
+One recorded session, on a small worker pool with a job that gets processed
+twice and another that never runs, and the part that matters after the fix: a
+leaf on a stronger model reads it and says what it missed.
 
 | | |
 |---|---|
-| ![Diagnosis of the shared backoff](media/01-plan.png) | ![The two edits](media/02-fix.png) |
+| ![The fix: shift before the await](media/01-fix.png) | ![The leaf reading the fix on opus](media/02-leaf.png) |
 
-![Both tests passing](media/03-pass.png)
+![The review arriving in the parent session](media/03-review.png)
 
-The full session is in [media/01-session.gif](media/01-session.gif) (28 seconds, 4.0 MB). The stills show the diagnosis, the edits, and the passing suite.
+The first still is the parent finding and fixing a real concurrency bug. The
+second is the leaf that opened on claude opus 5.5 while the parent stayed on
+deepseek, through the session message that handed it the context. The third is
+its review coming back into the parent, in the same conversation.
 
-The other three examples are a family review where a leaf attacks the fix, the question rail where the agent asks instead of guessing and you can chat a note onto a question without answering it, and a mixed-provider family using `/openmodels`, `/limit`, and a leaf on another provider. Those captures are still to come.
+Two minutes of that, start to finish, is
+[`media/01-session.gif`](media/01-session.gif) (3.5 MB). [workflow.md](workflow.md)
+writes the steps out and covers the question rail and mixed-provider families
+too; those are not recorded yet.

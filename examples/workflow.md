@@ -1,65 +1,69 @@
 # The workflow
 
-The first session below is real. It fixes a small RetryQueue in a scratch repo, and the captures show what happened. The family review, question rail, and mixed-provider family are written out too, but I have not recorded them yet.
+The first two examples are one recorded session on a scratch repo, and they are
+the reason the family exists at all: one session does the work, a second one
+reads it on a different model, and what it finds comes back on its own. The
+rail and the mixed-provider notes below are written out but not recorded yet.
 
 ---
 
-## 1. A first session
-
-I started with the failure and left the agent to work out why it happened.
+## 1. A failing test that isn't local
 
 ```
-> the second run of the retry test times out. find out why and fix it properly - dont touch the test.
+> the pool test fails: the same job runs twice and another never runs. find out why and fix it properly, dont touch the test.
 ```
 
-![The session diagnosing shared state](media/01-plan.png)
+The test says `saw [1,1,3,3]` when it wanted four different jobs. The session
+reads four files, runs the suite, and finds it in `JobQueue.next()`: it takes
+`jobs[0]`, awaits 5 ms, then shifts. Two workers start together, both read the
+same head, both shift after the await, and one job is handed out twice while
+another is shifted away and never runs.
 
-The agent listed the folder, searched, and read two files. It found that `backoff` was declared at module scope, so it doubled across every queue and job. The first test's four retries push it to 80 ms, then the second test inherits that and breaks its own 100 ms bound.
+![The diff: shift before the await](media/01-fix.png)
 
-It made two edits, first adding `const BASE_BACKOFF = 10`, then using `let backoff = BASE_BACKOFF` inside `attempt()`.
-
-![The two edits](media/02-fix.png)
-
-Then it ran the suite. Both tests passed, and the test file stayed untouched.
-
-![The passing tests and summary](media/03-pass.png)
-
-The summary names the change and the tests it ran. The full session, from the first tool call to the passing suite, is [media/01-session.gif](media/01-session.gif).
+It moves the shift in front of the await, so the claim is synchronous and the
+check and the removal cannot interleave, runs the suite, and reports the test
+file untouched. That part any decent agent does on a good day.
 
 ---
 
-## 2. A family review
-
-A leaf can start with the parent's context, so it can go straight at the fix without me repeating the whole story.
+## 2. The second session
 
 ```
-> /leaf ask a stronger model to find the flaw in the fix above
-
-● Opened leaf 2 (gateway-claude-opus-5-5) with this session's context
+> open a leaf on a stronger model and have it review that fix. i want to know what it missed.
 ```
 
-Then I ask what it found.
+The leaf opens with the parent's context - the failure, the diff, the job it is
+being given - so nothing has to be pasted or repeated. It runs on claude opus
+5.5 while the parent stays on deepseek, which is the whole point: the reviewer
+is not the same model agreeing with itself.
 
-```
-> leaf 2: what did the parent miss?
+![The leaf, on opus, reading the parent's fix](media/02-leaf.png)
 
-● The reset is right, but the loop still sleeps after the final failure, so a
-  job that never succeeds waits an extra backoff before it throws.
-```
+It is strict about it, because that is what it was asked for. It checks whether
+shift-before-await really is atomic under the JS event loop, whether `undefined`
+still works as the end sentinel with two workers, whether the `dequeued` metric
+moved in a sensible order, and whether the test itself is strong enough to catch
+the bug coming back. The answer arrives in the parent as a session message, in
+the same conversation that made the fix:
 
-The leaf's answer arrives as a peer message in the parent session. I can ask the parent to fix that too, and cap the delay at a second.
+![The review arriving in the parent session](media/03-review.png)
 
-```
-> fix that too, and cap the delay at a second
-```
+That is the part a single session cannot do for itself. The parent believed its
+own fix; the leaf ran on different weights and found the edges the parent had no
+reason to look for. Nothing had to be re-explained, no context was lost, and the
+disagreement is written down in both transcripts.
 
-This is the other session's job: read the fix with the same context and look for what it missed.
+The whole loop, from the failing test to the leaf's findings, is
+[`media/01-session.gif`](media/01-session.gif) - two minutes, three and a half
+megabytes.
 
 ---
 
 ## 3. The question rail
 
-When the agent needs a decision, it can ask instead of guessing. Questions collect in the rail at the bottom of the session.
+When the agent needs a decision it can ask instead of guessing, and it does not
+block the session on a modal while it waits.
 
 ```
 > add retries to the fetch call
@@ -68,26 +72,25 @@ When the agent needs a decision, it can ask instead of guessing. Questions colle
   a) connection errors only
   b) connection errors and 5xx
   c) everything except 4xx
-
-● Question: should the backoff be capped?
-  a) yes, at 30s
-  b) no cap
 ```
 
-I answer the first question with `b`. I am not ready to answer the second, so I use **Chat** to add a note without closing the question.
+Answer it with a key, or open **Chat** on it and add a note without answering:
 
 ```
 > about the cap: we already have a deadline at the call site, so the backoff
   only needs to outlast a blip
 ```
 
-The note gives the model more context for that question. It stays open until I answer it, and I can clear answered questions from the rail after the session has moved on.
+The note goes to the model as context for that question. The question stays open
+until it is actually answered, and answered ones can be cleared off the bar.
 
 ---
 
-## 4. A mixed-provider family
+## 4. A mixed family
 
-A family can use more than one provider. `/openmodels` lists what gateway can route to, `/limit` shows the current provider's quota, and a leaf can run on another provider while the parent stays where it is.
+Any session in the family can sit on a different provider. `/openmodels` lists
+what gateway can route to, `/limit` shows what the current provider says about
+quota, and a leaf can run somewhere else while the parent stays where it is.
 
 ```
 > /limit
@@ -95,4 +98,5 @@ A family can use more than one provider. `/openmodels` lists what gateway can ro
 > /leaf open a leaf on gateway-claude-sonnet-5-5 and ask it to review the plan
 ```
 
-That gives me another provider's review of the same plan, while the parent keeps its context and work.
+That is the cheapest way to find out if a model is worth its price on your work:
+give it one review, not a whole project.
