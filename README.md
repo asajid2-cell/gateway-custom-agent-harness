@@ -21,3 +21,15 @@ The main features of the Gateway harness include:
 
 The family keeps itself accountable, which helps reduce errors and confusion
 during the occasional compaction boundary.
+
+## Download
+
+Builds for Windows, Linux and macOS, 1.0.0-research, unsigned:
+https://ahmedsajid.ca/gateway/
+
+## This repository
+
+This tree is the Gateway layer: the model gateway, session family and peer
+bus, the question rail, the vault, and the release tooling. The Claude Code
+source snapshot it builds against is not redistributed here, so the tree is
+not buildable on its own.
