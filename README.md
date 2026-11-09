@@ -29,6 +29,10 @@ They're 1.0.0-research and unsigned.
 
 ## Where to go next
 
+Worked examples of the workflow - a first session, a family review, the rail,
+and a family running on more than one provider - are written out step by step,
+with captures, in [examples/](examples/README.md).
+
 If you just want to use it, read [human/README.md](human/README.md) - installing
 it, starting it, and the things that come up in the first week.
 
