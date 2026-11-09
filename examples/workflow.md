@@ -1,62 +1,44 @@
-# The workflow, step by step
+# The workflow
 
-Four shapes of work, written out in the order it happens. The first one is
-captured end to end; the others are the same workflow with a second session in
-the middle, and their captures are still to come.
-
-The session in the first example is real - a small `RetryQueue` with a test that
-fails on the second run, and the transcript below is what it actually did.
+The first session below is real. It fixes a small RetryQueue in a scratch repo, and the captures show what happened. The family review, question rail, and mixed-provider family are written out too, but I have not recorded them yet.
 
 ---
 
 ## 1. A first session
 
-Say what is wrong, not what to type.
+I started with the failure and left the agent to work out why it happened.
 
 ```
 > the second run of the retry test times out. find out why and fix it properly - dont touch the test.
 ```
 
-![The session reading the repo and finding the shared state](media/01-plan.png)
+![The session diagnosing shared state](media/01-plan.png)
 
-It lists the folder, searches, reads two files, and names the cause: `backoff`
-is module-scoped, so it is shared by every queue and every job. The first
-test's four retries push it to 80 ms, and the second test inherits that and
-blows its own 100 ms bound. It also notices the loop sleeps after the last
-failed attempt, which is a second, smaller bug.
+The agent listed the folder, searched, and read two files. It found that `backoff` was declared at module scope, so it doubled across every queue and job. The first test's four retries push it to 80 ms, then the second test inherits that and breaks its own 100 ms bound.
 
-The fix is two lines, and it shows them before writing:
+It made two edits, first adding `const BASE_BACKOFF = 10`, then using `let backoff = BASE_BACKOFF` inside `attempt()`.
 
-![The two edits, and the test run that follows](media/02-fix.png)
+![The two edits](media/02-fix.png)
 
-Then it runs the suite and reports what it saw:
+Then it ran the suite. Both tests passed, and the test file stayed untouched.
 
-![The summary: what was wrong, what changed, both tests passing](media/03-pass.png)
+![The passing tests and summary](media/03-pass.png)
 
-The test file is untouched, and the summary names the file and line it changed.
-That is the whole point of running the session rather than taking a patch: it
-found the bug, checked its own work, and left a record of both.
-
-*The rest of the session, from the first tool call to the passing suite, is
-[`media/01-session.gif`](media/01-session.gif).*
+The summary names the change and the tests it ran. The full session, from the first tool call to the passing suite, is [media/01-session.gif](media/01-session.gif).
 
 ---
 
 ## 2. A family review
 
-The interesting case is when a session is confident and wrong. That is what the
-family is for.
-
-From the same session:
+A leaf can start with the parent's context, so it can go straight at the fix without me repeating the whole story.
 
 ```
 > /leaf ask a stronger model to find the flaw in the fix above
 
-● Opened leaf 2 (gateway-claude-opus) with this session's context
+● Opened leaf 2 (gateway-claude-opus-5-5) with this session's context
 ```
 
-The leaf starts with the parent's context, so it does not need the story
-repeated. You ask it for the thing you actually want:
+Then I ask what it found.
 
 ```
 > leaf 2: what did the parent miss?
@@ -65,22 +47,19 @@ repeated. You ask it for the thing you actually want:
   job that never succeeds waits an extra backoff before it throws.
 ```
 
-Back in the parent, that arrives as a peer message, not as something you had to
-copy and paste:
+The leaf's answer arrives as a peer message in the parent session. I can ask the parent to fix that too, and cap the delay at a second.
 
 ```
 > fix that too, and cap the delay at a second
 ```
 
-Two sessions, one problem, and the disagreement is visible in the family
-instead of living in your head.
+This is the other session's job: read the fix with the same context and look for what it missed.
 
 ---
 
-## 3. The rail
+## 3. The question rail
 
-When the agent needs a decision it does not guess, and it does not block the
-session on a modal either. Questions collect in a bar at the bottom.
+When the agent needs a decision, it can ask instead of guessing. Questions collect in the rail at the bottom of the session.
 
 ```
 > add retries to the fetch call
@@ -95,42 +74,25 @@ session on a modal either. Questions collect in a bar at the bottom.
   b) no cap
 ```
 
-You answer the first with `b`. The second is not obvious yet, so you use
-**Chat** instead of answering:
+I answer the first question with `b`. I am not ready to answer the second, so I use **Chat** to add a note without closing the question.
 
 ```
 > about the cap: we already have a deadline at the call site, so the backoff
   only needs to outlast a blip
 ```
 
-The note reaches the model as context for that question. The question stays
-open until it is actually answered, and answered ones can be cleared from the
-bar once the session has moved on.
+The note gives the model more context for that question. It stays open until I answer it, and I can clear answered questions from the rail after the session has moved on.
 
 ---
 
-## 4. A second provider
+## 4. A mixed-provider family
 
-Nothing stops a family from being mixed. `/openmodels` lists what the gateway
-can route to, `/limit` shows what the current provider says about quota, and a
-leaf can run somewhere else entirely while the parent stays put - which is how
-you get a second opinion that is not the same model agreeing with itself.
+A family can use more than one provider. `/openmodels` lists what gateway can route to, `/limit` shows the current provider's quota, and a leaf can run on another provider while the parent stays where it is.
 
 ```
 > /limit
   gateway-gpt-6-sol   quota ok, resets in 2h
-> /leaf open a leaf on gateway-claude-sonnet-5 and ask it to review the plan
+> /leaf open a leaf on gateway-claude-sonnet-5-5 and ask it to review the plan
 ```
 
-That is also the cheapest way to find out whether a model is worth its price on
-your actual work: give it one review, not a whole project.
-
----
-
-## What to watch for
-
-Three things show up in all of these and are the reason the harness looks the
-way it does. The agent reads before it writes, and the diff is yours to reject.
-The checks it runs are its own, not yours - a session that reports a passing
-test has run it. And a second session, given the same context, is the cheapest
-error detector there is.
+That gives me another provider's review of the same plan, while the parent keeps its context and work.

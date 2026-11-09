@@ -1,25 +1,16 @@
 # Captures
 
-The short clips and stills that `workflow.md` refers to.
+The session captures used in [workflow.md](../workflow.md) are kept here.
 
-**Naming.** Numbered by step, then by what it shows: `01-plan.png`,
-`02-fix.png`, `03-pass.png`, `01-session.gif`. The number matches the example
-in `workflow.md`, so a file is findable later without opening it.
+The number matches the example, and the name says what the capture shows: `01-plan.png`, `02-fix.png`, `03-pass.png`, and `01-session.gif`. The first session is the only one recorded so far.
 
-**Weight.** A GIF here stays under 5 MB and a PNG under 300 KB; the first
-capture is 4.4 MB of GIF and 270 KB of stills. GitHub serves images through its
-own proxy, so a 40 MB GIF makes the page slow for everyone and is why most
-repos with a demo have a broken one. Keep the folder under 15 MB.
+The GIF is 28 seconds and 4.0 MB. Keep GIFs under 5 MB, PNGs under 300 KB, and this folder under 15 MB. These limits keep the captures small enough to load from a README.
 
-**Video is not here.** Git is bad at it and GitHub will not play an MP4 from a
-README anyway. The long walkthrough is served from the download site and linked
-from `examples/README.md`; only the short loops live in this folder.
+No video in git. GitHub will not play an MP4 from a README, so the long video lives on the download site and only short captures belong here.
 
 ## Capturing
 
-Terminal at 120x35 or thereabouts, dark theme, 14pt or larger - smaller than
-that and the GIF is unreadable after scaling. Record the window to `raw.mkv`,
-then derive everything from it:
+I record a terminal window and convert it with ffmpeg. A terminal around 120x35 with a dark theme and 14pt or larger text keeps the GIF readable after scaling. Record the window to `raw.mkv`, then make the GIF and the site video from that recording.
 
 ```
 # the GIF, 15 fps, 1280 wide, proper palette
@@ -33,15 +24,8 @@ ffmpeg -i raw.mkv -c:v libx264 -pix_fmt yuv420p -crf 23 -preset slow \
 ffmpeg -i 01-plan.mp4 -frames:v 1 01-plan-poster.jpg
 ```
 
-Record in a scratch repository, not a work tree. No keys on screen, no
-`C:\Users\...` or `/home/...` in a prompt, no other windows in frame. A capture
-that leaks a path is worse than no capture - it is the one part of the docs
-nobody re-reads before publishing.
+I record in a scratch repository, not a work tree. Keep keys off screen, and make sure no `C:\Users\...` or `/home/...` path or other window appears in the recording.
 
 ## Where the video goes
 
-`https://ahmedsajid.ca/gateway/` is behind the download gate, so anything served
-under it is behind the same gate - a README image would get a login page
-instead of pixels. The long video needs a path outside that gate (its own
-`/gateway-media/` location block, no auth, cacheable by extension), and this
-folder links to that page once it exists.
+The download site is https://ahmedsajid.ca/gateway/. The long video lives on that site, not in git, and will be linked here once it is available.

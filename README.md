@@ -24,21 +24,16 @@ during the occasional compaction boundary.
 
 ## Download
 
-Builds for Windows, Linux and macOS are at https://ahmedsajid.ca/gateway/.
-They're 1.0.0-research and unsigned.
+I have builds for Windows, Linux and macOS at https://ahmedsajid.ca/gateway/. They are 1.0.0-research and unsigned.
+
+## This repository
+
+This repo is the gateway layer only. The claude code source snapshot it builds against is not redistributed here, so this tree is not buildable on its own.
 
 ## Where to go next
 
-Worked examples of the workflow - a first session, a family review, the rail,
-and a family running on more than one provider - are written out step by step,
-with captures, in [examples/](examples/README.md).
+The examples are at [examples/README.md](examples/README.md), with the workflow written out in [examples/workflow.md](examples/workflow.md) and the captures in [examples/media/](examples/media/).
 
-If you just want to use it, read [human/README.md](human/README.md) - installing
-it, starting it, and the things that come up in the first week.
+For using gateway, start with [human/README.md](human/README.md). To work on the harness, start with [agents/AGENTS.md](agents/AGENTS.md), then read [agents/architecture.md](agents/architecture.md) and [agents/internals.md](agents/internals.md).
 
-If you want to understand it, take it apart or rebuild it, start at
-[agents/AGENTS.md](agents/AGENTS.md); [architecture](agents/architecture.md)
-says what the parts are and [internals](agents/internals.md) says how they work.
-
-Want to build it yourself? Bring your own claude code source snapshot, drop
-this repo on top, and let your agent read agents/AGENTS.md to start.
+Bring your own claude code source snapshot, put this repo on top of it, and have your agent start with agents/AGENTS.md.

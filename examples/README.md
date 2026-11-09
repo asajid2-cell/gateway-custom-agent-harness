@@ -1,29 +1,15 @@
 # Examples
 
-A session, written out the way it actually goes, with the capture beside it. The
-point is the shape of the workflow - where the agent reads, where it checks
-itself, where a second session earns its keep - rather than a demo of a model
-getting something right on the first try.
+I wanted a few real sessions here, so the first one is a small RetryQueue bug from a scratch repo, recorded from the first tool call through the passing test suite. The other examples are written out in [workflow.md](workflow.md), and I have not captured those yet.
 
-[`workflow.md`](workflow.md) has four of them. The first is captured end to
-end: a small `RetryQueue` with a test that fails on the second run, and what the
-session did about it.
+The first test makes four retries and pushes the shared `backoff` to 80 ms. Since `backoff` was declared at module scope, the second test inherits it and breaks its own 100 ms bound. The agent listed the folder, searched, read two files, made two edits, and ran the suite without touching the test file.
 
 | | |
 |---|---|
-| ![the diagnosis](media/01-plan.png) | ![the edits](media/02-fix.png) |
+| ![Diagnosis of the shared backoff](media/01-plan.png) | ![The two edits](media/02-fix.png) |
 
-![the summary](media/03-pass.png)
+![Both tests passing](media/03-pass.png)
 
-The rest of the session, first tool call to passing suite, is
-[`media/01-session.gif`](media/01-session.gif) - four and a bit megabytes, so it
-is the one heavy thing in here. The stills are the same session at the three
-moments worth looking at: finding the cause, making the edit, proving it.
+The full session is in [media/01-session.gif](media/01-session.gif) (28 seconds, 4.0 MB). The stills show the diagnosis, the edits, and the passing suite.
 
-The other three examples in `workflow.md` - a family review, the rail, a second
-provider - are the same workflow with a second session in the middle. Their
-captures are not recorded yet; the text is the script they were staged from.
-
-If you want to follow along in your own terminal, every step is a command or a
-keystroke. The scratch repo the capture was taken from is small enough to
-rebuild from the transcript.
+The other three examples are a family review where a leaf attacks the fix, the question rail where the agent asks instead of guessing and you can chat a note onto a question without answering it, and a mixed-provider family using `/openmodels`, `/limit`, and a leaf on another provider. Those captures are still to come.
