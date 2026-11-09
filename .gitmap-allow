@@ -1,0 +1,19 @@
+# Test fixtures: every value below is synthetic, generated to exercise the
+# redaction and header-building paths. None is a live credential.
+private-key-block:scripts/tool-result-redaction.test.ts:3cb15e8270a4
+jwt:scripts/tool-result-redaction.test.ts:9f5f30e672bf
+openai-key:scripts/leaf-pointer-terminal.py:d0efb2a28bfc
+hardcoded-secret-literal:scripts/codex-accounts.test.mjs:0eb3e143cf68
+hardcoded-secret-literal:scripts/gateway-identity-regression.test.mjs:105c8b701977
+hardcoded-secret-literal:scripts/gateway-memory-api.ts:991100ab1516
+hardcoded-secret-literal:scripts/gateway-performance-benchmark.mjs:ce0a299bea13
+hardcoded-secret-literal:scripts/gateway-subagent-routing.test.mjs:26e2453b4137
+hardcoded-secret-literal:scripts/keysafe-vault.test.mjs:fd7ce4bcef5c
+hardcoded-secret-literal:scripts/leaf-cli.test.ts:8f43b8e5d85f
+hardcoded-secret-literal:scripts/live-compiled-compaction-replay.mjs:1c4390f1af97
+hardcoded-secret-literal:scripts/model-gateway.test.mjs:d8a7c5bff0fe
+hardcoded-secret-literal:scripts/release/install.sh:2192eca7dfd5
+hardcoded-secret-literal:src/services/mcp/auth.ts:1e6ed1a7bc7d
+authorization-literal:scripts/gateway-identity-regression.test.mjs:222ab9e129f6
+authorization-literal:scripts/model-gateway.test.mjs:d8200c9e4506
+authorization-literal:scripts/tool-result-redaction.test.ts:7321c8598dfc
