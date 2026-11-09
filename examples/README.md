@@ -15,7 +15,7 @@ session did about it.
 
 ![the summary](media/03-pass.png)
 
-The full loop, prompt to passing suite in a minute, is
+The rest of the session, first tool call to passing suite, is
 [`media/01-session.gif`](media/01-session.gif) - four and a bit megabytes, so it
 is the one heavy thing in here. The stills are the same session at the three
 moments worth looking at: finding the cause, making the edit, proving it.

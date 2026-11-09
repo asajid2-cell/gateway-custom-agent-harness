@@ -37,7 +37,7 @@ The test file is untouched, and the summary names the file and line it changed.
 That is the whole point of running the session rather than taking a patch: it
 found the bug, checked its own work, and left a record of both.
 
-*The full loop, from the prompt to the passing suite, is
+*The rest of the session, from the first tool call to the passing suite, is
 [`media/01-session.gif`](media/01-session.gif).*
 
 ---
