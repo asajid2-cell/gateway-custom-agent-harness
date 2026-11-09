@@ -24,3 +24,6 @@ hardcoded-secret-literal:scripts/codex-accounts.test.mjs:be0a50e2faa6
 hardcoded-secret-literal:scripts/model-gateway.test.mjs:c801e5361321
 hardcoded-secret-literal:scripts/model-gateway.test.mjs:6514ad854afc
 hardcoded-secret-literal:scripts/model-gateway.test.mjs:888862ed5afd
+
+# agents/AGENTS.md is intentional contributor documentation, not a planning artifact.
+agent-artifact-path:agents/AGENTS.md
