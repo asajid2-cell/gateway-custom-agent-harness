@@ -1,7 +1,7 @@
 /**
  * Live keysafe chain for the model gateway.
  *
- * The gateway only ever reads `process.env` (see model-gateway-spec.md): nobody
+ * The gateway only ever reads `process.env`: nobody
  * prints a key, and no key is ever an argument or a file. Keys reach the
  * gateway's environment through one short-lived keysafe child that injects
  * every vault record at once (keysafe run-many) - the same shape scripts/cc.ps1
